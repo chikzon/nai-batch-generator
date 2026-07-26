@@ -306,6 +306,61 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual({item["path"] for item in filtered["files"]}, expected)
             self.assertFalse(filtered["has_more"])
 
+    def test_structured_diagnostics_redact_secrets_paths_and_export_safe_events(self):
+        raw_lines = [
+            (
+                "2026-07-27 01:02:03,000 [INFO] 생성 저장 "
+                r"C:\Users\alice\private\image.png token=pst-live-secret"
+            ),
+            (
+                "2026-07-27 01:02:04,250 [ERROR] "
+                "https://example.test/a?X-Amz-Signature=rawsig&key=rawkey "
+                "Authorization: Bearer rawbearer"
+            ),
+        ]
+        events = APP.parse_diagnostic_lines(raw_lines)
+        exported = json.dumps(events, ensure_ascii=False)
+        for secret in ("alice", "pst-live-secret", "rawsig", "rawkey", "rawbearer"):
+            self.assertNotIn(secret, exported)
+        self.assertIn(r"C:\\Users\\<user>", exported)
+        self.assertIn("[REDACTED]", exported)
+        # 민감값이 있는 행은 기능 종류보다 보안 범주를 우선한다.
+        self.assertEqual(events[0]["category"], "security")
+        self.assertEqual(events[1]["category"], "security")
+        self.assertEqual(events[1]["since_previous_ms"], 1250)
+        self.assertIn("[ERROR][security]", APP.diagnostic_event_line(events[1]))
+
+        with tempfile.TemporaryDirectory() as td:
+            log_file = Path(td) / "fixture.log"
+            log_file.write_text("\n".join(raw_lines), encoding="utf-8")
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            server = APP.ConfigServer(copy.deepcopy(APP.DEFAULT_CONFIG))
+            with (
+                patch.object(APP, "LOG_FILE", log_file),
+                patch.object(APP, "PREVIEW_PORT_RANGE", (port,)),
+                patch.object(APP.webbrowser, "open", return_value=None),
+            ):
+                url = server.start()
+                try:
+                    with urllib.request.urlopen(url + "api/diag?n=100", timeout=3) as response:
+                        payload = json.loads(response.read())
+                    with urllib.request.urlopen(
+                        url + "api/diag?n=100&err=1", timeout=3
+                    ) as response:
+                        errors_only = json.loads(response.read())
+                finally:
+                    server.httpd.shutdown()
+                    server.httpd.server_close()
+        self.assertEqual(payload.get("schema"), "nais-diagnostics/v1", payload)
+        self.assertEqual(len(payload["events"]), 2)
+        self.assertEqual(len(errors_only["events"]), 1)
+        self.assertEqual(errors_only["events"][0]["level"], "ERROR")
+        api_text = json.dumps(payload, ensure_ascii=False)
+        for secret in ("alice", "pst-live-secret", "rawsig", "rawkey", "rawbearer"):
+            self.assertNotIn(secret, api_text)
+
     def test_local_http_rejects_cross_site_post_but_allows_local_cli(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
