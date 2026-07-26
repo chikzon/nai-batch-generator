@@ -328,7 +328,7 @@ DEFAULT_CONFIG = {
     "height": 1216,
     # 4 None = NAI가 네거티브에 아무것도 더하지 않음. 내 네거티브만 그대로 쓴다.
     "uc_preset": 4,           # 0 Heavy · 1 Light · 3 Human Focus · 4 None
-    "quality_toggle": False,  # 켜면 ", very aesthetic, masterpiece, no text" 자동 추가
+    "quality_toggle": False,  # 켜면 선택한 모델의 공식 퀄리티 태그 자동 추가
     "smea": False,
     "smea_dyn": False,
     "dynamic_thresholding": False,
@@ -3448,9 +3448,6 @@ def seed_for(cfg, base_seed, index):
     return (int(base_seed) + int(index)) % (2 ** 32)
 
 
-QUALITY_SUFFIX = ", very aesthetic, masterpiece, no text"
-
-
 SAMPLERS = ["k_euler_ancestral", "k_euler", "k_dpmpp_2s_ancestral",
             "k_dpmpp_2m", "k_dpmpp_2m_sde", "k_dpmpp_sde"]
 NOISE_SCHEDULES = ["karras", "native", "exponential", "polyexponential"]
@@ -3488,36 +3485,134 @@ def model_id_from_metadata(value, fallback="nai-diffusion-4-5-full"):
         return "nai-diffusion-3"
     return fallback
 
-# ══ UC 프리셋의 실제 문구 ══════════════════════════════════════════════
+
+# ══ 모델별 퀄리티 태그·UC 프리셋의 실제 문구 ═══════════════════════════
+# NovelAI 공식 문서(2026-07-27 확인):
+#   https://docs.novelai.net/en/image/qualitytags/
+#   https://docs.novelai.net/en/image/undesiredcontent/
+QUALITY_SUFFIX_TEXT = {
+    "nai-diffusion-4-5-full":
+        "location, very aesthetic, masterpiece, no text",
+    "nai-diffusion-4-5-curated":
+        "location, masterpiece, no text, -0.8::feet::, rating:general",
+    "nai-diffusion-4-full":
+        "no text, best quality, very aesthetic, absurdres",
+    "nai-diffusion-4-curated-preview":
+        "rating:general, amazing quality, very aesthetic, absurdres",
+    "nai-diffusion-3":
+        "best quality, amazing quality, very aesthetic, absurdres",
+    "nai-diffusion-furry-3":
+        "{best quality}, {amazing quality}",
+}
+# 기존 테스트·외부 호출 호환용 이름. 실제 조립은 quality_suffix_text(model)을 쓴다.
+QUALITY_SUFFIX = ", " + QUALITY_SUFFIX_TEXT["nai-diffusion-4-5-full"]
+
+
+def quality_suffix_text(model):
+    return QUALITY_SUFFIX_TEXT.get(str(model or ""), "")
+
+
+def merge_quality_suffix(prompt, model):
+    text = quality_suffix_text(model)
+    raw = str(prompt or "").rstrip().rstrip(",")
+    if not text or raw.endswith(text):
+        return raw
+    return f"{raw}, {text}" if raw else text
+
+
+def split_quality_suffix(prompt, model=None):
+    """끝에 붙은 공식 퀄리티 태그를 떼어 (사용자 프롬프트, 켜짐)으로."""
+    raw = str(prompt or "").strip().rstrip(",")
+    candidates = []
+    if model and quality_suffix_text(model):
+        candidates.append(quality_suffix_text(model))
+    else:
+        candidates.extend(QUALITY_SUFFIX_TEXT.values())
+    # 이전 배포본이 넣던 축약 V4.5 Full 문구도 되읽기는 계속 지원한다.
+    candidates.append("very aesthetic, masterpiece, no text")
+    for text in sorted(set(candidates), key=len, reverse=True):
+        if raw == text:
+            return "", True
+        if raw.endswith(", " + text):
+            return raw[:-(len(text) + 2)].rstrip().rstrip(","), True
+    return raw, False
+
+
 # ⚠ NAI 는 요청의 `ucPreset` 숫자를 **그림에 반영하지 않는다.** 실측(2026-07):
 #     같은 시드로 ucPreset 0 과 4 를 보냈을 때 픽셀 차이 0.00/255
 #     같은 시드로 프리셋 문구를 네거티브에 직접 합쳤을 때 차이 58.65/255
 #   즉 `ucPreset` 은 화면 상태를 적어 두는 값일 뿐이고, **문구를 합치는 것은
 #   클라이언트 몫**이다. 숫자만 보내면 프리셋은 아무 일도 하지 않는다.
-# 문구는 실제 NAI 이미지 3,513장의 네거티브와 대조해 확인했다
-#   (Heavy 로 시작하는 것 434장 · Light 4장 · Human Focus 5장).
-_UC_HEAVY = ("nsfw, lowres, artistic error, film grain, scan artifacts, worst quality, "
-             "bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, "
-             "halftone, screentone, multiple views, logo, too many watermarks, negative space, "
-             "blank page")
+# `nsfw` 는 사용자 UC일 수 있지만 프리셋 자체에는 없다. 자동으로 끼워 넣지 않는다.
+_V45_FULL_HEAVY = ("lowres, artistic error, film grain, scan artifacts, worst quality, "
+                   "bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, "
+                   "halftone, screentone, multiple views, logo, too many watermarks, negative space, "
+                   "blank page")
 UC_PRESET_TEXT = {
-    0: _UC_HEAVY,
-    1: ("nsfw, lowres, artistic error, scan artifacts, worst quality, bad quality, "
-        "jpeg artifacts, multiple views, very displeasing, too many watermarks, "
-        "negative space, blank page"),
-    3: _UC_HEAVY + ", @_@, mismatched pupils, glowing eyes, bad anatomy",
-    4: "",
+    "nai-diffusion-4-5-full": {
+        0: _V45_FULL_HEAVY,
+        1: ("lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, "
+            "multiple views, very displeasing, too many watermarks, negative space, blank page"),
+        3: _V45_FULL_HEAVY + ", @_@, mismatched pupils, glowing eyes, bad anatomy",
+        4: "",
+    },
+    "nai-diffusion-4-5-curated": {
+        0: ("blurry, lowres, upscaled, artistic error, film grain, scan artifacts, worst quality, "
+            "bad quality, jpeg artifacts, very displeasing, chromatic aberration, halftone, "
+            "multiple views, logo, too many watermarks, negative space, blank page"),
+        1: ("blurry, lowres, upscaled, artistic error, scan artifacts, jpeg artifacts, logo, "
+            "too many watermarks, negative space, blank page"),
+        3: ("blurry, lowres, upscaled, artistic error, film grain, scan artifacts, bad anatomy, "
+            "bad hands, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic "
+            "aberration, halftone, multiple views, logo, too many watermarks, @_@, mismatched "
+            "pupils, glowing eyes, negative space, blank page"),
+        4: "",
+    },
+    "nai-diffusion-4-full": {
+        0: ("blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, "
+            "jpeg artifacts, very displeasing, chromatic aberration, multiple views, logo, "
+            "too many watermarks"),
+        1: "blurry, lowres, error, worst quality, bad quality, jpeg artifacts, very displeasing",
+        4: "",
+    },
+    "nai-diffusion-4-curated-preview": {
+        0: ("blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, "
+            "jpeg artifacts, very displeasing, chromatic aberration, logo, dated, signature, "
+            "multiple views, gigantic breasts"),
+        1: ("blurry, lowres, error, worst quality, bad quality, jpeg artifacts, very displeasing, "
+            "logo, dated, signature"),
+        4: "",
+    },
+    "nai-diffusion-3": {
+        0: ("lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad "
+            "quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra "
+            "digits, artistic error, username, scan, [abstract],"),
+        1: "lowres, jpeg artifacts, worst quality, watermark, blurry, very displeasing,",
+        3: ("lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad "
+            "quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra "
+            "digits, artistic error, username, scan, [abstract], bad anatomy, bad hands, @_@, "
+            "mismatched pupils, heart-shaped pupils, glowing eyes,"),
+        4: "",
+    },
+    "nai-diffusion-furry-3": {
+        0: ("{{worst quality}}, [displeasing], {unusual pupils}, guide lines, {{unfinished}}, "
+            "{bad}, url, artist name, {{tall image}}, mosaic, {sketch page}, comic panel, impact "
+            "(font), [dated], {logo}, ych, {what}, {where is your god now}, {distorted text}, "
+            "repeated text, {floating head}, {1994}, {widescreen}, absolutely everyone, sequence, "
+            "{compression artifacts}, hard translated, {cropped}, {commissioner name}, unknown "
+            "text, high contrast,"),
+        1: ("{worst quality}, guide lines, unfinished, bad, url, tall image, widescreen, "
+            "compression artifacts, unknown text,"),
+        4: "",
+    },
 }
-# 위 문구는 V4/V4.5 계열의 것이다. V3 는 프리셋 문구가 달라 확인하지 않았으므로
-# V3 를 쓸 때는 합치지 않는다 (틀린 문구를 넣는 것보다 안 넣는 편이 낫다).
-UC_TEXT_MODELS = ("nai-diffusion-4",)
 
 
 def uc_preset_text(model, preset):
     """이 모델에서 이 프리셋의 문구. 모르는 모델이면 빈 문자열."""
-    if not str(model or "").startswith(UC_TEXT_MODELS):
-        return ""
-    return UC_PRESET_TEXT.get(int(preset or 0), "")
+    return UC_PRESET_TEXT.get(str(model or ""), {}).get(
+        int(preset or 0), ""
+    ).strip().rstrip(",")
 
 
 def merge_uc_preset(negative, model, preset):
@@ -3526,7 +3621,7 @@ def merge_uc_preset(negative, model, preset):
     if not txt:
         return negative or ""
     neg = (negative or "").strip()
-    if neg == txt or neg.startswith(txt):
+    if neg == txt or txt in neg:
         return neg
     return f"{txt}, {neg}" if neg else txt
 
@@ -3537,15 +3632,22 @@ def split_uc_preset(negative, model=None):
     그림에서 설정을 읽어 올 때 쓴다. 떼지 않으면 다시 생성할 때 문구가 **두 번**
     붙는다. 가장 긴 것부터 맞춰 본다 (3 번은 0 번을 포함하므로)."""
     neg = (negative or "").strip()
-    best = (None, neg)
-    for num, txt in sorted(UC_PRESET_TEXT.items(), key=lambda kv: -len(kv[1])):
+    table = UC_PRESET_TEXT.get(str(model or ""), {})
+    candidates = list(table.items()) if table else [
+        item for preset_table in UC_PRESET_TEXT.values() for item in preset_table.items()
+    ]
+    candidates = [(num, txt.strip().rstrip(",")) for num, txt in candidates]
+    for num, txt in sorted(candidates, key=lambda kv: -len(kv[1])):
         if not txt:
             continue
-        if neg == txt:
-            return num, ""
-        if neg.startswith(txt + ", "):
-            return num, neg[len(txt) + 2:].strip()
-    return best
+        at = neg.find(txt)
+        if at < 0:
+            continue
+        before = neg[:at].strip().strip(",").strip()
+        after = neg[at + len(txt):].strip().strip(",").strip()
+        user = ", ".join(part for part in (before, after) if part)
+        return num, user
+    return None, neg
 RESOLUTIONS = [(832, 1216, "세로"), (1216, 832, "가로"), (1024, 1024, "정사각"),
                (1024, 1536, "세로 대형"), (1536, 1024, "가로 대형"),
                (1472, 1472, "정사각 대형"), (1920, 1088, "와이드"), (1088, 1920, "세로 와이드"),
@@ -3660,7 +3762,7 @@ def spread_centers(n):
     return out
 
 
-def _i2i_fields(i2i, action):
+def _i2i_fields(i2i, action, seed):
     """img2img · 인페인트 전용 필드. 일반 생성이면 아무것도 안 넣는다."""
     if action == "generate" or not i2i.get("image"):
         return {}
@@ -3672,7 +3774,9 @@ def _i2i_fields(i2i, action):
         "image": i2i["image"],                       # 원본 PNG base64
         "strength": strength,                        # 얼마나 바꿀지 (0=원본, 1=완전히)
         "noise": float(i2i.get("noise", 0.0)),
-        "extra_noise_seed": int(i2i.get("seed") or 0) or None,
+        # NAI 웹 실캡처와 비교 구현 4곳이 본 시드보다 1 작은 uint32를 쓴다.
+        "extra_noise_seed": (int(i2i.get("seed") or seed) - 1) % (2**32),
+        "color_correct": False,
     }
     if action == "infill":
         out["mask"] = i2i["mask"]                    # 칠한 곳만 다시 그린다
@@ -3730,8 +3834,8 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             p[key] = neutral
     if seed is None:
         seed = random.randint(0, 2**32 - 1)
-    if p.get("quality_toggle") and QUALITY_SUFFIX.strip(", ") not in base_prompt:
-        base_prompt = base_prompt.rstrip().rstrip(",") + QUALITY_SUFFIX
+    if p.get("quality_toggle"):
+        base_prompt = merge_quality_suffix(base_prompt, model)
     # UC 프리셋도 여기서 합친다 — 숫자만 보내면 NAI 가 무시한다(실측 픽셀차 0.00).
     # 이미 붙어 있으면 그대로 두므로 그림에서 읽어 온 네거티브도 이중이 되지 않는다.
     negative = merge_uc_preset(negative, model, p.get("uc_preset"))
@@ -3803,9 +3907,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             "scale": scale, "uncond_scale": float(p.get("uncond_scale", 0.0)),
             "cfg_rescale": cfg_rescale,
             "sampler": sampler, "noise_schedule": scheduler,
-            "seed": seed, "extra_noise_seed": seed,
+            "seed": seed,
             "negative_prompt": negative,
             "params_version": 3, "legacy": False,
+            "image_format": "png",
             # ⚠ `extra_passthrough_testing` 은 **메타데이터에만** 남는 값이다.
             #   요청에 넣으면 NAI 가 400 "extra_passthrough_testing is not allowed" 로 거부한다.
             #   (실제 이미지 99% 에 있다고 해서 요청에 넣어도 되는 건 아니다 — 실측으로 확인)
@@ -3834,8 +3939,20 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             "lora_unet_weights": None, "lora_clip_weights": None,
             "reference_information_extracted_multiple": [],
             "reference_strength_multiple": [],
+            "normalize_reference_strength_multiple": True,
             **_ref_fields(p),
-            **_i2i_fields(i2i, action),
+            **_i2i_fields(i2i, action, seed),
+            # V4 웹 페이로드 12/12와 비교 구현 5/5가 함께 보내는 레거시 배열.
+            # 서버 입력 호환뿐 아니라 NAI 표준 메타데이터 왕복에도 쓰인다.
+            "characterPrompts": [
+                {
+                    "prompt": cap,
+                    "uc": ng,
+                    "center": center(i)[0],
+                    "enabled": True,
+                }
+                for i, (cap, ng) in enumerate(people)
+            ],
             "v4_prompt": {
                 "caption": {"base_caption": base_prompt, "char_captions": char_captions},
                 "use_coords": use_coords, "use_order": True, "legacy_uc": False,
@@ -4343,8 +4460,11 @@ def finalized_token_texts(base, negative, chars, char_negatives, cfg):
     fixed = [normalize_prompt(x) for x in fixed]
     flat = [normalize_prompt(x) for x in flat]
     base, negative = fixed[0], fixed[1]
-    if cfg.get("quality_toggle") and QUALITY_SUFFIX.strip(", ") not in base:
-        base = base.rstrip().rstrip(",") + QUALITY_SUFFIX
+    if cfg.get("quality_toggle"):
+        base = merge_quality_suffix(
+            base,
+            cfg.get("model") or "nai-diffusion-4-5-full",
+        )
     negative = merge_uc_preset(
         negative,
         cfg.get("model") or "nai-diffusion-4-5-full",
@@ -5483,6 +5603,35 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 <script>
+function showFatalError(reason){
+  const message = reason && (reason.message || reason.stack || String(reason));
+  let bar = document.getElementById('fatalErrorBar');
+  if(!bar){
+    bar = document.createElement('div');
+    bar.id = 'fatalErrorBar';
+    bar.setAttribute('role', 'alert');
+    bar.style.cssText = 'position:fixed;z-index:99999;left:12px;right:12px;top:12px;'
+      + 'padding:12px 14px;border:2px solid #b42318;border-radius:10px;background:#fff1f0;'
+      + 'color:#7a271a;font:14px/1.45 system-ui;box-shadow:0 6px 24px #0004';
+    const title = document.createElement('strong');
+    title.textContent = '화면 실행 중 오류가 발생했습니다.';
+    const detail = document.createElement('div');
+    detail.id = 'fatalErrorDetail';
+    detail.style.cssText = 'margin-top:4px;white-space:pre-wrap;word-break:break-word';
+    const reload = document.createElement('button');
+    reload.type = 'button';
+    reload.textContent = '새로고침';
+    reload.style.cssText = 'margin-top:8px;padding:5px 10px;cursor:pointer';
+    reload.addEventListener('click', () => location.reload());
+    bar.append(title, detail, reload);
+    (document.body || document.documentElement).appendChild(bar);
+  }
+  const detail = document.getElementById('fatalErrorDetail');
+  if(detail) detail.textContent = (message || '알 수 없는 오류') + '\n생성.log의 마지막 오류도 함께 확인해 주세요.';
+}
+window.addEventListener('error', event => showFatalError(event.error || event.message));
+window.addEventListener('unhandledrejection', event => showFatalError(event.reason));
+
 let STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
 let FRAGS = {};
 const RES_PRESETS = __RESJSON__;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
@@ -10318,8 +10467,12 @@ class ConfigServer:
             # 그런데 프리셋 문구는 네거티브 앞에 그대로 들어 있으므로 **거꾸로 알아낼 수 있다.**
             # 떼어내지 않으면 이 그림체로 다시 뽑을 때 문구가 두 번 붙는다.
             #   (착안: NAIS3-MM 이 같은 역추적을 한다 — 코드는 가져오지 않았다)
-            ucp, user_neg = split_uc_preset(m["negative"])
             params = dict(m["params"] or {})
+            source_model = model_id_from_metadata(
+                params.get("model"),
+                self.cfg.get("model") or "nai-diffusion-4-5-full",
+            )
+            ucp, user_neg = split_uc_preset(m["negative"], source_model)
             if ucp is not None:
                 params["uc_preset"] = ucp
                 params["uc_preset_guessed"] = True
@@ -10327,11 +10480,7 @@ class ConfigServer:
             # 안 떼면 프롬프트 칸에 구워진 채 남아, 토글을 꺼도 접미사가 계속 전송된다
             # (외부 감사 nais_blue B-2 와 같은 계열 — 우리는 이중 추가는 가드가 막았지만
             #  '끄기가 안 듣는' 쪽이 남아 있었다. ai-review/외부감사/ 참고)
-            base_txt = m["base"]
-            qt = base_txt.rstrip().rstrip(",").endswith(QUALITY_SUFFIX.strip(", "))
-            if qt:
-                base_txt = base_txt.rstrip().rstrip(",")
-                base_txt = base_txt[:-len(QUALITY_SUFFIX.strip(", "))].rstrip().rstrip(",")
+            base_txt, qt = split_quality_suffix(m["base"], source_model)
             params["quality_toggle"] = qt
             params["quality_toggle_guessed"] = True
             rec = {

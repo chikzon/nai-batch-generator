@@ -145,11 +145,48 @@ class RegressionTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_quality_and_uc_text_are_model_specific_and_round_trip(self):
+        for model, quality in APP.QUALITY_SUFFIX_TEXT.items():
+            with self.subTest(model=model, kind="quality"):
+                merged = APP.merge_quality_suffix("user prompt", model)
+                self.assertEqual(merged, f"user prompt, {quality}")
+                self.assertEqual(
+                    APP.split_quality_suffix(merged, model),
+                    ("user prompt", True),
+                )
+
+        v45 = "nai-diffusion-4-5-full"
+        heavy = APP.uc_preset_text(v45, 0)
+        self.assertTrue(heavy.startswith("lowres, artistic error"))
+        self.assertNotIn("nsfw", heavy)
+        merged_uc = APP.merge_uc_preset("nsfw, custom tag", v45, 0)
+        self.assertEqual(
+            APP.split_uc_preset(merged_uc, v45),
+            (0, "nsfw, custom tag"),
+        )
+
+        # 같은 UI 번호라도 모델마다 공식 문구가 다르다.
+        self.assertNotEqual(
+            APP.uc_preset_text("nai-diffusion-4-5-full", 0),
+            APP.uc_preset_text("nai-diffusion-4-full", 0),
+        )
+        # V4 Full에는 Human Focus 공식 프리셋이 없으므로 V4.5 값을 대신 넣지 않는다.
+        self.assertEqual(APP.uc_preset_text("nai-diffusion-4-full", 3), "")
+
     def test_every_generation_path_builds_call_local_reference_params(self):
         source = (ROOT / "start.py").read_text(encoding="utf-8")
         self.assertEqual(source.count("runtime_generation_params("), 6)
         self.assertNotIn('raw.get("source_model")', source)
         self.assertNotIn("ensure_refs(", source)
+
+    def test_page_installs_visible_runtime_error_handlers_before_app_code(self):
+        page = APP.render_page()
+        handlers_at = page.index("window.addEventListener('error'")
+        state_at = page.index("let STATE = null")
+        self.assertLess(handlers_at, state_at)
+        self.assertIn("window.addEventListener('unhandledrejection'", page)
+        self.assertIn("fatalErrorBar", page)
+        self.assertIn("새로고침", page)
 
     def test_tag_alias_autocomplete_returns_canonical_tag(self):
         data = {
@@ -212,6 +249,16 @@ class RegressionTests(unittest.TestCase):
                 "pst-fixture", "base", "", "", "negative", 832, 1216,
                 seed=1, params={**base, "use_coords": True}, chars=people,
             )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=10,
+                params={
+                    **base,
+                    "use_coords": True,
+                    "_i2i": {"image": "fixture", "strength": 0.7, "noise": 0.0},
+                },
+                chars=people,
+            )
 
         def centers(payload, key):
             return [
@@ -225,6 +272,21 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(centers(payloads[0], "v4_negative_prompt"), neutral)
         self.assertEqual(centers(payloads[1], "v4_prompt"), chosen)
         self.assertEqual(centers(payloads[1], "v4_negative_prompt"), chosen)
+        parameters = payloads[1]["parameters"]
+        self.assertEqual(parameters["image_format"], "png")
+        self.assertTrue(parameters["normalize_reference_strength_multiple"])
+        self.assertEqual(
+            parameters["characterPrompts"],
+            [
+                {"prompt": "A", "uc": "na", "center": chosen[0], "enabled": True},
+                {"prompt": "B", "uc": "nb", "center": chosen[1], "enabled": True},
+            ],
+        )
+        self.assertNotIn("extra_noise_seed", parameters)
+        self.assertNotIn("color_correct", parameters)
+        i2i_parameters = payloads[2]["parameters"]
+        self.assertEqual(i2i_parameters["extra_noise_seed"], 9)
+        self.assertFalse(i2i_parameters["color_correct"])
 
     def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
         source = io.BytesIO()
