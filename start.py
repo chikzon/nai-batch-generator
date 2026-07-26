@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# NAI 배치 생성기 — Copyright (C) 2026 ninesdead
+# GPL-3.0-or-later. 이 프로그램은 어떠한 보증도 없이 제공됩니다.
+# 자세한 조건은 함께 배포되는 LICENSE 파일을 보십시오.
 """NAI 시드 배치 생성기 (단일 파일판, 브라우저 UI 내장)
 
 실행.bat -> start.py 를 실행하면:
@@ -2461,7 +2464,7 @@ def _migrate_legacy(cfg):
 
     if old.get("여자"):
         cfg["characters"].append({
-            "id": "sasa", "name": "사사", "female": old["여자"], "negative": "hair ornament",
+            "id": "char1", "name": "캐릭터 1", "female": old["여자"], "negative": "",
             "enabled": True, "folder_id": None, "subfolder_id": None,
         })
 
@@ -4337,7 +4340,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <input type="file" id="welcomeFile" accept="image/png,image/webp" multiple style="display:none;">
         </div>
         <p class="hint" style="margin-top:10px;">
-          가진 그림이 없다면 <b>[자료]</b>에서 그림체 <span id="welcomeCount">762</span>개 중에 골라도 됩니다.
+          가진 그림이 없다면 <b>[자료]</b>의 그림체 라이브러리(<span id="welcomeCount">…</span>개)에서 골라도 됩니다.
           카톡·디스코드를 거친 그림은 정보가 지워져 있으니 <b>원본 파일</b>을 넣어주세요.</p>
         <div class="bar" style="margin-top:8px;">
           <button class="primary" id="welcomeLib">📚 그림체 고르러 가기</button>
@@ -4430,8 +4433,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <option value="2">2배</option><option value="4" selected>4배</option></select>
           <span class="n" id="dirMsg"></span>
         </div>
-        <p class="hint">로컬 무료 대안: 배경 제거는 <b>이미지생성/bg_remove.py</b>(rembg)로도 됩니다.
-        디렉터 툴은 Anlas 를 씁니다 — Opus 는 409,600px 까지 대부분 무료(배경 제거는 예외).</p>
+        <p class="hint">디렉터 툴은 Anlas 를 씁니다 — Opus 는 409,600px 까지 대부분 무료(배경 제거는 예외).
+        배경 제거는 rembg 같은 로컬 무료 도구로 대신할 수도 있습니다.</p>
       </div>
 
     </div>
@@ -4736,7 +4739,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <h2><span class="n">05</span>모자이크 칠하기
           <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">내 컴퓨터에서 · Anlas 안 듦</span></h2>
         <p class="hint">가릴 곳을 붓으로 칠하면 그 부분만 모자이크로 바꿉니다. NAI 를 거치지 않아 <b>공짜</b>입니다.
-        (자동 검열은 <b>이미지생성/auto_censor.py</b> — YOLO 로 알아서 찾아 가립니다.)
         결과는 <b>output/모자이크/</b> 에 저장됩니다.</p>
         <div id="mosDrop" class="row" style="text-align:center;padding:16px 14px;border-style:dashed;cursor:pointer;">
           <b>🟦 가릴 그림을 여기에 놓거나 눌러서 고르세요</b>

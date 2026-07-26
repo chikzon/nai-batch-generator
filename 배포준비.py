@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# NAI 배치 생성기 — Copyright (C) 2026 ninesdead
+# GPL-3.0-or-later. 자세한 조건은 LICENSE 파일을 보십시오.
 """
 남에게 줄 배포본 만들기 — 내 설정·토큰·생성물을 뺀 깨끗한 사본을 ZIP으로.
 
@@ -54,7 +56,7 @@ SRC = Path(__file__).resolve().parent
 #   (앱은 세팅/ 이 없으면 씬규격/ → asset_config.json 순으로 되살리므로 셋 다 빼야 한다)
 #   남에게 줄 때는 세팅 없이 시작하고, 필요하면 세팅 파일만 따로 건네면 된다.
 DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json",
-              "generation_state.json", "배포준비.py", ".git",
+              "generation_state.json", "nsfw_seed_state.json", "배포준비.py", ".git",
               # 프로필/ 은 계정별 설정·토큰·생성물 전체 — 통째로 뺀다
               # (안의 설정.json 등이 이름 규칙으로 걸리긴 하지만 이름에 기대지 않는다)
               "프로필",
@@ -68,7 +70,7 @@ DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json
               "그림체.json", "작가통계.json", "레시피.json", "이미지캐시",
               # 작가조합.json 은 그림체.json 의 구세대 판 — 같은 수집물이다
               "작가조합.json"}
-DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle")
+DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle", ".tmp")
 # 사용자 콘텐츠라 비우는 폴더 (폴더 자체는 남김)
 #   조각/ 은 와일드카드 — 내 조각을 남에게 딸려 보내지 않는다
 CLEAR_DIRS = ["그림체", "수집/바이브", "조각"]
