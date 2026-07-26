@@ -270,6 +270,10 @@ class RegressionTests(unittest.TestCase):
         chosen = [{"x": 0.1, "y": 0.2}, {"x": 0.9, "y": 0.8}]
         self.assertEqual(centers(payloads[0], "v4_prompt"), neutral)
         self.assertEqual(centers(payloads[0], "v4_negative_prompt"), neutral)
+        self.assertEqual(
+            [item["center"] for item in payloads[0]["parameters"]["characterPrompts"]],
+            neutral,
+        )
         self.assertEqual(centers(payloads[1], "v4_prompt"), chosen)
         self.assertEqual(centers(payloads[1], "v4_negative_prompt"), chosen)
         parameters = payloads[1]["parameters"]
