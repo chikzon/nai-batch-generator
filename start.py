@@ -6174,15 +6174,22 @@ function autoCoordsOnSecond(){
      안 그러면 셋째부터는 기본 0.5/0.5 를 써서 서로 겹치고, 좌표를 켜 둔 게 무의미해진다
      (2명 기준 0.3/0.7 에 멈춰 있던 것을 실측에서 잡았다).
      이미 손으로 고른 자리가 있으면 그건 건드리지 않고 **빈 칸만** 채운다. */
-  const cs = (STATE.char_centers || []).slice(0, n);
+  /* ⚠ 좌표는 **칸 index** 로 저장한다 (껐다 켜도 자리가 유지되게).
+     예전에는 `slice(0, n)` 으로 **켠 인물 수**만큼 잘라서, 꺼 둔 칸이 앞에 있으면
+     뒤쪽 칸의 좌표가 통째로 날아갔다 (복제 후 좌표 소실 — Codex 재현 04:53).
+     자를 게 아니라 **칸 수만큼 유지하고, 켠 칸의 빈 자리만** 채운다. */
+  const idx = activeSlotIdx();
+  const slots = (STATE.char_slots || []).length;
+  const cs = (STATE.char_centers || []).slice(0, Math.max(slots, 0));
+  while(cs.length < slots) cs.push(null);
   const auto = spreadCenters(n);
   const taken = new Set(cs.filter(Boolean).map(c => `${c.x},${c.y}`));
-  for(let i = 0; i < n; i++){
-    if(cs[i] && cs[i].x != null) continue;
-    const free = auto.find(a => !taken.has(`${a.x},${a.y}`)) || auto[i] || {x:0.5, y:0.5};
-    cs[i] = free; taken.add(`${free.x},${free.y}`);
-  }
-  STATE.char_centers = cs;
+  idx.forEach((slotI, k) => {
+    if(cs[slotI] && cs[slotI].x != null) return;      // 손으로 고른 자리는 보존
+    const free = auto.find(a => !taken.has(`${a.x},${a.y}`)) || auto[k] || {x:0.5, y:0.5};
+    cs[slotI] = free; taken.add(`${free.x},${free.y}`);
+  });
+  STATE.char_centers = cs.map(c => c || {x:0.5, y:0.5});
   return first;
 }
 /* 좌표가 서로 겹치는 인물이 있는지 (겹치면 분리가 안 된다) */
@@ -6228,9 +6235,14 @@ if($('diagLoad')){
 /* 인물 칸 일괄 손질 (NAIS3 의 캐릭터 다중 선택·일괄 편집을 우리 구조로).
    칸이 여럿일 때 하나씩 누르는 수고를 줄인다. 켬/끔은 '보낼지'만 정하고 칸은 남는다. */
 function slotsBulk(fn){
+  /* ⚠ 좌표(char_centers)는 **칸 index** 로 짝지어져 있다. 칸 수가 안 바뀌는 동작
+     (켜기/끄기·태그 주입)에서 자동 재배치를 부르면 손으로 잡아 둔 자리가 날아간다.
+     칸 수가 실제로 바뀐 경우에만 자동 좌표를 손댄다 (Codex 재현 보고 04:53). */
   STATE.char_slots = STATE.char_slots || [];
+  const before = STATE.char_slots.length;
   fn(STATE.char_slots);
-  autoCoordsOnSecond(); renderSlots(); tokens(); save();
+  if(STATE.char_slots.length !== before) autoCoordsOnSecond();
+  renderSlots(); tokens(); save();
 }
 if($('slotAllOn')) $('slotAllOn').addEventListener('click', () =>
   slotsBulk(ss => ss.forEach(s => s.enabled = true)));
@@ -6247,10 +6259,19 @@ if($('slotBulkAdd')) $('slotBulkAdd').addEventListener('click', () => {
 });
 if($('slotDupAll')) $('slotDupAll').addEventListener('click', () => {
   slotsBulk(ss => {
-    const copies = ss.filter(s => s.enabled !== false)
-      .map(s => Object.assign({}, s, {name: (s.name || '인물') + ' 사본'}));
+    /* 칸을 복제하면 **좌표도 같은 자리에서 복제**해야 짝이 안 어긋난다.
+       (예전엔 칸만 늘어나 뒤쪽 칸의 좌표가 밀렸다 — Codex 가 A/B/C 시퀀스로 잡음) */
+    STATE.char_centers = STATE.char_centers || [];
+    const copies = [], ctrs = [];
+    ss.forEach((s, i) => {
+      if(s.enabled === false) return;
+      copies.push(Object.assign({}, s, {name: (s.name || '인물') + ' 사본'}));
+      ctrs.push(Object.assign({x:0.5, y:0.5}, STATE.char_centers[i] || {}));
+    });
     if(!copies.length){ flash('켠 인물 칸이 없습니다.'); return; }
+    while(STATE.char_centers.length < ss.length) STATE.char_centers.push({x:0.5, y:0.5});
     ss.push(...copies);
+    STATE.char_centers.push(...ctrs);
   });
 });
 if($('slotDelOff')) $('slotDelOff').addEventListener('click', () => {
