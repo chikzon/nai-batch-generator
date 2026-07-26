@@ -33,7 +33,7 @@ import traceback
 import webbrowser
 import zipfile
 import zlib
-from datetime import date
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -133,6 +133,113 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("gen")
+
+
+_DIAG_LINE_RE = re.compile(
+    r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) "
+    r"\[(?P<level>[A-Z]+)\] (?P<message>.*)$"
+)
+_DIAG_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(pst-)[A-Za-z0-9._~+/=-]+"), r"\1[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\b(authorization|proxy-authorization)\s*[:=]\s*"
+            r"(?:bearer\s+|basic\s+)?[^\s,;]+"
+        ),
+        r"\1: [REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|"
+            r"token|secret|signature|credential)\s*[:=]\s*[^\s,;&]+"
+        ),
+        r"\1=[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)([?&](?:api[-_]?key|access[-_]?token|refresh[-_]?token|"
+            r"token|key|secret|signature|credential|x-amz-[^=&#\s]+)=)"
+            r"[^&#\s]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+)
+_DIAG_USER_PATH_PATTERNS = (
+    (re.compile(r"(?i)([A-Z]:\\Users\\)[^\\/\s]+"), r"\1<user>"),
+    (re.compile(r"(?i)(/Users/)[^/\s]+"), r"\1<user>"),
+    (re.compile(r"(?i)(/home/)[^/\s]+"), r"\1<user>"),
+)
+
+
+def redact_diagnostic_text(value):
+    """진단 화면/API에 내보내기 전에 토큰·서명·사용자 홈 경로를 지운다."""
+    text = str(value or "")
+    for pattern, replacement in _DIAG_SECRET_PATTERNS + _DIAG_USER_PATH_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def diagnostic_category(message):
+    """기계적인 키워드 분류다. 원문 의미를 추측해 심각도를 바꾸지는 않는다."""
+    text = message.casefold()
+    categories = (
+        ("security", ("authorization", "token", "secret", "credential", "인증")),
+        ("metadata", ("metadata", "png", "exif", "메타데이터")),
+        ("pacing", ("pace", "delay", "retry", "backoff", "cancel", "중지", "재시도")),
+        ("generation", ("generate", "generation", "anlas", "생성", "seed")),
+        ("network", ("http", "request", "connection", "timeout", "network", "서버")),
+        ("storage", ("save", "saved", "output", "file", "folder", "저장", "파일", "폴더")),
+    )
+    for category, needles in categories:
+        if any(needle in text for needle in needles):
+            return category
+    return "system"
+
+
+def parse_diagnostic_lines(lines):
+    """logging 기본 형식의 각 줄을 redacted 구조화 이벤트로 변환한다."""
+    events = []
+    previous_at = None
+    for raw in lines:
+        match = _DIAG_LINE_RE.match(str(raw))
+        if match:
+            timestamp = match.group("time")
+            level = match.group("level")
+            message = match.group("message")
+            try:
+                at = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S,%f")
+            except ValueError:
+                at = None
+        else:
+            timestamp = ""
+            level = "INFO"
+            message = str(raw)
+            at = None
+        since_previous_ms = None
+        if at is not None and previous_at is not None:
+            since_previous_ms = max(0, round((at - previous_at).total_seconds() * 1000))
+        if at is not None:
+            previous_at = at
+        safe_message = redact_diagnostic_text(message)
+        events.append({
+            "time": timestamp,
+            "level": level,
+            "category": diagnostic_category(safe_message),
+            "message": safe_message,
+            "since_previous_ms": since_previous_ms,
+        })
+    return events
+
+
+def diagnostic_event_line(event):
+    """사람이 복사하기 쉬운 한 줄 표기. 모든 값은 이미 redaction을 거친다."""
+    elapsed = event.get("since_previous_ms")
+    delta = "" if elapsed is None else f" +{elapsed}ms"
+    stamp = event.get("time") or "시간 미상"
+    return (
+        f"{stamp}{delta} [{event.get('level', 'INFO')}]"
+        f"[{event.get('category', 'system')}] {event.get('message', '')}"
+    )
 
 
 # JSON 설정/재개 상태는 자동저장과 생성 worker가 동시에 만질 수 있다.
@@ -3223,6 +3330,12 @@ def _ref_fields(p):
         out["reference_information_extracted_multiple"] = ies
     refs = p.get("_char_refs") or {}
     imgs = refs.get("images") or []
+    if imgs and enc:
+        # SDStudio 는 V4.5 에서 캐릭레퍼가 있으면 바이브를 무효화하고 UI 도 잠근다.
+        # NAI 가 400 을 주는지 품질만 떨어지는지는 **검증하지 못했다** — 막지 않고 알리기만 한다
+        # (사용자가 일부러 같이 쓸 수 있다). SDS-C
+        log.warning(f"바이브 {len(enc)}개와 캐릭터 레퍼런스 {len(imgs)}개를 함께 보냅니다 — "
+                    "다른 앱은 이 조합을 막습니다. 결과가 이상하면 하나만 켜 보세요.")
     if imgs:
         out["director_reference_images"] = imgs
         # 설명은 **v4 프롬프트와 같은 모양의 객체**다 (문자열이 아니다).
@@ -3371,6 +3484,27 @@ V4_ONLY = ("variety", "use_coords", "deliberate_euler_ancestral_bug", "prefer_br
 
 def is_v4_model(model):
     return str(model or "").startswith("nai-diffusion-4")
+
+
+def variety_sigma(model):
+    """Variety+ 의 기준 시그마 계수. 모델 세대마다 다르다 (SDS-A).
+    V4.5 계열 58.0 · 그 외 19.0. 실제 NAI 이미지 128장 역산: 58 이 121장, 19 는 4장."""
+    return 58.0 if "4-5" in str(model or "") else 19.0
+
+
+def _variety_sigma_or_none(model, width, height, variety, p):
+    """Variety+ 값. 캐릭터 레퍼런스와 **함께 보내지 않는다** (SDS-B).
+    근거: SDStudio(nai.ts)와 NAIA 가 각각 독립적으로 같은 회피를 넣었다 —
+    동시 전송하면 서버가 깨진 결과를 낸다는 주석이 달려 있다.
+    ⚠ 우리가 실호출로 확인한 것은 아니다(계정 보호로 미실행). 깨진 그림을 받느니
+    Variety+ 를 끄는 쪽이 손실이 작다고 보고 끈다. 끌 때는 로그로 알린다."""
+    if not variety:
+        return None
+    if (p.get("_char_refs") or {}).get("images"):
+        log.info("캐릭터 레퍼런스가 있어 Variety+ 를 이번 장에서 끕니다 "
+                 "(동시 전송 시 결과가 깨진다는 보고가 있습니다 — SDS-B)")
+        return None
+    return variety_sigma(model) * ((width * height) / (832 * 1216)) ** 0.5
 
 
 POS_GRID = [0.1, 0.3, 0.5, 0.7, 0.9]      # NAI 좌표 격자 (실제 이미지에서 이 5값만 나온다)
@@ -3594,7 +3728,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             "dynamic_thresholding_percentile": 0.999,
             "dynamic_thresholding_mimic_scale": 10.0,
             "sm": bool(p.get("smea", False)), "sm_dyn": bool(p.get("smea_dyn", False)),
-            "skip_cfg_above_sigma": (19.0 * ((width * height) / (832 * 1216)) ** 0.5) if variety else None,
+            # Variety+ 기준 시그마. **모델 세대마다 계수가 다르다** (SDS-A, 2026-07 실측).
+            #   V4.5 계열 = 58.0 · 그 외 V4 = 19.0. 예전엔 19 고정이라 기본 모델에서
+            #   Variety+ 가 공홈의 1/3 강도로만 걸렸다.
+            "skip_cfg_above_sigma": _variety_sigma_or_none(model, width, height, variety, p),
             "skip_cfg_below_sigma": 0.0,
             "ucPreset": uc_preset, "use_coords": use_coords,
             "cfg_sched_eligibility": "enable_for_post_summer_samplers",
@@ -6245,6 +6382,22 @@ if($('diagLoad')){
   $('diagCopy').addEventListener('click', () => {
     navigator.clipboard.writeText($('diagOut').textContent || '')
       .then(() => $('diagStat').textContent = '복사됨 ✓');
+  });
+  $('diagExport').addEventListener('click', () => {
+    if(!DIAG_LAST){ $('diagStat').textContent = '먼저 불러오세요'; return; }
+    const safe = {
+      schema: DIAG_LAST.schema,
+      exported_at: new Date().toISOString(),
+      errors: DIAG_LAST.errors,
+      events: DIAG_LAST.events
+    };
+    const blob = new Blob([JSON.stringify(safe, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `nais-diagnostics-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(a.href);
+    $('diagStat').textContent = '안전 JSON 저장됨 ✓';
   });
 }
 
@@ -10522,7 +10675,7 @@ class ConfigServer:
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/diag"):
-                    # 진단 — 생성.log 의 끝부분을 돌려준다 (파일을 찾아 열지 않아도 되게)
+                    # 진단 — raw 로그는 절대 내보내지 않고 redacted 구조화 이벤트만 돌려준다.
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
                     try:
@@ -10532,16 +10685,34 @@ class ConfigServer:
                     err_only = q.get("err", [""])[0] in ("1", "true")
                     try:
                         if not LOG_FILE.exists():
-                            self._json({"ok": True, "lines": [], "errors": 0}); return
+                            self._json({
+                                "ok": True, "schema": "nais-diagnostics/v1",
+                                "lines": [], "events": [], "errors": 0,
+                            }); return
                         raw = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-                        errs = sum(1 for x in raw if "[ERROR]" in x or "[WARNING]" in x
-                                   or "[CRITICAL]" in x)
+                        events = parse_diagnostic_lines(raw)
+                        errs = sum(
+                            1 for event in events
+                            if event["level"] in ("WARNING", "ERROR", "CRITICAL")
+                        )
                         if err_only:
-                            raw = [x for x in raw if "[ERROR]" in x or "[WARNING]" in x
-                                   or "[CRITICAL]" in x]
-                        self._json({"ok": True, "lines": raw[-n:], "errors": errs})
+                            events = [
+                                event for event in events
+                                if event["level"] in ("WARNING", "ERROR", "CRITICAL")
+                            ]
+                        events = events[-n:]
+                        self._json({
+                            "ok": True,
+                            "schema": "nais-diagnostics/v1",
+                            "lines": [diagnostic_event_line(event) for event in events],
+                            "events": events,
+                            "errors": errs,
+                        })
                     except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
+                        self._json({
+                            "ok": False,
+                            "error": redact_diagnostic_text(e),
+                        })
                 elif self.path.startswith("/api/ac"):
                     from urllib.parse import urlparse, parse_qs, unquote
                     q = parse_qs(urlparse(self.path).query)
