@@ -2943,10 +2943,13 @@ def _build_std(acfg, char, scene, mode):
 
 
 def slot_prompt(sl):
-    """캐릭터 칸의 전송값 = 외형 + 의상. 의상을 따로 두면 외형을 안 건드리고 갈아입힐 수 있다."""
+    """캐릭터 칸의 전송값 = 외형 + 의상. 의상을 따로 두면 외형을 안 건드리고 갈아입힐 수 있다.
+    ⚠ 주석 제거를 **여기서** 한다 — 활성 판정(active_people)과 전송이 같은 값을 봐야
+    주석 전용 슬롯이 (people, centers) 짝을 어긋내지 못한다 (CQA-003)."""
     if not isinstance(sl, dict):
         return ""
-    return _join_tags(sl.get("prompt", ""), sl.get("outfit", ""))
+    return _join_tags(strip_comment_lines(sl.get("prompt", "")),
+                      strip_comment_lines(sl.get("outfit", "")))
 
 
 def _join_tags(*parts):
@@ -3187,8 +3190,10 @@ def active_people(slots, centers=None, extra=None):
         c = centers[i] if i < len(centers) and isinstance(centers[i], dict) else None
         ctrs.append(c or {"x": 0.5, "y": 0.5})
     for e in (extra or []):
-        if (e.get("prompt") or "").strip():
-            people.append(e)
+        cap = strip_comment_lines(e.get("prompt") or "")   # 씬 인물 칸도 같은 규칙 (CQA-003)
+        if cap.strip():
+            people.append({"prompt": cap,
+                           "negative": strip_comment_lines(e.get("negative") or "")})
             ctrs.append(e.get("center") or {"x": 0.5, "y": 0.5})
     if len(people) > MAX_CHARS:
         log.warning(f"켠 인물이 {len(people)}명입니다 — NAI 상한 {MAX_CHARS}명까지만 보냅니다 "
@@ -3536,6 +3541,22 @@ def save_picks(d):
     return d
 
 
+_DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각) — CQA-002 부분 조치
+
+
+def _dir_img_count(p):
+    """하위 폴더의 재귀 이미지 수 — 30초 캐시. 탐색기를 오갈 때마다
+    전체 트리를 다시 걷는 낭비를 막는다 (완전한 서버측 페이징은 필터
+    의미가 바뀌는 문제라 사용자 결정 대기)."""
+    now = time.time()
+    hit = _DIR_COUNT_CACHE.get(str(p))
+    if hit and now - hit[1] < 30:
+        return hit[0]
+    n = sum(1 for f in p.rglob("*") if f.suffix.lower() in IMG_EXT)
+    _DIR_COUNT_CACHE[str(p)] = (n, now)
+    return n
+
+
 def list_output(sub=""):
     """output/ 아래를 훑는다. sub 가 비면 최상위."""
     root = OUTPUT_BASE.resolve()
@@ -3550,8 +3571,7 @@ def list_output(sub=""):
     for p in sorted(base.iterdir()):
         rel = str(p.relative_to(root)).replace("\\", "/")
         if p.is_dir():
-            n = sum(1 for f in p.rglob("*") if f.suffix.lower() in IMG_EXT)
-            dirs.append({"name": p.name, "path": rel, "count": n})
+            dirs.append({"name": p.name, "path": rel, "count": _dir_img_count(p)})
         elif p.suffix.lower() in IMG_EXT:
             st = p.stat()
             files.append({"name": p.name, "path": rel,
@@ -5728,9 +5748,11 @@ function renderSlots(){
    기본을 안 켜 둬서 몸이 붙었다. 우리는 공홈을 따라간다. */
 /* 보낼 인물 = 켠 것 + 내용이 있는 것. 칸은 6명 넘게 둬도 된다. */
 function activeSlotIdx(){
+  /* 주석(#) 줄만 있는 칸은 '켠 인물'이 아니다 — 서버 slot_prompt 와 같은 규칙 (CQA-003) */
   return (STATE.char_slots || [])
     .map((s, i) => ({s, i}))
-    .filter(x => x.s.enabled !== false && (x.s.prompt || '').trim())
+    .filter(x => x.s.enabled !== false
+      && ((x.s.prompt || '').replace(/^[ \t]*#.*$/gm, '')).trim())
     .map(x => x.i);
 }
 function autoCoordsOnSecond(){
@@ -8343,7 +8365,11 @@ async function poll(){
     $('batchBtn').disabled = s.running;
     $('genBtn').disabled = s.running;
     $('genBtn').textContent = s.running ? '생성 중...' : '생성';
-    if($('stopBtn')) $('stopBtn').classList.toggle('hidden', !s.running);
+    if($('stopBtn')){
+      $('stopBtn').classList.toggle('hidden', !s.running);
+      $('stopBtn').disabled = !!s.stopping;
+      $('stopBtn').textContent = s.stopping ? '중지 중…' : '■ 중지';
+    }
     /* 돌던 것이 멈춘 순간에만 한 번 알린다 (계속 울리면 안 된다) */
     if(WAS_RUNNING && !s.running) notifyDone(s.status_text || '생성이 끝났습니다.');
     WAS_RUNNING = s.running;
@@ -8514,6 +8540,7 @@ class LiveState:
         self.status_text = "설정 중..."
         self.running = False
         self._owner = 0        # 실행권 토큰 (아래 try_claim/release)
+        self.stop_req = False  # 중지 요청 — 실행권과 별개다 (CQA-001)
         self.seed = 0          # 마지막으로 생성한 그림의 실제 NAI 시드
         self.seed_key = ""     # 배치 회차 번호 (01, 02 …)
 
@@ -8526,11 +8553,14 @@ class LiveState:
     # 예전에는 `if running: 거절` 검사와 스레드 안의 `running=True` 사이에 틈이 있어
     # 빠른 이중 요청이 둘 다 통과했고, 먼저 끝난 쪽 finally 가 남의 running 을 껐다.
     def try_claim(self):
-        """실행권 원자 선점 — 성공하면 소유 토큰, 이미 실행 중이면 None."""
+        """실행권 원자 선점 — 성공하면 소유 토큰, 이미 실행 중이면 None.
+        ⚠ 중지 요청이 와도 실행권은 owner 가 release 할 때까지 잡혀 있다 (CQA-001) —
+        중지 직후 재시작해도 옛 작업이 실제로 끝나기 전에는 새 작업이 못 들어온다."""
         with self.lock:
             if self.running:
                 return None
             self.running = True
+            self.stop_req = False
             self._owner += 1
             return self._owner
 
@@ -8539,6 +8569,16 @@ class LiveState:
         with self.lock:
             if self._owner == token:
                 self.running = False
+                self.stop_req = False
+
+    def request_stop(self):
+        """중지 요청 — 도는 작업이 장(파일) 경계에서 보고 멈춘다. 실행권은 안 푼다."""
+        with self.lock:
+            if not self.running:
+                return False
+            self.stop_req = True
+            self.status_text = "중지 요청 — 이번 장까지 마치고 멈춥니다."
+            return True
 
     def set_image(self, img):
         buf = io.BytesIO()
@@ -8557,6 +8597,7 @@ class LiveState:
                 "daily": self.daily, "daily_cap": self.daily_cap,
                 "status_text": self.status_text,
                 "running": self.running,
+                "stopping": self.stop_req,
                 "has_image": self.image_bytes is not None,
                 "seed": self.seed, "seed_key": self.seed_key,
             }
@@ -8784,7 +8825,7 @@ class ConfigServer:
             self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
             try:
                 for i, (f, raw) in enumerate(jobs, 1):
-                    if not self.live.running:
+                    if self.live.stop_req:
                         break
                     self.live.update(index=i, filename=f.name, status_text="복구 중...")
                     # 메타에서 그때 쓴 값을 그대로 꺼낸다
@@ -8877,7 +8918,7 @@ class ConfigServer:
             self.live.update(total=len(jobs), index=0, char_name="씬 모드")
             try:
                 for i, (sc, copy) in enumerate(jobs, 1):
-                    if not self.live.running:
+                    if self.live.stop_req:
                         break
                     suffix = "" if copy == 1 else f"_{copy}벌"
                     fname = f"{_safe_name(sc['name'])}{suffix}.webp"
@@ -9631,10 +9672,9 @@ class ConfigServer:
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/stop"):
-                    # 중지 — 도는 작업이 **장(파일) 경계**에서 멈춘다 (전송 중인 장은 마저 받음).
-                    # running=False 는 소유 토큰을 안 바꾸므로 원자 선점 설계와 안전하게 공존한다.
-                    server.live.update(running=False)
-                    self._json({"ok": True})
+                    # 중지 — 취소 **플래그**만 세운다 (CQA-001: running 을 직접 끄면
+                    # 옛 작업이 마저 도는 동안 새 작업이 실행권을 얻어 겹친다).
+                    self._json({"ok": server.live.request_stop()})
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
@@ -10034,7 +10074,7 @@ def _run_generation(server):
     completed = 0
 
     while True:
-        if not server.live.running:   # /api/stop — 장 경계에서 멈춘다
+        if server.live.stop_req:   # /api/stop — 장 경계에서 멈춘다 (실행권은 finally 가 푼다)
             log.info("■ 중지되었습니다 — '생성 시작'을 다시 누르면 이어서 합니다.")
             server.live.update(status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.")
             save_state(state)
@@ -10060,7 +10100,7 @@ def _run_generation(server):
             save_state(state)
             # 1초 단위로 쪼개 자야 중지 버튼이 휴식 중에도 듣는다
             for _ in range(int(pc["cool_seconds"])):
-                if not server.live.running:
+                if server.live.stop_req:
                     break
                 time.sleep(1)
         elif pc["soft_every"] and completed > 0 and completed % pc["soft_every"] == 0:
@@ -10070,7 +10110,7 @@ def _run_generation(server):
             server.live.update(status_text=f"소프트 휴식 {pause:.0f}초...")
             save_state(state)
             for _ in range(int(pause)):
-                if not server.live.running:
+                if server.live.stop_req:
                     break
                 time.sleep(1)
 
