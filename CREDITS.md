@@ -38,8 +38,8 @@
 
 | 자료 | 출처 · 조건 |
 |---|---|
-| `t5_tokenizer.json` (2.3MB) | NovelAI 가 쓰는 T5 토크나이저 vocab (공개 자료). 토큰 수 계산에만 쓴다 |
-| `태그/*.csv` (6MB) | 단부루 · e621 태그 목록(이름 + 게시물 수) — 웹에 공개된 태그 통계를 가공한 것 |
+| `t5_tokenizer.json` (2.3MB) | `sunanakgo/NAIS3` commit `6bff595`의 `resources/t5_tokenizer.json`과 JSON 의미 구조가 같다. NAIS3의 GPL-3.0을 따른다. 그보다 앞선 원출처는 확인하지 못했다 |
+| `태그/*.csv` (6MB) | `DominikDoom/a1111-sd-webui-tagcomplete` commit `4170882f90b47be130a0ff9314f663c230b9153d`의 태그 CSV와 SHA-256이 같다. MIT 고지와 해시는 `THIRD_PARTY_NOTICES.md`에 보존했다 |
 
 ### 저장소·배포본 **어디에도 없는 것** (자료팩으로만 따로 전달)
 
@@ -65,3 +65,4 @@
 ## 라이선스
 
 이 프로그램의 코드는 **GPL-3.0** 이다 (`LICENSE`).
+배포본에 포함되는 제3자 자료의 고지·고정 출처·해시는 `THIRD_PARTY_NOTICES.md`를 보라.

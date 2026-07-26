@@ -38,10 +38,10 @@ echo.
 
 :deps
 rem ?????? 2) libraries ??????
-"%PY%" -c "import requests, PIL" >nul 2>nul
+"%PY%" -c "from importlib.metadata import version as v; assert all(v(n)==x for n,x in (('requests','2.33.1'),('Pillow','12.2.0'),('certifi','2026.7.22'),('charset-normalizer','3.4.9'),('idna','3.18'),('urllib3','2.7.0')))" >nul 2>nul
 if errorlevel 1 (
   echo Installing libraries...
-  "%PY%" -m pip install requests pillow --no-warn-script-location --quiet
+  "%PY%" -m pip install -r requirements.txt --no-warn-script-location --quiet
 )
 
 rem ?????? 3) run (UTF-8 console for Korean output) ??????

@@ -19,7 +19,9 @@
    **수집물(그림체.json·작가통계.json·레시피.json·이미지캐시/)** — 남들이 공개한
    프롬프트 조합·예시 그림 모음이라 본 배포본에는 넣지 않는다 (라운드02 결정)
 ■ 들어가는 것 (남이 바로 쓸 수 있는 자산)
-   start.py · 실행.bat · 태그/ · 후보사전.json · 규격.json · 옵션.json · README.md
+   start.py · 실행.bat · requirements.txt · 태그/ · t5_tokenizer.json
+   후보사전.json · 규격.json · 옵션.json · README.md · CREDITS.md
+   LICENSE · THIRD_PARTY_NOTICES.md
 
 세팅을 함께 주고 싶으면 `세팅/*.json` 만 따로 건네면 된다 (받는 쪽에서 세팅/ 에 넣으면 끝).
 수집 자료를 주고 싶으면 `python 배포준비.py --자료팩` 으로 자료팩.zip 을 따로 만든다
@@ -179,6 +181,14 @@ def clean(dst: Path):
 def verify(dst: Path):
     """개인 정보가 남지 않았는지 확인."""
     problems = []
+    required_files = (
+        "start.py", "실행.bat", "requirements.txt", "README.md", "CREDITS.md",
+        "LICENSE", "THIRD_PARTY_NOTICES.md", "t5_tokenizer.json",
+        "태그/danbooru_e621_merged.csv",
+    )
+    for rel in required_files:
+        if not (dst / rel).is_file():
+            problems.append(f"{rel} 필수 배포 파일이 없음")
     if (dst / "설정.json").exists():
         problems.append("설정.json 이 남아 있음")
     for backup in dst.rglob("*.bak"):

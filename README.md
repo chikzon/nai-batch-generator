@@ -17,10 +17,11 @@ Windows 10 1803 이후면 다 들어 있다. 실패하면 [python.org](https://w
 > ⚠ 토큰은 계정 열쇠다. 공유하지 말 것. 무제한 생성은 Opus 구독이 필요하다.
 
 파이썬을 직접 쓰려면 `requests` 와 `pillow` 만 있으면 된다.
-(개발·검증에 쓴 환경: Python 3.10~3.12 · requests 2.x · Pillow 10~12. `실행.bat` 은
-Python 3.12.8 임베디드판을 SHA-256 확인 후 내려받는다.)
+검증한 직접·전이 의존성의 정확한 버전은 `requirements.txt`에 고정했다.
+`실행.bat`도 같은 파일로 설치한다.
+(`실행.bat`은 Python 3.12.8 임베디드판을 SHA-256 확인 후 내려받는다.)
 ```
-pip install requests pillow
+pip install -r requirements.txt
 python start.py
 ```
 계정이 둘이면 `실행_둘째계정.bat` (또는 `실행.bat --profile 이름`).
@@ -91,7 +92,7 @@ Variety+·시드 + 고급 항목, 모델 세대별로 잠금) · T5 토큰 수 �
 
 | 자료 | 저장소 | 배포본 ZIP | 비고 |
 |---|---|---|---|
-| `start.py`·실행.bat·문서·`규격.json`·`옵션.json`·`후보사전.json` | ✅ | ✅ | 프로그램 본체 |
+| `start.py`·실행.bat·문서·`requirements.txt`·`규격.json`·`옵션.json`·`후보사전.json` | ✅ | ✅ | 프로그램 본체 |
 | `t5_tokenizer.json` (2.3MB) | ❌ | **✅** | 토큰 수 계산용 vocab |
 | `태그/*.csv` (6MB) | ❌ | **✅** | 자동완성·빌더 사전 |
 | 그림체·작가통계·레시피·이미지캐시 (수집물) | ❌ | ❌ | `자료팩.zip` 으로만 따로 전달 |
@@ -111,7 +112,8 @@ Variety+·시드 + 고급 항목, 모델 세대별로 잠금) · T5 토큰 수 �
 **GPL-3.0** (`LICENSE`). 다른 프로젝트의 기능과 작업 흐름을 참고해 별도로 구현했다.
 확인한 범위에서 다른 프로젝트 코드를 직접 가져다 쓴 정황은 찾지 못했다(구조·언어가 다르다 —
 이쪽은 파이썬 단일 파일, 비교 대상은 Electron/Tauri + TypeScript).
-무엇을 참고했는지는 **`CREDITS.md`** 에 프로젝트별로 적어 두었다.
+무엇을 참고했는지는 **`CREDITS.md`**, 배포 자료의 고정 출처·해시·라이선스 고지는
+**`THIRD_PARTY_NOTICES.md`**에 적어 두었다.
 
 ## 아직 없는 것 (후속 로드맵)
 
