@@ -409,13 +409,24 @@ class RegressionTests(unittest.TestCase):
                 "https://example.test/a?X-Amz-Signature=rawsig&key=rawkey "
                 "Authorization: Bearer rawbearer"
             ),
+            "Traceback (most recent call last):",
+            (
+                r'  File "C:\Users\alice\private\worker.py", line 7, in run '
+                "token=pst-trace-secret"
+            ),
         ]
         events = APP.parse_diagnostic_lines(raw_lines)
         exported = json.dumps(events, ensure_ascii=False)
-        for secret in ("alice", "pst-live-secret", "rawsig", "rawkey", "rawbearer"):
+        for secret in (
+            "alice", "pst-live-secret", "pst-trace-secret",
+            "rawsig", "rawkey", "rawbearer",
+        ):
             self.assertNotIn(secret, exported)
+        self.assertEqual(len(events), 2)
         self.assertIn(r"C:\\Users\\<user>", exported)
         self.assertIn("[REDACTED]", exported)
+        self.assertIn("Traceback (most recent call last):", events[1]["message"])
+        self.assertIn(r"C:\Users\<user>\private\worker.py", events[1]["message"])
         # 민감값이 있는 행은 기능 종류보다 보안 범주를 우선한다.
         self.assertEqual(events[0]["category"], "security")
         self.assertEqual(events[1]["category"], "security")
@@ -450,8 +461,14 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(len(errors_only["events"]), 1)
         self.assertEqual(errors_only["events"][0]["level"], "ERROR")
         api_text = json.dumps(payload, ensure_ascii=False)
-        for secret in ("alice", "pst-live-secret", "rawsig", "rawkey", "rawbearer"):
+        for secret in (
+            "alice", "pst-live-secret", "pst-trace-secret",
+            "rawsig", "rawkey", "rawbearer",
+        ):
             self.assertNotIn(secret, api_text)
+        self.assertIn("Traceback (most recent call last):", errors_only["events"][0]["message"])
+        self.assertNotIn("toISOString().slice(0,10)", APP.PAGE_TEMPLATE)
+        self.assertIn("getFullYear()", APP.PAGE_TEMPLATE)
 
     def test_local_http_rejects_cross_site_post_but_allows_local_cli(self):
         with socket.socket() as probe:

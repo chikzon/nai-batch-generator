@@ -197,11 +197,18 @@ def diagnostic_category(message):
 
 
 def parse_diagnostic_lines(lines):
-    """logging 기본 형식의 각 줄을 redacted 구조화 이벤트로 변환한다."""
+    """logging 기본 형식의 각 줄을 redacted 구조화 이벤트로 변환한다.
+
+    traceback처럼 timestamp 없이 이어지는 줄은 직전 사건의 본문이다. 별도 INFO 사건으로
+    만들면 "오류만" 필터에서 원인 스택이 사라지므로 직전 사건에 안전하게 합친다.
+    """
     events = []
     previous_at = None
     for raw in lines:
         match = _DIAG_LINE_RE.match(str(raw))
+        if not match and events:
+            events[-1]["message"] += "\n" + redact_diagnostic_text(raw)
+            continue
         if match:
             timestamp = match.group("time")
             level = match.group("level")
@@ -6417,16 +6424,19 @@ if($('diagLoad')){
   });
   $('diagExport').addEventListener('click', () => {
     if(!DIAG_LAST){ $('diagStat').textContent = '먼저 불러오세요'; return; }
+    const now = new Date();
+    const pad2 = n => String(n).padStart(2, '0');
+    const localDay = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}`;
     const safe = {
       schema: DIAG_LAST.schema,
-      exported_at: new Date().toISOString(),
+      exported_at: now.toISOString(),
       errors: DIAG_LAST.errors,
       events: DIAG_LAST.events
     };
     const blob = new Blob([JSON.stringify(safe, null, 2)], {type:'application/json'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `nais-diagnostics-${new Date().toISOString().slice(0,10)}.json`;
+    a.download = `nais-diagnostics-${localDay}.json`;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(a.href);
     $('diagStat').textContent = '안전 JSON 저장됨 ✓';
