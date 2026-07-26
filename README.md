@@ -6,7 +6,11 @@ NovelAI 의 공식 제품이 아니며 NovelAI 와 아무 관계가 없다.
 
 ## 시작
 
-`실행.bat` 더블클릭 → 파이썬이 없으면 알아서 준비하고 브라우저가 열린다.
+**Windows x64 전용**이다 (임베디드 파이썬 자동 설치가 Windows용이다).
+`실행.bat` 더블클릭 → 파이썬이 없으면 알아서 내려받아 준비하고 브라우저가 열린다.
+자동 준비에는 인터넷 연결과 Windows 기본 도구(curl · tar · PowerShell)가 필요하다 —
+Windows 10 1803 이후면 다 들어 있다. 실패하면 [python.org](https://www.python.org/downloads/)에서
+파이썬을 설치한 뒤 `python start.py` 로 직접 실행하면 된다.
 `기타 → API` 에 NAI 토큰을 넣으면 끝이다.
 (토큰 발급: novelai.net → 설정 → Account → Get Persistent API Token)
 

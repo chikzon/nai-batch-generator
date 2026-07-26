@@ -22,11 +22,26 @@
 """
 import argparse
 import json
+import os
 import re
 import shutil
+import stat
 import sys
 import zipfile
 from pathlib import Path
+
+
+def force_rmtree(path):
+    """읽기 전용 파일(.git 객체 등)도 지워지는 rmtree.
+    Windows 에서 git 객체는 읽기 전용이라 일반 rmtree 가 조용히 실패한다 —
+    그 탓에 사본에 .git 이 남은 채 검사를 통과한 적이 있다 (라운드02 실측)."""
+    def _onerror(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=_onerror)
 
 sys.stdout.reconfigure(encoding="utf-8")
 SRC = Path(__file__).resolve().parent
@@ -37,6 +52,9 @@ SRC = Path(__file__).resolve().parent
 #   남에게 줄 때는 세팅 없이 시작하고, 필요하면 세팅 파일만 따로 건네면 된다.
 DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json",
               "generation_state.json", "배포준비.py", ".git",
+              # 프로필/ 은 계정별 설정·토큰·생성물 전체 — 통째로 뺀다
+              # (안의 설정.json 등이 이름 규칙으로 걸리긴 하지만 이름에 기대지 않는다)
+              "프로필",
               "세팅", "씬규격", "asset_config.json",
               # 씬 모드 목록도 내가 만든 데이터다 (앱이 없으면 빈 목록으로 시작)
               "씬.json",
@@ -91,7 +109,7 @@ def clean(dst: Path):
     for p in sorted(dst.rglob("*"), key=lambda x: -len(x.parts)):
         if should_drop(p, dst):
             try:
-                shutil.rmtree(p) if p.is_dir() else p.unlink()
+                force_rmtree(p) if p.is_dir() else p.unlink()
                 removed += 1
             except OSError:
                 pass
@@ -131,16 +149,29 @@ def verify(dst: Path):
             m = re.match(r"^([^#=]+?)\s*=\s*(.+)$", line)
             if m and m.group(1).strip() in BLANK_KEYS and m.group(2).strip():
                 problems.append(f"설정.txt 의 '{m.group(1).strip()}' 에 값이 남아 있음")
-    # 토큰 문자열 흔적
-    for p in dst.rglob("*.json"):
+    # 토큰 문자열 흔적 — json 만 보면 설정.txt·bat·py 의 잔재를 놓친다.
+    # 작은 텍스트 파일 전부를 본다 (라운드02 검토 반영).
+    # ⚠ start.py 의 안내문("pst-..." 자리표시)이 걸리지 않게 **실제 토큰 모양**만 잡는다:
+    #   pst- 뒤에 영숫자·-·_ 가 20자 이상 이어지는 것 (진짜 토큰은 60자 이상)
+    TOKEN_RE = re.compile(r"pst-[A-Za-z0-9_\-]{20,}")
+    TEXT_SUFFIX = (".json", ".txt", ".md", ".py", ".bat", ".csv", ".html", ".js")
+    for p in dst.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIX:
+            continue
         if p.stat().st_size > 30 * 1024 * 1024:
             continue
         try:
-            t = p.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+            t = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
             continue
-        if "pst-" in t:
+        if TOKEN_RE.search(t):
             problems.append(f"{p.relative_to(dst)} 에 NAI 토큰으로 보이는 문자열")
+    # 프로필 폴더는 통째로 빠져야 한다
+    if (dst / "프로필").exists():
+        problems.append("프로필/ 이 남아 있음 (계정별 토큰·설정)")
+    # .git 도 남으면 안 된다 (커밋 이력·이메일이 딸려 간다)
+    if (dst / ".git").exists():
+        problems.append(".git 이 남아 있음 (커밋 이력·git 설정)")
     return problems
 
 
@@ -154,7 +185,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     work = out_dir / "NAI배치생성기"
     if work.exists():
-        shutil.rmtree(work)
+        force_rmtree(work)
 
     print(f"사본 만드는 중... ({SRC.name} → {work})")
     shutil.copytree(SRC, work, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
