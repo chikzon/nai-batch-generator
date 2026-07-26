@@ -4398,6 +4398,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="psec-head" data-fold="pPos"><span class="chev">▾</span><span class="t">프롬프트</span>
         <span class="count" id="posTok">0</span>
         <span class="ed" id="tagVerifyBtn" title="단부루에 실제로 있는 태그인지 확인 (없는 태그는 토큰만 먹는다)">✓태그</span>
+        <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄찾바</span>
         <span class="ed" id="split3Btn" title="고정 / 가변 / 디테일 세 칸으로 나누기">⋮⋮</span></div>
       <div class="psec-body" id="pPos">
         <textarea id="basePrompt" placeholder="1girl, artist:..., masterpiece"></textarea>
@@ -7532,6 +7533,7 @@ function applySplit3(){
     joinSplit3();
   }
 }
+if($('findRepBtn')) $('findRepBtn').addEventListener('click', openFindReplace);
 $('split3Btn').addEventListener('click', () => {
   STATE.ui = STATE.ui || {};
   STATE.ui.split3 = !split3On();
@@ -7833,6 +7835,83 @@ function openCombos(target){
   loadCombos(false);
   $('modalFlash').textContent = '';
   $('modalBg').style.display = 'flex';
+}
+
+/* ── ⇄ 찾아 바꾸기 (SDStudio 의 FindReplaceDialog) ─────────────────────
+   프롬프트·네거티브·3분할·캐릭터 칸(외형·의상·전용 네거티브)을 한꺼번에.
+   작가를 통째로 갈아끼우거나 오타를 한 번에 고칠 때 쓴다. 미리보기 후 적용. */
+function openFindReplace(){
+  $('modalTitle').textContent = '⇄ 찾아 바꾸기';
+  $('modalBody').innerHTML = `
+    <p class="hint">프롬프트·네거티브·캐릭터 칸에서 한꺼번에 바꿉니다. 먼저 <b>몇 군데인지</b> 보여 주고,
+    <b>바꾸기</b>를 눌러야 실제로 바뀝니다.</p>
+    <div class="bar"><input type="text" id="frFind" placeholder="찾을 말 (예: artist:wanke)" style="flex:1;">
+      <input type="text" id="frRepl" placeholder="바꿀 말 (비우면 지움)" style="flex:1;"></div>
+    <div class="bar" style="flex-wrap:wrap;">
+      <label class="hint"><input type="checkbox" id="frCase"> 대소문자 구분</label>
+      <label class="hint"><input type="checkbox" id="frWord"> 태그 통째로만 (콤마 경계)</label>
+      <span class="n" id="frStat" style="margin-left:auto;"></span></div>
+    <div id="frPrev" class="hint" style="max-height:200px;overflow:auto;font-family:var(--mono);"></div>
+    <div class="bar"><button class="primary" id="frGo">바꾸기</button></div>`;
+  $('modalBg').style.display = 'flex';
+  const targets = () => {
+    const list = [
+      ['프롬프트', () => $('basePrompt').value, v => { $('basePrompt').value = v; STATE.base_prompt = v; }],
+      ['네거티브', () => $('negPrompt').value, v => { $('negPrompt').value = v; STATE.negative_prompt = v; }],
+    ];
+    ['baseFixed','baseVar','baseDetail'].forEach((id, i) => {
+      if($(id)) list.push([['고정','가변','디테일'][i], () => $(id).value,
+        v => { $(id).value = v; STATE[['base_fixed','base_var','base_detail'][i]] = v; }]);
+    });
+    (STATE.char_slots || []).forEach((s, i) => {
+      ['prompt','outfit','negative'].forEach(k => {
+        list.push([`인물${i+1}·${{prompt:'외형',outfit:'의상',negative:'네거'}[k]}`,
+          () => STATE.char_slots[i][k] || '', v => { STATE.char_slots[i][k] = v; }]);
+      });
+    });
+    return list;
+  };
+  const build = () => {
+    const find = $('frFind').value;
+    if(!find){ $('frStat').textContent = ''; $('frPrev').innerHTML = ''; return []; }
+    const flags = $('frCase').checked ? 'g' : 'gi';
+    const esc2 = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp($('frWord').checked ? `(^|,)\\s*${esc2}\\s*(?=,|$)` : esc2, flags);
+    const hits = [];
+    targets().forEach(([name, get, set]) => {
+      const cur = get();
+      if(cur && re.test(cur)){
+        re.lastIndex = 0;
+        const n = (cur.match(re) || []).length;
+        hits.push({name, get, set, n, re});
+      }
+      re.lastIndex = 0;
+    });
+    const total = hits.reduce((a, h) => a + h.n, 0);
+    $('frStat').textContent = total ? `${hits.length}칸 · ${total}군데` : '없음';
+    $('frPrev').innerHTML = hits.map(h => `<div>· ${esc(h.name)} — ${h.n}군데</div>`).join('');
+    return hits;
+  };
+  ['frFind','frRepl','frCase','frWord'].forEach(id => $(id).addEventListener('input', build));
+  ['frCase','frWord'].forEach(id => $(id).addEventListener('change', build));
+  $('frGo').addEventListener('click', () => {
+    const hits = build();
+    if(!hits.length){ $('frStat').textContent = '바꿀 것이 없습니다.'; return; }
+    const repl = $('frRepl').value;
+    let n = 0;
+    hits.forEach(h => {
+      const cur = h.get();
+      h.re.lastIndex = 0;
+      const out = $('frWord').checked
+        ? cur.replace(h.re, (m, p1) => (repl ? `${p1 || ''}${p1 ? ' ' : ''}${repl}` : (p1 || '')))
+        : cur.replace(h.re, repl);
+      h.set(out); n += h.n;
+    });
+    if(window.renderSlots) renderSlots();
+    tokens(); save();
+    $('frStat').textContent = `${n}군데 바꿨습니다 ✓`;
+    build();
+  });
 }
 
 /* 작가 평가 배지 — 별점·즐겨찾기·차단을 한눈에 (rater 의 ratings 를 우리 식으로) */
