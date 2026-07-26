@@ -2048,7 +2048,10 @@ def _load_tag_dict_inner(spec):
                             continue
                         slot, kind = _slot_of_tag(tag, cat, char_rules, style_rules)
                         display = tag.replace("_", " ")
-                        rows.append((display, cnt, slot or "", kind))
+                        # CSV 4열은 **별칭**이다 (`1girl,0,6008644,"1girls,sole_female"`).
+                        # 예전엔 버렸다 — 별칭으로 치면 정식 태그를 못 찾았다 (F-01).
+                        al = [x.strip().replace("_", " ") for x in (r[3] if len(r) > 3 else "").split(",")]
+                        rows.append((display, cnt, slot or "", kind, [x for x in al if x]))
                         if slot:
                             by_slot.setdefault((kind, slot), []).append((display, cnt))
             except Exception as e:
@@ -2082,6 +2085,7 @@ def _ac_index(spec):
 
 
 AC_CACHE_FILE = BASE_DIR / "수집" / "태그색인.pickle"
+AC_CACHE_VER = 2      # 구조가 바뀌면 올린다 (2 = 별칭 색인 포함)
 
 
 def _tag_fingerprint():
@@ -2103,6 +2107,10 @@ def _ac_cache_load():
         if got.get("fp") != _tag_fingerprint():
             log.info("태그 사전이 바뀌어 색인 캐시를 버립니다")
             return None
+        # 색인 구조가 바뀌면(별칭 추가 등) 옛 캐시는 못 쓴다 — 버전으로 가른다
+        if got.get("ver") != AC_CACHE_VER:
+            log.info("색인 형식이 바뀌어 캐시를 다시 만듭니다")
+            return None
         return got
     except Exception as e:
         log.info(f"색인 캐시 읽기 건너뜀: {e}")
@@ -2115,7 +2123,7 @@ def _ac_cache_save(rows, buckets, flat):
         AC_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = AC_CACHE_FILE.with_suffix(".tmp")
         with open(tmp, "wb") as f:
-            pickle.dump({"fp": _tag_fingerprint(), "rows": rows,
+            pickle.dump({"fp": _tag_fingerprint(), "ver": AC_CACHE_VER, "rows": rows,
                          "buckets": buckets, "flat": flat}, f, protocol=4)
         tmp.replace(AC_CACHE_FILE)
         log.info(f"색인 캐시 저장: {AC_CACHE_FILE.stat().st_size//1024//1024}MB")
@@ -2132,13 +2140,24 @@ def _ac_index_inner(d):
         log.info(f"자동완성 색인(캐시): 앞2글자 {len(got['buckets']):,}종")
         return d["ac"]
     buckets, flat = {}, []
-    for t, c, _slot, _k in d["rows"]:
+    for row in d["rows"]:
+        t, c, _slot, _k = row[0], row[1], row[2], row[3]
+        aliases = row[4] if len(row) > 4 else []
         tl = t.lower()
         flat.append((t, c, tl))
         keys = {tl[:2]}
         tb = re.sub(r"^artists?:", "", tl)
         if tb is not tl:
             keys.add(tb[:2])
+        # 별칭으로 쳐도 **정식 태그**가 나오게 한다 (F-01).
+        # 넣는 값은 정식 이름(t)이고 비교용 문자열만 별칭이다 — 사용자는 옳은 태그를 받는다.
+        for a2 in aliases[:6]:
+            al = a2.lower()
+            if al and al != tl:
+                flat.append((t, c, al))
+                if len(al) >= 2:
+                    keys.add(al[:2])
+                    buckets.setdefault(al[:2], []).append((t, c, al))
         for k in keys:
             if len(k) == 2:
                 buckets.setdefault(k, []).append((t, c, tl))
@@ -2194,7 +2213,7 @@ def search_tags(spec, kind, slot, q, limit=60):
             return [{"tag": t, "count": c} for t, c in pool[:limit]]
     if not q:
         return []
-    out = [(t, c) for t, c, s, k in d["rows"] if q in t.lower()]
+    out = [(r[0], r[1]) for r in d["rows"] if q in r[0].lower()]   # rows 는 5칸(별칭 포함)
     out.sort(key=lambda x: -x[1])
     return [{"tag": t, "count": c} for t, c in out[:limit]]
 
@@ -3660,11 +3679,17 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     except Exception:
         pass
 
-    # 캐릭터 위치. NAI 는 인물마다 centers 를 하나씩 받는다 (0.1~0.9 격자).
-    # use_coords 를 끄면 NAI 가 알아서 배치하므로 값은 무시된다(기본 0.5, 0.5).
+    # 캐릭터 위치. NAI 는 인물마다 centers 를 하나씩 받는다.
+    # ⚠ **위치 지정을 끄면 좌표를 보내지 않는다** — 0.5/0.5 로 보낸다 (MM-B).
+    #   예전에는 꺼도 사용자가 고른 좌표가 그대로 나갔다. 그림은 안 바뀌지만(NAI 가 무시)
+    #   **저장 메타데이터에 적용된 적 없는 좌표가 남아**, 나중에 그 그림을 불러오면
+    #   "이 자리에 놓고 뽑았다"고 오해하게 된다. 공홈·NAIS3-MM·nais_blue 모두 끄면 0.5/0.5 다.
+    use_coords = bool(p.get("use_coords", False))
     ctrs = p.get("char_centers") or []
 
     def center(i):
+        if not use_coords:
+            return [{"x": 0.5, "y": 0.5}]
         c = ctrs[i] if i < len(ctrs) and isinstance(ctrs[i], dict) else {}
         return [{"x": float(c.get("x", 0.5)), "y": float(c.get("y", 0.5))}]
 
@@ -3692,8 +3717,6 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
         char_captions.append({"char_caption": cap, "centers": center(i)})
         # 네거티브도 **인물 수만큼** 맞춰야 한다 (개수가 다르면 짝이 어긋난다)
         neg_char_captions.append({"char_caption": ng, "centers": center(i)})
-
-    use_coords = bool(p.get("use_coords", False))
 
     # img2img / 인페인트 — `_i2i` 가 있으면 그 모드로 보낸다.
     #   img2img : action="img2img" + image(base64) + strength/noise
