@@ -118,6 +118,55 @@ class RegressionTests(unittest.TestCase):
             image.unlink()
             self.assertFalse(APP.progress_record_valid(record, cfg, fingerprint))
 
+    def test_pace_gate_uses_completion_time_and_honors_cancel(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["pace"] = {
+            "delay_min": 5,
+            "delay_max": 5,
+            "daily_cap": 100,
+        }
+        clock = [100.0]
+
+        def fake_sleep(seconds):
+            clock[0] += seconds
+
+        class Live:
+            stop_req = False
+
+        APP._LAST_CALL["t"] = 0.0
+        with (
+            patch.object(APP, "load_state", return_value={"daily": {}}),
+            patch.object(APP.random, "uniform", return_value=5.0),
+            patch.object(APP.time, "time", side_effect=lambda: clock[0]),
+            patch.object(APP.time, "sleep", side_effect=fake_sleep),
+        ):
+            self.assertEqual(APP.pace_gate(cfg, Live()), (True, ""))
+            self.assertEqual(APP._LAST_CALL["t"], 0.0)
+            APP.pace_complete()
+            self.assertEqual(APP._LAST_CALL["t"], 100.0)
+
+            clock[0] = 102.0
+            self.assertEqual(APP.pace_gate(cfg, Live()), (True, ""))
+            self.assertEqual(clock[0], 105.0)
+
+            APP._LAST_CALL["t"] = 110.0
+            stopped = Live()
+            stopped.stop_req = True
+            before = clock[0]
+            ok, why = APP.pace_gate(cfg, stopped)
+            self.assertFalse(ok)
+            self.assertIn("중지", why)
+            self.assertEqual(clock[0], before)
+
+    def test_every_nai_generation_path_marks_completion(self):
+        source = (ROOT / "start.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("call_nai_api("), 6)  # definition + five callers
+        self.assertEqual(source.count("pace_complete()"), 6)  # definition + five callers
+        self.assertNotIn(
+            'time.sleep(random.uniform(pc["delay_min"], pc["delay_max"]))',
+            source,
+        )
+
     def test_custom_output_root_and_date_are_used_by_batch_and_thumbnails(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "chosen"
