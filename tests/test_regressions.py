@@ -83,6 +83,32 @@ class RegressionTests(unittest.TestCase):
             self.assertNotIn("Comment", result.info)
             self.assertTrue(all(alpha % 2 == 0 for alpha in result.getchannel("A").tobytes()))
 
+    def test_metadata_import_strips_quality_suffix_and_restores_toggle(self):
+        metadata = PngInfo()
+        metadata.add_text(
+            "Comment",
+            json.dumps({
+                "prompt": "1girl" + APP.QUALITY_SUFFIX,
+                "uc": "bad anatomy",
+                "seed": 1,
+                "steps": 28,
+                "width": 832,
+                "height": 1216,
+                "software": "NovelAI",
+            }),
+        )
+        source = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(source, "PNG", pnginfo=metadata)
+
+        with tempfile.TemporaryDirectory() as td, patch.object(APP, "IMG_CACHE", Path(td)):
+            result = APP.ConfigServer(
+                copy.deepcopy(APP.DEFAULT_CONFIG)
+            ).handle_inspect(source.getvalue(), "fixture.png", "")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["style"]["base"], "1girl")
+        self.assertTrue(result["style"]["params"]["quality_toggle"])
+        self.assertEqual(result["style"]["negative"], "bad anatomy")
+
     def test_atomic_json_recovers_last_backup(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "state.json"
