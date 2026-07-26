@@ -3267,25 +3267,38 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     """params: 설정.json 의 고급 파라미터 dict (없으면 기존 기본값 그대로)
     chars: 인물 목록 [{prompt, negative}, …] — 주면 female/male 대신 이것을 쓴다 (최대 6명)"""
     p = dict(params or {})
-    # 조각(와일드카드)을 **보내기 직전에** 푼다. 여기가 모든 생성 경로가 지나는
-    # 한 곳이라, 저장되는 메타데이터에도 풀린 프롬프트가 그대로 박힌다.
-    # 한 이미지의 여섯 칸을 한 번에 풀어야 `<*이름>` 순번이 칸마다 따로 돌지 않는다.
+    # ── 전처리 순서: 주석 제거 → 조각 치환 → 정규화 ──────────────────
+    # ⚠ 이 순서와 대상 목록이 중요하다 (CQA-004·005):
+    #   ① 주석을 **먼저** 지워야 메모 속 `<*이름>` 이 순번을 헛되이 소비하지 않는다.
+    #   ② `chars=` 로 온 인물 칸도 함께 풀어야 한다 — 예전엔 base/negative 와
+    #      옛 female/male 인자만 풀어서 캐릭터 칸의 조각이 그대로 NAI 로 나갔다.
+    #   ③ 한 이미지의 모든 칸을 **한 번의 resolve_fragments** 로 처리해야
+    #      `<*이름>` 순번이 칸마다 따로 돌지 않는다.
+    chars_list = []
+    if chars:
+        for c in chars:
+            if isinstance(c, dict):
+                chars_list.append([c.get("prompt", ""), c.get("negative", "")])
+            else:
+                pair = (list(c) + ["", ""])[:2]
+                chars_list.append([pair[0], pair[1]])
+    fixed = [strip_comment_lines(x) for x in
+             (base_prompt, negative, female_caption, male_caption, char_negative, male_negative)]
+    flat_chars = [strip_comment_lines(x) for pair in chars_list for x in pair]
     if p.get("use_fragments", True):
-        (base_prompt, negative, female_caption, male_caption,
-         char_negative, male_negative), counters = resolve_fragments(
-            [base_prompt, negative, female_caption, male_caption,
-             char_negative, male_negative], counters=p.get("_frag_counters"))
+        resolved, counters = resolve_fragments(fixed + flat_chars,
+                                               counters=p.get("_frag_counters"))
+        fixed, flat_chars = list(resolved[:6]), list(resolved[6:])
         if p.get("_frag_counters") is not None:
             p["_frag_counters"].update(counters)     # 호출자가 이어서 쓴다
     # 숫자로 끝나는 태그가 `::` 에 붙으면 NAI 가 그 숫자를 새 가중치로 읽어
     # 묶음이 닫히지 않는다 (`2::tag_number_37::` → 37 이 가중치가 됨).
-    # 닫는 `::` 앞에 공백을 넣어 원래 의도대로 전달한다.
-    base_prompt = normalize_prompt(base_prompt)
-    negative = normalize_prompt(negative)
-    female_caption = normalize_prompt(female_caption)
-    male_caption = normalize_prompt(male_caption)
-    char_negative = normalize_prompt(char_negative)
-    male_negative = normalize_prompt(male_negative)
+    # 닫는 `::` 앞에 공백을 넣어 원래 의도대로 전달한다. **캐릭터 칸도 똑같이.**
+    (base_prompt, negative, female_caption, male_caption,
+     char_negative, male_negative) = [normalize_prompt(x) for x in fixed]
+    flat_chars = [normalize_prompt(x) for x in flat_chars]
+    for i in range(len(chars_list)):
+        chars_list[i] = [flat_chars[i * 2], flat_chars[i * 2 + 1]]
     model = p.get("model") or "nai-diffusion-4-5-full"
     if is_v4_model(model):
         # V3 전용 값이 남아 있어도 V4에서는 중립값으로 보낸다 (결과 망가짐 방지)
@@ -3314,14 +3327,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     #   (세팅=체위는 '주인공+상대역' 2인 구조라 그대로 둔다).
     people = []
     if chars:
-        for c in chars:
-            if isinstance(c, dict):
-                cap, ng = c.get("prompt", ""), c.get("negative", "")
-            else:
-                cap, ng = (list(c) + ["", ""])[:2]
-            cap = strip_comment_lines(cap)   # chars 경로는 normalize 를 안 지나므로 여기서
+        # 위에서 주석 제거·조각 치환·정규화를 마친 값이다 (CQA-004·005)
+        for cap, ng in chars_list:
             if (cap or "").strip():
-                people.append((cap, strip_comment_lines(ng or "")))
+                people.append((cap, ng or ""))
     else:
         if female_caption:
             people.append((female_caption, char_negative or ""))
@@ -9262,25 +9271,28 @@ class ConfigServer:
         except json.JSONDecodeError:
             return {"ok": False, "error": "잘못된 데이터"}
         old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-        for key in ("token", "seed", "nai_seed", "base_prompt", "negative_prompt",
-                    "characters", "character_folders", "setting_state", "char_slots",
-                    "char_centers", "vibes", "char_refs", "ui",
-                    "cfg_scale", "cfg_rescale", "steps", "sampler", "scheduler", "variety",
-                    "style_name",
-                    # 생성 파라미터
-                    "model", "width", "height", "uc_preset", "quality_toggle",
-                    "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
-                    "controlnet_strength", "prefer_brownian",
-                    "deliberate_euler_ancestral_bug", "use_coords", "legacy_v3_extend",
-                    # 부루 계정 (단부루·겔부루·e621 태그 검색용)
-                    "booru_keys"):
-            if key in data:
-                self.cfg[key] = data[key]
+        # ⚠ 화이트리스트를 손으로 적다가 저장 포맷·메타제거·밴 예방·3분할 키가 빠져
+        #   화면에서 고른 값이 조용히 버려지고도 ok:true 가 나갔다 (CQA-011, Critical).
+        #   이제 **DEFAULT_CONFIG 의 사용자 편집 키 전부**를 자동으로 받는다 —
+        #   키를 새로 만들 때 여기 적는 것을 잊어도 저장이 죽지 않는다.
+        allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
+        allowed |= {"booru_keys"}          # 기본값 표에 없지만 사용자 편집값
+        allowed -= {"male_prompt"}         # 레거시(세팅 상대역으로 이전됨)
+        accepted, rejected = [], []
+        for key, val in data.items():
+            if key in allowed:
+                self.cfg[key] = val
+                accepted.append(key)
+            elif not key.startswith("_"):
+                rejected.append(key)
+        if rejected:
+            log.info(f"설정 저장에서 모르는 키를 건너뜀: {', '.join(sorted(rejected))}")
         new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
         delete_char_files(self.cfg, old_ids - new_ids)
         sync_chars_to_files(self.cfg)
         save_config(self.cfg)
-        return {"ok": True}
+        # 무엇이 실제로 저장됐는지 돌려준다 (조용한 유실 방지)
+        return {"ok": True, "accepted": accepted, "rejected": rejected}
 
     def handle_scene_save(self, body):
         """씬 내부 프롬프트 수정 → asset_config.json 에 저장 (생성 중이면 다음 장부터 반영)"""
