@@ -3795,9 +3795,10 @@ def _dir_img_count(p):
     return n
 
 
-def list_output(sub="", cfg=None):
+def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=False):
     """생성물 뿌리 아래를 훑는다. sub 가 비면 최상위.
-    저장 폴더를 바꿨으면(out_dir) 그쪽을 본다 — 탐색기와 저장이 어긋나면 안 된다."""
+    저장 폴더를 바꿨으면(out_dir) 그쪽을 본다 — 탐색기와 저장이 어긋나면 안 된다.
+    limit>0 이면 정렬·필터 뒤 해당 페이지만 반환한다. 기본 0은 내부 호환용 전체 반환."""
     root = out_root(cfg).resolve()
     base = (root / sub).resolve() if sub else root
     try:
@@ -3817,9 +3818,24 @@ def list_output(sub="", cfg=None):
                           "bytes": st.st_size, "mtime": int(st.st_mtime)})
     files.sort(key=lambda x: -x["mtime"])
     picks = load_picks()
+    if only_pick:
+        chosen = set(picks["picked"])
+        files = [f for f in files if f["path"] in chosen]
+    if only_fav:
+        chosen = set(picks["fav"])
+        files = [f for f in files if f["path"] in chosen]
+    total = len(files)
+    offset = max(0, int(offset or 0))
+    limit = max(0, min(500, int(limit or 0)))
+    if limit:
+        files = files[offset:offset + limit]
+    else:
+        offset = 0
     return {"ok": True, "dir": sub, "dirs": dirs, "files": files,
+            "total": total, "offset": offset,
+            "has_more": bool(limit and offset + len(files) < total),
             "picked": picks["picked"], "fav": picks["fav"],
-            "folders": picks["folders"],
+            "folders": picks["folders"], "ranks": picks.get("ranks", {}),
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
 
 
@@ -6799,17 +6815,70 @@ if($('i2iDrop')){
 
 /* ── 생성물 탐색기 · 선별 · 비교함 ──────────────────────────────────
    원본 파일은 옮기지 않는다. 선별·즐겨찾기는 경로에 붙는 이름표(선별.json)다. */
-let EXP = {dir:'', files:[], dirs:[], picked:new Set(), fav:new Set(), cmp:new Set(), open:-1};
+const EXP_CHUNK = 120;
+let EXP = {dir:'', files:[], dirs:[], total:0, loading:false,
+  loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1};
+function expListUrl(dir, offset=0){
+  const q = new URLSearchParams({
+    dir: dir ?? EXP.dir, limit: String(EXP_CHUNK), offset: String(offset)
+  });
+  if($('expOnlyPick').checked) q.set('only_pick', '1');
+  if($('expOnlyFav').checked) q.set('only_fav', '1');
+  return '/api/out_list?' + q.toString();
+}
 async function expLoad(dir){
-  const r = await (await fetch('/api/out_list?dir=' + encodeURIComponent(dir ?? EXP.dir))).json();
+  /* 폴더·필터를 빨리 바꾸면 이전의 느린 응답이 나중 상태를 덮을 수 있다.
+     요청 세대를 올려 **마지막 선택의 응답만** 적용한다. */
+  const seq = ++EXP.loadSeq;
+  EXP.loading = true;
+  let r;
+  try{
+    r = await (await fetch(expListUrl(dir ?? EXP.dir, 0))).json();
+  }catch(e){
+    if(seq === EXP.loadSeq){ EXP.loading = false; $('expStat').textContent = String(e); }
+    return;
+  }
+  if(seq !== EXP.loadSeq) return;
+  EXP.loading = false;
   if(!r.ok){ $('expStat').textContent = r.error || '못 읽음'; return; }
   EXP.dir = r.dir; EXP.files = r.files; EXP.dirs = r.dirs;
+  EXP.total = Number.isFinite(r.total) ? r.total : r.files.length;
   EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav); EXP.ranks = r.ranks || {};
   $('expPath').textContent = 'output/' + (r.dir ? r.dir + '/' : '');
   /* 최상위에서는 위로 갈 곳이 없다 — 눌려도 아무 일 없으면 고장으로 보인다 */
   const up = $('expUp');
   if(up){ up.disabled = !r.dir; up.title = r.dir ? '상위 폴더' : '이미 최상위입니다'; }
   expDraw();
+}
+async function expFetchMore(draw=true){
+  if(EXP.loading || EXP.files.length >= EXP.total) return false;
+  const seq = EXP.loadSeq;
+  EXP.loading = true;
+  let r;
+  try{
+    r = await (await fetch(expListUrl(EXP.dir, EXP.files.length))).json();
+  }catch(e){
+    if(seq === EXP.loadSeq){ EXP.loading = false; $('expStat').textContent = String(e); }
+    return false;
+  }
+  if(seq !== EXP.loadSeq) return false;
+  EXP.loading = false;
+  if(!r.ok){ $('expStat').textContent = r.error || '못 읽음'; return false; }
+  const seen = new Set(EXP.files.map(f => f.path));
+  const added = (r.files || []).filter(f => !seen.has(f.path));
+  EXP.files.push(...added);
+  EXP.total = Number.isFinite(r.total) ? r.total : EXP.files.length;
+  EXP.vis = expVisible();
+  if(draw) expChunk();
+  return added.length > 0;
+}
+async function expEnsureAll(){
+  while(EXP.files.length < EXP.total){
+    const before = EXP.files.length;
+    if(!await expFetchMore(false) || EXP.files.length === before) break;
+  }
+  EXP.vis = expVisible();
+  return EXP.vis;
 }
 function expVisible(){
   let f = EXP.files;
@@ -6828,15 +6897,14 @@ function expDraw(){
   const g = $('expGrid'); g.innerHTML = '';
   g.style.setProperty('--ecard', $('expSize').value + 'px');
   const vis = expVisible();
-  $('expCount').textContent = `${EXP.files.length}장`;
-  $('expStat').textContent = `${vis.length}장 보임 · 선별 ${EXP.picked.size} · 즐겨찾기 ${EXP.fav.size}`;
+  $('expCount').textContent = `${EXP.total}장`;
+  $('expStat').textContent = `${vis.length}/${EXP.total}장 불러옴 · 선별 ${EXP.picked.size} · 즐겨찾기 ${EXP.fav.size}`;
   $('expCmpN').textContent = EXP.cmp.size;
   /* 수천 장을 한 번에 그리면 초기 로딩·메모리가 터진다 (Custom 의 페이지 분할 참고).
      120장씩 그리고, '더 보기'가 화면에 가까워지면 자동으로 다음 묶음. */
   EXP.vis = vis; EXP.shown = 0;
   expChunk();
 }
-const EXP_CHUNK = 120;
 function expChunk(){
   const g = $('expGrid');
   const vis = EXP.vis || [];
@@ -6864,15 +6932,18 @@ function expChunk(){
     more = document.createElement('button');
     more.id = 'expMore';
     more.style.cssText = 'grid-column:1/-1;padding:8px 0;';
-    more.addEventListener('click', expChunk);
+    more.addEventListener('click', () =>
+      EXP.shown < (EXP.vis || []).length ? expChunk() : expFetchMore());
     /* 화면에 가까워지면 자동 로딩 — 탭이 숨어 있으면 안 돌므로 안전하다 */
     new IntersectionObserver(es => es.forEach(e => {
-      if(e.isIntersecting && EXP.shown < (EXP.vis || []).length) expChunk();
+      if(!e.isIntersecting) return;
+      if(EXP.shown < (EXP.vis || []).length) expChunk();
+      else if(EXP.files.length < EXP.total) expFetchMore();
     }), {rootMargin: '600px'}).observe(more);
   }
   g.appendChild(more);   // 항상 그리드 맨 끝
-  more.textContent = `더 보기 (${vis.length - EXP.shown}장 남음)`;
-  more.classList.toggle('hidden', EXP.shown >= vis.length);
+  more.textContent = `더 보기 (${Math.max(0, EXP.total - EXP.shown)}장 남음)`;
+  more.classList.toggle('hidden', EXP.shown >= EXP.total);
 }
 /* ── 🏆 이미지 월드컵 (SDStudio 의 토너먼트를 우리 탐색기에) ──────────────
    보이는 그림을 무작위로 짝지어 1:1 로 이긴 쪽만 다음 판에 올린다.
@@ -6880,8 +6951,8 @@ function expChunk(){
    순위는 선별.json 의 ranks 에 저장되어 카드에 배지로 남는다.
    조작: ←/→ 또는 클릭으로 승자 · Space 무승부(둘 다 진출) · Esc 중단 */
 let CUP = null;
-function cupStart(){
-  const vis = expVisible();
+async function cupStart(){
+  const vis = await expEnsureAll();
   if(vis.length < 2){ $('expStat').textContent = '월드컵은 그림이 2장 이상일 때 할 수 있습니다.'; return; }
   const pool = vis.map(f => f.path);
   for(let i = pool.length - 1; i > 0; i--){          // 섞기
@@ -6999,7 +7070,11 @@ window.addEventListener('keydown', async e => {
   const vis = expVisible(); const f = vis[EXP.open]; if(!f) return;
   const k = e.key.toLowerCase();
   if(e.key === 'Escape'){ expClose(); return; }
-  if(e.key === 'ArrowRight'){ e.preventDefault(); expOpen(Math.min(EXP.open+1, vis.length-1)); return; }
+  if(e.key === 'ArrowRight'){
+    e.preventDefault();
+    if(EXP.open >= vis.length-1 && EXP.files.length < EXP.total) await expFetchMore(false);
+    expOpen(Math.min(EXP.open+1, expVisible().length-1)); return;
+  }
   if(e.key === 'ArrowLeft'){ e.preventDefault(); expOpen(Math.max(EXP.open-1, 0)); return; }
   if(k === 'f'){ e.preventDefault();
     EXP.picked.has(f.path) ? EXP.picked.delete(f.path) : EXP.picked.add(f.path);
@@ -7015,7 +7090,8 @@ if($('expUp')){
   $('expUp').addEventListener('click', () => expLoad(EXP.dir.includes('/')
     ? EXP.dir.slice(0, EXP.dir.lastIndexOf('/')) : ''));
   $('expReload').addEventListener('click', () => expLoad());
-  ['expOnlyPick','expOnlyFav','expSize'].forEach(id => $(id).addEventListener('change', expDraw));
+  ['expOnlyPick','expOnlyFav'].forEach(id => $(id).addEventListener('change', () => expLoad(EXP.dir)));
+  $('expSize').addEventListener('change', expDraw);
   $('expCmpClear').addEventListener('click', () => { EXP.cmp.clear(); expDraw(); });
   if($('expCup')) $('expCup').addEventListener('click', cupStart);
   $('expCompare').addEventListener('click', () => {
@@ -7039,15 +7115,17 @@ if($('expUp')){
       ? `${r.count}장 복구 시작 (${r.mode === 'img2img' ? 'img2img' : '같은 설정'}) — 생성 탭 미리보기에 나옵니다`
       : (r.error || '실패');
   };
-  $('regenPicked').addEventListener('click', () =>
-    regen(expVisible().map(f => f.path).filter(p => EXP.picked.has(p))));
-  $('regenAll').addEventListener('click', () => {
-    const paths = expVisible().map(f => f.path);
+  $('regenPicked').addEventListener('click', async () => {
+    const vis = await expEnsureAll();
+    regen(vis.map(f => f.path).filter(p => EXP.picked.has(p)));
+  });
+  $('regenAll').addEventListener('click', async () => {
+    const paths = (await expEnsureAll()).map(f => f.path);
     if(paths.length > 20 && !confirm(`${paths.length}장을 복구합니다. 시간이 오래 걸립니다. 계속할까요?`)) return;
     regen(paths);
   });
   $('expDelUnpicked').addEventListener('click', async () => {
-    const vis = expVisible();
+    const vis = await expEnsureAll();
     const targets = vis.map(f => f.path).filter(p => !EXP.picked.has(p));
     if(!targets.length){ $('expStat').textContent = '지울 것이 없습니다 (전부 선별됨)'; return; }
     if(!confirm(`선별 안 된 ${targets.length}장을 정말 지울까요?\n파일이 실제로 사라집니다 (되돌릴 수 없음).`)) return;
@@ -10354,7 +10432,12 @@ class ConfigServer:
                     from urllib.parse import urlparse, parse_qs, unquote
                     q = parse_qs(urlparse(self.path).query)
                     try:
-                        self._json(list_output(unquote(q.get("dir", [""])[0]), server.cfg))
+                        self._json(list_output(
+                            unquote(q.get("dir", [""])[0]), server.cfg,
+                            limit=int(q.get("limit", ["0"])[0]),
+                            offset=int(q.get("offset", ["0"])[0]),
+                            only_pick=q.get("only_pick", [""])[0] in ("1", "true"),
+                            only_fav=q.get("only_fav", [""])[0] in ("1", "true")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/setting_thumbs"):

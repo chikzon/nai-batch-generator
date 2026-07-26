@@ -270,6 +270,42 @@ class RegressionTests(unittest.TestCase):
                     {"G": image.relative_to(root).as_posix()},
                 )
 
+    def test_output_listing_is_server_paginated_after_filters(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = td
+            for index in range(305):
+                image = root / f"{index:03d}.png"
+                image.write_bytes(b"image")
+                image.touch()
+            picked = [f"{index:03d}.png" for index in range(0, 305, 2)]
+            fav = [f"{index:03d}.png" for index in range(0, 305, 3)]
+            labels = {"picked": picked, "fav": fav, "folders": {}, "ranks": {}}
+
+            with patch.object(APP, "load_picks", return_value=labels):
+                first = APP.list_output("", cfg, limit=120, offset=0)
+                second = APP.list_output("", cfg, limit=120, offset=120)
+                filtered = APP.list_output(
+                    "", cfg, limit=500, offset=0, only_pick=True, only_fav=True
+                )
+
+            self.assertEqual(first["total"], 305)
+            self.assertEqual(len(first["files"]), 120)
+            self.assertTrue(first["has_more"])
+            self.assertEqual(first["ranks"], {})
+            self.assertEqual(second["offset"], 120)
+            self.assertEqual(len(second["files"]), 120)
+            self.assertTrue(
+                {item["path"] for item in first["files"]}.isdisjoint(
+                    item["path"] for item in second["files"]
+                )
+            )
+            expected = set(picked) & set(fav)
+            self.assertEqual(filtered["total"], len(expected))
+            self.assertEqual({item["path"] for item in filtered["files"]}, expected)
+            self.assertFalse(filtered["has_more"])
+
     def test_local_http_rejects_cross_site_post_but_allows_local_cli(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
