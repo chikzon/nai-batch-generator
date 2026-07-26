@@ -93,6 +93,31 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("# memo", final["chars"][0])
         self.assertIn("custom negative", final["negative"])
 
+    def test_resume_record_requires_existing_file_and_same_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = td
+            acfg = {"base": {"negative_prompt": "neg"},
+                    "scenes": {"1": {"name": "scene"}}}
+            char = {"name": "hero", "female": "face"}
+            context = APP.generation_context_fingerprint(cfg, acfg)
+            fingerprint = APP.generation_task_fingerprint(
+                context, char, "hero-id", 1, 1)
+            image = Path(td) / "nsfw_seed" / "image.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"image")
+            record = APP.make_progress_record(cfg, 1, 1, image, fingerprint)
+            self.assertTrue(APP.progress_record_valid(record, cfg, fingerprint))
+            changed_cfg = copy.deepcopy(cfg)
+            changed_cfg["base_prompt"] = "changed"
+            changed_context = APP.generation_context_fingerprint(changed_cfg, acfg)
+            changed_fingerprint = APP.generation_task_fingerprint(
+                changed_context, char, "hero-id", 1, 1)
+            self.assertNotEqual(fingerprint, changed_fingerprint)
+            self.assertFalse(APP.progress_record_valid(record, cfg, changed_fingerprint))
+            image.unlink()
+            self.assertFalse(APP.progress_record_valid(record, cfg, fingerprint))
+
     def test_custom_output_root_and_date_are_used_by_batch_and_thumbnails(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "chosen"

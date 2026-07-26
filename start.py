@@ -15,6 +15,7 @@
 이전 버전의 설정.txt 가 있다면 최초 1회 자동으로 설정.json 으로 옮겨옵니다.
 """
 import gzip
+import hashlib
 import base64
 import io
 import json
@@ -9319,6 +9320,16 @@ class LiveState:
                 self.running = False
                 self.stop_req = False
 
+    def wait_cancelable(self, seconds):
+        """중지를 존중하는 대기 — 중지되면 즉시 True 를 돌려준다 (CQA-019).
+        휴식·429·재시도 대기가 통짜 sleep 이면 중지를 눌러도 최대 60초 뒤 한 장이 더 나간다."""
+        end = time.time() + max(0.0, float(seconds))
+        while time.time() < end:
+            if self.stop_req:
+                return True
+            time.sleep(min(0.5, end - time.time()))
+        return self.stop_req
+
     def request_stop(self):
         """중지 요청 — 도는 작업이 장(파일) 경계에서 보고 멈춘다. 실행권은 안 푼다."""
         with self.lock:
@@ -10767,6 +10778,72 @@ def char_folder_id(char):
 
 # ═══════════════ 메인 ═══════════════
 
+def generation_context_fingerprint(cfg, acfg):
+    """Stable digest of inputs that can change a batch image.
+
+    Secrets and display-only settings are excluded. Private runtime keys such
+    as fragment counters are also excluded so finishing one image does not
+    invalidate every earlier image in the same run.
+    """
+    ignored = {"token", "booru_keys", "ui"}
+    clean_cfg = {
+        k: v for k, v in (cfg or {}).items()
+        if not str(k).startswith("_") and k not in ignored
+    }
+    raw = json.dumps(
+        {"config": clean_cfg, "assets": acfg}, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def generation_task_fingerprint(context_fingerprint, char, cid, num, copy):
+    raw = json.dumps(
+        {"context": context_fingerprint, "char": char, "cid": cid,
+         "scene": int(num), "copy": int(copy)},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def make_progress_record(cfg, num, copy, saved_path, fingerprint):
+    root = out_root(cfg).resolve()
+    path = Path(saved_path).resolve()
+    try:
+        stored = path.relative_to(root).as_posix()
+    except ValueError:
+        stored = str(path)
+    return {"scene": int(num), "copy": int(copy), "path": stored,
+            "bytes": path.stat().st_size, "fingerprint": fingerprint}
+
+
+def progress_item_key(item):
+    try:
+        if isinstance(item, dict):
+            return int(item["scene"]), int(item.get("copy", 1))
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            return int(item[0]), int(item[1])
+        return int(item), 1
+    except (KeyError, TypeError, ValueError):
+        return None
+
+def progress_record_valid(record, cfg, expected_fingerprint):
+    if not isinstance(record, dict):
+        return False
+    if record.get("fingerprint") != expected_fingerprint:
+        return False
+    value = record.get("path")
+    if not isinstance(value, str) or not value.strip():
+        return False
+    path = Path(value)
+    if not path.is_absolute():
+        path = out_root(cfg).resolve() / path
+    try:
+        return (path.is_file() and path.stat().st_size > 0
+                and path.stat().st_size == int(record.get("bytes", -1)))
+    except (OSError, TypeError, ValueError):
+        return False
+
 def compute_pending(cfg, acfg, done_this_run, skip_set):
     """세팅별 선택(setting_state)을 기준으로 작업 목록 계산. 사용 꺼진 세팅은 제외."""
     allowed = set()
@@ -10944,20 +11021,41 @@ def _run_generation(server):
     #   예전에는 progress 를 쓰기만 하고 읽지 않아, 중지 후 '생성 시작'을 다시 누르면
     #   끝난 장을 처음부터 다시 만들고 같은 파일을 덮어썼다 (Anlas·시간 재소모).
     #   회차(seed) 를 바꾸면 progress 키가 달라져 자연히 새로 시작한다.
-    done_this_run = {}
+    cfg = server.cfg
+    acfg = load_asset_config(cfg)
+    context_fingerprint = generation_context_fingerprint(cfg, acfg)
+    records = {}
+    legacy_records = 0
     for cid, items in (state.get("progress", {}).get(seed_key) or {}).items():
-        keep = set()
-        for it in items:
-            if isinstance(it, (list, tuple)) and len(it) == 2:
-                keep.add((int(it[0]), int(it[1])))
-            else:                       # 옛 기록은 씬 번호만 있었다 → 1벌로 본다
-                keep.add((int(it), 1))
-        if keep:
-            done_this_run[cid] = keep
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                legacy_records += 1
+                continue
+            try:
+                key = (str(cid), int(item["scene"]), int(item.get("copy", 1)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            records[key] = item
+
+    done_this_run = {}
+    invalid_records = 0
+    candidates = compute_pending(cfg, acfg, {}, set())
+    for char, cid, num, copy in candidates:
+        record = records.get((cid, num, copy))
+        if record is None:
+            continue
+        fingerprint = generation_task_fingerprint(
+            context_fingerprint, char, cid, num, copy)
+        if progress_record_valid(record, cfg, fingerprint):
+            done_this_run.setdefault(cid, set()).add((num, copy))
+        else:
+            invalid_records += 1
     if done_this_run:
         n_done = sum(len(v) for v in done_this_run.values())
-        log.info(f"회차 {seed_key} 에 이미 끝낸 {n_done}장을 건너뜁니다 "
-                 f"(처음부터 다시 하려면 회차 번호를 바꾸세요).")
+        log.info(f"회차 {seed_key}의 파일·설정이 일치하는 완료 {n_done}장을 건너뜁니다.")
+    if legacy_records or invalid_records:
+        log.warning("재개 기록 중 파일 또는 설정 근거가 없는 %d건은 다시 생성합니다.",
+                    legacy_records + invalid_records)
     skip_set = set()   # 이번 실행에서 계속 실패해 건너뛴 작업 (재실행하면 다시 시도)
     completed = 0
 
@@ -10969,6 +11067,7 @@ def _run_generation(server):
             return
         cfg = server.cfg  # 매 루프마다 최신 설정을 다시 읽는다 (실시간 반영 핵심)
         acfg = load_asset_config(cfg)
+        context_fingerprint = generation_context_fingerprint(cfg, acfg)
         pending = compute_pending(cfg, acfg, done_this_run, skip_set)
 
         if not pending:
@@ -10986,21 +11085,17 @@ def _run_generation(server):
             log.info(f"⏸ {pc['cool_every']}장 완료 — {pc['cool_seconds']}초 쿨다운")
             server.live.update(status_text=f"쿨다운 {pc['cool_seconds']}초...")
             save_state(state)
-            # 1초 단위로 쪼개 자야 중지 버튼이 휴식 중에도 듣는다
-            for _ in range(int(pc["cool_seconds"])):
-                if server.live.stop_req:
-                    break
-                time.sleep(1)
+            # 취소를 존중하는 대기 — 중지되면 다음 장을 시작하지 않고 바로 끝낸다
+            if server.live.wait_cancelable(pc["cool_seconds"]):
+                continue
         elif pc["soft_every"] and completed > 0 and completed % pc["soft_every"] == 0:
             pause = pc["soft_seconds"] + random.uniform(-5, 10)
             pause = max(1.0, pause)
             log.info(f"⏸ 소프트 휴식 {pause:.0f}초")
             server.live.update(status_text=f"소프트 휴식 {pause:.0f}초...")
             save_state(state)
-            for _ in range(int(pause)):
-                if server.live.stop_req:
-                    break
-                time.sleep(1)
+            if server.live.wait_cancelable(pause):
+                continue
 
         negative = acfg["base"].get("nsfw_negative_prompt", acfg["base"]["negative_prompt"])
         scale = acfg["base"].get("cfg_scale", cfg.get("cfg_scale", 5.5))
@@ -11055,6 +11150,8 @@ def _run_generation(server):
 
         ok = False
         for attempt in range(3):
+            if server.live.stop_req:      # 보내기 직전에도 확인 (CQA-019)
+                break
             try:
                 # 씬 전용 네거티브가 있으면 기본 네거티브 뒤에 붙인다
                 #   (씬 모드와 같은 규칙 — 세팅 씬도 이제 이 칸을 가진다)
@@ -11070,15 +11167,17 @@ def _run_generation(server):
                                    scale=scale, cfg_rescale=cfg_rescale,
                                    steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
                                    seed=seed, variety=variety, params=cfg)
-                save_with_meta(img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
-                                quality=out_clean(cfg)[2])
+                saved_path = save_with_meta(
+                    img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
+                    max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
                 server.live.set_image(img)
                 ok = True
                 break
             except RateLimitError:
                 log.warning("  429 — 60초 대기 후 재시도")
                 server.live.update(status_text="429 — 60초 대기 중...")
-                time.sleep(60)
+                if server.live.wait_cancelable(60):
+                    break                      # 중지 — 재시도하지 않는다
             except (AccountBannedError, AuthError) as e:
                 log.critical(f"  {e}")
                 server.live.update(status_text=f"중단됨: {e}")
@@ -11088,15 +11187,18 @@ def _run_generation(server):
             except Exception as e:
                 log.error(f"  시도 {attempt+1} 실패: {e}")
                 server.live.update(status_text=f"재시도 중... ({attempt+1}/3)")
-                if attempt < 2:
-                    time.sleep(30)
+                if attempt < 2 and server.live.wait_cancelable(30):
+                    break                      # 중지 — 재시도하지 않는다
 
         if ok:
             done_this_run.setdefault(cid, set()).add((num, copy))
-            # (씬 번호, 벌) 짝으로 기록해야 재개가 정확하다 — 예약 매수 2벌 이상일 때
-            # 번호만 적으면 남은 벌을 통째로 건너뛴다 (CQA-010)
+            fingerprint = generation_task_fingerprint(
+                context_fingerprint, char, cid, num, copy)
+            record = make_progress_record(
+                cfg, num, copy, saved_path, fingerprint)
             rec = state["progress"].setdefault(seed_key, {}).setdefault(cid, [])
-            rec.append([num, copy])
+            rec[:] = [item for item in rec if progress_item_key(item) != (num, copy)]
+            rec.append(record)
             bump_daily(state)
             server.live.update(daily=daily_count(state))
             completed += 1
