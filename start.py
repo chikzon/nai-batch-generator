@@ -3948,6 +3948,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 .poscell{width:10px;height:10px;border-radius:2px;background:var(--line);cursor:pointer;}
 .poscell:hover{background:var(--accent-dim);}
 .poscell.on{background:var(--accent);box-shadow:0 0 0 1px var(--accent);}
+.posnum{width:52px;padding:2px 4px;font-size:11px;}
 
 /* 필터 줄: 셀렉트/체크박스가 한 줄에 나란히 (input,select의 width:100% 무력화) */
 .filterbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px;}
@@ -5189,8 +5190,13 @@ function bindUseCoords(){
   c._bound = true;
   const paint = () => {
     c.checked = !!STATE.use_coords;
+    /* 실측(라운드01): 좌표는 2명부터 적용된다 — 1명일 때는 NAI 가 통째로 무시.
+       0명일 때 "1명" 안내를 내면 거짓말이 된다 — 정확히 1명일 때만 */
+    const solo = activeSlotIdx().length === 1;
     $('chCoordsNote').textContent = STATE.use_coords
-      ? '인물마다 아래 격자에서 고른 자리에 배치합니다.'
+      ? (solo
+        ? '켜져 있지만 인물이 1명일 때는 NAI 가 좌표를 무시합니다(실측) — 2명부터 적용됩니다.'
+        : '인물마다 격자(빠른 선택)나 숫자 칸(0~1 자유값)으로 자리를 정합니다.')
       : "끔 = AI's Choice — NAI 가 알아서 배치합니다.";
     /* 몸이 붙는 조건 두 가지 — ① 좌표를 안 씀 ② 좌표가 서로 겹침 */
     const n = activeSlotIdx().length;
@@ -5243,8 +5249,11 @@ function bindUseCoords(){
 }
 
 /* ── 캐릭터 위치 (centers) ──────────────────────────────────────────
-   NAI 는 인물마다 화면 어디에 둘지 좌표를 받는다 (0.1~0.9 격자).
-   실제 NAI 이미지 1,687장을 보면 (0.5,0.5) 기본에 (0.3,0.5)·(0.7,0.5) 가 흔하다.
+   NAI 는 인물마다 화면 어디에 둘지 좌표를 받는다. 공홈 UI 는 5×5 격자만 보여주지만
+   **서버는 0~1 자유값을 받고 격자로 반올림하지 않는다** (라운드01 실측 — 0.05 차이도 반영).
+   격자는 빠른 선택용으로 남기고 숫자 칸으로 자유값을 넣는다.
+   ⚠ 실측 주의: **인물이 1명이면 NAI 가 좌표를 통째로 무시한다** (12장 픽셀 동일 확인).
+   좌표는 2명부터 적용되고, 핀 고정이 아니라 느슨한 유도다.
    '캐릭터 위치 좌표 사용'(use_coords)이 꺼져 있으면 NAI 가 알아서 배치한다. */
 const POS_STEPS = [0.1, 0.3, 0.5, 0.7, 0.9];
 const MAX_CHARS = 6;      // NAI 가 한 그림에 받는 인물 수 (서버 상수와 같음)
@@ -5288,6 +5297,11 @@ function drawPosGrids(){
       });
       host.appendChild(cell);
     }));
+    /* 숫자 칸도 현재 값으로 (포커스 중인 칸은 건드리지 않는다 — 입력을 지우게 된다) */
+    const nx = document.querySelector(`[data-posx="${i}"]`);
+    const ny = document.querySelector(`[data-posy="${i}"]`);
+    if(nx && document.activeElement !== nx) nx.value = cur.x;
+    if(ny && document.activeElement !== ny) ny.value = cur.y;
     const lab = document.querySelector(`[data-poslabel="${i}"]`);
     if(lab) lab.textContent = (cur.x === 0.5 && cur.y === 0.5)
       ? '가운데 (기본)' : `x ${cur.x} · y ${cur.y}`;
@@ -5648,6 +5662,8 @@ function renderSlots(){
       <input type="text" data-sf="negative" data-si="${i}" placeholder="이 인물 전용 네거티브" value="${escA(s.negative)}">
       <div class="posrow"><span class="hint">위치</span>
         <div class="posgrid" data-pos="${i}"></div>
+        <input type="number" class="posnum" data-posx="${i}" min="0" max="1" step="0.01" title="x (0~1 자유값 — 격자 밖도 됩니다)">
+        <input type="number" class="posnum" data-posy="${i}" min="0" max="1" step="0.01" title="y (0~1 자유값 — 격자 밖도 됩니다)">
         <span class="hint" data-poslabel="${i}"></span></div>`;
     h.appendChild(el);
   });
@@ -5664,6 +5680,25 @@ function renderSlots(){
     STATE.char_slots.splice(+b.dataset.sdel, 1);
     (STATE.char_centers || []).splice(+b.dataset.sdel, 1);   // 좌표도 같이 지운다
     autoCoordsOnSecond(); renderSlots(); tokens(); save();
+  }));
+  /* 좌표 숫자 칸 — 격자(5×5)는 빠른 선택용이고, 여기는 0~1 자유값.
+     실측(라운드01): NAI 서버는 좌표를 격자로 반올림하지 않는다 — 0.05 차이도 반영된다.
+     'change' 에만 묶는다 (입력 중 다시 그리면 커서를 잃는다). */
+  h.querySelectorAll('[data-posx],[data-posy]').forEach(el => el.addEventListener('change', () => {
+    const i = +(el.dataset.posx != null ? el.dataset.posx : el.dataset.posy);
+    const axis = el.dataset.posx != null ? 'x' : 'y';
+    let v = parseFloat(el.value);
+    if(!isFinite(v)) v = 0.5;
+    v = Math.min(1, Math.max(0, Math.round(v * 100) / 100));
+    STATE.char_centers = STATE.char_centers || [];
+    while(STATE.char_centers.length <= i) STATE.char_centers.push({x:0.5, y:0.5});
+    STATE.char_centers[i] = Object.assign({x:0.5, y:0.5}, STATE.char_centers[i]);
+    STATE.char_centers[i][axis] = v;
+    /* 보정값을 칸에 바로 되쓴다 — drawPosGrids 는 포커스 중인 칸을 안 건드리는데
+       change 는 포커스가 남은 채로도 오므로, 안 쓰면 화면 1.5 / 저장 1 처럼 어긋난다 */
+    el.value = String(v);
+    drawPosGrids(); save();
+    if(!(STATE.use_coords)) flash('위치를 쓰려면 파라미터에서 [캐릭터 위치 좌표 사용]을 켜세요.');
   }));
   const lib = $('slotLib');
   lib.innerHTML = '<option value="">+ 라이브러리에서...</option>';
