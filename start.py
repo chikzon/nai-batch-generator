@@ -1703,49 +1703,75 @@ STYLE_SORTS = {
 #   별점·즐겨찾기·차단·메모를 작가 태그에 붙인다. 차단한 작가가 프롬프트에 있으면
 #   생성 전에 알려 준다. 그림체 라이브러리 정렬·필터에도 쓰인다.
 RATINGS_FILE = BASE_DIR / "수집" / "작가평가.json"
-_RATINGS = {"loaded": False, "data": {}}
+_RATINGS = {"mtime": -1, "data": {}}
+_RATINGS_LOCK = threading.RLock()
+
+
+def artist_key(name):
+    """작가 이름 표준화 — 저장·조회·프롬프트 판정이 **같은 규칙**을 써야 한다.
+    파서가 내부 연속 공백을 하나로 줄이므로 여기서도 같이 줄인다 (R3-02)."""
+    return re.sub(r"\s+", " ", str(name or "")).strip().casefold()
 
 
 def load_ratings():
-    if not _RATINGS["loaded"]:
-        d = {}
-        if RATINGS_FILE.exists():
-            try:
-                d = json.loads(RATINGS_FILE.read_text(encoding="utf-8")) or {}
-            except Exception as e:
-                log.warning(f"작가평가.json 읽기 실패: {e}")
-        _RATINGS.update({"loaded": True, "data": d if isinstance(d, dict) else {}})
-    return _RATINGS["data"]
+    """파일이 바뀌었으면 다시 읽는다 — 프로필을 둘 돌려도 서로의 평가를 안 잃는다."""
+    with _RATINGS_LOCK:
+        try:
+            mt = RATINGS_FILE.stat().st_mtime if RATINGS_FILE.exists() else 0
+        except OSError:
+            mt = 0
+        if mt != _RATINGS["mtime"]:
+            d = {}
+            if RATINGS_FILE.exists():
+                try:
+                    d = json.loads(RATINGS_FILE.read_text(encoding="utf-8")) or {}
+                except Exception as e:
+                    log.warning(f"작가평가.json 읽기 실패: {e}")
+                    return _RATINGS["data"]        # 깨진 파일로 기억을 지우지 않는다
+            _RATINGS.update({"mtime": mt, "data": d if isinstance(d, dict) else {}})
+        return _RATINGS["data"]
 
 
 def save_ratings(d):
-    RATINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    RATINGS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-    _RATINGS.update({"loaded": True, "data": d})
-    return d
+    """원자적으로 저장한다 (반쪽 JSON·동시 쓰기 유실 방지 — R3-01)."""
+    with _RATINGS_LOCK:
+        RATINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(RATINGS_FILE, d)
+        try:
+            _RATINGS.update({"mtime": RATINGS_FILE.stat().st_mtime, "data": d})
+        except OSError:
+            _RATINGS.update({"mtime": -1, "data": d})
+        return d
 
 
 def rate_artist(name, **fields):
     """작가 하나의 평가를 고친다. fields: score(0~5) · fav · block · memo"""
-    key = (name or "").strip().lower()
+    key = artist_key(name)
     if not key:
         return {}
-    d = load_ratings()
-    cur = dict(d.get(key) or {})
-    for k in ("score", "fav", "block", "memo"):
-        if k in fields:
-            if k == "score":
-                cur[k] = max(0, min(5, int(fields[k] or 0)))
-            elif k == "memo":
-                cur[k] = str(fields[k] or "")[:500]
-            else:
-                cur[k] = bool(fields[k])
-    if not any([cur.get("score"), cur.get("fav"), cur.get("block"), cur.get("memo")]):
-        d.pop(key, None)          # 전부 비면 기록을 남기지 않는다
-    else:
-        d[key] = cur
-    save_ratings(d)
-    return cur
+    with _RATINGS_LOCK:
+        d = dict(load_ratings())      # 최신을 다시 읽어 병합 (남의 저장을 덮지 않게)
+        cur = dict(d.get(key) or {})
+        for k in ("score", "fav", "block", "memo"):
+            if k in fields:
+                if k == "score":
+                    try:
+                        cur[k] = max(0, min(5, int(fields[k] or 0)))
+                    except (TypeError, ValueError):
+                        cur[k] = 0
+                elif k == "memo":
+                    cur[k] = str(fields[k] or "")[:500]
+                else:
+                    v = fields[k]
+                    # "false"·0·"" 같은 값이 참으로 읽히면 애먼 작가가 차단된다 (R4-01)
+                    cur[k] = (v if isinstance(v, bool)
+                              else str(v).strip().lower() in ("1", "true", "yes", "on"))
+        if not any([cur.get("score"), cur.get("fav"), cur.get("block"), cur.get("memo")]):
+            d.pop(key, None)          # 전부 비면 기록을 남기지 않는다
+        else:
+            d[key] = cur
+        save_ratings(d)
+        return cur
 
 
 def blocked_artists_in(text):
@@ -1754,14 +1780,14 @@ def blocked_artists_in(text):
     blocked = {k for k, v in d.items() if v.get("block")}
     if not blocked:
         return []
-    names = {a.lower() for _, a in parse_artist_combo(text or "")[0]}
+    names = {artist_key(a) for _, a in parse_artist_combo(text or "")[0]}
     return sorted(blocked & names)
 
 
 def style_rating(rec):
     """그림체 한 줄의 평가 요약 — 작가들의 평균 별점·즐겨찾기·차단 포함 여부."""
     d = load_ratings()
-    arts = [(a or "").lower() for a in (rec.get("artists") or [])]
+    arts = [artist_key(a) for a in (rec.get("artists") or [])]
     vals = [d.get(a) for a in arts if d.get(a)]
     scores = [v["score"] for v in vals if v.get("score")]
     return {
@@ -3463,6 +3489,15 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     # 이미 붙어 있으면 그대로 두므로 그림에서 읽어 온 네거티브도 이중이 되지 않는다.
     negative = merge_uc_preset(negative, model, p.get("uc_preset"))
 
+    # 차단해 둔 작가가 실제로 나가는 프롬프트에 있으면 알린다 (R5-01).
+    # 막지는 않는다 — 사용자가 일부러 넣었을 수 있다. 다만 모르고 나가지는 않게.
+    try:
+        blocked = blocked_artists_in(base_prompt)
+        if blocked:
+            log.warning(f"⛔ 차단해 둔 작가가 프롬프트에 있습니다: {', '.join(blocked)}")
+    except Exception:
+        pass
+
     # 캐릭터 위치. NAI 는 인물마다 centers 를 하나씩 받는다 (0.1~0.9 격자).
     # use_coords 를 끄면 NAI 가 알아서 배치하므로 값은 무시된다(기본 0.5, 0.5).
     ctrs = p.get("char_centers") or []
@@ -3667,6 +3702,19 @@ def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
     return path
 
 
+def available_output_path(path, fmt="webp"):
+    """기존 생성물을 덮지 않는 실제 확장자 경로를 예약한다(단일 실행 owner 전제)."""
+    path = Path(path).with_suffix(".png" if fmt == "png" else ".webp")
+    if not path.exists():
+        return path
+    stem, suffix, n = path.stem, path.suffix, 2
+    while True:
+        candidate = path.with_name(f"{stem}_{n}{suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  메타데이터 제거 — 공유용 사본
 #    NAI 그림에는 프롬프트가 **두 군데** 들어 있다:
@@ -3688,10 +3736,11 @@ def load_picks():
                 d.setdefault("picked", [])
                 d.setdefault("fav", [])
                 d.setdefault("folders", {})     # 폴더이름 → [경로…]
+                d.setdefault("ranks", {})       # 경로 → 월드컵 순위(1등이 1)
                 return d
         except Exception as e:
             log.warning(f"선별.json 읽기 실패: {e}")
-    return {"picked": [], "fav": [], "folders": {}}
+    return {"picked": [], "fav": [], "folders": {}, "ranks": {}}
 
 
 def save_picks(d):
@@ -3837,7 +3886,7 @@ def load_scenes():
     if not SCENES_FILE.exists():
         return []
     try:
-        d = json.loads(SCENES_FILE.read_text(encoding="utf-8"))
+        d = load_json_recover(SCENES_FILE)
         return d if isinstance(d, list) else d.get("씬", [])
     except Exception as e:
         log.warning(f"씬.json 읽기 실패: {e}")
@@ -3845,10 +3894,16 @@ def load_scenes():
 
 
 def save_scenes(scenes):
-    out = []
+    out, used_ids = [], set()
     for s in scenes or []:
+        root_id = _safe_name(str(s.get("id") or s.get("name") or f"scene{len(out)+1}"))
+        sid, serial = root_id, 2
+        while sid.casefold() in used_ids:
+            sid = f"{root_id}-{serial}"
+            serial += 1
+        used_ids.add(sid.casefold())
         out.append({
-            "id": s.get("id") or _safe_name(s.get("name", "")) or f"scene{len(out)+1}",
+            "id": sid,
             "name": (s.get("name") or "").strip() or "이름 없음",
             "prompt": s.get("prompt", ""),
             # 씬이 **인물별 프롬프트**도 가질 수 있다 (배경·구도는 prompt, 인물은 여기).
@@ -4806,6 +4861,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="bar" style="margin-top:6px;">
           <span class="n" id="expStat"></span>
+          <button id="expCup" title="보이는 그림들을 1:1 로 붙여 순위를 매깁니다 (SDStudio 의 이미지 월드컵)">🏆 월드컵</button>
           <button id="expCompare" style="margin-left:auto;">🔍 비교함 보기 (<span id="expCmpN">0</span>)</button>
           <button id="expCmpClear">비교함 비우기</button>
           <button id="expDelUnpicked" class="danger" title="이 폴더에서 선별 안 된 것을 실제로 지웁니다">선별 외 삭제</button>
@@ -5750,24 +5806,40 @@ function readParams(){
     el.addEventListener('change', readParams); el.addEventListener('input', readParams); });
 
 /* ── 저장 ── */
-let saveT = null;
+let saveT = null, saveBusy = false, saveQueued = false;
 function save(){ clearTimeout(saveT); saveT = setTimeout(doSave, 350); }
 async function doSave(){
+  /* 앞 요청보다 옛 STATE가 늦게 도착해 새 값을 덮지 않도록 한 번에 하나만 보낸다. */
+  if(saveBusy){ saveQueued = true; return; }
+  saveBusy = true;
   try{
     const r = await (await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(STATE)})).json();
-    /* 해상도를 NAI 규격으로 맞췄으면 조용히 넘기지 않고 알린다 (CQA-012) */
-    const note = $('pResNote');
-    if(note){
-      const f = (r && r.fixed) || {};
-      const parts = Object.keys(f).map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`);
-      note.textContent = parts.length ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${parts.join(' · ')}` : '';
-      if(parts.length){
-        if($('pWidth')) $('pWidth').value = STATE.width = f.width ? f.width.used : STATE.width;
-        if($('pHeight')) $('pHeight').value = STATE.height = f.height ? f.height.used : STATE.height;
+    if(r && r.conflict){ flash(r.error || '다른 화면에서 설정이 변경됐습니다. 새로고침해주세요.'); return; }
+    if(r && r.revision != null) STATE._revision = r.revision;
+    const f = (r && r.fixed) || {};
+    const ids = {width:'pWidth',height:'pHeight',steps:'pSteps',cfg_scale:'pScale',
+      cfg_rescale:'pRescale',save_quality:'pSaveQ',seed:'pSeed',nai_seed:'pNaiSeed',
+      uncond_scale:'pUncond',controlnet_strength:'pCtrl'};
+    Object.entries(f).forEach(([k, v]) => {
+      if(k.startsWith('pace.')){
+        const pk = k.slice(5); STATE.pace = STATE.pace || {}; STATE.pace[pk] = v.used;
+        const pe = Object.entries(PACE_FIELDS).find(([,key]) => key === pk);
+        if(pe && $(pe[0])) $(pe[0]).value = v.used;
+      }else if(ids[k]){
+        STATE[k] = v.used; if($(ids[k])) $(ids[k]).value = v.used;
       }
-    }
-  }catch(e){}
+    });
+    const wh = ['width','height'].filter(k => f[k]);
+    const note = $('pResNote');
+    if(note) note.textContent = wh.length
+      ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${wh.map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`).join(' · ')}` : '';
+    if(r && r.rejected && r.rejected.length) flash(`저장하지 않은 잘못된 값: ${r.rejected.join(', ')}`);
+  }catch(e){ console.warn('설정 저장 실패', e); }
+  finally{
+    saveBusy = false;
+    if(saveQueued){ saveQueued = false; doSave(); }
+  }
 }
 ['basePrompt','negPrompt','token','pScale','pRescale','pSteps','pSeed','pNaiSeed','pSampler','pSched','pVariety'].forEach(id => {
   const el = $(id);
@@ -6521,7 +6593,7 @@ async function expLoad(dir){
   const r = await (await fetch('/api/out_list?dir=' + encodeURIComponent(dir ?? EXP.dir))).json();
   if(!r.ok){ $('expStat').textContent = r.error || '못 읽음'; return; }
   EXP.dir = r.dir; EXP.files = r.files; EXP.dirs = r.dirs;
-  EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav);
+  EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav); EXP.ranks = r.ranks || {};
   $('expPath').textContent = 'output/' + (r.dir ? r.dir + '/' : '');
   /* 최상위에서는 위로 갈 곳이 없다 — 눌려도 아무 일 없으면 고장으로 보인다 */
   const up = $('expUp');
@@ -6568,6 +6640,9 @@ function expChunk(){
         border-radius:var(--radius);${EXP.cmp.has(f.path)?'outline:2px dashed var(--accent);outline-offset:1px;':''}">
       <div style="position:absolute;top:2px;right:3px;font-size:13px;text-shadow:0 0 3px #000;">
         ${EXP.fav.has(f.path)?'⭐':''}${EXP.picked.has(f.path)?'✔':''}</div>
+      ${(EXP.ranks||{})[f.path] ? `<div style="position:absolute;top:2px;left:3px;font-size:11px;
+        background:#000a;color:#ffd76e;padding:1px 4px;border-radius:var(--radius-pill);">
+        🏆${EXP.ranks[f.path]}</div>` : ''}
       <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>`;
     el.addEventListener('click', () => expOpen(i));
     g.appendChild(el);
@@ -6588,9 +6663,86 @@ function expChunk(){
   more.textContent = `더 보기 (${vis.length - EXP.shown}장 남음)`;
   more.classList.toggle('hidden', EXP.shown >= vis.length);
 }
+/* ── 🏆 이미지 월드컵 (SDStudio 의 토너먼트를 우리 탐색기에) ──────────────
+   보이는 그림을 무작위로 짝지어 1:1 로 이긴 쪽만 다음 판에 올린다.
+   판마다 진 쪽은 그 라운드의 등수를 받는다 → 마지막에 순위가 나온다.
+   순위는 선별.json 의 ranks 에 저장되어 카드에 배지로 남는다.
+   조작: ←/→ 또는 클릭으로 승자 · Space 무승부(둘 다 진출) · Esc 중단 */
+let CUP = null;
+function cupStart(){
+  const vis = expVisible();
+  if(vis.length < 2){ $('expStat').textContent = '월드컵은 그림이 2장 이상일 때 할 수 있습니다.'; return; }
+  const pool = vis.map(f => f.path);
+  for(let i = pool.length - 1; i > 0; i--){          // 섞기
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  CUP = {round: pool, next: [], i: 0, ranks: {}, place: pool.length, total: pool.length, matches: 0};
+  cupDraw();
+}
+function cupFinish(){
+  const el = $('cupBg'); if(el) el.remove();
+  const ranked = Object.entries(CUP.ranks).sort((a, b) => a[1] - b[1]);
+  Object.assign(EXP.ranks, CUP.ranks);
+  picksSave();
+  $('expStat').textContent = `🏆 월드컵 끝 — ${CUP.matches}판, 1등 ${ranked.length ? ranked[0][0].split('/').pop() : '?'}`;
+  CUP = null;
+  expDraw();
+}
+function cupDraw(){
+  if(!CUP) return;
+  /* 이번 라운드가 끝났으면 다음 라운드로 */
+  if(CUP.i >= CUP.round.length){
+    if(CUP.next.length <= 1){
+      if(CUP.next.length === 1) CUP.ranks[CUP.next[0]] = 1;   // 우승
+      cupFinish(); return;
+    }
+    CUP.round = CUP.next; CUP.next = []; CUP.i = 0;
+  }
+  /* 홀수로 남은 마지막 한 장은 부전승 */
+  if(CUP.i === CUP.round.length - 1){
+    CUP.next.push(CUP.round[CUP.i]); CUP.i++;
+    cupDraw(); return;
+  }
+  const a = CUP.round[CUP.i], b = CUP.round[CUP.i + 1];
+  let ov = $('cupBg');
+  if(!ov){
+    ov = document.createElement('div'); ov.id = 'cupBg';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:99;background:#000d;display:flex;'
+      + 'flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:12px;';
+    document.body.appendChild(ov);
+  }
+  const left = Math.max(0, CUP.round.length - CUP.i) + CUP.next.length;
+  ov.innerHTML = `<div style="color:#eee;font-size:13px;">
+      🏆 이미지 월드컵 — ${CUP.total}장 중 ${left}장 남음 · ${CUP.matches + 1}번째 판
+      <span style="opacity:.7;margin-left:10px;">←/→ 또는 클릭으로 승자 · Space 둘 다 · Esc 중단</span></div>
+    <div style="display:flex;gap:12px;align-items:center;justify-content:center;max-height:78vh;">
+      <img data-cup="L" src="/setout?p=${encodeURIComponent(a)}" style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
+      <img data-cup="R" src="/setout?p=${encodeURIComponent(b)}" style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
+    </div>
+    <div style="color:#aaa;font-size:11px;">${esc(a.split('/').pop())} vs ${esc(b.split('/').pop())}</div>`;
+  ov.querySelectorAll('[data-cup]').forEach(im => {
+    im.addEventListener('mouseenter', () => im.style.borderColor = 'var(--accent)');
+    im.addEventListener('mouseleave', () => im.style.borderColor = 'transparent');
+    im.addEventListener('click', () => cupPick(im.dataset.cup === 'L' ? 'a' : 'b'));
+  });
+}
+function cupPick(which){
+  if(!CUP) return;
+  const a = CUP.round[CUP.i], b = CUP.round[CUP.i + 1];
+  CUP.matches++;
+  if(which === 'both'){ CUP.next.push(a, b); }
+  else {
+    const win = which === 'a' ? a : b, lose = which === 'a' ? b : a;
+    CUP.next.push(win);
+    CUP.ranks[lose] = CUP.place--;          // 진 쪽은 남은 등수 중 가장 낮은 자리
+  }
+  CUP.i += 2;
+  cupDraw();
+}
 async function picksSave(){
   await fetch('/api/picks_save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({picked:[...EXP.picked], fav:[...EXP.fav]})});
+    body: JSON.stringify({picked:[...EXP.picked], fav:[...EXP.fav], ranks: EXP.ranks || {}})});
 }
 /* 크게 보기 — 여기서 ←→ F C Esc 가 먹는다 */
 function expOpen(i){
@@ -6619,6 +6771,14 @@ function expOpen(i){
 }
 function expClose(){ const o = $('expViewer'); if(o) o.remove(); EXP.open = -1; }
 window.addEventListener('keydown', async e => {
+  /* 월드컵이 열려 있으면 그쪽이 키를 먼저 먹는다 */
+  if(CUP){
+    if(e.key === 'ArrowLeft'){ e.preventDefault(); cupPick('a'); return; }
+    if(e.key === 'ArrowRight'){ e.preventDefault(); cupPick('b'); return; }
+    if(e.key === ' '){ e.preventDefault(); cupPick('both'); return; }
+    if(e.key === 'Escape'){ e.preventDefault(); const el = $('cupBg'); if(el) el.remove(); CUP = null; return; }
+    return;
+  }
   if(EXP.open < 0) return;
   const vis = expVisible(); const f = vis[EXP.open]; if(!f) return;
   const k = e.key.toLowerCase();
@@ -6641,6 +6801,7 @@ if($('expUp')){
   $('expReload').addEventListener('click', () => expLoad());
   ['expOnlyPick','expOnlyFav','expSize'].forEach(id => $(id).addEventListener('change', expDraw));
   $('expCmpClear').addEventListener('click', () => { EXP.cmp.clear(); expDraw(); });
+  if($('expCup')) $('expCup').addEventListener('click', cupStart);
   $('expCompare').addEventListener('click', () => {
     if(!EXP.cmp.size){ $('expStat').textContent = '비교함이 비어 있습니다 (그림을 열고 C)'; return; }
     let ov = document.createElement('div');
@@ -7622,6 +7783,7 @@ function cq(){ return {
   q: ($('comboQ')||{}).value || '', tab: ($('comboTab')||{}).value || '',
   source: ($('comboSrc')||{}).value || '', sort: ($('comboSort')||{}).value || '',
   seeded: ($('comboSeeded')||{}).checked ? '1' : '',
+  rating: ($('comboRate')||{}).value || '',
   size: +(($('comboSize')||{}).value || 50) }; }
 
 function openCombos(target){
@@ -7647,6 +7809,9 @@ function openCombos(target){
         <option value="small">작게</option><option value="medium" selected>보통</option>
         <option value="large">크게</option></select>
       <label class="hint"><input type="checkbox" id="comboSeeded"> 설정값만</label>
+      <select id="comboRate" title="작가 평가 필터">
+        <option value="">평가 전체</option><option value="fav">💛 즐겨찾기만</option>
+        <option value="rated">★ 별점 매긴 것만</option><option value="hideblock">⛔ 차단 숨기기</option></select>
       <span class="n" id="comboStat"></span>
     </div>
     <div id="comboDrop" class="row" style="text-align:center;padding:14px;border-style:dashed;cursor:pointer;">
@@ -7657,7 +7822,7 @@ function openCombos(target){
     <div id="comboList"></div>
     <div class="bar"><button id="comboMore" style="flex:1;">더 보기 ▾</button></div>`;
   $('comboQ').addEventListener('input', () => { clearTimeout(comboT); comboT = setTimeout(() => loadCombos(false), 300); });
-  ['comboSort','comboTab','comboSrc','comboSize','comboSeeded'].forEach(id =>
+  ['comboSort','comboTab','comboSrc','comboSize','comboSeeded','comboRate'].forEach(id =>
     $(id).addEventListener('change', () => loadCombos(false)));
   $('comboCard').addEventListener('change', () => {
     const px = CARD_PX[$('comboCard').value] || 116;
@@ -7814,7 +7979,8 @@ async function loadCombos(append){
   if(!append) comboOffset = 0;
   const url = `/api/combos?q=${encodeURIComponent(f.q)}&limit=${f.size}&offset=${comboOffset}`
     + `&tab=${encodeURIComponent(f.tab)}&source=${encodeURIComponent(f.source)}`
-    + `&sort=${encodeURIComponent(f.sort)}&seeded=${f.seeded}`;
+    + `&sort=${encodeURIComponent(f.sort)}&seeded=${f.seeded}`
+    + `&rating=${encodeURIComponent(f.rating || '')}`;
   const r = await (await fetch(url)).json();
   if(!r.ok) return;
   $('comboStat').textContent = `${r.matched} / ${r.total}개 (설정값 ${r.seeded})`;
@@ -9274,7 +9440,12 @@ class ConfigServer:
             cfg["_frag_counters"] = state["frag_seq"]
             out_dir = OUTPUT_BASE / "씬"
             out_dir.mkdir(parents=True, exist_ok=True)
-            base_seed = state["seeds"].get(f"{int(cfg.get('seed', 1)):02d}") or random.randint(0, 2**32 - 1)
+            seed_key = f"{int(cfg.get('seed', 1)):02d}"
+            state.setdefault("seeds", {})
+            if seed_key not in state["seeds"]:
+                state["seeds"][seed_key] = random.randint(0, 2**32 - 1)
+                save_state(state)
+            base_seed = state["seeds"][seed_key]
             style = (cfg.get("base_prompt") or "").strip()
             done = 0
             self.live.update(total=len(jobs), index=0, char_name="씬 모드")
@@ -9287,8 +9458,12 @@ class ConfigServer:
                         self.live.update(status_text=why)
                         break
                     suffix = "" if copy == 1 else f"_{copy}벌"
-                    fname = f"{_safe_name(sc['name'])}{suffix}.webp"
-                    self.live.update(index=i, filename=fname, status_text="생성 중...")
+                    seed = seed_for(cfg, base_seed, i + (copy - 1) * 100003)
+                    scene_id = _safe_name(str(sc.get("id") or f"scene-{i}"))
+                    stem = f"{scene_id}_{_safe_name(sc['name'])}_seed{seed}{suffix}"
+                    target = available_output_path(out_dir / f"{stem}.webp", out_format(cfg))
+                    fname = target.name
+                    self.live.update(index=i, filename=fname, status_text="생성 중...", seed=seed)
                     # 씬 프롬프트는 그림체(베이스) 뒤에 붙는다 — 세팅과 같은 규칙.
                     # ★ 인물 묘사는 base 가 아니라 **캐릭터 칸**으로 보내야 한다.
                     #   씬의 char1/char2 가 있으면 그것을 쓰고, 없으면 왼쪽 캐릭터 칸을 쓴다.
@@ -9311,8 +9486,6 @@ class ConfigServer:
                         pts = {(c.get("x"), c.get("y")) for c in ctrs}
                         if len(pts) < len(people):
                             ctrs = spread_centers(len(people))
-                    seed = seed_for(cfg, base_seed, i + (copy - 1) * 100003)
-                    self.live.update(seed=seed)
                     try:
                         img = call_nai_api(
                             cfg["token"], base, "", "",
@@ -9330,8 +9503,9 @@ class ConfigServer:
                         log.error(f"씬 '{sc['name']}' 실패: {e}")
                         self.live.update(status_text=f"'{sc['name']}' 실패: {e}")
                         continue
-                    save_with_meta(img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
-                                quality=out_clean(cfg)[2])
+                    saved_path = save_with_meta(img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
+                                                max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                    self.live.update(filename=saved_path.name)
                     self.live.set_image(img)
                     bump_daily(state)
                     save_state(state)
@@ -9357,8 +9531,7 @@ class ConfigServer:
             for k in ("외형", "착의", "네거티브", "의상"):
                 if k in (data.get("role") or {}):
                     role[k] = data["role"][k]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(pack, f, ensure_ascii=False, indent=2)
+            atomic_write_json(path, pack)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -9371,8 +9544,7 @@ class ConfigServer:
                 return {"ok": False, "error": "프리셋 이름을 입력해주세요."}
             SCENESET_DIR.mkdir(exist_ok=True)
             preset = {k: self.cfg.get(k) for k in SCENESET_KEYS}
-            (SCENESET_DIR / f"{_safe_name(name)}.json").write_text(
-                json.dumps(preset, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(SCENESET_DIR / f"{_safe_name(name)}.json", preset)
             return {"ok": True, "scene_presets": list_scene_presets()}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -9394,8 +9566,7 @@ class ConfigServer:
                 opts.pop(name, None)
             else:
                 opts[name] = data.get("value")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(pack, f, ensure_ascii=False, indent=2)
+            atomic_write_json(path, pack)
             return {"ok": True, "snapshot": self.snapshot_config()}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -9694,15 +9865,14 @@ class ConfigServer:
                             v = fields[k]
                             if k in NUMS:
                                 try:
-                                    v = max(64, min(2048, int(v)))
-                                except (TypeError, ValueError):
+                                    v = normalize_resolution(v)
+                                except (TypeError, ValueError, OverflowError):
                                     continue
                             sc[k] = v
                     changed = True
                     n += 1
                 if changed:
-                    with open(p, "w", encoding="utf-8") as f:
-                        json.dump(pack, f, ensure_ascii=False, indent=2)
+                    atomic_write_json(p, pack)
             return {"ok": True, "updated": n}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -10067,7 +10237,13 @@ class ConfigServer:
                 elif self.path.startswith("/api/rate"):
                     # 작가 평가 — 별점·즐겨찾기·차단·메모 (rater 의 ratings 를 우리 구조로)
                     try:
+                        if len(body or b"") > 64 * 1024:      # 입력 상한 (R4-01)
+                            self._json({"ok": False, "error": "요청이 너무 큽니다."}); return
                         d = json.loads(body or b"{}")
+                        if not isinstance(d, dict):
+                            self._json({"ok": False, "error": "잘못된 형식"}); return
+                        if not d.get("list") and len(str(d.get("artist", ""))) > 200:
+                            self._json({"ok": False, "error": "작가 이름이 너무 깁니다."}); return
                         if d.get("list"):
                             self._json({"ok": True, "ratings": load_ratings()})
                         else:
@@ -10098,7 +10274,7 @@ class ConfigServer:
                     try:
                         d = json.loads(body or b"{}")
                         cur = load_picks()
-                        for k in ("picked", "fav", "folders"):
+                        for k in ("picked", "fav", "folders", "ranks"):
                             if k in d:
                                 cur[k] = d[k]
                         self._json({"ok": True, "picks": save_picks(cur)})
