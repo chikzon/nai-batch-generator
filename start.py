@@ -3223,6 +3223,12 @@ def _ref_fields(p):
         out["reference_information_extracted_multiple"] = ies
     refs = p.get("_char_refs") or {}
     imgs = refs.get("images") or []
+    if imgs and enc:
+        # SDStudio 는 V4.5 에서 캐릭레퍼가 있으면 바이브를 무효화하고 UI 도 잠근다.
+        # NAI 가 400 을 주는지 품질만 떨어지는지는 **검증하지 못했다** — 막지 않고 알리기만 한다
+        # (사용자가 일부러 같이 쓸 수 있다). SDS-C
+        log.warning(f"바이브 {len(enc)}개와 캐릭터 레퍼런스 {len(imgs)}개를 함께 보냅니다 — "
+                    "다른 앱은 이 조합을 막습니다. 결과가 이상하면 하나만 켜 보세요.")
     if imgs:
         out["director_reference_images"] = imgs
         # 설명은 **v4 프롬프트와 같은 모양의 객체**다 (문자열이 아니다).
@@ -3371,6 +3377,27 @@ V4_ONLY = ("variety", "use_coords", "deliberate_euler_ancestral_bug", "prefer_br
 
 def is_v4_model(model):
     return str(model or "").startswith("nai-diffusion-4")
+
+
+def variety_sigma(model):
+    """Variety+ 의 기준 시그마 계수. 모델 세대마다 다르다 (SDS-A).
+    V4.5 계열 58.0 · 그 외 19.0. 실제 NAI 이미지 128장 역산: 58 이 121장, 19 는 4장."""
+    return 58.0 if "4-5" in str(model or "") else 19.0
+
+
+def _variety_sigma_or_none(model, width, height, variety, p):
+    """Variety+ 값. 캐릭터 레퍼런스와 **함께 보내지 않는다** (SDS-B).
+    근거: SDStudio(nai.ts)와 NAIA 가 각각 독립적으로 같은 회피를 넣었다 —
+    동시 전송하면 서버가 깨진 결과를 낸다는 주석이 달려 있다.
+    ⚠ 우리가 실호출로 확인한 것은 아니다(계정 보호로 미실행). 깨진 그림을 받느니
+    Variety+ 를 끄는 쪽이 손실이 작다고 보고 끈다. 끌 때는 로그로 알린다."""
+    if not variety:
+        return None
+    if (p.get("_char_refs") or {}).get("images"):
+        log.info("캐릭터 레퍼런스가 있어 Variety+ 를 이번 장에서 끕니다 "
+                 "(동시 전송 시 결과가 깨진다는 보고가 있습니다 — SDS-B)")
+        return None
+    return variety_sigma(model) * ((width * height) / (832 * 1216)) ** 0.5
 
 
 POS_GRID = [0.1, 0.3, 0.5, 0.7, 0.9]      # NAI 좌표 격자 (실제 이미지에서 이 5값만 나온다)
@@ -3594,7 +3621,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             "dynamic_thresholding_percentile": 0.999,
             "dynamic_thresholding_mimic_scale": 10.0,
             "sm": bool(p.get("smea", False)), "sm_dyn": bool(p.get("smea_dyn", False)),
-            "skip_cfg_above_sigma": (19.0 * ((width * height) / (832 * 1216)) ** 0.5) if variety else None,
+            # Variety+ 기준 시그마. **모델 세대마다 계수가 다르다** (SDS-A, 2026-07 실측).
+            #   V4.5 계열 = 58.0 · 그 외 V4 = 19.0. 예전엔 19 고정이라 기본 모델에서
+            #   Variety+ 가 공홈의 1/3 강도로만 걸렸다.
+            "skip_cfg_above_sigma": _variety_sigma_or_none(model, width, height, variety, p),
             "skip_cfg_below_sigma": 0.0,
             "ucPreset": uc_preset, "use_coords": use_coords,
             "cfg_sched_eligibility": "enable_for_post_summer_samplers",
