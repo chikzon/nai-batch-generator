@@ -9978,7 +9978,15 @@ class ConfigServer:
             if ucp is not None:
                 params["uc_preset"] = ucp
                 params["uc_preset_guessed"] = True
-            qt = m["base"].rstrip().rstrip(",").endswith(QUALITY_SUFFIX.strip(", "))
+            # 퀄리티 접미사도 UC 프리셋처럼 **떼고** 토글만 켠다.
+            # 안 떼면 프롬프트 칸에 구워진 채 남아, 토글을 꺼도 접미사가 계속 전송된다
+            # (외부 감사 nais_blue B-2 와 같은 계열 — 우리는 이중 추가는 가드가 막았지만
+            #  '끄기가 안 듣는' 쪽이 남아 있었다. ai-review/외부감사/ 참고)
+            base_txt = m["base"]
+            qt = base_txt.rstrip().rstrip(",").endswith(QUALITY_SUFFIX.strip(", "))
+            if qt:
+                base_txt = base_txt.rstrip().rstrip(",")
+                base_txt = base_txt[:-len(QUALITY_SUFFIX.strip(", "))].rstrip().rstrip(",")
             params["quality_toggle"] = qt
             params["quality_toggle_guessed"] = True
             rec = {
@@ -9990,7 +9998,7 @@ class ConfigServer:
                                    for w, n in artists),
                 "artists": [n for _, n in artists],
                 "weights": {n: (w if w is not None else 1.0) for w, n in artists},
-                "base": m["base"], "rest": ", ".join(rest)[:1200],
+                "base": base_txt, "rest": ", ".join(rest)[:1200],
                 # 네거티브는 프리셋을 뗀 '사용자가 쓴 부분' 만 담는다
                 "negative": user_neg if ucp is not None else m["negative"],
                 "negative_full": m["negative"],
