@@ -3852,6 +3852,30 @@ def bump_daily(state):
     state["total_generated"] += 1
 
 
+# ── 모든 생성 경로가 지나는 밴 예방 관문 (CQA-013) ──────────────────
+#   예전에는 배치·복구에만 간격/일일 상한이 있고 단독 생성·씬 모드는 그냥 나갔다.
+#   사용자가 설정한 보호값이 경로에 따라 안 먹으면 설정 자체가 거짓말이 된다.
+_LAST_CALL = {"t": 0.0}
+
+
+def pace_gate(cfg, live=None, label=""):
+    """일일 상한을 넘었으면 (False, 사유). 아니면 직전 호출과의 간격을 채우고 (True, "").
+    live 를 주면 취소(stop_req)를 존중해 기다리는 중에도 즉시 빠져나온다."""
+    pc = pace(cfg)
+    st = load_state()
+    if daily_count(st) >= pc["daily_cap"]:
+        return False, f"일일 상한 {pc['daily_cap']}장에 도달했습니다 — 내일 이어서 하세요."
+    gap = random.uniform(pc["delay_min"], pc["delay_max"])
+    wait = _LAST_CALL["t"] + gap - time.time()
+    while wait > 0:
+        if live is not None and getattr(live, "stop_req", False):
+            return False, "중지되었습니다."
+        time.sleep(min(0.5, wait))
+        wait = _LAST_CALL["t"] + gap - time.time()
+    _LAST_CALL["t"] = time.time()
+    return True, ""
+
+
 # ═══════════════ 브라우저 UI (설정 + 실시간 미리보기) ═══════════════
 
 PAGE_TEMPLATE = r"""<!DOCTYPE html>
@@ -8677,7 +8701,7 @@ class ConfigServer:
         if not cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         slots = [s for s in cfg.get("char_slots", [])
-                 if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+                 if slot_prompt(s).strip() and s.get("enabled") is not False]
         tok = self.live.try_claim()
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
@@ -8686,6 +8710,10 @@ class ConfigServer:
             self.live.update(status_text="단독 생성 중...", char_name="단독 생성",
                              filename="", index=1, total=1)
             try:
+                okp, why = pace_gate(cfg, self.live, "단독")   # 밴 예방 (CQA-013)
+                if not okp:
+                    self.live.update(status_text=why)
+                    return
                 style = (cfg.get("base_prompt") or "").strip()
                 base = style or "1girl"
                 # 켠 인물만 보낸다 (칸은 6명 넘게 둬도 된다)
@@ -8752,8 +8780,12 @@ class ConfigServer:
             self.live.update(status_text=f"{mode} 생성 중...",
                              char_name=mode, index=1, total=1)
             try:
+                okp, why = pace_gate(cfg, self.live, mode)     # 밴 예방 (CQA-013)
+                if not okp:
+                    self.live.update(status_text=why)
+                    return
                 slots = [s for s in cfg.get("char_slots", [])
-                 if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+                 if slot_prompt(s).strip() and s.get("enabled") is not False]
                 seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
                 params = dict(cfg)
                 params["_i2i"] = {"image": img_b64, "mask": mask_b64,
@@ -8910,7 +8942,7 @@ class ConfigServer:
         if not jobs:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
-                 if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+                 if slot_prompt(s).strip() and s.get("enabled") is not False]
         tok = self.live.try_claim()
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
@@ -8928,6 +8960,10 @@ class ConfigServer:
             try:
                 for i, (sc, copy) in enumerate(jobs, 1):
                     if self.live.stop_req:
+                        break
+                    okp, why = pace_gate(cfg, self.live, "씬")   # 밴 예방 (CQA-013)
+                    if not okp:
+                        self.live.update(status_text=why)
                         break
                     suffix = "" if copy == 1 else f"_{copy}벌"
                     fname = f"{_safe_name(sc['name'])}{suffix}.webp"
@@ -9340,8 +9376,8 @@ class ConfigServer:
             return {"ok": False, "error": "이미 생성 중입니다."}
         if not self.cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요 (pst-... 형식)."}
-        has_slot = any((s.get("prompt") or "").strip() for s in self.cfg.get("char_slots", []))
-        has_cast = any((c.get("prompt") or "").strip()
+        has_slot = any(slot_prompt(s).strip() for s in self.cfg.get("char_slots", []))
+        has_cast = any(strip_comment_lines(c.get("prompt") or "").strip()
                        for st in (self.cfg.get("setting_state") or {}).values()
                        for c in st.get("cast", []))
         if not (has_slot or has_cast):
@@ -9594,13 +9630,13 @@ class ConfigServer:
                             self._json({"ok": False, "error": f"{num}번 씬이 없습니다."}); return
                         cast = None
                         for c in (setting_state(cfg, scene.get("_setting", "")).get("cast") or []):
-                            if (c.get("prompt") or "").strip():
+                            if strip_comment_lines(c.get("prompt") or "").strip():
                                 cast = {"name": c.get("name") or "전용 캐스트",
                                         "female": c.get("prompt"), "negative": c.get("negative", "")}
                                 break
                         if cast is None:
                             slots = [s for s in (cfg.get("char_slots") or [])
-                                     if (s.get("prompt") or "").strip()]
+                                     if slot_prompt(s).strip()]
                             cast = ({"name": slots[0].get("name") or "캐릭터 1",
                                      "female": slot_prompt(slots[0]),
                                      "negative": slots[0].get("negative", "")}
@@ -9942,7 +9978,7 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
     # 주인공: 씬이 속한 세팅의 전용 캐스트 → 없으면 ① 설정의 캐릭터 슬롯 (설정을 강제하지 않음)
     # 켠 인물만 (칸은 6명 넘게 둬도 된다)
     slots = [s for s in cfg.get("char_slots", [])
-             if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+             if slot_prompt(s).strip() and s.get("enabled") is not False]
     # 씬 번호 → 예약 매수 (세트별로 '몇 벌' 뽑을지. 기본 1벌)
     reserve = {}
     for name in acfg.get("_settings", {}):
@@ -9961,7 +9997,7 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
         sc = acfg["scenes"][str(num)]
         sname = sc.get("_setting", "")
         cast = [c for c in setting_state(cfg, sname).get("cast", [])
-                if (c.get("prompt") or "").strip()]
+                if strip_comment_lines(c.get("prompt") or "").strip()]
         # 두 목록의 뜻이 다르다 (UI 문구 그대로):
         #   세팅 전용 캐스트 = "각자 따로 전체 씬 생성" → 인원수만큼 벌이 늘어난다
         #   ① 설정의 캐릭터 칸 = "한 그림에 함께 들어갈 인물" → 늘어나지 않는다.
@@ -10081,7 +10117,24 @@ def _run_generation(server):
     if not enabled_now:
         log.warning("⚠ 켜진 캐릭터가 없습니다. 브라우저에서 캐릭터를 추가하거나 켜주세요.")
 
-    done_this_run = {}   # 이번 실행 중 만든 것만 기억 (다음 실행에는 이어지지 않음)
+    # 이 회차에서 **이미 끝낸 장**을 상태 파일에서 되살린다 (CQA-010).
+    #   예전에는 progress 를 쓰기만 하고 읽지 않아, 중지 후 '생성 시작'을 다시 누르면
+    #   끝난 장을 처음부터 다시 만들고 같은 파일을 덮어썼다 (Anlas·시간 재소모).
+    #   회차(seed) 를 바꾸면 progress 키가 달라져 자연히 새로 시작한다.
+    done_this_run = {}
+    for cid, items in (state.get("progress", {}).get(seed_key) or {}).items():
+        keep = set()
+        for it in items:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                keep.add((int(it[0]), int(it[1])))
+            else:                       # 옛 기록은 씬 번호만 있었다 → 1벌로 본다
+                keep.add((int(it), 1))
+        if keep:
+            done_this_run[cid] = keep
+    if done_this_run:
+        n_done = sum(len(v) for v in done_this_run.values())
+        log.info(f"회차 {seed_key} 에 이미 끝낸 {n_done}장을 건너뜁니다 "
+                 f"(처음부터 다시 하려면 회차 번호를 바꾸세요).")
     skip_set = set()   # 이번 실행에서 계속 실패해 건너뛴 작업 (재실행하면 다시 시도)
     completed = 0
 
@@ -10217,12 +10270,15 @@ def _run_generation(server):
 
         if ok:
             done_this_run.setdefault(cid, set()).add((num, copy))
-            state["progress"].setdefault(seed_key, {}).setdefault(cid, []).append(num)
+            # (씬 번호, 벌) 짝으로 기록해야 재개가 정확하다 — 예약 매수 2벌 이상일 때
+            # 번호만 적으면 남은 벌을 통째로 건너뛴다 (CQA-010)
+            rec = state["progress"].setdefault(seed_key, {}).setdefault(cid, [])
+            rec.append([num, copy])
             bump_daily(state)
             server.live.update(daily=daily_count(state))
             completed += 1
-            if completed % 20 == 0:
-                save_state(state)
+            # 매 장 저장한다 — 중지·강제 종료 후 재개가 정확해야 하고 파일은 몇 KB 다
+            save_state(state)
         else:
             skip_set.add((cid, num, copy))
             server.live.update(status_text=f"실패 — 건너뜀: {fname}")
