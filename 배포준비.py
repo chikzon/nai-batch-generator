@@ -14,7 +14,7 @@
    설정.json · 설정.txt의 토큰/그림체/네거티브/캐릭터 · 상태.json · 생성.log
    수집/바이브/ (내 바이브·캐릭터 레퍼런스 원본과 인코딩)
    output/ · 캐릭터/ 내 캐릭터 · 그림체/ 내 프리셋 · 프로필/ · .git
-   __pycache__ · *.덮어쓰기전백업 · 개인 zip 파일
+   __pycache__ · *.덮어쓰기전백업 · *.bak · 개인 zip 파일
    **세팅/ · 씬규격/ · asset_config.json** (내가 만든 씬 데이터 — 필수가 아님)
    **수집물(그림체.json·작가통계.json·레시피.json·이미지캐시/)** — 남들이 공개한
    프롬프트 조합·예시 그림 모음이라 본 배포본에는 넣지 않는다 (라운드02 결정)
@@ -70,7 +70,7 @@ DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json
               "그림체.json", "작가통계.json", "레시피.json", "이미지캐시",
               # 작가조합.json 은 그림체.json 의 구세대 판 — 같은 수집물이다
               "작가조합.json"}
-DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle", ".tmp")
+DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle", ".tmp", ".bak")
 # 사용자 콘텐츠라 비우는 폴더 (폴더 자체는 남김)
 #   조각/ 은 와일드카드 — 내 조각을 남에게 딸려 보내지 않는다
 CLEAR_DIRS = ["그림체", "수집/바이브", "조각"]
@@ -88,6 +88,34 @@ def should_drop(p: Path, root: Path) -> bool:
     if p.suffix.lower() == ".zip" and p.parent == root:
         return True
     return False
+
+
+def copy_ignore(directory, names):
+    """개인 자료는 사본에 복사한 뒤 지우지 말고 처음부터 건너뛴다.
+
+    `clean()`과 `verify()`는 복사 중 예외·새 파일 규칙에 대비한 이중 방어로 그대로 둔다.
+    """
+    parent = Path(directory)
+    ignored = set()
+    try:
+        parent_rel = parent.resolve().relative_to(SRC)
+    except ValueError:
+        parent_rel = Path()
+    clear_roots = {Path(rel) for rel in CLEAR_DIRS}
+    inside_clear = any(
+        parent_rel == root or root in parent_rel.parents
+        for root in clear_roots
+    )
+    inside_characters = parent_rel == Path("캐릭터")
+    for name in names:
+        p = parent / name
+        if should_drop(p, SRC):
+            ignored.add(name)
+        elif inside_clear:
+            ignored.add(name)
+        elif inside_characters and name != "규격_설명.txt":
+            ignored.add(name)
+    return ignored
 
 
 def blank_settings_txt(path: Path):
@@ -153,6 +181,9 @@ def verify(dst: Path):
     problems = []
     if (dst / "설정.json").exists():
         problems.append("설정.json 이 남아 있음")
+    for backup in dst.rglob("*.bak"):
+        if backup.is_file():
+            problems.append(f"{backup.relative_to(dst)} 백업 파일이 남아 있음")
     txt = dst / "설정.txt"
     if txt.exists():
         for line in txt.read_text(encoding="utf-8").splitlines():
@@ -224,7 +255,7 @@ def main():
         force_rmtree(work)
 
     print(f"사본 만드는 중... ({SRC.name} → {work})")
-    shutil.copytree(SRC, work, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(SRC, work, ignore=copy_ignore)
     n = clean(work)
     print(f"개인 데이터 {n}건 제거")
 
