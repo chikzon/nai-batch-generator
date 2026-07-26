@@ -7842,6 +7842,45 @@ function openCombos(target){
   $('modalBg').style.display = 'flex';
 }
 
+/* ── 그림에서 가져올 항목 고르기 (SDStudio 의 ExternalImageView.applyImport) ──
+   예전에는 그림을 넣으면 프롬프트·네거티브·설정값이 통째로 덮어써졌다.
+   지금 쓰던 네거티브만 지키고 싶다거나 시드만 가져오고 싶을 때를 위해 고르게 한다. */
+function openApplyPicker(c){
+  const p = c.params || {};
+  const rows = [
+    ['base', '프롬프트(베이스)', c.base ? c.base.slice(0, 90) : '', !!c.base],
+    ['negative', '네거티브', (c.negative || (c.negative_full != null ? '(비움)' : '')).slice(0, 90),
+      !!(c.negative || c.negative_full != null)],
+    ['params', '설정값 (CFG·리스케일·스텝·샘플러·스케줄)',
+      [p.scale != null ? `CFG ${p.scale}` : '', p.cfg_rescale != null ? `리스케일 ${p.cfg_rescale}` : '',
+       p.steps ? `${p.steps}스텝` : '', p.sampler || '', p.noise_schedule || ''].filter(Boolean).join(' · '),
+      p.scale != null || p.steps != null || !!p.sampler],
+    ['size', '해상도', (p.width && p.height) ? `${p.width}×${p.height}` : '', !!(p.width && p.height)],
+    ['uc', 'UC 프리셋 · 퀄리티 태그',
+      [p.uc_preset != null ? `UC ${p.uc_preset}` : '', p.quality_toggle != null ? (p.quality_toggle ? '퀄리티 켬' : '퀄리티 끔') : ''].filter(Boolean).join(' · '),
+      p.uc_preset != null || p.quality_toggle != null],
+    ['seed', '시드 고정', p.seed ? String(p.seed) : '', !!p.seed],
+  ].filter(r => r[3]);
+  $('modalTitle').textContent = '🖼 그림에서 가져올 항목 고르기';
+  $('modalBody').innerHTML = `
+    <p class="hint">체크한 것만 지금 설정에 넣습니다. 나머지는 지금 값 그대로 둡니다.</p>
+    ${rows.map(([k, label, val]) => `<label class="row" style="display:flex;gap:8px;align-items:flex-start;">
+      <input type="checkbox" data-imp="${k}" checked style="margin-top:3px;">
+      <span style="flex:1;min-width:0;"><b>${esc(label)}</b>
+      ${val ? `<div class="hint" style="font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(val)}</div>` : ''}</span></label>`).join('')}
+    <div class="bar"><button class="primary" id="impGo">고른 것만 가져오기</button>
+      <button id="impAll">전부 가져오기</button></div>`;
+  $('modalBg').style.display = 'flex';
+  const run = (only) => {
+    const pick = {};
+    document.querySelectorAll('#modalBody [data-imp]').forEach(x => pick[x.dataset.imp] = x.checked);
+    applyStyle(c, only ? pick : null);
+    $('modalBg').style.display = 'none';
+  };
+  $('impGo').addEventListener('click', () => run(true));
+  $('impAll').addEventListener('click', () => run(false));
+}
+
 /* ── ⇄ 찾아 바꾸기 (SDStudio 의 FindReplaceDialog) ─────────────────────
    프롬프트·네거티브·3분할·캐릭터 칸(외형·의상·전용 네거티브)을 한꺼번에.
    작가를 통째로 갈아끼우거나 오타를 한 번에 고칠 때 쓴다. 미리보기 후 적용. */
@@ -8010,26 +8049,39 @@ function flash(msg, extraBtn){
 }
 
 /* 그림체 통째로 적용 — 베이스 + 네거티브 + 파라미터 */
-function applyStyle(c){
+function applyStyle(c, pick){
+  /* pick 을 주면 **체크한 항목만** 넣는다 (그림에서 항목별 가져오기).
+     pick 이 없으면 예전처럼 통째로 — 그림체 카드의 '통째로 적용' 이 이 경로다. */
+  const want = k => !pick || pick[k];
   const p = c.params || {};
-  if(c.base){ STATE.base_prompt = c.base; $('basePrompt').value = c.base; }
+  if(want('base') && c.base){ STATE.base_prompt = c.base; $('basePrompt').value = c.base; }
   /* negative_full 이 있으면 프리셋을 떼어낸 결과라 빈 문자열도 뜻이 있다 (그대로 비운다) */
-  if(c.negative || c.negative_full != null){
+  if(want('negative') && (c.negative || c.negative_full != null)){
     const nv = c.negative || '';
     STATE.negative_prompt = nv; $('negPrompt').value = nv;
   }
   const set = (k, el, v) => { if(v != null && v !== ''){ STATE[k] = v; if($(el)) $(el).value = v; } };
-  set('cfg_scale','pScale', p.scale);
-  set('cfg_rescale','pRescale', p.cfg_rescale);
-  set('steps','pSteps', p.steps);
-  set('sampler','pSampler', p.sampler);
-  set('scheduler','pSched', p.noise_schedule);
-  if(p.variety_plus != null){ STATE.variety = !!p.variety_plus; if($('pVariety')) $('pVariety').value = p.variety_plus ? 'on' : 'off'; }
+  if(want('params')){
+    set('cfg_scale','pScale', p.scale);
+    set('cfg_rescale','pRescale', p.cfg_rescale);
+    set('steps','pSteps', p.steps);
+    set('sampler','pSampler', p.sampler);
+    set('scheduler','pSched', p.noise_schedule);
+    if(p.variety_plus != null){ STATE.variety = !!p.variety_plus; if($('pVariety')) $('pVariety').value = p.variety_plus ? 'on' : 'off'; }
+  }
   // 그림체 = 베이스 + 네거티브 + 설정값 전부. UC 프리셋·퀄리티 태그도 그림체의 일부다.
-  if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
-  if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
-  if(p.width && $('pWidth')){ STATE.width = p.width; $('pWidth').value = p.width; }
-  if(p.height && $('pHeight')){ STATE.height = p.height; $('pHeight').value = p.height; }
+  if(want('uc')){
+    if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
+    if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
+  }
+  if(want('size')){
+    if(p.width && $('pWidth')){ STATE.width = p.width; $('pWidth').value = p.width; }
+    if(p.height && $('pHeight')){ STATE.height = p.height; $('pHeight').value = p.height; }
+  }
+  if(pick && pick.seed && p.seed){          // 시드는 고르면 바로 고정한다
+    STATE.nai_seed = Number(p.seed) || 0;
+    if($('pNaiSeed')) $('pNaiSeed').value = STATE.nai_seed;
+  }
   tokens(); save();
   const bits = [];
   if(c.base) bits.push('베이스');
@@ -8163,7 +8215,9 @@ async function inspectImages(files){
   flash(`${ok}개 추출 완료${fail ? `, ${fail}개는 생성 정보가 없었습니다` : ''}`);
   if(ok){
     if($('comboList')){ $('comboQ').value = ''; $('comboSrc').value = '내 이미지'; await loadCombos(false); }
-    if(last) applyStyle(last);
+    /* 통째로 덮어쓰지 않고 **무엇을 가져올지 고르게** 한다 (SDStudio 의 항목별 적용).
+       한 장이면 고르기 창, 여러 장이면 마지막 것을 예전처럼 통째로 적용한다. */
+    if(last) (imgs.length === 1 ? openApplyPicker(last) : applyStyle(last));
   }
   return ok;
 }
