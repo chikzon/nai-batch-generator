@@ -65,7 +65,9 @@ DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json
               "선별.json",
               # 수집물 — 남들이 공개한 프롬프트 조합·예시 그림. 본 배포본에서 제외하고
               # `--자료팩` 으로 따로 만든다 (앱은 이 파일들이 없어도 조용히 빈 채로 돈다)
-              "그림체.json", "작가통계.json", "레시피.json", "이미지캐시"}
+              "그림체.json", "작가통계.json", "레시피.json", "이미지캐시",
+              # 작가조합.json 은 그림체.json 의 구세대 판 — 같은 수집물이다
+              "작가조합.json"}
 DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle")
 # 사용자 콘텐츠라 비우는 폴더 (폴더 자체는 남김)
 #   조각/ 은 와일드카드 — 내 조각을 남에게 딸려 보내지 않는다
@@ -179,7 +181,8 @@ def verify(dst: Path):
     if (dst / ".git").exists():
         problems.append(".git 이 남아 있음 (커밋 이력·git 설정)")
     # 수집물은 본 배포본에서 빠져야 한다 (자료팩으로만 전달)
-    for rel in ("수집/그림체.json", "수집/작가통계.json", "수집/레시피.json", "수집/이미지캐시"):
+    for rel in ("수집/그림체.json", "수집/작가통계.json", "수집/레시피.json",
+                "수집/이미지캐시", "수집/작가조합.json"):
         if (dst / rel).exists():
             problems.append(f"{rel} 이(가) 남아 있음 (자료팩 전용)")
     return problems
