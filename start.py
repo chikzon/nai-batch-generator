@@ -3492,18 +3492,19 @@ def variety_sigma(model):
     return 58.0 if "4-5" in str(model or "") else 19.0
 
 
-def _variety_sigma_or_none(model, width, height, variety, p):
-    """Variety+ 값. 캐릭터 레퍼런스와 **함께 보내지 않는다** (SDS-B).
-    근거: SDStudio(nai.ts)와 NAIA 가 각각 독립적으로 같은 회피를 넣었다 —
-    동시 전송하면 서버가 깨진 결과를 낸다는 주석이 달려 있다.
-    ⚠ 우리가 실호출로 확인한 것은 아니다(계정 보호로 미실행). 깨진 그림을 받느니
-    Variety+ 를 끄는 쪽이 손실이 작다고 보고 끈다. 끌 때는 로그로 알린다."""
+def _variety_sigma_value(model, width, height, variety, p):
+    """Variety+ 값. 캐릭터 레퍼런스와의 조합은 경고하되 사용자 선택을 보존한다.
+
+    SDStudio와 NAIA가 이 조합을 피한다는 간접 근거는 있지만 우리 실호출 재현은 없다.
+    따라서 자동으로 기능을 끄지 않고, 진단에 조건부 위험을 남긴 뒤 그대로 전송한다.
+    """
     if not variety:
         return None
     if (p.get("_char_refs") or {}).get("images"):
-        log.info("캐릭터 레퍼런스가 있어 Variety+ 를 이번 장에서 끕니다 "
-                 "(동시 전송 시 결과가 깨진다는 보고가 있습니다 — SDS-B)")
-        return None
+        log.warning(
+            "Variety+와 캐릭터 레퍼런스를 함께 보냅니다 — 다른 앱 두 곳은 결과 이상을 "
+            "피하려 이 조합을 막습니다. 문제가 생기면 둘 중 하나를 꺼 보세요 (SDS-B 조건부)"
+        )
     return variety_sigma(model) * ((width * height) / (832 * 1216)) ** 0.5
 
 
@@ -3729,9 +3730,11 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             "dynamic_thresholding_mimic_scale": 10.0,
             "sm": bool(p.get("smea", False)), "sm_dyn": bool(p.get("smea_dyn", False)),
             # Variety+ 기준 시그마. **모델 세대마다 계수가 다르다** (SDS-A, 2026-07 실측).
-            #   V4.5 계열 = 58.0 · 그 외 V4 = 19.0. 예전엔 19 고정이라 기본 모델에서
+            #   V4.5 계열 = 58.0 · 그 외 V4 = 19.0
+            #   근거: 우리 수집물의 실제 NAI 이미지 128장을 역산하니 121장이 58, 4장만 19(옛 상수).
+            #   SDStudio(nai.ts)도 같은 분기를 쓴다. 예전엔 19 고정이라 기본 모델(4-5-full)에서
             #   Variety+ 가 공홈의 1/3 강도로만 걸렸다.
-            "skip_cfg_above_sigma": _variety_sigma_or_none(model, width, height, variety, p),
+            "skip_cfg_above_sigma": _variety_sigma_value(model, width, height, variety, p),
             "skip_cfg_below_sigma": 0.0,
             "ucPreset": uc_preset, "use_coords": use_coords,
             "cfg_sched_eligibility": "enable_for_post_summer_samplers",
@@ -5269,13 +5272,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="card">
         <h2><span class="n">04b</span>진단 · 최근 기록
           <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">생성.log 를 앱 안에서</span></h2>
-        <p class="hint">실패 원인을 파일을 찾아 열지 않고 여기서 봅니다. <b>오류만</b>을 켜면 경고·오류만 남습니다.
-        복사해서 그대로 물어보면 됩니다.</p>
+        <p class="hint">실패 원인을 파일을 찾아 열지 않고 시간·심각도·종류별로 봅니다.
+        토큰·서명·사용자 홈 경로는 서버에서 지운 뒤 표시합니다. <b>오류만</b>을 켜면 경고·오류만 남습니다.</p>
         <div class="bar" style="flex-wrap:wrap;">
           <button id="diagLoad">↻ 불러오기</button>
           <label class="hint"><input type="checkbox" id="diagErrOnly"> 오류만</label>
           <select id="diagN" title="줄 수"><option>100</option><option selected>300</option><option>1000</option></select>
           <button id="diagCopy">📋 복사</button>
+          <button id="diagExport">⬇ 안전 JSON</button>
           <span class="n" id="diagStat" style="margin-left:auto;"></span>
         </div>
         <pre id="diagOut" style="max-height:260px;overflow:auto;background:var(--bg);padding:8px;
@@ -6363,18 +6367,20 @@ $('slotAdd').addEventListener('click', () => {
   if(autoCoordsOnSecond()) flash('인물이 둘이 되어 위치 지정을 켜고 좌우로 벌렸습니다 (공홈과 같은 동작).');
   renderSlots(); tokens(); save();
 });
-/* ── 진단 서랍 (nais_blue 의 DiagnosticDrawer) — 생성.log 를 앱 안에서 ── */
+/* ── 진단 서랍 — 서버에서 먼저 redaction한 구조화 이벤트만 받는다 ── */
+let DIAG_LAST = null;
 async function diagLoad(){
   const box = $('diagOut'); if(!box) return;
   box.textContent = '읽는 중...';
   try{
     const r = await (await fetch('/api/diag?n=' + (($('diagN')||{}).value || 300)
       + (($('diagErrOnly')||{}).checked ? '&err=1' : ''))).json();
-    if(!r.ok){ box.textContent = r.error || '못 읽음'; return; }
+    if(!r.ok){ DIAG_LAST = null; box.textContent = r.error || '못 읽음'; return; }
+    DIAG_LAST = r;
     box.textContent = r.lines.join(String.fromCharCode(10)) || '(기록 없음)';
-    $('diagStat').textContent = `${r.lines.length}줄` + (r.errors != null ? ` · 오류/경고 ${r.errors}` : '');
+    $('diagStat').textContent = `${r.events.length}건` + (r.errors != null ? ` · 오류/경고 ${r.errors}` : '');
     box.scrollTop = box.scrollHeight;
-  }catch(e){ box.textContent = String(e); }
+  }catch(e){ DIAG_LAST = null; box.textContent = String(e); }
 }
 if($('diagLoad')){
   $('diagLoad').addEventListener('click', diagLoad);

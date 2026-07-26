@@ -70,6 +70,22 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(estimate["free"])
             self.assertGreater(estimate["total"], 0)
 
+    def test_variety_sigma_tracks_model_generation(self):
+        self.assertEqual(APP.variety_sigma("nai-diffusion-4-5-full"), 58.0)
+        self.assertEqual(APP.variety_sigma("nai-diffusion-4-5-curated"), 58.0)
+        self.assertEqual(APP.variety_sigma("nai-diffusion-4-full"), 19.0)
+        self.assertEqual(APP.variety_sigma("nai-diffusion-3"), 19.0)
+        with self.assertLogs(APP.log, level="WARNING") as captured:
+            combined = APP._variety_sigma_value(
+                "nai-diffusion-4-5-full",
+                832,
+                1216,
+                True,
+                {"_char_refs": {"images": ["fixture"]}},
+            )
+        self.assertEqual(combined, 58.0)
+        self.assertIn("함께 보냅니다", "\n".join(captured.output))
+
     def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
         source = io.BytesIO()
         image = Image.new("RGBA", (2, 2), (10, 20, 30, 255))
