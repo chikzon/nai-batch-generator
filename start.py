@@ -11136,14 +11136,20 @@ class ConfigServer:
                         token = str(server.cfg.get("token") or "")
                         token_key = hashlib.sha256(token.encode("utf-8")).hexdigest() \
                             if token else None
-                        if token_key != server.anlas_balance_token_key:
-                            server.anlas_balance_cache = None
-                            server.anlas_balance_token_key = token_key
+                        with server.config_lock:
+                            if token_key != server.anlas_balance_token_key:
+                                server.anlas_balance_cache = None
+                                server.anlas_balance_token_key = token_key
                         fresh_balance = fetch_anlas_balance(token) \
                             if d.get("balance") else None
-                        if fresh_balance:
-                            server.anlas_balance_cache = fresh_balance
-                        known_balance = server.anlas_balance_cache
+                        with server.config_lock:
+                            # 조회 중 사용자가 토큰을 바꿨다면 이전 계정 응답을 캐시하지 않는다.
+                            if (fresh_balance
+                                    and token_key == server.anlas_balance_token_key):
+                                server.anlas_balance_cache = fresh_balance
+                            known_balance = (server.anlas_balance_cache
+                                             if token_key == server.anlas_balance_token_key
+                                             else None)
                         opus = bool(known_balance and known_balance.get("opus"))
                         cfg = server.cfg
                         # 켜진 캐릭터 레퍼런스 수 — 장당 +5 이고 Opus 무료가 깨진다
