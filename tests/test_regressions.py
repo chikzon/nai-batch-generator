@@ -7,6 +7,7 @@ audit and are intentionally runnable with the Python standard test runner.
 from __future__ import annotations
 
 import copy
+import io
 import importlib.util
 import json
 import socket
@@ -17,6 +18,9 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("nai_helper_under_test", ROOT / "start.py")
@@ -26,6 +30,59 @@ SPEC.loader.exec_module(APP)
 
 
 class RegressionTests(unittest.TestCase):
+    def test_active_people_keep_slot_coordinate_pairs(self):
+        slots = [
+            {"prompt": "A", "negative": "na", "enabled": True},
+            {"prompt": "B", "negative": "nb", "enabled": False},
+            {"prompt": "# memo only", "negative": "nc", "enabled": True},
+            {"prompt": "", "outfit": "red dress", "negative": "nd", "enabled": True},
+            {"prompt": "C", "negative": "ne", "enabled": True},
+        ]
+        centers = [
+            {"x": 0.1, "y": 0.2},
+            {"x": 0.3, "y": 0.4},
+            {"x": 0.5, "y": 0.6},
+            {"x": 0.7, "y": 0.8},
+            {"x": 0.9, "y": 0.1},
+        ]
+        people, used_centers = APP.active_people(slots, centers)
+        self.assertEqual([x["prompt"] for x in people], ["A", "red dress", "C"])
+        self.assertEqual(
+            used_centers,
+            [centers[0], centers[3], centers[4]],
+        )
+
+    def test_spread_centers_never_overlap_through_nai_limit(self):
+        for count in range(2, APP.MAX_CHARS + 1):
+            centers = APP.spread_centers(count)
+            self.assertEqual(len(centers), count)
+            self.assertEqual(
+                len({(point["x"], point["y"]) for point in centers}),
+                count,
+            )
+
+    def test_img2img_and_inpaint_are_not_reported_as_opus_free(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(width=832, height=1216, steps=28)
+        self.assertTrue(APP.anlas_estimate(cfg, mode="t2i", opus=True)["free"])
+        for mode in ("img2img", "infill"):
+            estimate = APP.anlas_estimate(cfg, mode=mode, opus=True, strength=0.5)
+            self.assertFalse(estimate["free"])
+            self.assertGreater(estimate["total"], 0)
+
+    def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
+        source = io.BytesIO()
+        image = Image.new("RGBA", (2, 2), (10, 20, 30, 255))
+        metadata = PngInfo()
+        metadata.add_text("Comment", "private prompt")
+        image.save(source, "PNG", pnginfo=metadata)
+
+        cleaned, suffix = APP.strip_metadata(source.getvalue(), "fixture.png")
+        self.assertEqual(suffix, ".png")
+        with Image.open(io.BytesIO(cleaned)) as result:
+            self.assertNotIn("Comment", result.info)
+            self.assertTrue(all(alpha % 2 == 0 for alpha in result.getchannel("A").tobytes()))
+
     def test_atomic_json_recovers_last_backup(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "state.json"
