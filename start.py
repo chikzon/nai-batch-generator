@@ -815,23 +815,31 @@ def anlas_per_image(width, height, steps, strength=1.0, char_refs=0):
     return max(base, 2) + 5 * int(char_refs)
 
 
-def anlas_estimate(cfg, count=1, width=None, height=None, opus=True, char_refs=0):
-    """장당·총액과 무료 여부. count=한 회차에 뽑을 장수."""
+def anlas_estimate(cfg, count=1, width=None, height=None, opus=True, char_refs=0,
+                   mode="t2i", strength=1.0):
+    """장당·총액과 무료 여부. count=한 회차에 뽑을 장수.
+    mode: t2i | img2img | infill — **베이스 이미지를 쓰면 Opus 무료가 아니다**
+    (공식 조건: 한 번에 1장 · 베이스 이미지 미사용 · 1024² 이하 · 28스텝 이하). CQA-008"""
     w = int(width or cfg.get("width", 832))
     h = int(height or cfg.get("height", 1216))
     steps = int(cfg.get("steps", 28))
     px = max(w * h, 65536)
-    free = bool(opus) and px <= OPUS_FREE_PX and steps <= OPUS_FREE_STEPS and not char_refs
-    per = anlas_per_image(w, h, steps, 1.0, char_refs)
+    uses_base = mode in ("img2img", "infill")
+    free = (bool(opus) and px <= OPUS_FREE_PX and steps <= OPUS_FREE_STEPS
+            and not char_refs and not uses_base)
+    per = anlas_per_image(w, h, steps, strength if uses_base else 1.0, char_refs)
     return {
         "per_image": 0 if free else per,
         "per_image_paid": per,
         "total": 0 if free else per * max(int(count), 0),
         "count": int(count),
         "free": free,
+        "mode": mode,
         "width": w, "height": h, "steps": steps,
         "why": ("Opus 무료 (1024² 이하 · 28스텝 이하)" if free else
-                ("캐릭터 레퍼런스가 있어 유료" if char_refs else
+                ("원본 그림을 쓰는 작업은 Opus 무료가 아닙니다 (img2img·인페인트)"
+                 if uses_base else
+                 "캐릭터 레퍼런스가 있어 유료" if char_refs else
                  f"무료 조건 초과 — {w}×{h}·{steps}스텝 "
                  f"(무료는 1024² 이하·28스텝 이하)")),
     }
@@ -4358,8 +4366,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div class="field"><label>해상도 <span class="hint">(세팅 씬은 씬별 값을 씀)</span></label>
             <select id="pRes">__RES__<option value="">직접 입력...</option></select></div>
           <div class="field" id="pWHwrap" style="display:none;"><label>가로 × 세로</label>
-            <div class="bar"><input type="number" id="pWidth" step="64" style="flex:1;">
-            <input type="number" id="pHeight" step="64" style="flex:1;"></div></div>
+            <div class="bar"><input type="number" id="pWidth" step="64" min="64" max="2048" style="flex:1;">
+            <input type="number" id="pHeight" step="64" min="64" max="2048" style="flex:1;"></div>
+            <span class="hint" id="pResNote"></span></div>
           <div class="field"><label>CFG (Prompt Guidance)</label><input type="number" id="pScale" step="0.1" min="1" max="10"></div>
           <div class="field"><label>리스케일</label><input type="number" id="pRescale" step="0.02" min="0" max="1"></div>
           <div class="field"><label>스텝</label><input type="number" id="pSteps" min="1" max="50"></div>
@@ -4475,7 +4484,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           </div>
           <div class="bar" style="margin-top:6px;">
             <span class="n" id="i2iMode">칠하지 않음 → img2img</span>
-            <button class="primary" id="i2iGo" style="margin-left:auto;">▶ 고쳐 그리기</button>
+            <span class="hint" id="i2iCost" style="margin-left:auto;"></span>
+            <button class="primary" id="i2iGo">▶ 고쳐 그리기</button>
             <button id="i2iDrop2">다른 그림</button>
           </div>
           <p class="hint" id="i2iMsg"></p>
@@ -4986,11 +4996,19 @@ async function naiTokens(){
   clearTimeout(tokT);
   tokT = setTimeout(async () => {
     try{
-      const chars = (STATE.char_slots || []).map(s => s.prompt || '').filter(Boolean);
+      /* ⚠ 실제 전송값은 prompt + outfit 이다 — 의상을 빼고 세면 화면은 512 이하인데
+         실전송이 넘어 뒷부분이 잘린다 (CQA-009). 캐릭터 네거티브도 함께 센다.
+         켠 칸만 세는 것도 전송 규칙과 같다. */
+      const slots = (STATE.char_slots || []).filter(s => s && s.enabled !== false);
+      const join = (a, b) => [a, b].map(x => (x || '').trim().replace(/^,|,$/g, '').trim())
+        .filter(Boolean).join(', ');
+      const chars = slots.map(s => join(s.prompt, s.outfit)).filter(Boolean);
+      const charNegs = slots.map(s => s.negative || '').filter(Boolean);
       const r = await (await fetch('/api/tokens', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({base: $('basePrompt').value,
-                              negative: $('negPrompt').value, chars})})).json();
+                              negative: $('negPrompt').value, chars,
+                              char_negatives: charNegs})})).json();
       if(!r.ok) return;
       const over = r.shared > r.limit;
       /* 토크나이저 vocab 이 없으면 어림값이다 — 정확한 값처럼 보여 주면 안 된다 */
@@ -5005,7 +5023,12 @@ async function naiTokens(){
       // 그림이 흐릿하고 뭉개진다. 실제로 확인한 조합이라 경고를 띄운다.
       const ucNone = Number((STATE.uc_preset ?? 4)) === 4;
       const weak = r.negative < 25;
+      const negShared = r.shared_negative ?? r.negative;
+      const negOver = negShared > r.limit;
       $('negTok').innerHTML = `${approx}${r.negative} 토큰`
+        + (negShared > r.negative
+            ? ` <span style="opacity:.7">+캐릭터 ${negShared - r.negative}</span>`
+              + ` <span style="color:${negOver ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>` : '')
         + (ucNone && weak ? ' <span style="color:#e0a04e">⚠ UC 프리셋이 None</span>' : '');
       $('negTok').title = ucNone && weak
         ? '네거티브가 너무 짧고 UC 프리셋이 None 입니다 — NAI 가 품질 태그를 하나도 보태지 '
@@ -5591,7 +5614,21 @@ function readParams(){
 let saveT = null;
 function save(){ clearTimeout(saveT); saveT = setTimeout(doSave, 350); }
 async function doSave(){
-  try{ await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(STATE)}); }catch(e){}
+  try{
+    const r = await (await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(STATE)})).json();
+    /* 해상도를 NAI 규격으로 맞췄으면 조용히 넘기지 않고 알린다 (CQA-012) */
+    const note = $('pResNote');
+    if(note){
+      const f = (r && r.fixed) || {};
+      const parts = Object.keys(f).map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`);
+      note.textContent = parts.length ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${parts.join(' · ')}` : '';
+      if(parts.length){
+        if($('pWidth')) $('pWidth').value = STATE.width = f.width ? f.width.used : STATE.width;
+        if($('pHeight')) $('pHeight').value = STATE.height = f.height ? f.height.used : STATE.height;
+      }
+    }
+  }catch(e){}
 }
 ['basePrompt','negPrompt','token','pScale','pRescale','pSteps','pSeed','pNaiSeed','pSampler','pSched','pVariety'].forEach(id => {
   const el = $(id);
@@ -6194,6 +6231,7 @@ function i2iLoad(file){
       i2iZoom();
       $('i2iMsg').textContent = `${im.width}×${im.height} → ${w}×${h} 로 맞춰 보냅니다 (NAI 는 64 배수만 받습니다)`;
       i2iMode();
+      if(window.i2iCostRefresh) window.i2iCostRefresh();
     };
     im.src = fr.result;
   };
@@ -6219,6 +6257,7 @@ function i2iMode(){
   $('i2iMode').textContent = (painted
     ? '칠한 곳만 다시 그림 → 인페인트 (강도 1.00 까지)'
     : '칠하지 않음 → img2img (전체를 다시 그림 · 강도 0.99 까지)');
+  if(window.i2iCostRefresh) window.i2iCostRefresh();   // 모드가 바뀌면 비용도 (CQA-008)
 }
 function i2iZoom(){
   const b = $('i2iBase'), m = $('i2iMask');
@@ -6295,6 +6334,23 @@ if($('i2iDrop')){
     const f = [...(e.dataTransfer.files || [])].find(x => /image\/(png|webp)/.test(x.type));
     if(f) i2iLoad(f);
   });
+  /* 원본 그림을 쓰는 작업은 Opus 무료가 아니다 — 실행 버튼 옆에 실제 비용을 띄운다 (CQA-008) */
+  window.i2iCostRefresh = async () => {
+    const el = $('i2iCost');
+    if(!el || !I2I.img) return;
+    const painted = i2iPainted();
+    const b = $('i2iBase');
+    const w = Math.max(64, Math.floor(b.width / 64) * 64), h = Math.max(64, Math.floor(b.height / 64) * 64);
+    try{
+      const r = await (await fetch('/api/anlas', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({count:1, mode: painted ? 'infill' : 'img2img', width:w, height:h,
+          strength: Number($('i2iStrength').value)})})).json();
+      if(r.ok) el.textContent = r.est.total > 0
+        ? `💰 ${r.est.total} Anlas (${painted ? '인페인트' : 'img2img'} — 원본을 쓰면 무료가 아닙니다)`
+        : `${painted ? '인페인트' : 'img2img'} — ${r.est.why}`;
+    }catch(e){}
+  };
+  if($('i2iStrength')) $('i2iStrength').addEventListener('change', () => window.i2iCostRefresh());
   $('i2iGo').addEventListener('click', async () => {
     if(!I2I.img){ $('i2iMsg').textContent = '먼저 그림을 넣어주세요.'; return; }
     const painted = i2iPainted();
@@ -9314,9 +9370,18 @@ class ConfigServer:
         allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
         allowed |= {"booru_keys"}          # 기본값 표에 없지만 사용자 편집값
         allowed -= {"male_prompt"}         # 레거시(세팅 상대역으로 이전됨)
-        accepted, rejected = [], []
+        accepted, rejected, fixed_vals = [], [], {}
         for key, val in data.items():
             if key in allowed:
+                if key in ("width", "height"):
+                    # NAI 는 64 배수·범위 밖을 거부한다 — 조용히 보내지 말고 맞춰 준다 (CQA-012)
+                    try:
+                        raw = int(val)
+                    except (TypeError, ValueError):
+                        raw = DEFAULT_CONFIG[key]
+                    val = max(64, min(2048, raw // 64 * 64)) or 64
+                    if val != raw:
+                        fixed_vals[key] = {"sent": raw, "used": val}
                 self.cfg[key] = val
                 accepted.append(key)
             elif not key.startswith("_"):
@@ -9328,7 +9393,9 @@ class ConfigServer:
         sync_chars_to_files(self.cfg)
         save_config(self.cfg)
         # 무엇이 실제로 저장됐는지 돌려준다 (조용한 유실 방지)
-        return {"ok": True, "accepted": accepted, "rejected": rejected}
+        if fixed_vals:
+            log.info(f"해상도를 NAI 규격(64 배수·64~2048)으로 맞췄습니다: {fixed_vals}")
+        return {"ok": True, "accepted": accepted, "rejected": rejected, "fixed": fixed_vals}
 
     def handle_scene_save(self, body):
         """씬 내부 프롬프트 수정 → asset_config.json 에 저장 (생성 중이면 다음 장부터 반영)"""
@@ -9712,8 +9779,12 @@ class ConfigServer:
                                             f"{cfg.get('steps')}스텝 / 씬 해상도가 무료 조건"
                                             f"(1024² 이하·28스텝 이하)을 넘습니다"))}
                         else:
+                            # mode 를 받아 img2img·인페인트면 Opus 무료를 빼고 센다 (CQA-008)
                             est = anlas_estimate(cfg, int(d.get("count") or 1),
-                                                 opus=opus, char_refs=refs)
+                                                 width=d.get("width"), height=d.get("height"),
+                                                 opus=opus, char_refs=refs,
+                                                 mode=(d.get("mode") or "t2i"),
+                                                 strength=float(d.get("strength") or 1.0))
                             est["total"] += 2 * vibe_new
                             est["vibe_encode"] = 2 * vibe_new
                         self._json({"ok": True, "est": est, "balance": bal})
@@ -9728,11 +9799,15 @@ class ConfigServer:
                         d = json.loads(body or b"{}")
                         base = nai_tokens(d.get("base", ""))
                         chars = [nai_tokens(c) for c in (d.get("chars") or [])]
+                        neg = nai_tokens(d.get("negative", ""))
+                        # 네거티브도 베이스+캐릭터가 한도를 나눠 쓴다 (CQA-009)
+                        cnegs = [nai_tokens(c) for c in (d.get("char_negatives") or [])]
                         self._json({"ok": True, "exact": tokens_exact(), "base": base,
-                                    "negative": nai_tokens(d.get("negative", "")),
-                                    "chars": chars,
+                                    "negative": neg,
+                                    "chars": chars, "char_negatives": cnegs,
                                     # 베이스와 캐릭터 프롬프트가 512 토큰을 공유한다
-                                    "shared": base + sum(chars), "limit": 512})
+                                    "shared": base + sum(chars),
+                                    "shared_negative": neg + sum(cnegs), "limit": 512})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/picks_save"):
