@@ -69,6 +69,30 @@ STATE_FILE = PROFILE_DIR / "nsfw_seed_state.json"
 OUTPUT_BASE = PROFILE_DIR / "output"
 LOG_FILE = PROFILE_DIR / "생성.log"
 
+
+def out_root(cfg=None):
+    """생성물이 실제로 쌓일 뿌리. 설정의 `out_dir` 이 있으면 거기로 (NAIS3-Custom 참고).
+    잘못된 경로면 조용히 무시하고 기본값을 쓴다 — 생성이 실패하면 안 된다.
+    ⚠ 탐색기·선별의 경로 이름표는 이 뿌리 기준이라, 뿌리를 바꾸면 옛 목록은 안 보인다."""
+    d = ((cfg or {}).get("out_dir") or "").strip()
+    if d:
+        try:
+            p = Path(d).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+            return p.resolve()
+        except (OSError, ValueError) as e:
+            log.warning(f"저장 폴더 '{d}' 를 쓸 수 없어 기본 폴더에 저장합니다: {e}")
+    return OUTPUT_BASE
+
+
+def out_sub(cfg, name):
+    """모드별 하위 폴더(단독·씬·복구…). 날짜별 정리를 켜면 그 아래 YYYY-MM-DD 로 나눈다."""
+    p = out_root(cfg) / name
+    if (cfg or {}).get("out_by_date"):
+        p = p / date.today().isoformat()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 NAI_API_URL = "https://image.novelai.net/ai/generate-image"
 MAX_CHARS = 6            # NAI 가 한 그림에 받는 인물 수 상한
 
@@ -211,6 +235,8 @@ DEFAULT_CONFIG = {
     "save_max_side": 0,         # 저장할 때 긴 변 줄이기 (0 = 그대로)
     "save_quality": 92,         # WebP 품질
     "per_char_order": True,     # 캐스트가 여럿이면 한 사람씩 몰아서 생성
+    "out_dir": "",              # 생성물 저장 폴더 (비면 profile/output)
+    "out_by_date": False,       # 켜면 모드 폴더 아래 날짜(YYYY-MM-DD)로 또 나눈다
     "char_slots": [],        # ① 설정의 캐릭터 칸들 (한 그림에 함께 들어갈 인물): [{name, prompt, negative}]
     "setting_state": {},        # 세팅 이름 → {use, selected, opts, cast: [{name, prompt, negative}]}
     "ui": {},                   # 화면 설정 {theme, accent, fs, radius}
@@ -2183,7 +2209,7 @@ def setting_thumbs(name):
         return {}
     scenes = st["data"].get("씬", {})
     newest = {}                       # 씬번호 → (mtime, 경로)
-    root = OUTPUT_BASE / "nsfw_seed"
+    root = out_root() / "nsfw_seed"
     if root.exists():
         for p in root.rglob("*"):
             if p.suffix.lower() not in (".webp", ".png"):
@@ -2202,7 +2228,7 @@ def setting_thumbs(name):
         best = max((newest[i] for i in g["ids"] if i in newest),
                    default=None, key=lambda x: x[0])
         if best:
-            out[str(g["id"])] = str(best[1].relative_to(OUTPUT_BASE)).replace("\\", "/")
+            out[str(g["id"])] = str(best[1].relative_to(out_root())).replace("\\", "/")
     return out
 
 
@@ -3721,7 +3747,11 @@ def available_output_path(path, fmt="webp"):
 #      ① PNG tEXt/zTXt/iTXt · WebP EXIF   ② 알파 채널 LSB (스텔스)
 #    ①만 지우면 novelai.net/inspect 로 ②가 그대로 읽힌다. 둘 다 지워야 한다.
 # ══════════════════════════════════════════════════════════════════════
-STRIP_DIR = OUTPUT_BASE / "메타제거"
+# 메타 제거 사본 — 저장 폴더 설정을 따른다 (out_root)
+def strip_dir(cfg=None):
+    d = out_root(cfg) / "메타제거"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 PICKS_FILE = PROFILE_DIR / "선별.json"     # 프로필별 (생성물이 갈리므로)
 IMG_EXT = (".webp", ".png", ".jpg", ".jpeg")
 
@@ -3764,10 +3794,11 @@ def _dir_img_count(p):
     return n
 
 
-def list_output(sub=""):
-    """output/ 아래를 훑는다. sub 가 비면 최상위."""
-    root = OUTPUT_BASE.resolve()
-    base = (OUTPUT_BASE / sub).resolve() if sub else root
+def list_output(sub="", cfg=None):
+    """생성물 뿌리 아래를 훑는다. sub 가 비면 최상위.
+    저장 폴더를 바꿨으면(out_dir) 그쪽을 본다 — 탐색기와 저장이 어긋나면 안 된다."""
+    root = out_root(cfg).resolve()
+    base = (root / sub).resolve() if sub else root
     try:
         inside = base.is_relative_to(root)
     except AttributeError:
@@ -3818,13 +3849,13 @@ def strip_metadata(data, filename="image.png", max_side=0, quality=95, force_web
         return out.getvalue(), ".webp"
 
 
-def strip_and_save(data, filename="image.png", max_side=0, quality=95, force_webp=False):
-    STRIP_DIR.mkdir(parents=True, exist_ok=True)
+def strip_and_save(data, filename="image.png", max_side=0, quality=95, force_webp=False, cfg=None):
+    _dir = strip_dir(cfg)
     blob, ext = strip_metadata(data, filename, max_side, quality, force_webp)
     stem = _safe_name(Path(filename).stem) or "image"
-    target, k = STRIP_DIR / f"{stem}{ext}", 2
+    target, k = _dir / f"{stem}{ext}", 2
     while target.exists():
-        target = STRIP_DIR / f"{stem} ({k}){ext}"
+        target = _dir / f"{stem} ({k}){ext}"
         k += 1
     target.write_bytes(blob)
     # 정말 지워졌는지 스스로 확인한다 (스텔스까지).
@@ -3834,7 +3865,7 @@ def strip_and_save(data, filename="image.png", max_side=0, quality=95, force_web
     remains = bool((left.get("raw") or {}) or (left.get("base") or "")
                    or (left.get("negative") or "") or (left.get("characters") or []))
     return {"ok": True, "file": target.name,
-            "path": str(target.relative_to(OUTPUT_BASE)).replace("\\", "/"),
+            "path": str(target.relative_to(out_root(cfg))).replace("\\", "/"),
             "bytes": len(blob), "before": len(data), "남은메타": remains}
 
 
@@ -4546,6 +4577,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <select id="pFormat">
               <option value="webp">WebP — 용량이 작음 (기본)</option>
               <option value="png">PNG — 무손실 · 투명 지원</option></select></div>
+          <!-- 저장 폴더 — 비우면 프로필의 output/. 탐색기도 이 폴더를 본다 -->
+          <div class="field"><label>저장 폴더 <span class="hint">(비우면 기본 output)</span></label>
+            <input type="text" id="pOutDir" placeholder="예: D:\\NAI결과"></div>
+          <div class="field"><label>날짜별로 나누기</label>
+            <select id="pOutDate">
+              <option value="off">한 폴더에 모으기 (기본)</option>
+              <option value="on">모드 폴더 아래 날짜별로</option></select></div>
           <!-- 저장 시점에 메타를 아예 안 넣는 선택. 나중에 따로 지우는 기능(기타 탭)은 그대로 둔다. -->
           <div class="field"><label>메타데이터 <span class="hint">(저장 시점)</span></label>
             <select id="pClean">
@@ -5743,6 +5781,8 @@ let paramsPainted = false;
 function paintParams(){
   $('pModel').value = STATE.model || 'nai-diffusion-4-5-full';
   $('pFormat').value = STATE.save_format || 'webp';
+  if($('pOutDir')) $('pOutDir').value = STATE.out_dir || '';
+  if($('pOutDate')) $('pOutDate').value = STATE.out_by_date ? 'on' : 'off';
   $('pClean').value = STATE.save_clean ? 'on' : 'off';
   $('pMaxSide').value = String(STATE.save_max_side || 0);
   $('pSaveQ').value = STATE.save_quality ?? 92;
@@ -5786,6 +5826,8 @@ function readParams(){
   if(!paramsPainted) return;
   STATE.model = $('pModel').value;
   STATE.save_format = $('pFormat').value;
+  if($('pOutDir')) STATE.out_dir = $('pOutDir').value.trim();
+  if($('pOutDate')) STATE.out_by_date = $('pOutDate').value === 'on';
   STATE.save_clean = $('pClean').value === 'on';
   STATE.save_max_side = Number($('pMaxSide').value) || 0;
   STATE.save_quality = Number($('pSaveQ').value) || 92;
@@ -5802,7 +5844,7 @@ function readParams(){
   if(window._paintCoords) window._paintCoords();
   tokens(); save();
 }
-['pModel','pFormat','pClean','pMaxSide','pSaveQ','pUc','pRes','pWidth','pHeight',...ONOFF.map(x=>x[0]),...NUMS.map(x=>x[0])]
+['pModel','pFormat','pOutDir','pOutDate','pClean','pMaxSide','pSaveQ','pUc','pRes','pWidth','pHeight',...ONOFF.map(x=>x[0]),...NUMS.map(x=>x[0])]
   .forEach(id => { const el = $(id); if(!el) return;
     el.addEventListener('change', readParams); el.addEventListener('input', readParams); });
 
@@ -9356,8 +9398,7 @@ class ConfigServer:
                     scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
                     uc_preset=int(cfg.get("uc_preset", 3)),
                     seed=fixed_seed(cfg), params=with_centers(cfg, ctrs))
-                out_dir = OUTPUT_BASE / "단독"
-                out_dir.mkdir(parents=True, exist_ok=True)
+                out_dir = out_sub(cfg, "단독")
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
                 save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
                                 quality=out_clean(cfg)[2])
@@ -9427,8 +9468,7 @@ class ConfigServer:
                     scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
                     uc_preset=int(cfg.get("uc_preset", 3)), seed=seed,
                     params=with_centers(params, active_people(slots, cfg.get("char_centers"))[1]))
-                out_dir = OUTPUT_BASE / mode
-                out_dir.mkdir(parents=True, exist_ok=True)
+                out_dir = out_sub(cfg, mode)
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
                 save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
                                 quality=out_clean(cfg)[2])
@@ -9462,10 +9502,10 @@ class ConfigServer:
             return {"ok": False, "error": str(e)}
         mode = d.get("mode") or "generate"
         strength = float(d.get("strength", 0.5))
-        root = OUTPUT_BASE.resolve()
+        root = out_root(cfg).resolve()
         jobs = []
         for rel in (d.get("paths") or []):
-            f = (OUTPUT_BASE / rel).resolve()
+            f = (root / rel).resolve()
             try:
                 inside = f.is_relative_to(root)
             except AttributeError:
@@ -9486,8 +9526,7 @@ class ConfigServer:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
-            out_dir = OUTPUT_BASE / "복구"
-            out_dir.mkdir(parents=True, exist_ok=True)
+            out_dir = out_sub(cfg, "복구")
             state = load_state()
             done = 0
             self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
@@ -9578,8 +9617,7 @@ class ConfigServer:
             state = load_state()
             state.setdefault("frag_seq", {})
             cfg["_frag_counters"] = state["frag_seq"]
-            out_dir = OUTPUT_BASE / "씬"
-            out_dir.mkdir(parents=True, exist_ok=True)
+            out_dir = out_sub(cfg, "씬")
             seed_key = f"{int(cfg.get('seed', 1)):02d}"
             state.setdefault("seeds", {})
             if seed_key not in state["seeds"]:
@@ -9873,7 +9911,7 @@ class ConfigServer:
 
             img = Image.open(io.BytesIO(out))
             keep_alpha = tool == "bg-removal"        # 배경 제거는 투명도를 살려야 한다
-            d = OUTPUT_BASE / "디렉터"
+            d = out_sub(self.cfg, "디렉터")
             d.mkdir(parents=True, exist_ok=True)
             stem = _safe_name(Path(filename or "결과").stem)[:40] or "결과"
             ext = "png" if keep_alpha else "webp"
@@ -10046,9 +10084,32 @@ class ConfigServer:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _trusted_post(self):
+                """브라우저의 다른 사이트가 127.0.0.1 API를 대신 누르지 못하게 한다."""
+                from urllib.parse import urlparse
+                allowed = {"127.0.0.1", "localhost", "::1"}
+                try:
+                    host = urlparse("http://" + (self.headers.get("Host") or ""))
+                    if host.hostname not in allowed or host.port != self.server.server_port:
+                        return False
+                    origin = self.headers.get("Origin")
+                    if origin:
+                        src = urlparse(origin)
+                        if (src.scheme != "http" or src.hostname not in allowed
+                                or src.port != self.server.server_port):
+                            return False
+                    fetch_site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+                    if fetch_site and fetch_site != "same-origin":
+                        return False
+                    return True
+                except (TypeError, ValueError):
+                    return False
 
             def do_GET(self):
                 if self.path.startswith("/api/config"):
@@ -10073,11 +10134,12 @@ class ConfigServer:
                     from urllib.parse import urlparse, parse_qs, unquote
                     q = parse_qs(urlparse(self.path).query)
                     rel = unquote(q.get("p", [""])[0])
-                    f = (OUTPUT_BASE / rel).resolve()
+                    _root = out_root(server.cfg).resolve()
+                    f = (_root / rel).resolve()
                     try:
-                        inside = f.is_relative_to(OUTPUT_BASE.resolve())
+                        inside = f.is_relative_to(_root)
                     except AttributeError:                      # 파이썬 3.8 이하
-                        inside = str(f).startswith(str(OUTPUT_BASE.resolve()))
+                        inside = str(f).startswith(str(_root))
                     if not (rel and inside and f.is_file()):
                         self.send_response(404); self.end_headers(); return
                     data = f.read_bytes()
@@ -10091,7 +10153,7 @@ class ConfigServer:
                     from urllib.parse import urlparse, parse_qs, unquote
                     q = parse_qs(urlparse(self.path).query)
                     try:
-                        self._json(list_output(unquote(q.get("dir", [""])[0])))
+                        self._json(list_output(unquote(q.get("dir", [""])[0]), server.cfg))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/setting_thumbs"):
@@ -10238,7 +10300,18 @@ class ConfigServer:
                     self.send_response(404); self.end_headers()
 
             def do_POST(self):
-                length = int(self.headers.get("Content-Length", 0))
+                if not self._trusted_post():
+                    self._json({"ok": False, "error": "허용되지 않은 요청 출처입니다."}, status=403)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "error": "잘못된 Content-Length입니다."}, status=400)
+                    return
+                # 이미지 업로드를 허용하되 무제한 메모리 할당은 막는다.
+                if length < 0 or length > 128 * 1024 * 1024:
+                    self._json({"ok": False, "error": "요청 본문이 너무 큽니다."}, status=413)
+                    return
                 body = self.rfile.read(length) if length else b""
                 if self.path.startswith("/api/save"):
                     self._json(server.handle_save(body))
@@ -10428,12 +10501,12 @@ class ConfigServer:
                     try:
                         d = json.loads(body or b"{}")
                         keep = set(d.get("keep") or [])
-                        root = OUTPUT_BASE.resolve()
+                        root = out_root(cfg).resolve()
                         gone = 0
                         for rel in (d.get("targets") or []):
                             if rel in keep:
                                 continue
-                            f = (OUTPUT_BASE / rel).resolve()
+                            f = (root / rel).resolve()
                             try:
                                 inside = f.is_relative_to(root)
                             except AttributeError:
@@ -10447,7 +10520,7 @@ class ConfigServer:
                 elif self.path.startswith("/api/mosaic_save"):
                     # 모자이크는 브라우저에서 이미 칠해 왔다. 우리는 저장만 한다.
                     try:
-                        d = OUTPUT_BASE / "모자이크"
+                        d = out_sub(server.cfg, "모자이크")
                         d.mkdir(parents=True, exist_ok=True)
                         n = len(list(d.glob("*.png"))) + 1
                         f = d / f"{n:04d}.png"
@@ -10462,7 +10535,8 @@ class ConfigServer:
                             body, unquote(self.headers.get("X-Filename", "image.png")),
                             max_side=int(self.headers.get("X-MaxSide", "0") or 0),
                             quality=int(self.headers.get("X-Quality", "95") or 95),
-                            force_webp=self.headers.get("X-ForceWebp") == "1"))
+                            force_webp=self.headers.get("X-ForceWebp") == "1",
+                            cfg=server.cfg))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/scenes_save"):
@@ -10681,10 +10755,13 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
         #   ① 설정의 캐릭터 칸 = "한 그림에 함께 들어갈 인물" → 늘어나지 않는다.
         #     첫 칸이 주인공, 둘째 칸이 상대역이 된다 (단독 생성과 같은 규칙).
         if cast:
-            runs = [[c] for c in cast]
+            # 표시 이름이 같아도 각 캐스트는 별개 작업이다. index와 내용 fingerprint를 identity로 쓴다.
+            runs = [([c], f"{sname}\0cast\0{i}\0{c.get('id', '')}\0"
+                             f"{c.get('prompt', '')}\0{c.get('negative', '')}")
+                    for i, c in enumerate(cast)]
         else:
-            runs = [slots] if slots else []
-        for i, group in enumerate(runs):
+            runs = [(slots, None)] if slots else []
+        for i, (group, identity) in enumerate(runs):
             p = group[0]
             partner = group[1] if len(group) > 1 else {}
             char = {"name": p.get("name") or f"인물{i+1}", "female": slot_prompt(p),
@@ -10696,6 +10773,9 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
                     "extras": [{"prompt": slot_prompt(x), "negative": x.get("negative", "")}
                                for x in group[2:]]}
             cid = _safe_name(char["name"]).lower() or f"char{i+1}"
+            if identity is not None:
+                digest = zlib.crc32(identity.encode("utf-8")) & 0xffffffff
+                cid = f"{cid[:30]}-{digest:08x}"
             done_set = done_this_run.get(cid, set())
             for copy in range(1, max(1, int(reserve.get(num, 1))) + 1):
                 if (num, copy) in done_set or (cid, num, copy) in skip_set:
@@ -10883,7 +10963,7 @@ def _run_generation(server):
         total_now = completed + len(pending)
 
         try:
-            out_dir = OUTPUT_BASE / "nsfw_seed" / f"seed_{seed_key}" / cid
+            out_dir = out_root(cfg) / "nsfw_seed" / f"seed_{seed_key}" / cid
             out_dir.mkdir(parents=True, exist_ok=True)
 
             scene = acfg["scenes"][str(num)]
