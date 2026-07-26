@@ -4138,22 +4138,29 @@ _LAST_CALL = {"t": 0.0}
 
 
 def pace_gate(cfg, live=None, label=""):
-    """일일 상한을 넘었으면 (False, 사유). 아니면 직전 호출과의 간격을 채우고 (True, "").
-    live 를 주면 취소(stop_req)를 존중해 기다리는 중에도 즉시 빠져나온다."""
+    """Wait until the configured gap since the previous API completion.
+
+    The completion timestamp is written by ``pace_complete`` in each call
+    site's ``finally`` block. Measuring from request start can collapse the
+    real gap to zero when a slow API call lasts longer than the configured gap.
+    """
     pc = pace(cfg)
     st = load_state()
     if daily_count(st) >= pc["daily_cap"]:
         return False, f"일일 상한 {pc['daily_cap']}장에 도달했습니다 — 내일 이어서 하세요."
     gap = random.uniform(pc["delay_min"], pc["delay_max"])
-    wait = _LAST_CALL["t"] + gap - time.time()
-    while wait > 0:
+    while True:
+        wait = _LAST_CALL["t"] + gap - time.time()
+        if wait <= 0:
+            return True, ""
         if live is not None and getattr(live, "stop_req", False):
             return False, "중지되었습니다."
         time.sleep(min(0.5, wait))
-        wait = _LAST_CALL["t"] + gap - time.time()
-    _LAST_CALL["t"] = time.time()
-    return True, ""
 
+
+def pace_complete():
+    """Mark the end of an attempted NAI generation request."""
+    _LAST_CALL["t"] = time.time()
 
 # ═══════════════ 브라우저 UI (설정 + 실시간 미리보기) ═══════════════
 
@@ -4552,6 +4559,15 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar" style="margin-top:8px;">
           <button id="slotAdd">+ 직접 입력</button>
           <select id="slotLib" style="flex:1;"><option value="">+ 라이브러리에서...</option></select>
+        </div>
+        <!-- 인물 칸 일괄 손질 (NAIS3 의 캐릭터 다중 선택·일괄 편집을 우리 구조로) -->
+        <div class="bar" style="margin-top:4px;flex-wrap:wrap;">
+          <span class="hint">일괄:</span>
+          <button id="slotAllOn" title="모든 칸 켜기">전부 켜기</button>
+          <button id="slotAllOff" title="모든 칸 끄기 — 칸은 남습니다">전부 끄기</button>
+          <button id="slotBulkAdd" title="켠 칸의 외형 뒤에 같은 태그를 한꺼번에 붙입니다">＋태그 주입</button>
+          <button id="slotDupAll" title="켠 칸을 복제합니다">⧉ 복제</button>
+          <button class="danger" id="slotDelOff" title="꺼 둔 칸을 모두 지웁니다">꺼진 칸 정리</button>
         </div>
       </div>
     </div>
@@ -5094,6 +5110,23 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <b>Alt+1~5</b> 탭 이동 ·
           생성물 탐색기에서 그림을 열면 <b>←→</b> 넘기기 · <b>F</b> 선별 · <b>S</b> 즐겨찾기 ·
           <b>C</b> 비교함 · <b>Esc</b> 닫기</p>
+      </div>
+
+      <!-- 진단 — 무엇이 왜 실패했는지 앱 안에서 본다 (nais_blue 의 DiagnosticDrawer) -->
+      <div class="card">
+        <h2><span class="n">04b</span>진단 · 최근 기록
+          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">생성.log 를 앱 안에서</span></h2>
+        <p class="hint">실패 원인을 파일을 찾아 열지 않고 여기서 봅니다. <b>오류만</b>을 켜면 경고·오류만 남습니다.
+        복사해서 그대로 물어보면 됩니다.</p>
+        <div class="bar" style="flex-wrap:wrap;">
+          <button id="diagLoad">↻ 불러오기</button>
+          <label class="hint"><input type="checkbox" id="diagErrOnly"> 오류만</label>
+          <select id="diagN" title="줄 수"><option>100</option><option selected>300</option><option>1000</option></select>
+          <button id="diagCopy">📋 복사</button>
+          <span class="n" id="diagStat" style="margin-left:auto;"></span>
+        </div>
+        <pre id="diagOut" style="max-height:260px;overflow:auto;background:var(--bg);padding:8px;
+          font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-all;margin:6px 0 0;"></pre>
       </div>
 
       <div class="card">
@@ -6169,6 +6202,70 @@ $('slotAdd').addEventListener('click', () => {
   (STATE.char_slots = STATE.char_slots || []).push({name:'', prompt:'', negative:''});
   if(autoCoordsOnSecond()) flash('인물이 둘이 되어 위치 지정을 켜고 좌우로 벌렸습니다 (공홈과 같은 동작).');
   renderSlots(); tokens(); save();
+});
+/* ── 진단 서랍 (nais_blue 의 DiagnosticDrawer) — 생성.log 를 앱 안에서 ── */
+async function diagLoad(){
+  const box = $('diagOut'); if(!box) return;
+  box.textContent = '읽는 중...';
+  try{
+    const r = await (await fetch('/api/diag?n=' + (($('diagN')||{}).value || 300)
+      + (($('diagErrOnly')||{}).checked ? '&err=1' : ''))).json();
+    if(!r.ok){ box.textContent = r.error || '못 읽음'; return; }
+    box.textContent = r.lines.join(String.fromCharCode(10)) || '(기록 없음)';
+    $('diagStat').textContent = `${r.lines.length}줄` + (r.errors != null ? ` · 오류/경고 ${r.errors}` : '');
+    box.scrollTop = box.scrollHeight;
+  }catch(e){ box.textContent = String(e); }
+}
+if($('diagLoad')){
+  $('diagLoad').addEventListener('click', diagLoad);
+  ['diagErrOnly','diagN'].forEach(id => $(id) && $(id).addEventListener('change', diagLoad));
+  $('diagCopy').addEventListener('click', () => {
+    navigator.clipboard.writeText($('diagOut').textContent || '')
+      .then(() => $('diagStat').textContent = '복사됨 ✓');
+  });
+}
+
+/* 인물 칸 일괄 손질 (NAIS3 의 캐릭터 다중 선택·일괄 편집을 우리 구조로).
+   칸이 여럿일 때 하나씩 누르는 수고를 줄인다. 켬/끔은 '보낼지'만 정하고 칸은 남는다. */
+function slotsBulk(fn){
+  STATE.char_slots = STATE.char_slots || [];
+  fn(STATE.char_slots);
+  autoCoordsOnSecond(); renderSlots(); tokens(); save();
+}
+if($('slotAllOn')) $('slotAllOn').addEventListener('click', () =>
+  slotsBulk(ss => ss.forEach(s => s.enabled = true)));
+if($('slotAllOff')) $('slotAllOff').addEventListener('click', () =>
+  slotsBulk(ss => ss.forEach(s => s.enabled = false)));
+if($('slotBulkAdd')) $('slotBulkAdd').addEventListener('click', () => {
+  const t = prompt('켠 인물 칸의 외형 뒤에 붙일 태그 (콤마로 여러 개):');
+  if(!t || !t.trim()) return;
+  slotsBulk(ss => ss.forEach(s => {
+    if(s.enabled === false) return;
+    const cur = (s.prompt || '').trim().replace(/,$/, '');
+    s.prompt = cur ? cur + ', ' + t.trim() : t.trim();
+  }));
+});
+if($('slotDupAll')) $('slotDupAll').addEventListener('click', () => {
+  slotsBulk(ss => {
+    const copies = ss.filter(s => s.enabled !== false)
+      .map(s => Object.assign({}, s, {name: (s.name || '인물') + ' 사본'}));
+    if(!copies.length){ flash('켠 인물 칸이 없습니다.'); return; }
+    ss.push(...copies);
+  });
+});
+if($('slotDelOff')) $('slotDelOff').addEventListener('click', () => {
+  const off = (STATE.char_slots || []).filter(s => s.enabled === false).length;
+  if(!off){ flash('꺼 둔 칸이 없습니다.'); return; }
+  if(!confirm(`꺼 둔 칸 ${off}개를 지울까요? (좌표도 함께 지웁니다)`)) return;
+  slotsBulk(ss => {
+    const keep = [], ctrs = [];
+    ss.forEach((s, i) => {
+      if(s.enabled === false) return;
+      keep.push(s); ctrs.push((STATE.char_centers || [])[i] || {x:0.5, y:0.5});
+    });
+    STATE.char_centers = ctrs;         // 좌표는 칸 index 라 같이 추려야 짝이 안 어긋난다
+    ss.length = 0; ss.push(...keep);
+  });
 });
 $('slotLib').addEventListener('change', () => {
   const c = (STATE.characters||[]).find(x => x.id === $('slotLib').value);
@@ -9448,16 +9545,19 @@ class ConfigServer:
                 # 켠 인물만 보낸다 (칸은 6명 넘게 둬도 된다)
                 people, ctrs = active_people(slots, cfg.get("char_centers"))
                 state = load_state()
-                img = call_nai_api(
-                    cfg["token"], base, "", "",
-                    cfg.get("negative_prompt", ""),
-                    int(cfg.get("width", 832)), int(cfg.get("height", 1216)),
-                    chars=people,
-                    scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                    steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
-                    scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
-                    uc_preset=int(cfg.get("uc_preset", 3)),
-                    seed=fixed_seed(cfg), params=with_centers(cfg, ctrs))
+                try:
+                    img = call_nai_api(
+                        cfg["token"], base, "", "",
+                        cfg.get("negative_prompt", ""),
+                        int(cfg.get("width", 832)), int(cfg.get("height", 1216)),
+                        chars=people,
+                        scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
+                        steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
+                        scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
+                        uc_preset=int(cfg.get("uc_preset", 3)),
+                        seed=fixed_seed(cfg), params=with_centers(cfg, ctrs))
+                finally:
+                    pace_complete()
                 out_dir = out_sub(cfg, "단독")
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
                 save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
@@ -9519,15 +9619,18 @@ class ConfigServer:
                 params["_i2i"] = {"image": img_b64, "mask": mask_b64,
                                   "strength": float(d.get("strength", 0.7)),
                                   "noise": float(d.get("noise", 0.0)), "seed": seed}
-                img = call_nai_api(
-                    cfg["token"], cfg.get("base_prompt", "") or "1girl", "", "",
-                    cfg.get("negative_prompt", ""), w, h,
-                    chars=active_people(slots, cfg.get("char_centers"))[0],
-                    scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                    steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
-                    scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
-                    uc_preset=int(cfg.get("uc_preset", 3)), seed=seed,
-                    params=with_centers(params, active_people(slots, cfg.get("char_centers"))[1]))
+                try:
+                    img = call_nai_api(
+                        cfg["token"], cfg.get("base_prompt", "") or "1girl", "", "",
+                        cfg.get("negative_prompt", ""), w, h,
+                        chars=active_people(slots, cfg.get("char_centers"))[0],
+                        scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
+                        steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
+                        scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
+                        uc_preset=int(cfg.get("uc_preset", 3)), seed=seed,
+                        params=with_centers(params, active_people(slots, cfg.get("char_centers"))[1]))
+                finally:
+                    pace_complete()
                 out_dir = out_sub(cfg, mode)
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
                 save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
@@ -9625,18 +9728,25 @@ class ConfigServer:
                         prm["_i2i"] = {"image": base64.b64encode(b.getvalue()).decode(),
                                        "mask": None, "strength": strength, "noise": 0.0}
                     seed = int(raw.get("seed") or 0) or random.randint(0, 2**32 - 1)
+                    okp, why = pace_gate(cfg, self.live, "복구")
+                    if not okp:
+                        self.live.update(status_text=why)
+                        break
                     try:
-                        img = call_nai_api(
-                            cfg["token"], base, "", "", neg,
-                            int(raw.get("width") or cfg.get("width", 832)),
-                            int(raw.get("height") or cfg.get("height", 1216)),
-                            scale=float(raw.get("scale") or cfg.get("cfg_scale", 5.5)),
-                            cfg_rescale=float(raw.get("cfg_rescale") or 0.0),
-                            steps=int(raw.get("steps") or 28),
-                            sampler=raw.get("sampler") or "k_euler_ancestral",
-                            scheduler=raw.get("noise_schedule") or "karras",
-                            uc_preset=int(raw.get("ucPreset", cfg.get("uc_preset", 3))),
-                            seed=seed, params=prm, chars=chars)
+                        try:
+                            img = call_nai_api(
+                                cfg["token"], base, "", "", neg,
+                                int(raw.get("width") or cfg.get("width", 832)),
+                                int(raw.get("height") or cfg.get("height", 1216)),
+                                scale=float(raw.get("scale") or cfg.get("cfg_scale", 5.5)),
+                                cfg_rescale=float(raw.get("cfg_rescale") or 0.0),
+                                steps=int(raw.get("steps") or 28),
+                                sampler=raw.get("sampler") or "k_euler_ancestral",
+                                scheduler=raw.get("noise_schedule") or "karras",
+                                uc_preset=int(raw.get("ucPreset", cfg.get("uc_preset", 3))),
+                                seed=seed, params=prm, chars=chars)
+                        finally:
+                            pace_complete()
                     except Exception as e:
                         log.error(f"복구 실패 {f.name}: {e}")
                         self.live.update(status_text=f"{f.name} 실패: {e}")
@@ -9648,7 +9758,6 @@ class ConfigServer:
                     self.live.set_image(img)
                     bump_daily(state); save_state(state)
                     done += 1
-                    time.sleep(random.uniform(*[pace(cfg)["delay_min"], pace(cfg)["delay_max"]]))
                 self.live.update(status_text=f"그림체 복구 완료 ✓ {done}/{len(jobs)}장 (output/복구/)")
             finally:
                 self.live.release(tok)
@@ -9725,18 +9834,21 @@ class ConfigServer:
                         if len(pts) < len(people):
                             ctrs = spread_centers(len(people))
                     try:
-                        img = call_nai_api(
-                            cfg["token"], base, "", "",
-                            neg, int(sc.get("width", 832)), int(sc.get("height", 1216)),
-                            chars=people,
-                            scale=cfg.get("cfg_scale", 5.5),
-                            cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                            steps=int(cfg.get("steps", 28)),
-                            sampler=cfg.get("sampler", "k_euler_ancestral"),
-                            scheduler=cfg.get("scheduler", "karras"),
-                            variety=cfg.get("variety", False),
-                            uc_preset=int(cfg.get("uc_preset", 3)),
-                            seed=seed, params=with_centers(cfg, ctrs))
+                        try:
+                            img = call_nai_api(
+                                cfg["token"], base, "", "",
+                                neg, int(sc.get("width", 832)), int(sc.get("height", 1216)),
+                                chars=people,
+                                scale=cfg.get("cfg_scale", 5.5),
+                                cfg_rescale=cfg.get("cfg_rescale", 0.56),
+                                steps=int(cfg.get("steps", 28)),
+                                sampler=cfg.get("sampler", "k_euler_ancestral"),
+                                scheduler=cfg.get("scheduler", "karras"),
+                                variety=cfg.get("variety", False),
+                                uc_preset=int(cfg.get("uc_preset", 3)),
+                                seed=seed, params=with_centers(cfg, ctrs))
+                        finally:
+                            pace_complete()
                     except Exception as e:
                         log.error(f"씬 '{sc['name']}' 실패: {e}")
                         self.live.update(status_text=f"'{sc['name']}' 실패: {e}")
@@ -10295,6 +10407,27 @@ class ConfigServer:
                             int(q.get("limit", ["60"])[0]), int(q.get("offset", ["0"])[0]))
                         prewarm_images(res.get("items"), n=60)
                         self._json({"ok": True, **res})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/diag"):
+                    # 진단 — 생성.log 의 끝부분을 돌려준다 (파일을 찾아 열지 않아도 되게)
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    try:
+                        n = max(10, min(2000, int(q.get("n", ["300"])[0])))
+                    except (TypeError, ValueError):
+                        n = 300
+                    err_only = q.get("err", [""])[0] in ("1", "true")
+                    try:
+                        if not LOG_FILE.exists():
+                            self._json({"ok": True, "lines": [], "errors": 0}); return
+                        raw = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+                        errs = sum(1 for x in raw if "[ERROR]" in x or "[WARNING]" in x
+                                   or "[CRITICAL]" in x)
+                        if err_only:
+                            raw = [x for x in raw if "[ERROR]" in x or "[WARNING]" in x
+                                   or "[CRITICAL]" in x]
+                        self._json({"ok": True, "lines": raw[-n:], "errors": errs})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/ac"):
@@ -11137,7 +11270,8 @@ def _run_generation(server):
             log.error(traceback.format_exc())
             server.live.update(status_text=f"오류(건너뜀): {e}")
             skip_set.add((cid, num, copy))
-            time.sleep(1)
+            if server.live.wait_cancelable(1):
+                return
             continue
 
         # 이 장의 시드 — 씬 번호로 갈라지고, 같은 씬을 여러 벌 뽑으면 벌마다 또 갈라진다
@@ -11152,6 +11286,10 @@ def _run_generation(server):
         for attempt in range(3):
             if server.live.stop_req:      # 보내기 직전에도 확인 (CQA-019)
                 break
+            okp, why = pace_gate(cfg, server.live, "배치")
+            if not okp:
+                server.live.update(status_text=why)
+                break
             try:
                 # 씬 전용 네거티브가 있으면 기본 네거티브 뒤에 붙인다
                 #   (씬 모드와 같은 규칙 — 세팅 씬도 이제 이 칸을 가진다)
@@ -11162,11 +11300,14 @@ def _run_generation(server):
                 if male:
                     people.append({"prompt": male, "negative": male_neg})
                 people += char.get("extras") or []
-                img = call_nai_api(token, base_p, "", "", neg_now, w, h,
-                                   chars=people,
-                                   scale=scale, cfg_rescale=cfg_rescale,
-                                   steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
-                                   seed=seed, variety=variety, params=cfg)
+                try:
+                    img = call_nai_api(token, base_p, "", "", neg_now, w, h,
+                                       chars=people,
+                                       scale=scale, cfg_rescale=cfg_rescale,
+                                       steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
+                                       seed=seed, variety=variety, params=cfg)
+                finally:
+                    pace_complete()
                 saved_path = save_with_meta(
                     img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                     max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
@@ -11207,9 +11348,6 @@ def _run_generation(server):
         else:
             skip_set.add((cid, num, copy))
             server.live.update(status_text=f"실패 — 건너뜀: {fname}")
-
-        pc = pace(cfg)
-        time.sleep(random.uniform(pc["delay_min"], pc["delay_max"]))
 
 
 if __name__ == "__main__":
