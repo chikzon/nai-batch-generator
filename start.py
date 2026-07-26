@@ -3731,7 +3731,7 @@ def load_picks():
     경로에 이름표만 붙인다 (mm 의 '원본 경로 유지' 와 같은 생각)."""
     if PICKS_FILE.exists():
         try:
-            d = json.loads(PICKS_FILE.read_text(encoding="utf-8"))
+            d = load_json_recover(PICKS_FILE)
             if isinstance(d, dict):
                 d.setdefault("picked", [])
                 d.setdefault("fav", [])
@@ -3744,7 +3744,7 @@ def load_picks():
 
 
 def save_picks(d):
-    PICKS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(PICKS_FILE, d, indent=1)
     return d
 
 
@@ -6698,6 +6698,11 @@ function cupDraw(){
       if(CUP.next.length === 1) CUP.ranks[CUP.next[0]] = 1;   // 우승
       cupFinish(); return;
     }
+    /* 모두 '둘 다'를 고른 라운드는 참가 수가 줄지 않는다. 전원 공동 1위로 종료한다. */
+    if(CUP.next.length === CUP.round.length){
+      CUP.next.forEach(p => { CUP.ranks[p] = 1; });
+      cupFinish(); return;
+    }
     CUP.round = CUP.next; CUP.next = []; CUP.i = 0;
   }
   /* 홀수로 남은 마지막 한 장은 부전승 */
@@ -7902,9 +7907,11 @@ function openFindReplace(){
     hits.forEach(h => {
       const cur = h.get();
       h.re.lastIndex = 0;
-      const out = $('frWord').checked
+      let out = $('frWord').checked
         ? cur.replace(h.re, (m, p1) => (repl ? `${p1 || ''}${p1 ? ' ' : ''}${repl}` : (p1 || '')))
         : cur.replace(h.re, repl);
+      /* 통째로 삭제할 때 `a,, b`나 선두 콤마를 남기지 않는다. */
+      if($('frWord').checked) out = out.split(',').map(x => x.trim()).filter(Boolean).join(', ');
       h.set(out); n += h.n;
     });
     if(window.renderSlots) renderSlots();
@@ -10352,11 +10359,14 @@ class ConfigServer:
                 elif self.path.startswith("/api/picks_save"):
                     try:
                         d = json.loads(body or b"{}")
-                        cur = load_picks()
-                        for k in ("picked", "fav", "folders", "ranks"):
-                            if k in d:
-                                cur[k] = d[k]
-                        self._json({"ok": True, "picks": save_picks(cur)})
+                        # load→merge→save 전체가 한 transaction이어야 다른 탭의 선별을 덮지 않는다.
+                        with _JSON_IO_LOCK:
+                            cur = load_picks()
+                            for k in ("picked", "fav", "folders", "ranks"):
+                                if k in d:
+                                    cur[k] = d[k]
+                            saved = save_picks(cur)
+                        self._json({"ok": True, "picks": saved})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/picks_del"):
