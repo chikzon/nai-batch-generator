@@ -1154,6 +1154,41 @@ def prepare_char_refs(cfg):
     return imgs, types, strengths, fids
 
 
+def runtime_generation_params(cfg, token, include_refs=True):
+    """현재 설정에서 한 호출에만 쓸 레퍼런스 파라미터를 만든다.
+
+    `_vibes`/`_char_refs`는 영구 설정이 아니라 전송 직전 계산값이다. 공유 cfg에
+    남기면 앞 배치의 레퍼런스가 단독·씬·복구 호출로 새므로 항상 제거한 복사본에서
+    시작한다. 메타데이터 복구는 원본에 없는 현재 레퍼런스를 덧붙이지 않는다.
+    """
+    params = dict(cfg or {})
+    params.pop("_vibes", None)
+    params.pop("_char_refs", None)
+    if not include_refs:
+        return params
+    try:
+        encoded, strengths, ies, newly = prepare_vibes(cfg, token)
+        images, types, ref_strengths, fidelities = prepare_char_refs(cfg)
+        params["_vibes"] = {
+            "encoded": encoded,
+            "strengths": strengths,
+            "ies": ies,
+        }
+        params["_char_refs"] = {
+            "images": images,
+            "types": types,
+            "strengths": ref_strengths,
+            "fidelities": fidelities,
+        }
+        if newly:
+            log.info(f"바이브 {newly}개를 새로 인코딩했습니다.")
+    except Exception as e:
+        log.warning(f"레퍼런스 준비 실패 — 레퍼런스 없이 계속합니다: {e}")
+        params["_vibes"] = {}
+        params["_char_refs"] = {}
+    return params
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  디렉터 툴 — NAI 가 그림을 다시 손봐 주는 기능
 #   augment-image : 배경 제거 · 라인아트 · 스케치 · 색칠 · 표정 변경 · 정리
@@ -3428,6 +3463,30 @@ MODELS = [
     ("nai-diffusion-furry-3", "V3 Furry"),
 ]
 UC_PRESETS = [(0, "Heavy"), (1, "Light"), (3, "Human Focus"), (4, "None")]
+
+
+def model_id_from_metadata(value, fallback="nai-diffusion-4-5-full"):
+    """NAI PNG의 표시명/Source 문자열을 실제 API 모델 ID로 바꾼다.
+
+    Source 끝의 8자리 빌드 해시는 모델 버전이 아니므로 버전 토큰만 판정한다.
+    알 수 없는 구형/타사 모델은 사용자가 고른 지원 모델로 안전하게 되돌린다.
+    """
+    supported = {model_id for model_id, _label in MODELS}
+    fallback = fallback if fallback in supported else "nai-diffusion-4-5-full"
+    text = str(value or "").strip()
+    if text in supported:
+        return text
+    low = text.casefold()
+    curated = "curated" in low
+    if re.search(r"\bv?4(?:[._ -]?5)\b", low):
+        return "nai-diffusion-4-5-curated" if curated else "nai-diffusion-4-5-full"
+    if "furry" in low and re.search(r"\bv?3\b", low):
+        return "nai-diffusion-furry-3"
+    if re.search(r"\bv?4\b", low):
+        return "nai-diffusion-4-curated-preview" if curated else "nai-diffusion-4-full"
+    if re.search(r"\bv?3\b", low) or low.startswith("stable diffusion xl"):
+        return "nai-diffusion-3"
+    return fallback
 
 # ══ UC 프리셋의 실제 문구 ══════════════════════════════════════════════
 # ⚠ NAI 는 요청의 `ucPreset` 숫자를 **그림에 반영하지 않는다.** 실측(2026-07):
@@ -9842,6 +9901,7 @@ class ConfigServer:
                 base = style or "1girl"
                 # 켠 인물만 보낸다 (칸은 6명 넘게 둬도 된다)
                 people, ctrs = active_people(slots, cfg.get("char_centers"))
+                params = runtime_generation_params(cfg, cfg["token"])
                 state = load_state()
                 try:
                     img = call_nai_api(
@@ -9853,7 +9913,7 @@ class ConfigServer:
                         steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
                         scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
                         uc_preset=int(cfg.get("uc_preset", 3)),
-                        seed=fixed_seed(cfg), params=with_centers(cfg, ctrs))
+                        seed=fixed_seed(cfg), params=with_centers(params, ctrs))
                 finally:
                     pace_complete()
                 out_dir = out_sub(cfg, "단독")
@@ -9913,7 +9973,7 @@ class ConfigServer:
                 slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
                 seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
-                params = dict(cfg)
+                params = runtime_generation_params(cfg, cfg["token"])
                 params["_i2i"] = {"image": img_b64, "mask": mask_b64,
                                   "strength": float(d.get("strength", 0.7)),
                                   "noise": float(d.get("noise", 0.0)), "seed": seed}
@@ -9978,7 +10038,13 @@ class ConfigServer:
             raw = (meta or {}).get("raw") or {}
             if not raw:
                 continue                      # 메타가 없는 그림은 되살릴 수 없다
-            jobs.append((f, raw))
+            # ⚠ 모델은 `raw` 가 아니라 `params["model"]` 에 **표시명**으로 들어 있다
+            #   ("NovelAI Diffusion V4.5 4BDE2A90" 같은 꼴). 예전엔 `raw["source_model"]`
+            #   을 읽었는데 그 키는 어디서도 만들어지지 않아 **모델 복원이 늘 무시**됐다.
+            #   표시명을 그대로 보내면 400 이므로 `model_id_from_metadata()` 로 옮긴다.
+            #   Variety+ 시그마도 모델에서 역산하므로 이걸 고쳐야 재현이 맞는다.
+            meta_model = ((meta or {}).get("params") or {}).get("model")
+            jobs.append((f, raw, meta_model))
         if not jobs:
             return {"ok": False, "error": "메타데이터가 있는 그림이 없습니다. "
                                           "(카톡·디스코드를 거친 그림은 정보가 지워집니다)"}
@@ -9992,7 +10058,7 @@ class ConfigServer:
             done = 0
             self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
             try:
-                for i, (f, raw) in enumerate(jobs, 1):
+                for i, (f, raw, meta_model) in enumerate(jobs, 1):
                     if self.live.stop_req:
                         break
                     self.live.update(index=i, filename=f.name, status_text="복구 중...")
@@ -10008,9 +10074,10 @@ class ConfigServer:
                         if k < len(chars):
                             chars[k]["negative"] = c.get("char_caption", "")
                     ctrs = [(c.get("centers") or [{}])[0] for c in (cap.get("char_captions") or [])]
-                    prm = dict(cfg)
+                    prm = runtime_generation_params(cfg, cfg["token"], include_refs=False)
                     prm.update({
-                        "model": raw.get("source_model") or cfg.get("model") or "nai-diffusion-4-5-full",
+                        "model": model_id_from_metadata(
+                            meta_model, cfg.get("model") or "nai-diffusion-4-5-full"),
                         "use_coords": bool(v4.get("use_coords")),
                         "char_centers": [{"x": float(c.get("x", 0.5)), "y": float(c.get("y", 0.5))}
                                          for c in ctrs],
@@ -10084,6 +10151,7 @@ class ConfigServer:
             state = load_state()
             state.setdefault("frag_seq", {})
             cfg["_frag_counters"] = state["frag_seq"]
+            params = runtime_generation_params(cfg, cfg["token"])
             out_dir = out_sub(cfg, "씬")
             seed_key = f"{int(cfg.get('seed', 1)):02d}"
             state.setdefault("seeds", {})
@@ -10144,7 +10212,7 @@ class ConfigServer:
                                 scheduler=cfg.get("scheduler", "karras"),
                                 variety=cfg.get("variety", False),
                                 uc_preset=int(cfg.get("uc_preset", 3)),
-                                seed=seed, params=with_centers(cfg, ctrs))
+                                seed=seed, params=with_centers(params, ctrs))
                         finally:
                             pace_complete()
                     except Exception as e:
@@ -11569,17 +11637,7 @@ def _run_generation(server):
         steps = int(cfg.get("steps", acfg["base"].get("steps", 28)))
         token = cfg["token"]
         # 바이브는 한 번 인코딩하면 캐시되어 이 회차 내내 공짜로 재사용된다
-        try:
-            enc, vst, vies, newly = prepare_vibes(cfg, token)
-            ri, rt, rs, rf = prepare_char_refs(cfg)
-            cfg["_vibes"] = {"encoded": enc, "strengths": vst, "ies": vies}
-            cfg["_char_refs"] = {"images": ri, "types": rt,
-                                 "strengths": rs, "fidelities": rf}
-            if enc or ri:
-                log.info(f"바이브 {len(enc)}개(새 인코딩 {newly}) · 캐릭터 레퍼런스 {len(ri)}개")
-        except Exception as e:
-            log.warning(f"레퍼런스 준비 실패 — 없이 진행합니다: {e}")
-            cfg["_vibes"] = cfg["_char_refs"] = {}
+        params = runtime_generation_params(cfg, token)
 
         char, cid, num, copy = pending[0]
         total_now = completed + len(pending)
@@ -11634,7 +11692,7 @@ def _run_generation(server):
                                        chars=people,
                                        scale=scale, cfg_rescale=cfg_rescale,
                                        steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
-                                       seed=seed, variety=variety, params=cfg)
+                                       seed=seed, variety=variety, params=params)
                 finally:
                     pace_complete()
                 saved_path = save_with_meta(

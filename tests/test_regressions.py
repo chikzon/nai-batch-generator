@@ -96,6 +96,61 @@ class RegressionTests(unittest.TestCase):
         got, _ = APP.resolve_fragments(["1girl, {red|blue|green}"], counters={})
         self.assertIn(got[0].rsplit(", ", 1)[-1], {"red", "blue", "green"})
 
+    def test_runtime_reference_params_replace_stale_state_without_mutating_cfg(self):
+        cfg = {
+            "_vibes": {"encoded": ["stale-vibe"]},
+            "_char_refs": {"images": ["stale-ref"]},
+            "vibes": [],
+            "char_refs": [],
+        }
+        with (
+            patch.object(
+                APP,
+                "prepare_vibes",
+                return_value=(["fresh-vibe"], [0.7], [0.8], 0),
+            ),
+            patch.object(
+                APP,
+                "prepare_char_refs",
+                return_value=(["fresh-ref"], ["character&style"], [0.6], [0.5]),
+            ),
+        ):
+            params = APP.runtime_generation_params(cfg, "pst-test")
+
+        self.assertEqual(params["_vibes"]["encoded"], ["fresh-vibe"])
+        self.assertEqual(params["_char_refs"]["images"], ["fresh-ref"])
+        self.assertEqual(cfg["_vibes"]["encoded"], ["stale-vibe"])
+        self.assertEqual(cfg["_char_refs"]["images"], ["stale-ref"])
+
+        restored = APP.runtime_generation_params(cfg, "pst-test", include_refs=False)
+        self.assertNotIn("_vibes", restored)
+        self.assertNotIn("_char_refs", restored)
+
+    def test_restore_model_mapping_ignores_source_build_hash_digits(self):
+        fallback = "nai-diffusion-4-5-curated"
+        cases = {
+            "NovelAI Diffusion V4.5 4BDE2A90": "nai-diffusion-4-5-full",
+            "NAI Diffusion 4.5 Curated": "nai-diffusion-4-5-curated",
+            "NAI Diffusion V4 Full": "nai-diffusion-4-full",
+            "NAI Diffusion V4 Curated": "nai-diffusion-4-curated-preview",
+            "NovelAI Diffusion Furry V3": "nai-diffusion-furry-3",
+            "Stable Diffusion XL 9CC2F394": "nai-diffusion-3",
+            "Stable Diffusion XL C1E1DE52": "nai-diffusion-3",
+            "Stable Diffusion 1D44365E": fallback,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(
+                    APP.model_id_from_metadata(source, fallback),
+                    expected,
+                )
+
+    def test_every_generation_path_builds_call_local_reference_params(self):
+        source = (ROOT / "start.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("runtime_generation_params("), 6)
+        self.assertNotIn('raw.get("source_model")', source)
+        self.assertNotIn("ensure_refs(", source)
+
     def test_tag_alias_autocomplete_returns_canonical_tag(self):
         data = {
             "rows": [
