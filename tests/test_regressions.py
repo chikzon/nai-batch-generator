@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,6 +86,81 @@ class RegressionTests(unittest.TestCase):
             )
         self.assertEqual(combined, 58.0)
         self.assertIn("함께 보냅니다", "\n".join(captured.output))
+
+    def test_tag_alias_autocomplete_returns_canonical_tag(self):
+        data = {
+            "rows": [
+                ("1girl", 6008644, "", "general", ["1girls", "sole female"]),
+                ("highres", 5256195, "", "meta", ["hires", "high resolution"]),
+            ]
+        }
+        with (
+            patch.object(APP, "_ac_cache_load", return_value=None),
+            patch.object(APP, "_ac_cache_save"),
+        ):
+            index = APP._ac_index_inner(data)
+        with patch.object(APP, "_ac_index", return_value=index):
+            self.assertEqual(
+                APP.autocomplete_tags({}, "1girls", 12)[0]["tag"],
+                "1girl",
+            )
+            self.assertEqual(
+                APP.autocomplete_tags({}, "sole female", 12)[0]["tag"],
+                "1girl",
+            )
+            self.assertEqual(
+                APP.autocomplete_tags({}, "hires", 12)[0]["tag"],
+                "highres",
+            )
+
+    def test_disabled_coordinates_are_neutralized_in_actual_payload(self):
+        png = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(png, "PNG")
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as archive:
+            archive.writestr("image.png", png.getvalue())
+
+        class Response:
+            status_code = 200
+            content = zipped.getvalue()
+            text = ""
+
+        payloads = []
+
+        def fake_post(_url, json=None, **_kwargs):
+            payloads.append(json)
+            return Response()
+
+        base = {
+            "model": "nai-diffusion-4-5-full",
+            "char_centers": [{"x": 0.1, "y": 0.2}, {"x": 0.9, "y": 0.8}],
+        }
+        people = [
+            {"prompt": "A", "negative": "na"},
+            {"prompt": "B", "negative": "nb"},
+        ]
+        with patch.object(APP.requests, "post", side_effect=fake_post):
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1, params={**base, "use_coords": False}, chars=people,
+            )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1, params={**base, "use_coords": True}, chars=people,
+            )
+
+        def centers(payload, key):
+            return [
+                item["centers"][0]
+                for item in payload["parameters"][key]["caption"]["char_captions"]
+            ]
+
+        neutral = [{"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0.5}]
+        chosen = [{"x": 0.1, "y": 0.2}, {"x": 0.9, "y": 0.8}]
+        self.assertEqual(centers(payloads[0], "v4_prompt"), neutral)
+        self.assertEqual(centers(payloads[0], "v4_negative_prompt"), neutral)
+        self.assertEqual(centers(payloads[1], "v4_prompt"), chosen)
+        self.assertEqual(centers(payloads[1], "v4_negative_prompt"), chosen)
 
     def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
         source = io.BytesIO()
