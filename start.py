@@ -348,8 +348,18 @@ def search_recipes(q="", axis="", limit=60, offset=0):
 _W_GROUP = re.compile(r"([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::")
 _ARTIST_CLOSER = re.compile(r"(artist\s*:[^,\n]*?\d)\s*::", re.I)
 
+# `#` 로 **시작하는 줄**은 메모다 — 전송·미리보기·토큰 계산에서 뺀다
+# (NAIS3-Custom 의 프롬프트 주석 참고). 줄 중간의 # 는 건드리지 않는다.
+_COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*\n?", re.M)
+
+
+def strip_comment_lines(text):
+    t = str(text or "")
+    return _COMMENT_LINE.sub("", t) if "#" in t else t
+
 
 def normalize_prompt(prompt):
+    prompt = strip_comment_lines(prompt)   # 주석 줄은 애초에 프롬프트가 아니다
     def fix(m):
         body = m.group(2).rstrip()
         if body[-1:].isdigit():
@@ -1401,6 +1411,7 @@ def fetch_anlas_balance(token):
 
 
 def nai_tokens(text):
+    text = strip_comment_lines(text)   # 주석 줄은 전송에서 빠지므로 세지도 않는다
     return count_tokens(text, TOKENIZER_FILE)
 
 
@@ -3303,8 +3314,9 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
                 cap, ng = c.get("prompt", ""), c.get("negative", "")
             else:
                 cap, ng = (list(c) + ["", ""])[:2]
+            cap = strip_comment_lines(cap)   # chars 경로는 normalize 를 안 지나므로 여기서
             if (cap or "").strip():
-                people.append((cap, ng or ""))
+                people.append((cap, strip_comment_lines(ng or "")))
     else:
         if female_caption:
             people.append((female_caption, char_negative or ""))
@@ -4167,6 +4179,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <button id="qtyM">−</button><input id="qty" value="1"><button id="qtyP">+</button>
       </div>
       <button class="primary go" id="genBtn">생성</button>
+      <button class="danger go hidden" id="stopBtn" title="도는 작업을 장 경계에서 멈춥니다 (전송 중인 장은 마저 받음)"
+        onclick="fetch('/api/stop',{method:'POST'})">■ 중지</button>
     </div>
     <div class="genrow" style="border:none;padding-top:0;">
       <button class="go" id="batchBtn" style="flex:1;">🎬 선택 세팅 일괄 생성</button>
@@ -8300,6 +8314,7 @@ async function poll(){
     $('batchBtn').disabled = s.running;
     $('genBtn').disabled = s.running;
     $('genBtn').textContent = s.running ? '생성 중...' : '생성';
+    if($('stopBtn')) $('stopBtn').classList.toggle('hidden', !s.running);
     /* 돌던 것이 멈춘 순간에만 한 번 알린다 (계속 울리면 안 된다) */
     if(WAS_RUNNING && !s.running) notifyDone(s.status_text || '생성이 끝났습니다.');
     WAS_RUNNING = s.running;
@@ -9568,6 +9583,11 @@ class ConfigServer:
                         self._json({"ok": True, "est": est, "balance": bal})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/stop"):
+                    # 중지 — 도는 작업이 **장(파일) 경계**에서 멈춘다 (전송 중인 장은 마저 받음).
+                    # running=False 는 소유 토큰을 안 바꾸므로 원자 선점 설계와 안전하게 공존한다.
+                    server.live.update(running=False)
+                    self._json({"ok": True})
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
@@ -9967,6 +9987,11 @@ def _run_generation(server):
     completed = 0
 
     while True:
+        if not server.live.running:   # /api/stop — 장 경계에서 멈춘다
+            log.info("■ 중지되었습니다 — '생성 시작'을 다시 누르면 이어서 합니다.")
+            server.live.update(status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.")
+            save_state(state)
+            return
         cfg = server.cfg  # 매 루프마다 최신 설정을 다시 읽는다 (실시간 반영 핵심)
         acfg = load_asset_config(cfg)
         pending = compute_pending(cfg, acfg, done_this_run, skip_set)
@@ -9986,14 +10011,21 @@ def _run_generation(server):
             log.info(f"⏸ {pc['cool_every']}장 완료 — {pc['cool_seconds']}초 쿨다운")
             server.live.update(status_text=f"쿨다운 {pc['cool_seconds']}초...")
             save_state(state)
-            time.sleep(pc["cool_seconds"])
+            # 1초 단위로 쪼개 자야 중지 버튼이 휴식 중에도 듣는다
+            for _ in range(int(pc["cool_seconds"])):
+                if not server.live.running:
+                    break
+                time.sleep(1)
         elif pc["soft_every"] and completed > 0 and completed % pc["soft_every"] == 0:
             pause = pc["soft_seconds"] + random.uniform(-5, 10)
             pause = max(1.0, pause)
             log.info(f"⏸ 소프트 휴식 {pause:.0f}초")
             server.live.update(status_text=f"소프트 휴식 {pause:.0f}초...")
             save_state(state)
-            time.sleep(pause)
+            for _ in range(int(pause)):
+                if not server.live.running:
+                    break
+                time.sleep(1)
 
         negative = acfg["base"].get("nsfw_negative_prompt", acfg["base"]["negative_prompt"])
         scale = acfg["base"].get("cfg_scale", cfg.get("cfg_scale", 5.5))
