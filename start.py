@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import math
+import os
 import random
 import re
 import string
@@ -107,6 +108,59 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("gen")
+
+
+# JSON 설정/재개 상태는 자동저장과 생성 worker가 동시에 만질 수 있다.
+# 같은 디렉터리의 임시 파일을 fsync한 뒤 os.replace해야 중간 종료에도 반쪽 JSON이 남지 않는다.
+_JSON_IO_LOCK = threading.RLock()
+
+
+def _atomic_write_bytes(path, payload, keep_backup=True):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _JSON_IO_LOCK:
+        if keep_backup and path.exists():
+            try:
+                old = path.read_bytes()
+                bak = path.with_name(path.name + ".bak")
+                bak_tmp = bak.with_name(f".{bak.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                with open(bak_tmp, "wb") as f:
+                    f.write(old); f.flush(); os.fsync(f.fileno())
+                os.replace(bak_tmp, bak)
+            except OSError as e:
+                log.warning(f"JSON 백업 저장 실패({path.name}): {e}")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(payload); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path, data, indent=2, keep_backup=True):
+    raw = json.dumps(data, ensure_ascii=False, indent=indent).encode("utf-8")
+    _atomic_write_bytes(path, raw, keep_backup=keep_backup)
+
+
+def load_json_recover(path):
+    """주 파일이 잘렸으면 마지막 정상 .bak을 읽고 주 파일도 복구한다."""
+    path = Path(path)
+    with _JSON_IO_LOCK:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as first:
+            bak = path.with_name(path.name + ".bak")
+            try:
+                data = json.loads(bak.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise first
+            log.error(f"손상된 {path.name} 대신 백업을 복구했습니다: {first}")
+            atomic_write_json(path, data, keep_backup=False)
+            return data
 
 # 체위 목록 (asset_config.json 의 nude 씬을 5장 단위로 그룹핑한 것) — 브라우저 체크박스용
 POSITIONS = [{"id": 101, "cat": "A", "label": "A01 핸드잡"}, {"id": 106, "cat": "A", "label": "A02 펠라치오"}, {"id": 111, "cat": "A", "label": "A03 파이즈리"}, {"id": 116, "cat": "A", "label": "A04 69"}, {"id": 121, "cat": "A", "label": "A05 허벅지"}, {"id": 126, "cat": "A", "label": "A06 스탠딩69"}, {"id": 131, "cat": "A", "label": "A07 피드백"}, {"id": 136, "cat": "A", "label": "A08 플레시라이트"}, {"id": 141, "cat": "A", "label": "A09 라잉블로우"}, {"id": 146, "cat": "A", "label": "A10 노스폴"}, {"id": 151, "cat": "A", "label": "A11 너싱핑거링"}, {"id": 156, "cat": "A", "label": "A12 너싱핸드잡"}, {"id": 161, "cat": "A", "label": "A13 온사이드핑거링"}, {"id": 166, "cat": "A", "label": "A14 온사이드핸드잡"}, {"id": 171, "cat": "A", "label": "A15 우로보로스"}, {"id": 176, "cat": "A", "label": "A16 싯앤블로우"}, {"id": 181, "cat": "A", "label": "A17 사우스폴"}, {"id": 186, "cat": "A", "label": "A18 스탠드앤블로우"}, {"id": 191, "cat": "A", "label": "A19 스로트스와빙"}, {"id": 201, "cat": "B", "label": "B01 정상위"}, {"id": 206, "cat": "B", "label": "B02 메이팅 프레스"}, {"id": 211, "cat": "B", "label": "B03 레그락정상위"}, {"id": 216, "cat": "B", "label": "B04 다리어깨"}, {"id": 221, "cat": "B", "label": "B05 테이블"}, {"id": 226, "cat": "B", "label": "B06 데크체어"}, {"id": 231, "cat": "B", "label": "B07 이글"}, {"id": 236, "cat": "B", "label": "B08 가드"}, {"id": 241, "cat": "B", "label": "B09 플랫폼미셔너리"}, {"id": 246, "cat": "B", "label": "B10 리버스앤빌"}, {"id": 251, "cat": "B", "label": "B11 시저드데크체어"}, {"id": 256, "cat": "B", "label": "B12 사이드웨이미셔너리"}, {"id": 261, "cat": "B", "label": "B13 티스퀘어"}, {"id": 266, "cat": "B", "label": "B14 빅토리"}, {"id": 301, "cat": "C", "label": "C01 후배위"}, {"id": 306, "cat": "C", "label": "C02 측위"}, {"id": 311, "cat": "C", "label": "C03 프론본"}, {"id": 316, "cat": "C", "label": "C04 립프로그"}, {"id": 321, "cat": "C", "label": "C05 크라우칭타이거"}, {"id": 326, "cat": "C", "label": "C06 백파이프"}, {"id": 331, "cat": "C", "label": "C07 벤트스푼"}, {"id": 336, "cat": "C", "label": "C08 댕글링도기"}, {"id": 341, "cat": "C", "label": "C09 자키"}, {"id": 346, "cat": "C", "label": "C10 라잉버틀러"}, {"id": 351, "cat": "C", "label": "C11 머메이드"}, {"id": 356, "cat": "C", "label": "C12 마운팅"}, {"id": 361, "cat": "C", "label": "C13 사이드바이사이드"}, {"id": 366, "cat": "C", "label": "C14 스피드범프"}, {"id": 371, "cat": "C", "label": "C15 트라이앵글"}, {"id": 376, "cat": "C", "label": "C16 트위스티드스푼"}, {"id": 401, "cat": "D", "label": "D01 기승위"}, {"id": 406, "cat": "D", "label": "D02 역기승위"}, {"id": 411, "cat": "D", "label": "D03 아마존"}, {"id": 416, "cat": "D", "label": "D04 마스터리"}, {"id": 421, "cat": "D", "label": "D05 리버스아마존"}, {"id": 426, "cat": "D", "label": "D06 리버스메이팅프레스"}, {"id": 431, "cat": "D", "label": "D07 리버스미셔너리"}, {"id": 436, "cat": "D", "label": "D08 스쿼트"}, {"id": 501, "cat": "E", "label": "E01 대면좌위"}, {"id": 506, "cat": "E", "label": "E02 배면좌위"}, {"id": 511, "cat": "E", "label": "E03 사이드새들"}, {"id": 516, "cat": "E", "label": "E04 바스켓"}, {"id": 521, "cat": "E", "label": "E05 체어"}, {"id": 526, "cat": "E", "label": "E06 크레이들"}, {"id": 531, "cat": "E", "label": "E07 프롬비하인드"}, {"id": 536, "cat": "E", "label": "E08 프롬프론트"}, {"id": 541, "cat": "E", "label": "E09 닐링바디가드"}, {"id": 546, "cat": "E", "label": "E10 퍼칭"}, {"id": 551, "cat": "E", "label": "E11 리클라인드테이블로터스"}, {"id": 556, "cat": "E", "label": "E12 리버스퍼칭"}, {"id": 561, "cat": "E", "label": "E13 리버스세인트"}, {"id": 566, "cat": "E", "label": "E14 리버스테이블로터스"}, {"id": 571, "cat": "E", "label": "E15 세인트"}, {"id": 576, "cat": "E", "label": "E16 시티드캐리"}, {"id": 581, "cat": "E", "label": "E17 시팅테이블로터스"}, {"id": 586, "cat": "E", "label": "E18 스튜던츠"}, {"id": 591, "cat": "E", "label": "E19 테이블로터스"}, {"id": 596, "cat": "E", "label": "E20 트위스티드체어"}, {"id": 601, "cat": "F", "label": "F01 들박"}, {"id": 606, "cat": "F", "label": "F02 역들박"}, {"id": 611, "cat": "F", "label": "F03 풀넬슨"}, {"id": 616, "cat": "F", "label": "F04 스탠딩백"}, {"id": 621, "cat": "F", "label": "F05 스탠딩대면"}, {"id": 626, "cat": "F", "label": "F06 바디가드"}, {"id": 631, "cat": "F", "label": "F07 발레리나"}, {"id": 636, "cat": "F", "label": "F08 브라이덜캐리"}, {"id": 641, "cat": "F", "label": "F09 버틀러"}, {"id": 646, "cat": "F", "label": "F10 케이블카"}, {"id": 651, "cat": "F", "label": "F11 댄서"}, {"id": 656, "cat": "F", "label": "F12 페어리"}, {"id": 661, "cat": "F", "label": "F13 플랫폼캐리"}, {"id": 666, "cat": "F", "label": "F14 플랫폼스탠딩도기"}, {"id": 671, "cat": "F", "label": "F15 프리즌가드"}, {"id": 676, "cat": "F", "label": "F16 리어애드미럴"}, {"id": 681, "cat": "F", "label": "F17 리버스댄서"}, {"id": 686, "cat": "F", "label": "F18 스텝"}, {"id": 691, "cat": "F", "label": "F19 서스펜디드로터스"}, {"id": 701, "cat": "G", "label": "G01 파일드라이버"}, {"id": 706, "cat": "G", "label": "G02 서스펜션브릿지"}, {"id": 711, "cat": "G", "label": "G03 크랩"}, {"id": 716, "cat": "G", "label": "G04 레그글라이더"}, {"id": 721, "cat": "G", "label": "G05 휠배로우"}, {"id": 726, "cat": "G", "label": "G06 잭해머"}, {"id": 731, "cat": "G", "label": "G07 아치"}, {"id": 736, "cat": "G", "label": "G08 플로어브릿지"}, {"id": 741, "cat": "G", "label": "G09 플랫폼레그글라이더"}, {"id": 746, "cat": "G", "label": "G10 리버스잭해머"}, {"id": 751, "cat": "G", "label": "G11 리버스파일드라이버"}, {"id": 756, "cat": "G", "label": "G12 리버스서스펜션브릿지"}, {"id": 761, "cat": "G", "label": "G13 리버스휠배로우"}, {"id": 766, "cat": "G", "label": "G14 시저드레그글라이더"}, {"id": 771, "cat": "G", "label": "G15 스윙잉"}, {"id": 776, "cat": "G", "label": "G16 트라피즈"}, {"id": 781, "cat": "G", "label": "G17 언유주얼"}]
@@ -1645,7 +1699,81 @@ STYLE_SORTS = {
 }
 
 
-def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded=""):
+# ── 작가 평가 (DanbooruArtistRater 의 ratings 를 우리 구조로) ──────────
+#   별점·즐겨찾기·차단·메모를 작가 태그에 붙인다. 차단한 작가가 프롬프트에 있으면
+#   생성 전에 알려 준다. 그림체 라이브러리 정렬·필터에도 쓰인다.
+RATINGS_FILE = BASE_DIR / "수집" / "작가평가.json"
+_RATINGS = {"loaded": False, "data": {}}
+
+
+def load_ratings():
+    if not _RATINGS["loaded"]:
+        d = {}
+        if RATINGS_FILE.exists():
+            try:
+                d = json.loads(RATINGS_FILE.read_text(encoding="utf-8")) or {}
+            except Exception as e:
+                log.warning(f"작가평가.json 읽기 실패: {e}")
+        _RATINGS.update({"loaded": True, "data": d if isinstance(d, dict) else {}})
+    return _RATINGS["data"]
+
+
+def save_ratings(d):
+    RATINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RATINGS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    _RATINGS.update({"loaded": True, "data": d})
+    return d
+
+
+def rate_artist(name, **fields):
+    """작가 하나의 평가를 고친다. fields: score(0~5) · fav · block · memo"""
+    key = (name or "").strip().lower()
+    if not key:
+        return {}
+    d = load_ratings()
+    cur = dict(d.get(key) or {})
+    for k in ("score", "fav", "block", "memo"):
+        if k in fields:
+            if k == "score":
+                cur[k] = max(0, min(5, int(fields[k] or 0)))
+            elif k == "memo":
+                cur[k] = str(fields[k] or "")[:500]
+            else:
+                cur[k] = bool(fields[k])
+    if not any([cur.get("score"), cur.get("fav"), cur.get("block"), cur.get("memo")]):
+        d.pop(key, None)          # 전부 비면 기록을 남기지 않는다
+    else:
+        d[key] = cur
+    save_ratings(d)
+    return cur
+
+
+def blocked_artists_in(text):
+    """프롬프트에 차단한 작가가 들어 있으면 목록으로 (생성 전 경고용)."""
+    d = load_ratings()
+    blocked = {k for k, v in d.items() if v.get("block")}
+    if not blocked:
+        return []
+    names = {a.lower() for _, a in parse_artist_combo(text or "")[0]}
+    return sorted(blocked & names)
+
+
+def style_rating(rec):
+    """그림체 한 줄의 평가 요약 — 작가들의 평균 별점·즐겨찾기·차단 포함 여부."""
+    d = load_ratings()
+    arts = [(a or "").lower() for a in (rec.get("artists") or [])]
+    vals = [d.get(a) for a in arts if d.get(a)]
+    scores = [v["score"] for v in vals if v.get("score")]
+    return {
+        "score": round(sum(scores) / len(scores), 1) if scores else 0,
+        "fav": any(v.get("fav") for v in vals),
+        "block": any(v.get("block") for v in vals),
+        "rated": len(vals),
+    }
+
+
+def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="",
+                  rating=""):
     """그림체 검색. q=제목/작가/프롬프트, tab=NAI·R18_NAI, source=아카·도랑·내 이미지,
     sort=recommend|views|newest|oldest|artists, seeded=1 이면 설정값 완비된 것만."""
     rows = load_combos()
@@ -1662,6 +1790,14 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
         hit = [r for r in hit if (r.get("source") or "") == source]
     if seeded in ("1", "true", True):
         hit = [r for r in hit if (r.get("params") or {}).get("seed")]
+    # 평가 필터 — fav(즐겨찾기만) · rated(별점 매긴 것만) · hideblock(차단 숨김)
+    if rating:
+        if rating == "fav":
+            hit = [r for r in hit if style_rating(r)["fav"]]
+        elif rating == "rated":
+            hit = [r for r in hit if style_rating(r)["score"]]
+        elif rating == "hideblock":
+            hit = [r for r in hit if not style_rating(r)["block"]]
     if sort in STYLE_SORTS and sort != "default":
         rev = sort in {"newest"}
         hit = sorted(hit, key=STYLE_SORTS[sort], reverse=rev)
@@ -1674,10 +1810,17 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
                 out[v] = out.get(v, 0) + 1
         return out
 
+    page = hit[offset:offset + limit]
+    # 카드에 평가(별점·즐겨찾기·차단)를 실어 준다 — 화면에서 바로 보이게
+    items = []
+    for r in page:
+        item = dict(r)
+        item["_rate"] = style_rating(r)
+        items.append(item)
     return {"total": len(rows), "matched": len(hit),
             "sources": tally("source", "도랑"), "tabs": tally("tab"),
             "seeded": sum(1 for r in rows if (r.get("params") or {}).get("seed")),
-            "items": hit[offset:offset + limit], "offset": offset}
+            "items": items, "offset": offset}
 
 
 # ══ 캐릭터 빌더 후보사전 (슬롯별 후보 태그 — 후보사전.json 에서 자유롭게 확장) ══
@@ -2551,8 +2694,7 @@ def _prefill_partner_defaults(cfg):
 
 def load_or_init_config():
     if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
+        cfg = load_json_recover(SETTINGS_FILE)
         merged = dict(DEFAULT_CONFIG)
         merged.update(cfg)
         ensure_settings_migration()
@@ -2716,8 +2858,7 @@ def save_config(cfg):
     clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
     _BOORU_KEYS.clear()
     _BOORU_KEYS.update(clean.get("booru_keys") or {})
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
+    atomic_write_json(SETTINGS_FILE, clean)
 
 
 # ═══════════════ 프롬프트 조합 ═══════════════
@@ -3724,7 +3865,7 @@ def save_scenes(scenes):
             # 해상도를 직접 입력으로 두겠다는 표시 (프리셋과 값이 같아도 칸을 보여 준다)
             "custom_res": bool(s.get("custom_res")),
         })
-    SCENES_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(SCENES_FILE, out, indent=1)
     return out
 
 
@@ -3840,14 +3981,12 @@ def resolve_fragments(texts, frags=None, counters=None, rng=None):
 
 def load_state():
     if STATE_FILE.exists():
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        return load_json_recover(STATE_FILE)
     return {"seeds": {}, "progress": {}, "daily": {}, "total_generated": 0}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    atomic_write_json(STATE_FILE, state)
 
 
 def daily_count(state):
@@ -7531,6 +7670,47 @@ function openCombos(target){
   $('modalBg').style.display = 'flex';
 }
 
+/* 작가 평가 배지 — 별점·즐겨찾기·차단을 한눈에 (rater 의 ratings 를 우리 식으로) */
+function rateBadge(r){
+  r = r || {};
+  if(r.block) return '⛔ 차단됨';
+  const s = r.score ? '★'.repeat(Math.round(r.score)) + `${r.score}` : '☆ 평가';
+  return (r.fav ? '💛 ' : '') + s;
+}
+/* 작가 평가 모달 — 조합 안의 작가마다 별점·즐겨찾기·차단·메모 */
+async function openRate(artists){
+  const cur = await (await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({list:true})})).json();
+  const R = (cur.ok && cur.ratings) || {};
+  const rows = artists.map(a => {
+    const k = String(a).toLowerCase(), v = R[k] || {};
+    return `<div class="row" data-art="${escA(k)}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      <b style="min-width:150px;font-family:var(--mono);font-size:var(--fs-xs);">${esc(a)}</b>
+      <span>${[0,1,2,3,4,5].map(n => `<button data-star="${n}" style="padding:2px 5px;${(v.score||0)===n?'background:var(--accent);color:#fff;':''}">${n===0?'—':'★'+n}</button>`).join('')}</span>
+      <label style="display:flex;gap:3px;align-items:center;"><input type="checkbox" data-fav ${v.fav?'checked':''}>즐겨찾기</label>
+      <label style="display:flex;gap:3px;align-items:center;"><input type="checkbox" data-block ${v.block?'checked':''}>차단</label>
+      <input type="text" data-memo placeholder="메모" value="${escA(v.memo||'')}" style="flex:1;min-width:120px;">
+    </div>`;
+  }).join('');
+  $('modalTitle').textContent = '⭐ 작가 평가';
+  $('modalBody').innerHTML = `<p class="hint">별점·즐겨찾기는 그림체 목록의 필터로 쓰이고, 차단한 작가가
+    프롬프트에 있으면 생성 전에 알려 줍니다. 저장은 즉시 됩니다 (수집/작가평가.json).</p>${rows}`;
+  $('modalBg').style.display = 'flex';
+  const send = async (el, body) => {
+    const art = el.closest('[data-art]').dataset.art;
+    await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(Object.assign({artist: art}, body))});
+  };
+  document.querySelectorAll('#modalBody [data-star]').forEach(b => b.addEventListener('click', async () => {
+    await send(b, {score: Number(b.dataset.star)});
+    b.parentElement.querySelectorAll('[data-star]').forEach(x => x.style.background = '');
+    b.style.background = 'var(--accent)'; b.style.color = '#fff';
+  }));
+  document.querySelectorAll('#modalBody [data-fav]').forEach(c2 => c2.addEventListener('change', () => send(c2, {fav: c2.checked})));
+  document.querySelectorAll('#modalBody [data-block]').forEach(c2 => c2.addEventListener('change', () => send(c2, {block: c2.checked})));
+  document.querySelectorAll('#modalBody [data-memo]').forEach(t => t.addEventListener('change', () => send(t, {memo: t.value})));
+}
+
 function styleCard(c){
   const p = c.params || {};
   const px = CARD_PX[($('comboCard')||{}).value || 'medium'];
@@ -7560,6 +7740,8 @@ function styleCard(c){
           ${c.base ? `<button data-cbase="${escA(c.base)}">베이스 전체</button>` : ''}
           <button class="primary" data-cfull="${escA(JSON.stringify(c))}">그림체 통째로 적용</button>
           <button data-csave="${escA(JSON.stringify(c))}">내 프리셋으로 저장</button>
+          <button data-crate="${escA(JSON.stringify(c.artists||[]))}"
+            title="이 조합의 작가들에게 별점·즐겨찾기·차단을 매깁니다">${rateBadge(c._rate)}</button>
           ${c.url ? `<a href="${escA(c.url)}" target="_blank" style="font-size:var(--fs-xs);color:var(--muted);">원본 ↗</a>` : ''}
         </div>
       </div>
@@ -7668,6 +7850,11 @@ async function loadCombos(append){
   });
   host.querySelectorAll('[data-cfull]').forEach(b =>
     b.addEventListener('click', () => applyStyle(JSON.parse(b.dataset.cfull))));
+  host.querySelectorAll('[data-crate]').forEach(b => b.addEventListener('click', () => {
+    const arts = JSON.parse(b.dataset.crate || '[]');
+    if(!arts.length){ flash('이 조합에는 작가 태그가 없습니다.'); return; }
+    openRate(arts);
+  }));
   host.querySelectorAll('[data-csave]').forEach(b => b.addEventListener('click', async () => {
     const c = JSON.parse(b.dataset.csave);
     const name = prompt('프리셋 이름:', (c.title || '그림체').slice(0, 30));
@@ -8614,6 +8801,81 @@ def esc_html(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+# 서버는 HTML input의 min/max를 신뢰하지 않는다. 직접 HTTP 요청과 손상된 설정도 같은 규칙을 거친다.
+_NUMERIC_RULES = {
+    "steps": (1, 50, True), "cfg_scale": (1.0, 10.0, False),
+    "cfg_rescale": (0.0, 1.0, False), "save_quality": (40, 100, True),
+    "seed": (1, 999999999, True), "nai_seed": (0, 2**32 - 1, True),
+    "uncond_scale": (0.0, 1.5, False), "controlnet_strength": (0.0, 2.0, False),
+}
+_PACE_RULES = {
+    "delay_min": (0.0, 120.0, False), "delay_max": (0.0, 300.0, False),
+    "daily_cap": (1, 100000, True), "soft_every": (0, 100000, True),
+    "soft_seconds": (1, 3600, True), "cool_every": (0, 100000, True),
+    "cool_seconds": (1, 7200, True),
+}
+
+
+def _bounded_number(value, low, high, integer=False):
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("number must be finite")
+    if integer:
+        number = int(number)
+    used = max(low, min(high, number))
+    return int(used) if integer else float(used)
+
+
+def normalize_resolution(value):
+    raw = _bounded_number(value, 64, 2048, True)
+    return max(64, min(2048, raw // 64 * 64))
+
+
+def validate_config_value(key, value, current):
+    """(ok, value, corrections). corrections는 UI에 보낼 dotted-key 사전."""
+    fixed = {}
+    try:
+        if key in ("width", "height"):
+            used = normalize_resolution(value)
+        elif key in _NUMERIC_RULES:
+            used = _bounded_number(value, *_NUMERIC_RULES[key])
+        elif key == "save_max_side":
+            used = int(value)
+            if used not in (0, 768, 1024, 1536):
+                raise ValueError("unsupported save size")
+        elif key == "uc_preset":
+            used = int(value)
+            if used not in (0, 1, 3, 4):
+                raise ValueError("unsupported UC preset")
+        elif key == "pace":
+            if not isinstance(value, dict):
+                raise ValueError("pace must be an object")
+            used = dict(current) if isinstance(current, dict) else dict(PACE_DEFAULT)
+            for pkey, rule in _PACE_RULES.items():
+                if pkey not in value:
+                    continue
+                pused = _bounded_number(value[pkey], *rule)
+                used[pkey] = pused
+                if pused != value[pkey]:
+                    fixed[f"pace.{pkey}"] = {"sent": value[pkey], "used": pused}
+            unknown = set(value) - set(_PACE_RULES)
+            if unknown:
+                raise ValueError(f"unknown pace fields: {sorted(unknown)}")
+            if used.get("delay_max", 0) < used.get("delay_min", 0):
+                sent = used["delay_max"]
+                used["delay_max"] = used["delay_min"]
+                fixed["pace.delay_max"] = {"sent": sent, "used": used["delay_max"]}
+        else:
+            return True, value, fixed
+    except (TypeError, ValueError, OverflowError):
+        return False, current, fixed
+    if used != value:
+        fixed[key] = {"sent": value, "used": used}
+    return True, used, fixed
+
+
 class LiveState:
     """생성 진행 상황을 브라우저에 공유하기 위한 상태 저장소."""
 
@@ -8706,6 +8968,8 @@ class ConfigServer:
         self.start_event = threading.Event()
         self.httpd = None
         self.url = None
+        self.config_lock = threading.RLock()
+        self.config_revision = 0
 
     def snapshot_config(self):
         settings_out = []
@@ -8738,7 +9002,8 @@ class ConfigServer:
         except Exception as e:
             log.warning(f"세팅 로드 실패: {e}")
         return {
-            "config": {k: v for k, v in self.cfg.items() if not k.startswith("_")},
+            "config": {**{k: v for k, v in self.cfg.items() if not k.startswith("_")},
+                       "_revision": self.config_revision},
             "settings": settings_out,
             "scene_clashes": scene_num_clashes(),
             "fragments": list_fragments(),
@@ -9362,40 +9627,44 @@ class ConfigServer:
             data = json.loads(body)
         except json.JSONDecodeError:
             return {"ok": False, "error": "잘못된 데이터"}
-        old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-        # ⚠ 화이트리스트를 손으로 적다가 저장 포맷·메타제거·밴 예방·3분할 키가 빠져
-        #   화면에서 고른 값이 조용히 버려지고도 ok:true 가 나갔다 (CQA-011, Critical).
-        #   이제 **DEFAULT_CONFIG 의 사용자 편집 키 전부**를 자동으로 받는다 —
-        #   키를 새로 만들 때 여기 적는 것을 잊어도 저장이 죽지 않는다.
-        allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
-        allowed |= {"booru_keys"}          # 기본값 표에 없지만 사용자 편집값
-        allowed -= {"male_prompt"}         # 레거시(세팅 상대역으로 이전됨)
-        accepted, rejected, fixed_vals = [], [], {}
-        for key, val in data.items():
-            if key in allowed:
-                if key in ("width", "height"):
-                    # NAI 는 64 배수·범위 밖을 거부한다 — 조용히 보내지 말고 맞춰 준다 (CQA-012)
-                    try:
-                        raw = int(val)
-                    except (TypeError, ValueError):
-                        raw = DEFAULT_CONFIG[key]
-                    val = max(64, min(2048, raw // 64 * 64)) or 64
-                    if val != raw:
-                        fixed_vals[key] = {"sent": raw, "used": val}
-                self.cfg[key] = val
+        revision = data.pop("_revision", None)
+        with self.config_lock:
+            if revision is not None:
+                try:
+                    stale = int(revision) != self.config_revision
+                except (TypeError, ValueError):
+                    stale = True
+                if stale:
+                    return {"ok": False, "conflict": True, "revision": self.config_revision,
+                            "error": "다른 화면에서 설정이 먼저 변경됐습니다. 새로고침 후 다시 시도하세요."}
+            old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
+            allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
+            allowed |= {"booru_keys"}
+            allowed -= {"male_prompt"}
+            accepted, rejected, fixed_vals = [], [], {}
+            for key, val in data.items():
+                if key not in allowed:
+                    if not key.startswith("_"):
+                        rejected.append(key)
+                    continue
+                ok, used, fixes = validate_config_value(key, val, self.cfg.get(key))
+                fixed_vals.update(fixes)
+                if not ok:
+                    rejected.append(key)
+                    continue
+                self.cfg[key] = used
                 accepted.append(key)
-            elif not key.startswith("_"):
-                rejected.append(key)
-        if rejected:
-            log.info(f"설정 저장에서 모르는 키를 건너뜀: {', '.join(sorted(rejected))}")
-        new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-        delete_char_files(self.cfg, old_ids - new_ids)
-        sync_chars_to_files(self.cfg)
-        save_config(self.cfg)
-        # 무엇이 실제로 저장됐는지 돌려준다 (조용한 유실 방지)
-        if fixed_vals:
-            log.info(f"해상도를 NAI 규격(64 배수·64~2048)으로 맞췄습니다: {fixed_vals}")
-        return {"ok": True, "accepted": accepted, "rejected": rejected, "fixed": fixed_vals}
+            new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
+            delete_char_files(self.cfg, old_ids - new_ids)
+            sync_chars_to_files(self.cfg)
+            save_config(self.cfg)
+            self.config_revision += 1
+            if rejected:
+                log.warning(f"설정 저장에서 잘못된 키/값을 거절함: {', '.join(sorted(rejected))}")
+            if fixed_vals:
+                log.info(f"설정값을 허용 범위로 맞췄습니다: {fixed_vals}")
+            return {"ok": True, "accepted": accepted, "rejected": rejected,
+                    "fixed": fixed_vals, "revision": self.config_revision}
 
     def handle_scene_save(self, body):
         """씬 내부 프롬프트 수정 → asset_config.json 에 저장 (생성 중이면 다음 장부터 반영)"""
@@ -9579,7 +9848,8 @@ class ConfigServer:
                             q.get("q", [""])[0], int(q.get("limit", ["40"])[0]),
                             int(q.get("offset", ["0"])[0]),
                             tab=q.get("tab", [""])[0], source=q.get("source", [""])[0],
-                            sort=q.get("sort", [""])[0], seeded=q.get("seeded", [""])[0])
+                            sort=q.get("sort", [""])[0], seeded=q.get("seeded", [""])[0],
+                            rating=q.get("rating", [""])[0])
                         prewarm_images(res.get("items"), n=len(res.get("items") or []))
                         self._json({"ok": True, **res})
                     except Exception as e:
@@ -9794,6 +10064,20 @@ class ConfigServer:
                     # 중지 — 취소 **플래그**만 세운다 (CQA-001: running 을 직접 끄면
                     # 옛 작업이 마저 도는 동안 새 작업이 실행권을 얻어 겹친다).
                     self._json({"ok": server.live.request_stop()})
+                elif self.path.startswith("/api/rate"):
+                    # 작가 평가 — 별점·즐겨찾기·차단·메모 (rater 의 ratings 를 우리 구조로)
+                    try:
+                        d = json.loads(body or b"{}")
+                        if d.get("list"):
+                            self._json({"ok": True, "ratings": load_ratings()})
+                        else:
+                            cur = rate_artist(d.get("artist", ""),
+                                              **{k: d[k] for k in ("score", "fav", "block", "memo")
+                                                 if k in d})
+                            self._json({"ok": True, "artist": (d.get("artist") or "").lower(),
+                                        "rating": cur})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
