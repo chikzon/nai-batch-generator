@@ -10702,8 +10702,13 @@ class ConfigServer:
                 elif self.path.startswith("/api/setting_dup"):
                     try:
                         d = json.loads(body or b"{}")
-                        r = duplicate_setting_group(d.get("name", ""), d.get("id"))
-                        self._json(r)
+                        # 씬 번호가 없거나 숫자가 아니면 파이썬 오류 대신 사람 말로 (세팅 빌더 점검)
+                        try:
+                            sid = int(d.get("id"))
+                        except (TypeError, ValueError):
+                            self._json({"ok": False, "error": "복제할 세트의 씬 번호(id)가 필요합니다."})
+                            return
+                        self._json(duplicate_setting_group(d.get("name", ""), sid))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/ref_add"):
