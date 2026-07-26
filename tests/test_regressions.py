@@ -87,6 +87,15 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(combined, 58.0)
         self.assertIn("함께 보냅니다", "\n".join(captured.output))
 
+    def test_pipe_tags_survive_inline_wildcard_expansion(self):
+        """`{| |}`(23,000장)·`{|_|}` 는 실제 단부루 태그다 — 인라인 선택으로 오인해 지우면 안 된다."""
+        for text in ("1girl, {| |}, smile", "1girl, {|_|}", "1girl, {a|}", "1girl, {|b}"):
+            got, _ = APP.resolve_fragments([text], counters={})
+            self.assertEqual(got[0], text, f"파이프 태그가 파괴됨: {text}")
+        # 정상 인라인 선택은 계속 동작해야 한다
+        got, _ = APP.resolve_fragments(["1girl, {red|blue|green}"], counters={})
+        self.assertIn(got[0].rsplit(", ", 1)[-1], {"red", "blue", "green"})
+
     def test_tag_alias_autocomplete_returns_canonical_tag(self):
         data = {
             "rows": [

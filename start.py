@@ -4234,8 +4234,12 @@ def resolve_fragments(texts, frags=None, counters=None, rng=None):
 
     def inline(m):
         parts = [x.strip() for x in m.group(1).split("|")]
-        parts = [x for x in parts if x]
-        return rng.choice(parts) if parts else ""
+        # ⚠ `{| |}`(23,000장)·`{|_|}`(11,000장) 은 **실제 단부루 태그**다 (얼굴 표정).
+        #   빈 칸이 하나라도 있으면 인라인 선택이 아니라 태그로 보고 **원문을 그대로 둔다**.
+        #   예전엔 빈 조각을 걸러내 `{| |}` 가 통째로 사라졌다 (NAIS3 세션 지적).
+        if any(not x for x in parts) or len(parts) < 2:
+            return m.group(0)
+        return rng.choice(parts)
 
     out = []
     for t in texts:
