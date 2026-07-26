@@ -629,6 +629,63 @@ class RegressionTests(unittest.TestCase):
             server.httpd.shutdown()
             server.httpd.server_close()
 
+    def test_anlas_estimate_is_conservative_until_opus_tier_is_cached(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["token"] = "pst-tier-fixture"
+        cfg.update(width=832, height=1216, steps=28)
+        server = APP.ConfigServer(cfg)
+        with (
+            patch.object(APP, "PREVIEW_PORT_RANGE", (port,)),
+            patch.object(APP.webbrowser, "open", return_value=None),
+        ):
+            url = server.start()
+
+        def post(data):
+            request = urllib.request.Request(
+                url + "api/anlas",
+                data=json.dumps(data).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.loads(response.read())
+
+        try:
+            unknown = post({"count": 1, "balance": False})
+            self.assertFalse(unknown["est"]["free"])
+            self.assertFalse(unknown["est"]["subscription_known"])
+            self.assertIsNone(unknown["est"]["opus"])
+
+            opus_balance = {
+                "fixed": 1000,
+                "purchased": 0,
+                "total": 1000,
+                "tier": 3,
+                "opus": True,
+                "active": True,
+            }
+            with patch.object(APP, "fetch_anlas_balance", return_value=opus_balance):
+                fetched = post({"count": 1, "balance": True})
+            self.assertTrue(fetched["est"]["free"])
+            self.assertEqual(fetched["balance"], opus_balance)
+
+            cached = post({"count": 1, "balance": False})
+            self.assertTrue(cached["est"]["free"])
+            self.assertTrue(cached["est"]["subscription_known"])
+            self.assertTrue(cached["est"]["opus"])
+            self.assertIsNone(cached["balance"])
+
+            # 계정 토큰이 바뀌면 이전 계정의 Opus 상태를 상속하지 않는다.
+            server.cfg["token"] = "pst-another-account"
+            changed = post({"count": 1, "balance": False})
+            self.assertFalse(changed["est"]["free"])
+            self.assertFalse(changed["est"]["subscription_known"])
+        finally:
+            server.httpd.shutdown()
+            server.httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

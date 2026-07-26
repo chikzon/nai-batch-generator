@@ -1010,7 +1010,7 @@ def anlas_per_image(width, height, steps, strength=1.0, char_refs=0):
     return max(base, 2) + 5 * int(char_refs)
 
 
-def anlas_estimate(cfg, count=1, width=None, height=None, opus=True, char_refs=0,
+def anlas_estimate(cfg, count=1, width=None, height=None, opus=False, char_refs=0,
                    mode="t2i", strength=1.0):
     """장당·총액과 무료 여부. count=한 회차에 뽑을 장수.
     mode: t2i | img2img | infill — **베이스 이미지를 쓰면 Opus 무료가 아니다**
@@ -6206,6 +6206,9 @@ function anlasRefresh(withBalance){
         txt = `${what} — 장당 ${e.per_image} × ${e.count.toLocaleString()} = `
             + `<b>${e.total.toLocaleString()} Anlas</b>`;
       }
+      if(e.subscription_known === false){
+        txt += ' <span style="color:#9a6700">(구독 등급 미확인 · 유료 기준 예상, 잔액 확인을 눌러주세요)</span>';
+      }
       if(r.balance){
         const b = r.balance;
         const after = b.total - e.total;
@@ -9981,6 +9984,8 @@ class ConfigServer:
         self.url = None
         self.config_lock = threading.RLock()
         self.config_revision = 0
+        self.anlas_balance_cache = None
+        self.anlas_balance_token_key = None
 
     def snapshot_config(self):
         settings_out = []
@@ -11128,9 +11133,18 @@ class ConfigServer:
                 elif self.path.startswith("/api/anlas"):
                     try:
                         d = json.loads(body or b"{}")
-                        bal = fetch_anlas_balance(server.cfg.get("token")) \
+                        token = str(server.cfg.get("token") or "")
+                        token_key = hashlib.sha256(token.encode("utf-8")).hexdigest() \
+                            if token else None
+                        if token_key != server.anlas_balance_token_key:
+                            server.anlas_balance_cache = None
+                            server.anlas_balance_token_key = token_key
+                        fresh_balance = fetch_anlas_balance(token) \
                             if d.get("balance") else None
-                        opus = bal["opus"] if bal else True
+                        if fresh_balance:
+                            server.anlas_balance_cache = fresh_balance
+                        known_balance = server.anlas_balance_cache
+                        opus = bool(known_balance and known_balance.get("opus"))
                         cfg = server.cfg
                         # 켜진 캐릭터 레퍼런스 수 — 장당 +5 이고 Opus 무료가 깨진다
                         refs = sum(1 for r in cfg.get("char_refs", []) if r.get("enabled"))
@@ -11179,7 +11193,15 @@ class ConfigServer:
                                                  strength=float(d.get("strength") or 1.0))
                             est["total"] += 2 * vibe_new
                             est["vibe_encode"] = 2 * vibe_new
-                        self._json({"ok": True, "est": est, "balance": bal})
+                        est["subscription_known"] = known_balance is not None
+                        est["opus"] = (bool(known_balance.get("opus"))
+                                       if known_balance is not None else None)
+                        self._json({
+                            "ok": True,
+                            "est": est,
+                            # 잔액 숫자는 사용자가 조회 버튼을 눌렀을 때만 보낸다.
+                            "balance": fresh_balance if d.get("balance") else None,
+                        })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/stop"):
