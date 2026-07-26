@@ -1,0 +1,136 @@
+{
+  "_설명": "생성 옵션의 실제 내용입니다. 항목 추가/삭제/수정 자유 — UI 선택지에 바로 반영됩니다. UI의 [옵션 내용 편집]에서도 고칠 수 있습니다.",
+  "장소테마": {
+    "호텔": {
+      "A": "luxury hotel room, bedside, carpet",
+      "B": "luxury hotel room, on hotel bed, white sheets, large window",
+      "C": "luxury hotel room, on hotel bed, white sheets, large window",
+      "D": "luxury hotel room, on hotel bed, white sheets, large window",
+      "E": "luxury hotel suite, on sofa, large window",
+      "F": "luxury hotel room, against wall, floor-to-ceiling window",
+      "G": "luxury hotel room, spacious floor, soft carpet"
+    },
+    "온천여관": {
+      "A": "japanese ryokan room, tatami, futon, warm lantern light",
+      "B": "japanese ryokan room, on futon, tatami, warm lantern light, shoji",
+      "C": "japanese ryokan room, on futon, tatami, warm lantern light, shoji",
+      "D": "japanese ryokan room, on futon, tatami, warm lantern light",
+      "E": "japanese ryokan room, tatami, low table, warm lantern light",
+      "F": "onsen, outdoor bath, steam, stone floor, lanterns, wet",
+      "G": "japanese ryokan room, tatami, futon, warm lantern light"
+    },
+    "저택": {
+      "A": "luxury mansion bedroom, bedside, carpet, candlelight",
+      "B": "luxury mansion bedroom, canopy bed, silk sheets, candlelight",
+      "C": "luxury mansion bedroom, canopy bed, silk sheets, candlelight",
+      "D": "luxury mansion bedroom, canopy bed, silk sheets, candlelight",
+      "E": "mansion study, leather sofa, fireplace lighting, bookshelf",
+      "F": "mansion hallway, against wall, tall window",
+      "G": "mansion floor, fireplace lighting, luxurious rug"
+    },
+    "원룸": {
+      "A": "small apartment room, bedside, dim lamp light",
+      "B": "small apartment, on bed, messy sheets, dim lamp light, window",
+      "C": "small apartment, on bed, messy sheets, dim lamp light",
+      "D": "small apartment, on bed, messy sheets, dim lamp light",
+      "E": "small apartment, on couch, tv light",
+      "F": "small apartment, against wall, dim lamp light",
+      "G": "small apartment floor, rug, dim lamp light"
+    },
+    "사무실": {
+      "A": "office, desk lamp, window blinds",
+      "B": "office, lying on office desk, scattered papers, desk lamp",
+      "C": "office, lying on office desk, scattered papers, desk lamp",
+      "D": "office chair, window blinds",
+      "E": "office chair, window blinds, desk lamp",
+      "F": "office, against glass window, city view",
+      "G": "office floor, carpet, desk lamp"
+    },
+    "야외": {
+      "A": "forest clearing, grass",
+      "B": "on blanket, forest clearing, fireflies",
+      "C": "on blanket, forest clearing, fireflies",
+      "D": "on blanket, grass field",
+      "E": "sitting on blanket, forest clearing",
+      "F": "against tree, forest",
+      "G": "grass field, flowers"
+    },
+    "해변": {
+      "A": "beach, sand, beach mat",
+      "B": "lying on beach mat, sand, ocean, waves",
+      "C": "lying on beach mat, sand, ocean, waves",
+      "D": "on beach mat, sand, ocean",
+      "E": "sitting on beach mat, sand, ocean",
+      "F": "standing in shallow water, ocean, wet",
+      "G": "sand, beach, ocean"
+    },
+    "욕실": {
+      "A": "bathroom, tiles, steam, wet",
+      "B": "large bathtub, water, steam, wet",
+      "C": "bathroom floor, wet tiles, steam",
+      "D": "in bathtub, water, steam, wet",
+      "E": "bathtub edge, steam, wet",
+      "F": "bathroom, against tile wall, shower, water stream, wet",
+      "G": "bathroom floor, wet tiles, steam"
+    },
+    "판타지성": {
+      "A": "fantasy castle chamber, stone walls, candlelight",
+      "B": "fantasy castle bedroom, canopy bed, torchlight, stone walls",
+      "C": "fantasy castle bedroom, canopy bed, torchlight, stone walls",
+      "D": "fantasy castle bedroom, canopy bed, torchlight",
+      "E": "fantasy throne room, on throne, torchlight",
+      "F": "castle corridor, against stone wall, torchlight",
+      "G": "castle chamber, fur rug, candlelight"
+    },
+    "러브호텔": {
+      "A": "love hotel room, neon mood lighting, bedside",
+      "B": "love hotel, heart-shaped bed, pink sheets, neon mood lighting, mirror ceiling",
+      "C": "love hotel, heart-shaped bed, pink sheets, neon mood lighting, mirror ceiling",
+      "D": "love hotel, heart-shaped bed, pink sheets, neon mood lighting",
+      "E": "love hotel, sofa, neon mood lighting",
+      "F": "love hotel, against mirror wall, neon mood lighting",
+      "G": "love hotel floor, carpet, neon mood lighting"
+    }
+  },
+  "시간대": {
+    "아침": "morning, soft sunlight, sunlight through window",
+    "낮": "daytime, bright sunlight",
+    "노을": "sunset, dusk, golden hour lighting, orange light",
+    "밤": "night, dim warm lighting"
+  },
+  "표정진행": {
+    "참교육": [
+      "seductive smile, smug, half-closed eyes, licking lips, eye contact, looking at viewer",
+      "smug, smirk, teasing smile, half-closed eyes, light blush, eye contact",
+      "wavy mouth, trembling, sweat, heavy blush, tearing up, forced smile",
+      "ahegao, rolling eyes, stick out tongue, heart shaped pupils, crying, streaming tears, heavy blush",
+      "dazed, exhausted, teary eyes, drooling, twitching, heavy breathing"
+    ],
+    "수줍음": [
+      "embarrassed, shy, averting eyes, biting lip, deep blush",
+      "embarrassed, blush, looking away, covering own face, trembling",
+      "tearful, trembling, heavy blush, hand over own mouth, wavy mouth",
+      "crying, tightly closed eyes, tears, open mouth, heavy blush",
+      "exhausted, teary eyes, embarrassed smile, heavy breathing, blush"
+    ],
+    "도발": [
+      "seductive smile, smug, half-closed eyes, licking lips, eye contact, looking at viewer",
+      "smirk, teasing smile, eye contact, half-closed eyes, light blush",
+      "confident smile, sweat, blush, half-closed eyes, eye contact",
+      "grin, heart shaped pupils, eye contact, blush, open mouth",
+      "satisfied smug smile, licking lips, half-closed eyes, heavy breathing"
+    ],
+    "순애": [
+      "loving gaze, gentle smile, blush, eye contact",
+      "happy, smile, blush, eye contact, trembling",
+      "happy, deep blush, trembling, half-closed eyes, smile",
+      "happy tears, smile, heart shaped pupils, deep blush",
+      "satisfied smile, teary eyes, heavy breathing, blush"
+    ]
+  },
+  "탈의단계": {
+    "1": "open clothes, unbuttoned, clothes pull",
+    "2": "underwear only, bra, panties",
+    "3": "topless"
+  }
+}

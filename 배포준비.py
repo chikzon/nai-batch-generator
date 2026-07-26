@@ -1,0 +1,193 @@
+# -*- coding: utf-8 -*-
+"""
+남에게 줄 배포본 만들기 — 내 설정·토큰·생성물을 뺀 깨끗한 사본을 ZIP으로.
+
+  python 배포준비.py                 # 바탕화면에 ZIP 생성
+  python 배포준비.py --out D:\어디    # 위치 지정
+  python 배포준비.py --folder        # ZIP 대신 폴더로
+
+내 작업 폴더는 건드리지 않는다. 사본을 만들어서 거기서 지운다.
+
+■ 빠지는 것 (내 개인 데이터)
+   설정.json · 설정.txt의 토큰/그림체/네거티브/캐릭터 · 상태.json · 생성.log
+   수집/바이브/ (내 바이브·캐릭터 레퍼런스 원본과 인코딩)
+   output/ · 캐릭터/ 내 캐릭터 · 그림체/ 내 프리셋 · 수집/이미지캐시/원격/
+   __pycache__ · *.덮어쓰기전백업 · 개인 zip 파일
+   **세팅/ · 씬규격/ · asset_config.json** (내가 만든 씬 데이터 — 필수가 아님)
+■ 들어가는 것 (남이 바로 쓸 수 있는 자산)
+   start.py · 실행.bat · 수집/(그림체·작가통계·레시피·이미지캐시)
+   태그/ · 후보사전.json · 규격.json · 옵션.json · README.md
+
+세팅을 함께 주고 싶으면 `세팅/*.json` 만 따로 건네면 된다 (받는 쪽에서 세팅/ 에 넣으면 끝).
+"""
+import argparse
+import json
+import re
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+SRC = Path(__file__).resolve().parent
+
+# 통째로 뺄 것 (폴더/파일 이름)
+#   세팅/·씬규격/·asset_config.json 은 전부 '내가 만든 씬 데이터'다.
+#   (앱은 세팅/ 이 없으면 씬규격/ → asset_config.json 순으로 되살리므로 셋 다 빼야 한다)
+#   남에게 줄 때는 세팅 없이 시작하고, 필요하면 세팅 파일만 따로 건네면 된다.
+DROP_NAMES = {"__pycache__", "output", "생성.log", "설정.json", "상태.json",
+              "generation_state.json", "배포준비.py", ".git",
+              "세팅", "씬규격", "asset_config.json",
+              # 씬 모드 목록도 내가 만든 데이터다 (앱이 없으면 빈 목록으로 시작)
+              "씬.json",
+              # 선별·즐겨찾기는 내 생성물에 붙은 이름표라 남에게 갈 이유가 없다
+              "선별.json"}
+DROP_SUFFIX = (".덮어쓰기전백업", ".log", ".pyc", ".pickle")
+# 사용자 콘텐츠라 비우는 폴더 (폴더 자체는 남김)
+#   조각/ 은 와일드카드 — 내 조각을 남에게 딸려 보내지 않는다
+CLEAR_DIRS = ["그림체", "수집/이미지캐시/원격", "수집/바이브", "조각"]
+# 설정.txt 에서 값을 비울 항목 (캐릭터 이름은 캐릭터 파일과 함께 빠지므로 같이 비움)
+BLANK_KEYS = ["토큰", "그림체", "네거티브", "여자", "남자",
+              "캐릭터", "남자캐릭터", "파트너캐릭터"]
+
+
+def should_drop(p: Path, root: Path) -> bool:
+    if p.name in DROP_NAMES:
+        return True
+    if p.name.endswith(DROP_SUFFIX):
+        return True
+    # 최상위에 있는 개인 zip (프로젝트 자산이 아님)
+    if p.suffix.lower() == ".zip" and p.parent == root:
+        return True
+    return False
+
+
+def blank_settings_txt(path: Path):
+    """설정.txt 를 '값은 비고 설명은 남은' 템플릿으로."""
+    if not path.exists():
+        return
+    out, in_char_section = [], False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        # [여자 사사] 같은 캐릭터 섹션부터는 통째로 버림
+        if re.match(r"^\[(여자|남자)\s", stripped):
+            in_char_section = True
+            continue
+        if in_char_section:
+            if stripped.startswith("#") or not stripped:
+                in_char_section = False
+            else:
+                continue
+        m = re.match(r"^([^#=]+?)\s*=\s*(.*)$", line)
+        if m and m.group(1).strip() in BLANK_KEYS:
+            out.append(f"{m.group(1).strip()} = ")
+            continue
+        out.append(line)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def clean(dst: Path):
+    removed = 0
+    for p in sorted(dst.rglob("*"), key=lambda x: -len(x.parts)):
+        if should_drop(p, dst):
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    for rel in CLEAR_DIRS:
+        d = dst / rel
+        if d.exists():
+            for f in d.glob("*"):
+                try:
+                    shutil.rmtree(f) if f.is_dir() else f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            d.mkdir(exist_ok=True)
+    blank_settings_txt(dst / "설정.txt")
+
+    # 캐릭터/ 는 설명 파일만 남긴다
+    ch = dst / "캐릭터"
+    if ch.exists():
+        for f in ch.glob("*"):
+            if f.name != "규격_설명.txt":
+                try:
+                    shutil.rmtree(f) if f.is_dir() else f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def verify(dst: Path):
+    """개인 정보가 남지 않았는지 확인."""
+    problems = []
+    if (dst / "설정.json").exists():
+        problems.append("설정.json 이 남아 있음")
+    txt = dst / "설정.txt"
+    if txt.exists():
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^([^#=]+?)\s*=\s*(.+)$", line)
+            if m and m.group(1).strip() in BLANK_KEYS and m.group(2).strip():
+                problems.append(f"설정.txt 의 '{m.group(1).strip()}' 에 값이 남아 있음")
+    # 토큰 문자열 흔적
+    for p in dst.rglob("*.json"):
+        if p.stat().st_size > 30 * 1024 * 1024:
+            continue
+        try:
+            t = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if "pst-" in t:
+            problems.append(f"{p.relative_to(dst)} 에 NAI 토큰으로 보이는 문자열")
+    return problems
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=str(Path.home() / "Desktop"))
+    ap.add_argument("--folder", action="store_true", help="ZIP 대신 폴더로 남김")
+    a = ap.parse_args()
+
+    out_dir = Path(a.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work = out_dir / "NAI배치생성기"
+    if work.exists():
+        shutil.rmtree(work)
+
+    print(f"사본 만드는 중... ({SRC.name} → {work})")
+    shutil.copytree(SRC, work, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    n = clean(work)
+    print(f"개인 데이터 {n}건 제거")
+
+    problems = verify(work)
+    if problems:
+        print("\n! 확인 필요:")
+        for p in problems:
+            print("   -", p)
+        print("  (그대로 두면 남에게 전달됩니다)")
+        return 1
+
+    size = sum(f.stat().st_size for f in work.rglob("*") if f.is_file())
+    files = sum(1 for f in work.rglob("*") if f.is_file())
+    print(f"검사 통과 — 파일 {files:,}개 / {size/1024/1024:.0f} MB")
+
+    if a.folder:
+        print(f"\n완료 → {work}")
+        return 0
+
+    zip_path = out_dir / "NAI배치생성기.zip"
+    print("압축 중...")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for f in sorted(work.rglob("*")):
+            if f.is_file():
+                z.write(f, Path("NAI배치생성기") / f.relative_to(work))
+    shutil.rmtree(work)
+    print(f"\n완료 → {zip_path}  ({zip_path.stat().st_size/1024/1024:.0f} MB)")
+    print("이 파일을 통째로 주면 됩니다. 받은 사람은 압축을 풀고 실행.bat 을 더블클릭.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
