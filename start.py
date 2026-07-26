@@ -8451,6 +8451,7 @@ class LiveState:
         self.daily_cap = DAILY_CAP
         self.status_text = "설정 중..."
         self.running = False
+        self._owner = 0        # 실행권 토큰 (아래 try_claim/release)
         self.seed = 0          # 마지막으로 생성한 그림의 실제 NAI 시드
         self.seed_key = ""     # 배치 회차 번호 (01, 02 …)
 
@@ -8458,6 +8459,24 @@ class LiveState:
         with self.lock:
             for k, v in kwargs.items():
                 setattr(self, k, v)
+
+    # 이중 POST 레이스 방지 (라운드04 — Forge 가 실사용에서 겪은 함정과 같은 계열).
+    # 예전에는 `if running: 거절` 검사와 스레드 안의 `running=True` 사이에 틈이 있어
+    # 빠른 이중 요청이 둘 다 통과했고, 먼저 끝난 쪽 finally 가 남의 running 을 껐다.
+    def try_claim(self):
+        """실행권 원자 선점 — 성공하면 소유 토큰, 이미 실행 중이면 None."""
+        with self.lock:
+            if self.running:
+                return None
+            self.running = True
+            self._owner += 1
+            return self._owner
+
+    def release(self, token):
+        """소유 토큰이 맞을 때만 running 을 끈다 — 옛 작업이 새 작업 상태를 못 끄게."""
+        with self.lock:
+            if self._owner == token:
+                self.running = False
 
     def set_image(self, img):
         buf = io.BytesIO()
@@ -8547,9 +8566,12 @@ class ConfigServer:
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         slots = [s for s in cfg.get("char_slots", [])
                  if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+        tok = self.live.try_claim()
+        if tok is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
-            self.live.update(running=True, status_text="단독 생성 중...", char_name="단독 생성",
+            self.live.update(status_text="단독 생성 중...", char_name="단독 생성",
                              filename="", index=1, total=1)
             try:
                 style = (cfg.get("base_prompt") or "").strip()
@@ -8580,7 +8602,7 @@ class ConfigServer:
                 log.error(f"단독 생성 실패: {e}")
                 self.live.update(status_text=f"단독 생성 실패: {e}")
             finally:
-                self.live.update(running=False)
+                self.live.release(tok)
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True}
@@ -8610,9 +8632,12 @@ class ConfigServer:
             return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
         # NAI 는 64 의 배수를 원한다
         w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
+        tok = self.live.try_claim()
+        if tok is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
-            self.live.update(running=True, status_text=f"{mode} 생성 중...",
+            self.live.update(status_text=f"{mode} 생성 중...",
                              char_name=mode, index=1, total=1)
             try:
                 slots = [s for s in cfg.get("char_slots", [])
@@ -8644,7 +8669,7 @@ class ConfigServer:
                 log.error(f"{mode} 실패: {e}")
                 self.live.update(status_text=f"{mode} 실패: {e}")
             finally:
-                self.live.update(running=False)
+                self.live.release(tok)
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "mode": mode, "width": w, "height": h}
@@ -8685,13 +8710,16 @@ class ConfigServer:
         if not jobs:
             return {"ok": False, "error": "메타데이터가 있는 그림이 없습니다. "
                                           "(카톡·디스코드를 거친 그림은 정보가 지워집니다)"}
+        tok = self.live.try_claim()
+        if tok is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
             out_dir = OUTPUT_BASE / "복구"
             out_dir.mkdir(parents=True, exist_ok=True)
             state = load_state()
             done = 0
-            self.live.update(running=True, total=len(jobs), index=0, char_name="그림체 복구")
+            self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
             try:
                 for i, (f, raw) in enumerate(jobs, 1):
                     if not self.live.running:
@@ -8753,7 +8781,7 @@ class ConfigServer:
                     time.sleep(random.uniform(*[pace(cfg)["delay_min"], pace(cfg)["delay_max"]]))
                 self.live.update(status_text=f"그림체 복구 완료 ✓ {done}/{len(jobs)}장 (output/복구/)")
             finally:
-                self.live.update(running=False)
+                self.live.release(tok)
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "count": len(jobs), "mode": mode}
@@ -8771,6 +8799,9 @@ class ConfigServer:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
                  if (s.get("prompt") or "").strip() and s.get("enabled") is not False]
+        tok = self.live.try_claim()
+        if tok is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
             state = load_state()
@@ -8781,7 +8812,7 @@ class ConfigServer:
             base_seed = state["seeds"].get(f"{int(cfg.get('seed', 1)):02d}") or random.randint(0, 2**32 - 1)
             style = (cfg.get("base_prompt") or "").strip()
             done = 0
-            self.live.update(running=True, total=len(jobs), index=0, char_name="씬 모드")
+            self.live.update(total=len(jobs), index=0, char_name="씬 모드")
             try:
                 for i, (sc, copy) in enumerate(jobs, 1):
                     if not self.live.running:
@@ -8839,7 +8870,7 @@ class ConfigServer:
                 self.live.update(status_text=f"씬 모드 완료 ✓ {done}/{len(jobs)}장 (output/씬/)")
             finally:
                 cfg.pop("_frag_counters", None)
-                self.live.update(running=False)
+                self.live.release(tok)
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "count": len(jobs)}
@@ -9874,22 +9905,26 @@ def main():
 
     while True:
         server.start_event.wait()  # '생성 시작' 클릭까지 대기
-        server.live.update(running=True)
+        # 단독 생성 등이 그 틈에 실행권을 가져갔다면 배치를 겹쳐 돌리지 않는다
+        tok = server.live.try_claim()
+        if tok is None:
+            server.start_event.clear()
+            server.live.update(status_text="다른 생성이 도는 중입니다 — 끝난 뒤 '생성 시작'을 다시 눌러주세요.")
+            continue
         try:
             _run_generation(server)
             log.info("═══ 이번 실행 완료 — 설정을 바꾸고 '생성 시작'을 다시 누르면 계속할 수 있습니다 ═══")
             server.live.update(status_text="완료! 다시 '생성 시작'을 누르면 계속할 수 있습니다.")
         except FatalStopError:
-            server.live.update(running=False)
             break
         except Exception as e:
             log.critical(f"예기치 못한 오류로 중단되었습니다: {e}")
             log.critical(traceback.format_exc())
-            server.live.update(status_text=f"오류로 중단됨: {e}", running=False)
+            server.live.update(status_text=f"오류로 중단됨: {e}")
             input("오류가 발생했습니다. 위 내용을 확인하고 엔터를 누르면 프로그램을 종료합니다...")
             break
         finally:
-            server.live.update(running=False)
+            server.live.release(tok)
             server.start_event.clear()
 
     print("프로그램을 종료합니다.")
