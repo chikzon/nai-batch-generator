@@ -6298,10 +6298,21 @@ function expDraw(){
   $('expCount').textContent = `${EXP.files.length}장`;
   $('expStat').textContent = `${vis.length}장 보임 · 선별 ${EXP.picked.size} · 즐겨찾기 ${EXP.fav.size}`;
   $('expCmpN').textContent = EXP.cmp.size;
-  vis.forEach((f, i) => {
+  /* 수천 장을 한 번에 그리면 초기 로딩·메모리가 터진다 (Custom 의 페이지 분할 참고).
+     120장씩 그리고, '더 보기'가 화면에 가까워지면 자동으로 다음 묶음. */
+  EXP.vis = vis; EXP.shown = 0;
+  expChunk();
+}
+const EXP_CHUNK = 120;
+function expChunk(){
+  const g = $('expGrid');
+  const vis = EXP.vis || [];
+  const end = Math.min(vis.length, EXP.shown + EXP_CHUNK);
+  for(let i = EXP.shown; i < end; i++){
+    const f = vis[i];
     const el = document.createElement('div');
     el.style.cssText = 'position:relative;cursor:pointer;';
-    el.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt=""
+    el.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt="" loading="lazy"
         style="width:100%;aspect-ratio:1/1;object-fit:cover;display:block;
         border:2px solid ${EXP.picked.has(f.path)?'var(--good)':'var(--line)'};
         border-radius:var(--radius);${EXP.cmp.has(f.path)?'outline:2px dashed var(--accent);outline-offset:1px;':''}">
@@ -6310,7 +6321,22 @@ function expDraw(){
       <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>`;
     el.addEventListener('click', () => expOpen(i));
     g.appendChild(el);
-  });
+  }
+  EXP.shown = end;
+  let more = $('expMore');
+  if(!more){
+    more = document.createElement('button');
+    more.id = 'expMore';
+    more.style.cssText = 'grid-column:1/-1;padding:8px 0;';
+    more.addEventListener('click', expChunk);
+    /* 화면에 가까워지면 자동 로딩 — 탭이 숨어 있으면 안 돌므로 안전하다 */
+    new IntersectionObserver(es => es.forEach(e => {
+      if(e.isIntersecting && EXP.shown < (EXP.vis || []).length) expChunk();
+    }), {rootMargin: '600px'}).observe(more);
+  }
+  g.appendChild(more);   // 항상 그리드 맨 끝
+  more.textContent = `더 보기 (${vis.length - EXP.shown}장 남음)`;
+  more.classList.toggle('hidden', EXP.shown >= vis.length);
 }
 async function picksSave(){
   await fetch('/api/picks_save', {method:'POST', headers:{'Content-Type':'application/json'},
