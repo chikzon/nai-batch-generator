@@ -292,6 +292,82 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(i2i_parameters["extra_noise_seed"], 9)
         self.assertFalse(i2i_parameters["color_correct"])
 
+    def test_vibe_and_character_references_reach_actual_payload_in_aligned_arrays(self):
+        png = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(png, "PNG")
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as archive:
+            archive.writestr("image.png", png.getvalue())
+
+        class Response:
+            status_code = 200
+            content = zipped.getvalue()
+            text = ""
+
+        payloads = []
+
+        def fake_post(_url, json=None, **_kwargs):
+            payloads.append(json)
+            return Response()
+
+        params = {
+            "model": "nai-diffusion-4-5-full",
+            "_vibes": {
+                "encoded": ["vibe-a", "vibe-b"],
+                "strengths": [0.4, 0.9],
+                "ies": [0.3, 0.8],
+            },
+            "_char_refs": {
+                "images": ["char-a", "char-b"],
+                "types": ["character", "character&style"],
+                "strengths": [0.0, 2.0],
+                "fidelities": [0.25, 1.0],
+            },
+        }
+        with (
+            patch.object(APP.requests, "post", side_effect=fake_post),
+            self.assertLogs(APP.log, level="WARNING"),
+        ):
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1, params=params,
+            )
+
+        self.assertEqual(len(payloads), 1)
+        sent = payloads[0]["parameters"]
+        self.assertEqual(sent["reference_image_multiple"], ["vibe-a", "vibe-b"])
+        self.assertEqual(sent["reference_strength_multiple"], [0.4, 0.9])
+        self.assertEqual(
+            sent["reference_information_extracted_multiple"], [0.3, 0.8]
+        )
+        self.assertTrue(sent["normalize_reference_strength_multiple"])
+        self.assertEqual(sent["director_reference_images"], ["char-a", "char-b"])
+        self.assertEqual(
+            [
+                item["caption"]["base_caption"]
+                for item in sent["director_reference_descriptions"]
+            ],
+            ["character", "character&style"],
+        )
+        self.assertEqual(
+            sent["director_reference_information_extracted"], [1.0, 1.0]
+        )
+        self.assertEqual(sent["director_reference_strength_values"], [0.0, 2.0])
+        self.assertEqual(
+            sent["director_reference_secondary_strength_values"], [0.75, 0.0]
+        )
+        for key in (
+            "reference_image_multiple",
+            "reference_strength_multiple",
+            "reference_information_extracted_multiple",
+            "director_reference_images",
+            "director_reference_descriptions",
+            "director_reference_information_extracted",
+            "director_reference_strength_values",
+            "director_reference_secondary_strength_values",
+        ):
+            self.assertEqual(len(sent[key]), 2, key)
+
     def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
         source = io.BytesIO()
         image = Image.new("RGBA", (2, 2), (10, 20, 30, 255))
