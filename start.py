@@ -3987,6 +3987,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   /* ── 3단 레이아웃 ── */
   .app{display:grid;grid-template-columns:var(--lw,320px) 1fr 250px;height:calc(100vh - 42px);}
   .left{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;position:relative;background:var(--paper);}
+  /* 왼쪽 패널 폭 조절 손잡이 (Forge 참고) — 드래그로 240~560px */
+  #lwDrag{position:absolute;top:0;right:-3px;width:6px;height:100%;cursor:col-resize;z-index:5;}
+  #lwDrag:hover{background:var(--accent-dim);}
   .center{min-width:0;overflow-y:auto;padding:16px;}
   .right{border-left:1px solid var(--line);overflow-y:auto;padding:10px;background:var(--paper);}
 
@@ -4130,7 +4133,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="app" id="app">
   <!-- ══ 왼쪽: 프롬프트 패널 ══ -->
-  <div class="left">
+  <div class="left"><div id="lwDrag" title="드래그로 패널 폭 조절"></div>
     <div class="preset-bar">
       <select id="presetSel"><option value="">베이스 프리셋 불러오기...</option></select>
       <button id="presetSave" title="현재 프롬프트+네거티브+파라미터를 파일로 저장">저장</button>
@@ -8324,6 +8327,24 @@ async function poll(){
 
 init();
 poll();
+
+/* ── 왼쪽 패널 폭 드래그 조절 — 브라우저별 취향이라 localStorage 에 저장 ── */
+(function(){
+  const d = $('lwDrag');
+  if(!d) return;
+  const clamp = w => Math.min(560, Math.max(240, w));
+  const apply = w => document.documentElement.style.setProperty('--lw', w + 'px');
+  const saved = parseInt(localStorage.getItem('lw') || '', 10);
+  if(saved) apply(clamp(saved));
+  let on = false;
+  d.addEventListener('mousedown', e => { on = true; e.preventDefault(); });
+  document.addEventListener('mousemove', e => { if(on) apply(clamp(e.clientX)); });
+  document.addEventListener('mouseup', e => {
+    if(!on) return;
+    on = false;
+    localStorage.setItem('lw', clamp(e.clientX));
+  });
+})();
 
 /* ── 태그 검증 ────────────────────────────────────────────────────────
    posts.json 은 비로그인 태그 2개 제한이 있지만 tags.json 은 제한이 없다.
