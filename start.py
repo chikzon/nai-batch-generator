@@ -2201,7 +2201,7 @@ def scene_num_clashes():
     return clash
 
 
-def setting_thumbs(name):
+def setting_thumbs(name, cfg=None):
     """세트 대표 썸네일 — 세트에 속한 씬 번호로 시작하는 결과물 중 가장 새것.
     파일명이 `101_A01_핸드잡_시작전.webp` 꼴이므로 앞 3자리로 찾는다."""
     st = next((s for s in list_settings() if s["name"] == name), None)
@@ -2209,7 +2209,7 @@ def setting_thumbs(name):
         return {}
     scenes = st["data"].get("씬", {})
     newest = {}                       # 씬번호 → (mtime, 경로)
-    root = out_root() / "nsfw_seed"
+    root = out_root(cfg) / "nsfw_seed"
     if root.exists():
         for p in root.rglob("*"):
             if p.suffix.lower() not in (".webp", ".png"):
@@ -2228,7 +2228,7 @@ def setting_thumbs(name):
         best = max((newest[i] for i in g["ids"] if i in newest),
                    default=None, key=lambda x: x[0])
         if best:
-            out[str(g["id"])] = str(best[1].relative_to(out_root())).replace("\\", "/")
+            out[str(g["id"])] = str(best[1].relative_to(out_root(cfg))).replace("\\", "/")
     return out
 
 
@@ -10161,7 +10161,7 @@ class ConfigServer:
                     q = parse_qs(urlparse(self.path).query)
                     try:
                         self._json({"ok": True,
-                                    "thumbs": setting_thumbs(unquote(q.get("name", [""])[0]))})
+                                    "thumbs": setting_thumbs(unquote(q.get("name", [""])[0]), server.cfg)})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/frag_export"):
@@ -10963,7 +10963,7 @@ def _run_generation(server):
         total_now = completed + len(pending)
 
         try:
-            out_dir = out_root(cfg) / "nsfw_seed" / f"seed_{seed_key}" / cid
+            out_dir = out_sub(cfg, "nsfw_seed") / f"seed_{seed_key}" / cid
             out_dir.mkdir(parents=True, exist_ok=True)
 
             scene = acfg["scenes"][str(num)]
