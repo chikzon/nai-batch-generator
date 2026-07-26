@@ -4063,6 +4063,51 @@ def resolve_fragments(texts, frags=None, counters=None, rng=None):
     return out, counters
 
 
+def finalized_token_texts(base, negative, chars, char_negatives, cfg):
+    """Return NAI-bound prompt strings without advancing fragment state.
+
+    The token preview must expand fragments, normalize weights, append the
+    quality suffix, and merge the UC preset just like ``call_nai_api``. A
+    private RNG keeps a preview from consuming the generator random stream.
+    """
+    chars = list(chars or [])
+    char_negatives = list(char_negatives or [])
+    count = max(len(chars), len(char_negatives))
+    chars += [""] * (count - len(chars))
+    char_negatives += [""] * (count - len(char_negatives))
+    pairs = [[chars[i], char_negatives[i]] for i in range(count)]
+
+    fixed = [strip_comment_lines(x) for x in (base, negative, "", "", "", "")]
+    flat = [strip_comment_lines(x) for pair in pairs for x in pair]
+    if cfg.get("use_fragments", True):
+        counters = cfg.get("_frag_counters")
+        if counters is None:
+            try:
+                counters = load_state().get("frag_seq", {})
+            except Exception:
+                counters = {}
+        resolved, _ = resolve_fragments(
+            fixed + flat, counters=dict(counters or {}), rng=random.Random(0))
+        fixed, flat = list(resolved[:6]), list(resolved[6:])
+
+    fixed = [normalize_prompt(x) for x in fixed]
+    flat = [normalize_prompt(x) for x in flat]
+    base, negative = fixed[0], fixed[1]
+    if cfg.get("quality_toggle") and QUALITY_SUFFIX.strip(", ") not in base:
+        base = base.rstrip().rstrip(",") + QUALITY_SUFFIX
+    negative = merge_uc_preset(
+        negative,
+        cfg.get("model") or "nai-diffusion-4-5-full",
+        cfg.get("uc_preset"),
+    )
+    return {
+        "base": base,
+        "negative": negative,
+        "chars": [flat[i * 2] for i in range(count)],
+        "char_negatives": [flat[i * 2 + 1] for i in range(count)],
+    }
+
+
 # ═══════════════ 진행 상태 (재개용) ═══════════════
 
 def load_state():
@@ -5233,16 +5278,18 @@ async function naiTokens(){
       /* ⚠ 실제 전송값은 prompt + outfit 이다 — 의상을 빼고 세면 화면은 512 이하인데
          실전송이 넘어 뒷부분이 잘린다 (CQA-009). 캐릭터 네거티브도 함께 센다.
          켠 칸만 세는 것도 전송 규칙과 같다. */
-      const slots = (STATE.char_slots || []).filter(s => s && s.enabled !== false);
-      const join = (a, b) => [a, b].map(x => (x || '').trim().replace(/^,|,$/g, '').trim())
+      const clean = x => (x || '').replace(/^[ \t]*#.*$/gm, '').trim();
+      const join = (a, b) => [a, b].map(x => clean(x).replace(/^,|,$/g, '').trim())
         .filter(Boolean).join(', ');
+      const slots = (STATE.char_slots || []).filter(s => s && s.enabled !== false
+        && clean(join(s.prompt, s.outfit)));
       const chars = slots.map(s => join(s.prompt, s.outfit)).filter(Boolean);
       const charNegs = slots.map(s => s.negative || '').filter(Boolean);
       const r = await (await fetch('/api/tokens', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({base: $('basePrompt').value,
                               negative: $('negPrompt').value, chars,
-                              char_negatives: charNegs})})).json();
+                              char_negatives: charNegs, finalize: true})})).json();
       if(!r.ok) return;
       const over = r.shared > r.limit;
       /* 토크나이저 vocab 이 없으면 어림값이다 — 정확한 값처럼 보여 주면 안 된다 */
@@ -5250,7 +5297,8 @@ async function naiTokens(){
       $('posTok').innerHTML = `${approx}${r.base} 토큰`
         + (chars.length ? ` <span style="opacity:.7">+캐릭터 ${r.shared - r.base}</span>` : '')
         + ` <span style="color:${over ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>`;
-      $('posTok').title = (approx ? 't5_tokenizer.json 이 없어 어림값입니다 (≈). ' : '')
+      $('posTok').title = (r.finalized ? '조각·품질·UC 반영값입니다. 무작위 조각은 실제 선택에 따라 달라질 수 있습니다. ' : '')
+        + (approx ? 't5_tokenizer.json 이 없어 어림값입니다 (≈). ' : '')
         + (over ? `512 토큰을 ${r.shared - r.limit} 초과 — 뒷부분이 잘립니다`
                 : '베이스 + 캐릭터 프롬프트가 512 토큰을 함께 씁니다');
       // 네거티브가 부실한데 UC 프리셋이 None 이면 NAI 가 아무것도 안 보태서
@@ -5278,7 +5326,7 @@ function tokens(){
   $('negTok').textContent = t($('negPrompt').value) + '태그';
   naiTokens();   // 정확한 토큰 수로 곧 갈아치운다
   redrawHL();   // 프롬프트가 바뀔 때마다 하이라이트도 다시 그림
-  const n = (STATE.char_slots||[]).filter(s=>(s.prompt||'').trim()).length;
+  const n = activeSlotIdx().length;
   $('bgChars').textContent = n;
   $('bgChars').style.display = n ? 'flex' : 'none';
   let sets = 0;
@@ -6076,7 +6124,8 @@ function activeSlotIdx(){
   return (STATE.char_slots || [])
     .map((s, i) => ({s, i}))
     .filter(x => x.s.enabled !== false
-      && ((x.s.prompt || '').replace(/^[ \t]*#.*$/gm, '')).trim())
+      && [x.s.prompt, x.s.outfit].some(v =>
+        ((v || '').replace(/^[ \t]*#.*$/gm, '')).trim()))
     .map(x => x.i);
 }
 function autoCoordsOnSecond(){
@@ -10470,17 +10519,28 @@ class ConfigServer:
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
-                        base = nai_tokens(d.get("base", ""))
-                        chars = [nai_tokens(c) for c in (d.get("chars") or [])]
-                        neg = nai_tokens(d.get("negative", ""))
-                        # 네거티브도 베이스+캐릭터가 한도를 나눠 쓴다 (CQA-009)
-                        cnegs = [nai_tokens(c) for c in (d.get("char_negatives") or [])]
+                        if d.get("finalize"):
+                            final = finalized_token_texts(
+                                d.get("base", ""), d.get("negative", ""),
+                                d.get("chars") or [], d.get("char_negatives") or [],
+                                server.cfg)
+                        else:
+                            final = {
+                                "base": d.get("base", ""),
+                                "negative": d.get("negative", ""),
+                                "chars": d.get("chars") or [],
+                                "char_negatives": d.get("char_negatives") or [],
+                            }
+                        base = nai_tokens(final["base"])
+                        chars = [nai_tokens(c) for c in final["chars"]]
+                        neg = nai_tokens(final["negative"])
+                        cnegs = [nai_tokens(c) for c in final["char_negatives"]]
                         self._json({"ok": True, "exact": tokens_exact(), "base": base,
                                     "negative": neg,
                                     "chars": chars, "char_negatives": cnegs,
-                                    # 베이스와 캐릭터 프롬프트가 512 토큰을 공유한다
                                     "shared": base + sum(chars),
-                                    "shared_negative": neg + sum(cnegs), "limit": 512})
+                                    "shared_negative": neg + sum(cnegs), "limit": 512,
+                                    "finalized": bool(d.get("finalize"))})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/picks_save"):

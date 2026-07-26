@@ -74,6 +74,25 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual([(x[1], x[2], x[3]) for x in remaining],
                              [(pending[1][1], 1, 1)])
 
+    def test_token_preview_expands_fragments_without_advancing_counters(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(use_fragments=True, _frag_counters={"long": 0})
+        expansion = ", ".join(f"tag{i}" for i in range(900))
+        with patch.object(APP, "list_fragments", return_value={"long": [expansion]}):
+            final = APP.finalized_token_texts("<long>", "", [], [], cfg)
+        self.assertGreater(APP.nai_tokens(final["base"]), 512)
+        self.assertEqual(cfg["_frag_counters"], {"long": 0})
+
+    def test_token_preview_includes_outfit_quality_and_uc_text(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(quality_toggle=True, uc_preset=0)
+        final = APP.finalized_token_texts(
+            "base", "custom negative", ["# memo\nface, red dress"], [""], cfg)
+        self.assertIn("very aesthetic", final["base"])
+        self.assertEqual(final["chars"], ["face, red dress"])
+        self.assertNotIn("# memo", final["chars"][0])
+        self.assertIn("custom negative", final["negative"])
+
     def test_custom_output_root_and_date_are_used_by_batch_and_thumbnails(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "chosen"
