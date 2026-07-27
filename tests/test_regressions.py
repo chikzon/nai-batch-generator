@@ -36,6 +36,14 @@ BUILD_SPEC.loader.exec_module(BUILD)
 
 
 class RegressionTests(unittest.TestCase):
+    def test_combo_cards_do_not_duplicate_full_records_into_html_attributes(self):
+        page = APP.PAGE_TEMPLATE
+        self.assertIn("el._comboRecord = c", page)
+        self.assertNotIn('data-cfull="${escA(JSON.stringify(c))}"', page)
+        self.assertNotIn('data-csave="${escA(JSON.stringify(c))}"', page)
+        self.assertNotIn('data-crate="${escA(JSON.stringify(c.artists||[]))}"', page)
+        self.assertIn("const fragment = document.createDocumentFragment()", page)
+
     def test_distribution_includes_core_scenes_but_not_personal_collections(self):
         self.assertIn("asset_config.json", BUILD.ASSETS)
         self.assertIn("세팅", BUILD.ASSET_DIRS)

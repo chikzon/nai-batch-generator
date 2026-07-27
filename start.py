@@ -9785,6 +9785,10 @@ function styleCard(c){
   if(c.posted_at) meta.push(c.posted_at);
   const el = document.createElement('div');
   el.className = 'row';
+  // 전체 레코드를 data-* 문자열로 버튼마다 복제하지 않는다.
+  // 긴 프롬프트·메타데이터가 있는 50개 카드에서 HTML이 수백 KB로 불어나고,
+  // 파싱·속성 디코딩·JSON 재파싱이 메인 스레드를 막았다.
+  el._comboRecord = c;
   el.innerHTML = `<div class="tag">${esc(c.source||'도랑')}${c.tab ? ' · '+esc(c.tab) : ''} · 작가 ${c.count}명${c.title ? ' · '+esc(c.title.slice(0,34)) : ''}${meta.length ? ' · '+esc(meta.join(' · ')) : ''}</div>
     <div style="display:flex;gap:9px;">
       ${(c.images && c.images[0]) ? `<img src="/img?u=${encodeURIComponent(c.images[0])}" loading="lazy" alt="" onerror="this.style.display='none'" style="width:${px}px;height:${px}px;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);flex:none;background:#0004;">` : ''}
@@ -9792,11 +9796,11 @@ function styleCard(c){
         <div style="font-family:var(--mono);font-size:var(--fs-xs);line-height:1.5;max-height:66px;overflow:auto;">${esc(c.combo || '(작가 태그 없음)')}</div>
         ${bits.length ? `<div class="hint" style="margin-top:5px;">⚙ ${esc(bits.join(' · '))}</div>` : ''}
         <div class="bar" style="margin:6px 0 0;flex-wrap:wrap;">
-          ${window._comboTarget ? `<button data-cuse="${escA(c.combo)}"
+          ${window._comboTarget ? `<button data-cuse
             title="빌더의 작가 조합 칸에 이 값을 넣습니다">이 조합 쓰기</button>` : ''}
-          <button class="primary" data-cfull="${escA(JSON.stringify(c))}">그림체 통째로 적용</button>
-          <button data-csave="${escA(JSON.stringify(c))}">내 프리셋으로 저장</button>
-          <button data-crate="${escA(JSON.stringify(c.artists||[]))}"
+          <button class="primary" data-cfull>그림체 통째로 적용</button>
+          <button data-csave>내 프리셋으로 저장</button>
+          <button data-crate
             title="이 조합의 작가들에게 별점·즐겨찾기·차단을 매깁니다">${rateBadge(c._rate)}</button>
           ${c.url ? `<a href="${escA(c.url)}" target="_blank" style="font-size:var(--fs-xs);color:var(--muted);">원본 ↗</a>` : ''}
         </div>
@@ -9893,8 +9897,7 @@ function addPickBoxes(){
   host.querySelectorAll('[data-cfull]').forEach(b => {
     const box = b.closest('.row') || b.parentElement;
     if(!box || box.querySelector('[data-pick]')) return;
-    let id = '';
-    try { id = String(JSON.parse(b.dataset.cfull).id || ''); } catch(e){}
+    const id = String((box._comboRecord || {}).id || '');
     if(!id) return;
     const t = document.createElement('button');
     t.dataset.pick = id; t.className = 'mini'; t.title = '고르기';
@@ -9980,14 +9983,22 @@ async function loadCombos(append){
   }
   const host = $('comboList');
   if(!append) host.innerHTML = '';
-  r.items.forEach(c => host.appendChild(styleCard(c)));
+  // DocumentFragment로 한 번만 레이아웃한다. 50~200장을 한 장씩 붙이면
+  // 모달 높이 계산과 스타일 계산이 카드 수만큼 반복된다.
+  const fragment = document.createDocumentFragment();
+  const added = r.items.map(c => {
+    const card = styleCard(c);
+    fragment.appendChild(card);
+    return card;
+  });
+  host.appendChild(fragment);
   /* '이 조합 쓰기' 는 **빌더에서 열었을 때만** 나온다.
      빌더의 작가 조합 칸에 값을 고르는 일이지 '그림체를 적용' 하는 것이 아니다.
      그림체를 왼쪽 화면에 넣는 길은 '통째로 적용' **하나뿐**이다 — 베이스만·설정만
      넣는 길을 두면 원래 그림이 재현되지 않는 잡종이 만들어진다. */
-  host.querySelectorAll('[data-cuse]').forEach(btn => {
+  added.flatMap(card => [...card.querySelectorAll('[data-cuse]')]).forEach(btn => {
     btn.addEventListener('click', () => {
-      const val = btn.dataset.cuse;
+      const val = (btn.closest('.row')._comboRecord || {}).combo || '';
       const tg = window._comboTarget;
       if(!(tg && document.body.contains(tg))) return;
       if(![...tg.options].some(o => o.value === val)){
@@ -10000,16 +10011,16 @@ async function loadCombos(append){
       $('modalFlash').textContent = '빌더 항목에 적용됨 ✓';
     });
   });
-  host.querySelectorAll('[data-cfull]').forEach(b =>
-    b.addEventListener('click', () => applyStyle(JSON.parse(b.dataset.cfull))));
+  added.flatMap(card => [...card.querySelectorAll('[data-cfull]')]).forEach(b =>
+    b.addEventListener('click', () => applyStyle(b.closest('.row')._comboRecord)));
   if(tidyOn()) addPickBoxes();      /* 더 보기로 이어 붙인 카드에도 붙는다 */
-  host.querySelectorAll('[data-crate]').forEach(b => b.addEventListener('click', () => {
-    const arts = JSON.parse(b.dataset.crate || '[]');
+  added.flatMap(card => [...card.querySelectorAll('[data-crate]')]).forEach(b => b.addEventListener('click', () => {
+    const arts = (b.closest('.row')._comboRecord || {}).artists || [];
     if(!arts.length){ flash('이 조합에는 작가 태그가 없습니다.'); return; }
     openRate(arts);
   }));
-  host.querySelectorAll('[data-csave]').forEach(b => b.addEventListener('click', async () => {
-    const c = JSON.parse(b.dataset.csave);
+  added.flatMap(card => [...card.querySelectorAll('[data-csave]')]).forEach(b => b.addEventListener('click', async () => {
+    const c = b.closest('.row')._comboRecord;
     const name = prompt('프리셋 이름:', (c.title || '그림체').slice(0, 30));
     if(!name) return;
     const p = c.params || {};
@@ -12151,7 +12162,9 @@ class ConfigServer:
                             tab=q.get("tab", [""])[0], source=q.get("source", [""])[0],
                             sort=q.get("sort", [""])[0], seeded=q.get("seeded", [""])[0],
                             rating=q.get("rating", [""])[0])
-                        prewarm_images(res.get("items"), n=len(res.get("items") or []))
+                        # 카드의 <img loading="lazy">가 보이는 것만 요청한다.
+                        # 여기서 결과 50~200장을 모두 선다운로드하면 브라우저 요청과
+                        # 겹쳐 네트워크·디스크·WebP 디코딩이 몰리고 모달이 멈춘다.
                         self._json({"ok": True, **res})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
