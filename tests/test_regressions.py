@@ -944,6 +944,37 @@ class RegressionTests(unittest.TestCase):
             restored_path = root / restored["paths"][0]
             self.assertEqual(restored_path.read_bytes(), b"old")
 
+    def test_style_restore_keeps_conflicting_deleted_data_in_trash(self):
+        """같은 id가 다시 생겨도 새 자료를 덮거나 옛 자료를 휴지통에서 잃지 않는다."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            style_file = root / "수집" / "그림체.json"
+            trash_file = root / "수집" / "지운그림체.json"
+            style_file.parent.mkdir(parents=True)
+            style_file.write_text(json.dumps([
+                {"id": "same", "base": "new current data"},
+            ], ensure_ascii=False), encoding="utf-8")
+            trash_file.write_text(json.dumps([
+                {"id": "same", "base": "old deleted data", "_지운때": "batch"},
+                {"id": "unique", "base": "recover me", "_지운때": "batch"},
+            ], ensure_ascii=False), encoding="utf-8")
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "STYLE_FILE", style_file):
+                result = APP.restore_styles(["same", "unique"])
+                current = json.loads(style_file.read_text(encoding="utf-8"))
+                remaining = json.loads(trash_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(result["되살림"], 1)
+            self.assertEqual(result["충돌"], 1)
+            self.assertEqual(
+                {row["id"]: row["base"] for row in current},
+                {"same": "new current data", "unique": "recover me"},
+            )
+            self.assertEqual(
+                [(row["id"], row["base"]) for row in remaining],
+                [("same", "old deleted data")],
+            )
+
     def test_setout_serves_normal_output_but_blocks_trashed_files(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "output"

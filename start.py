@@ -1976,6 +1976,7 @@ STYLE_FILE = BASE_DIR / "수집" / "그림체.json"
 COMBO_FILE = BASE_DIR / "수집" / "작가조합.json"
 _COMBOS = {"loaded": False, "rows": []}
 _COMBOS_LOCK = threading.Lock()
+_STYLE_TX_LOCK = threading.RLock()
 
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
@@ -2041,20 +2042,22 @@ def load_combos():
 
 def add_style(rec):
     """새 그림체를 라이브러리에 넣고 파일에 저장 (이미지 추출 결과 등)."""
-    rows = load_combos()
-    key = " ".join(sorted((a or "").lower() for a in rec.get("artists", [])))
-    p = rec.get("params") or {}
-    for i, r in enumerate(rows):
-        rp = r.get("params") or {}
-        if (" ".join(sorted((a or "").lower() for a in r.get("artists", []))) == key
-                and rp.get("seed") == p.get("seed")):
-            rows[i] = rec                       # 같은 조합+시드면 갱신
-            break
-    else:
-        rows.insert(0, rec)
-    STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(STYLE_FILE, rows, indent=None)
-    return len(rows)
+    with _STYLE_TX_LOCK:
+        rows = list(load_combos())
+        key = " ".join(sorted((a or "").lower() for a in rec.get("artists", [])))
+        p = rec.get("params") or {}
+        for i, r in enumerate(rows):
+            rp = r.get("params") or {}
+            if (" ".join(sorted((a or "").lower() for a in r.get("artists", []))) == key
+                    and rp.get("seed") == p.get("seed")):
+                rows[i] = rec                   # 같은 조합+시드면 갱신
+                break
+        else:
+            rows.insert(0, rec)
+        STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(STYLE_FILE, rows, indent=None)
+        forget_collection_caches()
+        return len(rows)
 
 
 # ── 그림체 정리 ────────────────────────────────────────────────────────────
@@ -2086,6 +2089,11 @@ def _write_styles_raw(rows):
 
 def delete_styles(ids):
     """고른 그림체를 지운다 → 지운그림체.json 으로 옮긴다."""
+    with _STYLE_TX_LOCK:
+        return _delete_styles_locked(ids)
+
+
+def _delete_styles_locked(ids):
     want = {str(x) for x in (ids or []) if str(x)}
     if not want:
         return {"ok": False, "error": "고른 것이 없습니다."}
@@ -2115,6 +2123,11 @@ def delete_styles(ids):
 
 def restore_styles(ids=None):
     """지운 것을 되살린다. ids 가 없으면 **가장 최근에 지운 묶음** 전부."""
+    with _STYLE_TX_LOCK:
+        return _restore_styles_locked(ids)
+
+
+def _restore_styles_locked(ids=None):
     p = _trashed_style_path()
     if not p.exists():
         return {"ok": False, "error": "지운 그림체가 없습니다."}
@@ -2130,21 +2143,29 @@ def restore_styles(ids=None):
         last = trash[-1].get("_지운때")          # 마지막 묶음만 되살린다
         want = {str(r.get("id")) for r in trash if r.get("_지운때") == last}
     back = [r for r in trash if str(r.get("id")) in want]
-    rest = [r for r in trash if str(r.get("id")) not in want]
     if not back:
         return {"ok": False, "error": "되살릴 것을 못 찾았습니다."}
     rows = _load_styles_raw()
     have = {str(r.get("id")) for r in rows}
-    added = 0
-    for r in back:
-        if str(r.get("id")) in have:
+    added, conflicts, rest = 0, 0, []
+    for r in trash:
+        rid = str(r.get("id"))
+        if rid not in want:
+            rest.append(r)
             continue
-        r = {k: v for k, v in r.items() if k != "_지운때"}
-        rows.insert(0, r)
+        if rid in have:
+            # 같은 id의 새 자료를 덮지 않고, 옛 자료도 휴지통에서 잃지 않는다.
+            # 사용자가 새 자료를 지우거나 id를 정리한 뒤 다시 복원할 수 있다.
+            rest.append(r)
+            conflicts += 1
+            continue
+        clean = {k: v for k, v in r.items() if k != "_지운때"}
+        rows.insert(0, clean)
+        have.add(rid)
         added += 1
     _write_styles_raw(rows)
     atomic_write_json(p, rest, indent=None)
-    return {"ok": True, "되살림": added, "남은휴지통": len(rest)}
+    return {"ok": True, "되살림": added, "충돌": conflicts, "남은휴지통": len(rest)}
 
 
 def _combo_fingerprint(r):
@@ -11103,12 +11124,14 @@ function bindTidy(){
       : `${r['지움']}건 지움 · 남은 그림체 ${r['남음']}건 · 되살릴 수 있는 것 ${r['되살릴수있음']}건`;
     PICKED.clear(); await loadCombos(false); if(tidyOn()) addPickBoxes();
   });
-  $('comboUndo').addEventListener('click', async () => {
-    const r = await (await fetch('/api/style_restore', {method:'POST', body:'{}'})).json();
-    $('comboTidyMsg').textContent = r.error ? r.error
-      : `${r['되살림']}건 되살림 · 휴지통에 ${r['남은휴지통']}건 남음`;
-    await loadCombos(false); if(tidyOn()) addPickBoxes();
-  });
+    $('comboUndo').addEventListener('click', async () => {
+      const r = await (await fetch('/api/style_restore', {method:'POST', body:'{}'})).json();
+      $('comboTidyMsg').textContent = r.error ? r.error
+      : `${r['되살림']}건 되살림`
+        + (r['충돌'] ? ` · 같은 id ${r['충돌']}건은 덮지 않고 휴지통에 보존` : '')
+        + ` · 휴지통에 ${r['남은휴지통']}건 남음`;
+      await loadCombos(false); if(tidyOn()) addPickBoxes();
+    });
 }
 
 async function loadCombos(append){
