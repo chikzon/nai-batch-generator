@@ -443,13 +443,87 @@ class RegressionTests(unittest.TestCase):
             pack = BUILD.build_data_pack(Path(td))
             with zipfile.ZipFile(pack) as archive:
                 names = set(archive.namelist())
+                manifest = json.loads(archive.read("manifest.json"))
+                verified_manifest = APP._validate_datapack_manifest(archive)
+                checked_entries = []
+                for entry in manifest["files"]:
+                    raw = archive.read(entry["path"])
+                    checked_entries.append((
+                        entry["size"] == len(raw),
+                        entry["sha256"] == hashlib.sha256(raw).hexdigest(),
+                    ))
         self.assertIn("후보사전.json", names)
         self.assertIn("규격.json", names)
         self.assertIn("옵션.json", names)
+        self.assertIn("manifest.json", names)
         self.assertTrue(any(x.startswith("태그/") for x in names))
         self.assertTrue(any(x.startswith("세팅/") for x in names))
         self.assertNotIn("asset_config.json", names)
         self.assertFalse(any(x.startswith("수집/") for x in names))
+
+        self.assertEqual(manifest["schema"], APP.DATAPACK_SCHEMA)
+        self.assertEqual(
+            verified_manifest["content_sha256"], manifest["content_sha256"])
+        self.assertTrue(all(size_ok and hash_ok
+                            for size_ok, hash_ok in checked_entries))
+
+    def test_installed_program_uses_separate_user_data_root(self):
+        program = Path(r"C:\Apps\NAI배치생성기")
+        local = Path(r"C:\Users\tester\AppData\Local")
+        self.assertEqual(
+            APP.resolve_data_dir(
+                program, frozen=True, argv=[], local_app_data=local),
+            local / "NAI배치생성기" / "데이터",
+        )
+        self.assertEqual(
+            APP.resolve_data_dir(
+                program, frozen=True, argv=["--portable"],
+                local_app_data=local),
+            program,
+        )
+        custom = Path(r"D:\NAI 개인 자료")
+        self.assertEqual(
+            APP.resolve_data_dir(
+                program, frozen=True,
+                argv=["--data-dir", str(custom)], local_app_data=local),
+            custom,
+        )
+        self.assertEqual(
+            APP.resolve_data_dir(
+                program, frozen=False, argv=[], local_app_data=local),
+            program,
+        )
+
+    def test_legacy_installed_data_is_copied_without_deleting_or_overwriting(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            program = root / "program"
+            data = root / "personal"
+            (program / "output").mkdir(parents=True)
+            (program / "설정.json").write_text(
+                '{"base_prompt":"keep whole"}', encoding="utf-8")
+            (program / "output" / "old.webp").write_bytes(b"old-output")
+            (program / "NAI배치생성기.exe").write_bytes(b"program")
+            (program / "ui").mkdir()
+            (program / "ui" / "studio.css").write_text(
+                "program css", encoding="utf-8")
+
+            result = APP.migrate_legacy_program_data(program, data)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(
+                (data / "설정.json").read_text(encoding="utf-8"),
+                '{"base_prompt":"keep whole"}',
+            )
+            self.assertEqual(
+                (data / "output" / "old.webp").read_bytes(), b"old-output")
+            self.assertFalse((data / "NAI배치생성기.exe").exists())
+            self.assertFalse((data / "ui").exists())
+            self.assertTrue((program / "설정.json").exists())
+            self.assertTrue((program / "output" / "old.webp").exists())
+
+            again = APP.migrate_legacy_program_data(program, data)
+            self.assertEqual(again["status"], "complete")
+            self.assertEqual(again["copied"], result["copied"])
 
     def test_comparison_plan_counts_each_mode_and_preserves_style_bundle(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
@@ -1306,6 +1380,120 @@ class RegressionTests(unittest.TestCase):
                     "세팅/시험.json", "태그/시험.csv",
                 ):
                     self.assertFalse((root / rel).exists(), rel)
+
+    def test_manifested_data_pack_is_verified_before_any_write(self):
+        content = json.dumps([{"id": "safe"}]).encode("utf-8")
+        declared = {
+            "path": "수집/그림체.json",
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        fingerprint = hashlib.sha256(
+            f"{declared['path']}\t{declared['size']}\t{declared['sha256']}"
+            .encode("utf-8")
+        ).hexdigest()
+        manifest = {
+            "schema": APP.DATAPACK_SCHEMA,
+            "id": "fixture-pack",
+            "name": "검증 시험팩",
+            "content_sha256": fingerprint,
+            "files": [declared],
+        }
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "manifest.json", json.dumps(manifest, ensure_ascii=False))
+            archive.writestr("수집/그림체.json", content + b" ")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "STYLE_FILE", root / "수집" / "그림체.json"),
+                patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
+            ):
+                with self.assertRaisesRegex(ValueError, "내용 검사가 실패"):
+                    APP.import_datapack_bytes(
+                        payload.getvalue(), "tampered.zip")
+                self.assertFalse((root / "수집" / "그림체.json").exists())
+
+    def test_verified_data_pack_records_identity_and_content_hash(self):
+        content = json.dumps(
+            [{"id": "verified", "base": "whole prompt"}],
+            ensure_ascii=False,
+        ).encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        line = f"수집/그림체.json\t{len(content)}\t{digest}"
+        manifest = {
+            "schema": APP.DATAPACK_SCHEMA,
+            "id": "verified-pack",
+            "name": "검증된 팩",
+            "version": "1",
+            "content_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(),
+            "files": [{
+                "path": "수집/그림체.json",
+                "size": len(content),
+                "sha256": digest,
+            }],
+        }
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "manifest.json", json.dumps(manifest, ensure_ascii=False))
+            archive.writestr("수집/그림체.json", content)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "STYLE_FILE", root / "수집" / "그림체.json"),
+                patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
+            ):
+                result = APP.import_datapack_bytes(
+                    payload.getvalue(), "verified.zip")
+                self.assertTrue(result["ok"])
+                record = APP.load_pack_log()[0]
+                self.assertEqual(record["manifest"]["id"], "verified-pack")
+                self.assertEqual(
+                    record["manifest"]["content_sha256"],
+                    manifest["content_sha256"],
+                )
+                brief = APP.pack_log_brief()[0]
+                self.assertEqual(brief["pack_name"], "검증된 팩")
+                self.assertEqual(
+                    brief["content_sha256"], manifest["content_sha256"])
+
+    def test_data_index_is_rebuildable_and_excludes_remote_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "캐릭터").mkdir()
+            (root / "캐릭터" / "A.json").write_text(
+                '{"id":"a"}', encoding="utf-8")
+            local = root / "수집" / "이미지캐시" / "local.webp"
+            local.parent.mkdir(parents=True)
+            local.write_bytes(b"local")
+            remote = root / "수집" / "이미지캐시" / "원격" / "remote.webp"
+            remote.parent.mkdir()
+            remote.write_bytes(b"remote")
+            with patch.object(APP, "BASE_DIR", root):
+                first = APP.rebuild_data_index()
+                index_path = root / "수집" / "자료색인.json"
+                self.assertTrue(index_path.exists())
+                self.assertEqual(first["schema"], APP.DATA_INDEX_SCHEMA)
+                paths = {entry["path"] for entry in first["entries"]}
+                self.assertIn("캐릭터/A.json", paths)
+                self.assertIn("수집/이미지캐시/local.webp", paths)
+                self.assertNotIn("수집/이미지캐시/원격/remote.webp", paths)
+                index_path.unlink()
+                second = APP.rebuild_data_index()
+                self.assertEqual(first["fingerprint"], second["fingerprint"])
+
+        page = APP.PAGE_TEMPLATE
+        for marker in (
+            'id="dataStorageStatus"', 'id="dataIndexBuild"',
+            "/api/data_storage", "/api/data_index_rebuild",
+        ):
+            self.assertIn(marker, page)
 
     def test_data_pack_overwrite_undo_restores_previous_whole_file(self):
         with tempfile.TemporaryDirectory() as td:

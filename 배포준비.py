@@ -24,10 +24,11 @@
    LICENSE · THIRD_PARTY_NOTICES.md
 
 세팅을 함께 주고 싶으면 `세팅/*.json` 만 따로 건네면 된다 (받는 쪽에서 세팅/ 에 넣으면 끝).
-수집 자료를 주고 싶으면 `python 배포준비.py --자료팩` 으로 자료팩.zip 을 따로 만든다
-(받는 쪽은 압축을 풀어 나온 수집/ 폴더를 앱 폴더에 덮어넣으면 라이브러리가 채워진다).
+수집 자료를 주고 싶으면 `python 배포준비.py --자료팩` 으로 자료팩.zip 을 따로 만든다.
+받는 쪽은 앱의 자료 탭에 ZIP을 그대로 넣는다. 파일별 SHA-256을 확인한 뒤 장착된다.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import shutil
 import stat
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -245,20 +247,46 @@ def main():
 
     if getattr(a, "자료팩"):
         # 본 배포본과 별도로 건네는 수집 자료 묶음.
-        # 받는 쪽은 압축을 풀어 나온 수집/ 을 앱 폴더에 덮어넣으면 된다.
+        # 받는 쪽은 압축을 풀지 않고 자료 탭에 넣는다.
         zip_path = out_dir / "자료팩.zip"
         print("자료팩 압축 중...")
+        payloads = {}
+        for rel in ("수집/그림체.json", "수집/작가통계.json", "수집/레시피.json"):
+            p = SRC / rel
+            if p.exists():
+                payloads[rel] = p.read_bytes()
+        cache = SRC / "수집" / "이미지캐시"
+        if cache.exists():
+            for f in sorted(cache.rglob("*")):
+                # 원격/ 은 실행 중 캐시라 넣지 않는다
+                if f.is_file() and "원격" not in f.relative_to(cache).parts:
+                    rel = (Path("수집/이미지캐시")
+                           / f.relative_to(cache)).as_posix()
+                    payloads[rel] = f.read_bytes()
+        entries = [{
+            "path": rel,
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        } for rel, raw in sorted(payloads.items())]
+        fingerprint = hashlib.sha256("\n".join(
+            f"{item['path']}\t{item['size']}\t{item['sha256']}"
+            for item in entries
+        ).encode("utf-8")).hexdigest()
+        manifest = {
+            "schema": "nais-datapack/v1",
+            "id": f"personal-{fingerprint[:20]}",
+            "name": "개인 수집 자료팩",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "content_sha256": fingerprint,
+            "files": entries,
+        }
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-            for rel in ("수집/그림체.json", "수집/작가통계.json", "수집/레시피.json"):
-                p = SRC / rel
-                if p.exists():
-                    z.write(p, rel)
-            cache = SRC / "수집" / "이미지캐시"
-            if cache.exists():
-                for f in sorted(cache.rglob("*")):
-                    # 원격/ 은 실행 중 캐시라 넣지 않는다
-                    if f.is_file() and "원격" not in f.relative_to(cache).parts:
-                        z.write(f, Path("수집/이미지캐시") / f.relative_to(cache))
+            z.writestr(
+                "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"),
+            )
+            for rel, raw in sorted(payloads.items()):
+                z.writestr(rel, raw)
         print(f"완료 → {zip_path}  ({zip_path.stat().st_size/1024/1024:.0f} MB)")
         return 0
     work = out_dir / "NAI배치생성기"

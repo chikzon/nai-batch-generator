@@ -14,18 +14,22 @@ PyInstaller 는 지금 구조를 **그대로 두고** 파이썬 런타임만 함
     python 빌드.py --정리        # build/dist/생성물 삭제
 
 ⚠ 프로그램 자산만 exe **옆**에 둔다 (`_internal` 안이 아니라).
-   `start.py` 의 `BASE_DIR` 22곳이 전부 그 자리를 보므로 코드를 안 고쳐도 된다.
-   사용자 데이터(`설정.json`·`output/`)도 같은 자리에 쌓여 **포터블**이 된다.
+   설치 실행본의 사용자 데이터(`설정.json`·`output/`)는
+   `%LOCALAPPDATA%\\NAI배치생성기\\데이터`에 쌓여 제거·재설치와 분리된다.
+   `--portable`을 명시한 경우에만 exe 옆을 쓴다.
    후보사전·태그·세팅 같은 내용물은 `기본자료팩.zip`으로 따로 만든다.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ⚠ 윈도우 기본 콘솔은 cp949 라 `—`·`✔` 에서 UnicodeEncodeError 로 죽는다.
@@ -235,30 +239,56 @@ def copy_assets(app_dir: Path) -> tuple[list[str], list[str]]:
 
 
 def build_data_pack(out_dir: Path) -> Path:
-    """기본 후보·태그·세팅을 본체와 섞지 않고 ZIP 하나로 만든다."""
+    """기본 후보·태그·세팅을 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다."""
     target = out_dir / DATA_PACK_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
+    payloads: dict[str, bytes] = {}
+    for name in DATA_PACK_ASSETS:
+        src = HERE / name
+        if src.is_file():
+            payloads[name] = src.read_bytes()
+    for name in DATA_PACK_DIRS:
+        root = HERE / name
+        if not root.is_dir():
+            continue
+        for src in sorted(root.rglob("*")):
+            if src.is_file() and "__pycache__" not in src.parts:
+                payloads[src.relative_to(HERE).as_posix()] = src.read_bytes()
+    entries = [{
+        "path": name,
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    } for name, raw in sorted(payloads.items())]
+    fingerprint = hashlib.sha256("\n".join(
+        f"{entry['path']}\t{entry['size']}\t{entry['sha256']}"
+        for entry in entries
+    ).encode("utf-8")).hexdigest()
+    manifest = {
+        "schema": "nais-datapack/v1",
+        "id": f"basic-{APP_VERSION}-{fingerprint[:16]}",
+        "name": "NAI 배치 생성기 기본 자료팩",
+        "version": APP_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "content_sha256": fingerprint,
+        "files": entries,
+    }
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED,
                          compresslevel=9) as z:
-        for name in DATA_PACK_ASSETS:
-            src = HERE / name
-            if src.is_file():
-                z.write(src, name)
-        for name in DATA_PACK_DIRS:
-            root = HERE / name
-            if not root.is_dir():
-                continue
-            for src in sorted(root.rglob("*")):
-                if src.is_file() and "__pycache__" not in src.parts:
-                    z.write(src, src.relative_to(HERE).as_posix())
+        z.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"),
+        )
+        for name, raw in sorted(payloads.items()):
+            z.writestr(name, raw)
         z.writestr(
             "기본자료팩-사용법.txt",
             "NAI 배치 생성기 기본 자료팩\n\n"
             "1. 프로그램을 실행합니다.\n"
             "2. [자료] → [자료 넣기]에 이 ZIP을 그대로 끌어다 놓습니다.\n"
             "3. 후보사전·규격·옵션·태그·세팅이 각각 제자리에 들어갑니다.\n\n"
-            "본체에는 이 자료가 포함되지 않습니다. 같은 팩을 다시 넣어도 기존 자료를 "
-            "덮어쓰지 않으며, 가져온 기록에서 이번에 추가한 자료만 되돌릴 수 있습니다.\n",
+            "본체에는 이 자료가 포함되지 않습니다. manifest.json의 파일별 SHA-256을 "
+            "검사한 뒤 장착하며, 같은 팩을 다시 넣어도 기존 개인 자료를 덮어쓰지 않습니다. "
+            "가져온 기록에서 이번에 추가한 자료만 해제할 수 있습니다.\n",
         )
     return target
 

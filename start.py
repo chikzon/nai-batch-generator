@@ -45,12 +45,139 @@ from PIL import Image
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-# ⚠ exe 로 묶었을 때(`빌드.py`) `__file__` 은 PyInstaller 가 푼 **임시 폴더**를 가리킨다.
-#   거기에 설정·생성물을 쓰면 종료할 때 통째로 사라진다. 그래서 묶인 경우에만
-#   **exe 가 있는 자리**를 쓴다 — 자산도 그 옆에 두므로 나머지 코드는 손댈 필요가 없다.
-#   스크립트로 그냥 실행하면 `sys.frozen` 이 없어 예전과 완전히 같다.
-BASE_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
-            else Path(__file__).parent)
+# 프로그램 파일과 사용자 자료는 생명주기가 다르다. 설치 프로그램을 제거해도 설정·
+# 캐릭터·세팅·수집물·생성물이 함께 사라지면 안 된다. 묶인 실행본은 기본적으로
+# %LOCALAPPDATA%\NAI배치생성기\데이터 를 쓰고, 코드·CSS·토크나이저는 exe 옆에서 읽는다.
+# 소스 실행은 개발 중인 기존 자료 위치를 바꾸지 않도록 예전처럼 소스 폴더를 쓴다.
+PROGRAM_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+               else Path(__file__).parent)
+
+
+def resolve_data_dir(program_dir=None, frozen=None, argv=None, local_app_data=None):
+    """사용자 자료 뿌리를 부작용 없이 결정한다.
+
+    `--data-dir <경로>`는 대용량 개인 자료를 다른 드라이브에 둘 때 쓴다.
+    `--portable`은 명시적으로 프로그램 옆에 자료를 두는 호환 모드다.
+    """
+    program_dir = Path(program_dir or PROGRAM_DIR).resolve()
+    frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for index, arg in enumerate(argv):
+        if str(arg).startswith("--data-dir="):
+            value = str(arg).split("=", 1)[1].strip()
+            if value:
+                return Path(value).expanduser().resolve()
+        if arg == "--data-dir" and index + 1 < len(argv):
+            value = str(argv[index + 1]).strip()
+            if value:
+                return Path(value).expanduser().resolve()
+    if "--portable" in argv or not frozen:
+        return program_dir
+    local_root = local_app_data or os.environ.get("LOCALAPPDATA")
+    if not local_root:
+        # LOCALAPPDATA가 없는 특수 환경에서도 임시 해제 폴더가 아니라 exe 옆에 남긴다.
+        return program_dir
+    return (Path(local_root) / "NAI배치생성기" / "데이터").resolve()
+
+
+BASE_DIR = resolve_data_dir()
+
+_LEGACY_USER_FILES = (
+    "설정.json", "설정.json.bak", "설정.txt", "asset_config.json",
+    "후보사전.json", "규격.json", "옵션.json", "씬.json", "선별.json",
+    "nsfw_seed_state.json", "비교생성-진행.json",
+)
+_LEGACY_USER_DIRS = (
+    "프로필", "output", "수집", "캐릭터", "그림체", "태그", "세팅",
+    "씬규격", "씬프리셋", "조각",
+)
+
+
+def migrate_legacy_program_data(program_dir, data_dir):
+    """옛 설치본의 프로그램 옆 자료를 새 사용자 폴더로 **복사만** 한다.
+
+    원본은 지우지 않고, 대상에 다른 내용이 있으면 덮지 않는다. 중간에 종료돼도 다음
+    실행에서 없는 파일만 이어 복사할 수 있도록 완료 기록은 맨 마지막에 쓴다.
+    """
+    source, target = Path(program_dir).resolve(), Path(data_dir).resolve()
+    if source == target:
+        return {"status": "same", "copied": 0, "skipped": 0, "conflicts": 0}
+    receipt = target / "이전자료-복사기록.json"
+    old_receipt = {}
+    try:
+        old_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+        if old_receipt.get("status") == "complete":
+            return old_receipt
+    except (OSError, json.JSONDecodeError):
+        pass
+    evidence = [source / name for name in _LEGACY_USER_FILES + _LEGACY_USER_DIRS]
+    if not any(path.exists() for path in evidence):
+        return {"status": "none", "copied": 0, "skipped": 0, "conflicts": 0}
+
+    # 사용자가 이미 새 위치에 자료를 만든 경우 두 저장소를 자동 병합하지 않는다.
+    destination_evidence = [
+        target / name for name in _LEGACY_USER_FILES + _LEGACY_USER_DIRS
+    ]
+    if (old_receipt.get("status") not in ("copying", "partial")
+            and any(path.exists() for path in destination_evidence)):
+        return {"status": "destination-not-empty", "copied": 0,
+                "skipped": 0, "conflicts": 0}
+
+    target.mkdir(parents=True, exist_ok=True)
+    result = {"schema": "nais-data-migration/v1", "status": "copying",
+              "source": str(source), "target": str(target),
+              "copied": 0, "skipped": 0, "conflicts": 0, "errors": []}
+
+    def save_receipt():
+        tmp = receipt.with_name(
+            f".{receipt.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, receipt)
+
+    save_receipt()
+
+    def copy_one(src, dst):
+        if src.is_symlink():
+            result["skipped"] += 1
+            return
+        try:
+            if dst.exists():
+                if (dst.is_file() and src.is_file()
+                        and hashlib.sha256(dst.read_bytes()).digest()
+                        == hashlib.sha256(src.read_bytes()).digest()):
+                    result["skipped"] += 1
+                else:
+                    result["conflicts"] += 1
+                return
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            result["copied"] += 1
+        except OSError as e:
+            result["errors"].append(f"{src.name}: {e}")
+
+    for name in _LEGACY_USER_FILES:
+        src = source / name
+        if src.is_file():
+            copy_one(src, target / name)
+    for name in _LEGACY_USER_DIRS:
+        root = source / name
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for src in sorted(root.rglob("*")):
+            if src.is_file():
+                copy_one(src, target / name / src.relative_to(root))
+    result["status"] = "complete" if not result["errors"] else "partial"
+    result["completed_at"] = datetime.now().isoformat(timespec="seconds")
+    save_receipt()
+    return result
+
+
+if getattr(sys, "frozen", False) and BASE_DIR.resolve() != PROGRAM_DIR.resolve():
+    _DATA_MIGRATION = migrate_legacy_program_data(PROGRAM_DIR, BASE_DIR)
+else:
+    _DATA_MIGRATION = {"status": "not-needed", "copied": 0,
+                       "skipped": 0, "conflicts": 0}
 
 # ── 프로필 (계정 여러 개를 한 폴더에서) ───────────────────────────────
 #   실행.bat 이나 명령줄에 `--profile 둘째` 를 주면 그 프로필의
@@ -68,9 +195,8 @@ def _profile_from_argv():
 
 PROFILE = _profile_from_argv()
 PROFILE_DIR = (BASE_DIR / "프로필" / PROFILE) if PROFILE else BASE_DIR
-UI_DIR = BASE_DIR / "ui"
-if PROFILE:
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+UI_DIR = PROGRAM_DIR / "ui"
+PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 LEGACY_SETTINGS_FILE = BASE_DIR / "설정.txt"          # 원본 대조본은 공용
 SETTINGS_FILE = PROFILE_DIR / "설정.json"
@@ -1046,7 +1172,7 @@ def count_tokens(text, vocab_path=None):
     return total + 1                     # </s>
 
 
-TOKENIZER_FILE = BASE_DIR / "t5_tokenizer.json"
+TOKENIZER_FILE = PROGRAM_DIR / "t5_tokenizer.json"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3577,6 +3703,197 @@ def save_pack_log(rows):
     atomic_write_json(p, rows[-50:], indent=1)
 
 
+DATAPACK_SCHEMA = "nais-datapack/v1"
+DATA_INDEX_SCHEMA = "nais-data-index/v1"
+
+
+def _data_index_path():
+    return BASE_DIR / "수집" / "자료색인.json"
+
+
+def _iter_indexed_data_files():
+    """다시 만들 수 있는 캐시·기록은 빼고 실제 자료 파일만 순회한다."""
+    roots = [
+        BASE_DIR / name for name in (
+            "후보사전.json", "규격.json", "옵션.json",
+            "태그", "세팅", "캐릭터", "그림체", "씬규격", "씬프리셋", "조각", "수집",
+        )
+    ]
+    blocked_parts = {
+        "원격", "가져온백업", "이미지무결성기록", "사용자복원기록",
+        "__pycache__", ".NAI-휴지통",
+    }
+    blocked_names = {
+        "자료색인.json", "가져온기록.json", "태그색인.pickle",
+    }
+    seen = set()
+    for root in roots:
+        candidates = [root] if root.is_file() else (
+            sorted(root.rglob("*")) if root.is_dir() else [])
+        for path in candidates:
+            if (not path.is_file() or path.is_symlink()
+                    or path.name in blocked_names):
+                continue
+            try:
+                if BASE_DIR.resolve() not in path.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            rel = path.relative_to(BASE_DIR)
+            if any(part in blocked_parts for part in rel.parts):
+                continue
+            if path.suffix.lower() in (".bak", ".tmp", ".log", ".pyc", ".pickle"):
+                continue
+            key = rel.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            yield path, key
+
+
+def rebuild_data_index():
+    """현재 개인 자료를 파일별 SHA-256으로 다시 센다.
+
+    색인은 원본이 아니라 파생 목록이다. 지워져도 원자료를 다시 훑어 만들 수 있다.
+    """
+    entries, by_root, total = [], {}, 0
+    for path, rel in _iter_indexed_data_files():
+        if len(entries) >= 250_000:
+            raise ValueError("자료 파일이 250,000개를 넘어 색인 생성을 중단했습니다.")
+        raw = path.read_bytes()
+        size = len(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        top = rel.split("/", 1)[0]
+        stat = by_root.setdefault(top, {"files": 0, "bytes": 0})
+        stat["files"] += 1
+        stat["bytes"] += size
+        total += size
+        entries.append({"path": rel, "size": size, "sha256": digest})
+    fingerprint = hashlib.sha256("\n".join(
+        f"{item['path']}\t{item['size']}\t{item['sha256']}" for item in entries
+    ).encode("utf-8")).hexdigest()
+    index = {
+        "schema": DATA_INDEX_SCHEMA,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "data_dir": str(BASE_DIR),
+        "files": len(entries),
+        "bytes": total,
+        "by_root": by_root,
+        "fingerprint": fingerprint,
+        "entries": entries,
+    }
+    atomic_write_json(_data_index_path(), index, indent=1, keep_backup=False)
+    return index
+
+
+def data_storage_status():
+    """화면용 저장 위치와 마지막 색인 요약. 토큰·프롬프트 내용은 내보내지 않는다."""
+    index = None
+    path = _data_index_path()
+    if path.is_file():
+        try:
+            loaded = load_json_recover(path)
+            if isinstance(loaded, dict) and loaded.get("schema") == DATA_INDEX_SCHEMA:
+                index = {key: loaded.get(key) for key in (
+                    "generated_at", "files", "bytes", "by_root", "fingerprint")}
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "program_dir": str(PROGRAM_DIR),
+        "data_dir": str(BASE_DIR),
+        "separated": PROGRAM_DIR.resolve() != BASE_DIR.resolve(),
+        "profile": PROFILE or "기본",
+        "migration": {
+            key: _DATA_MIGRATION.get(key)
+            for key in ("status", "copied", "skipped", "conflicts")
+        },
+        "index": index,
+    }
+
+
+def _validate_datapack_manifest(archive):
+    """v1 manifest가 있으면 쓰기 전에 파일 수·크기·내용 해시를 전부 확인한다.
+
+    manifest가 없는 예전 자료팩은 계속 받는다. 다만 manifest가 있다고 주장한 팩은
+    한 파일이라도 빠지거나 달라졌으면 일부만 설치하지 않고 전체를 거절한다.
+    """
+    infos = [info for info in archive.infolist() if not info.is_dir()]
+    if len(infos) > 100_000:
+        raise ValueError("자료팩 파일 수가 비정상적으로 많습니다.")
+    if any(info.file_size > 512 * 1024 * 1024 for info in infos):
+        raise ValueError("자료팩의 낱개 파일이 512MB를 넘습니다.")
+    if sum(info.file_size for info in infos) > 2 * 1024 * 1024 * 1024:
+        raise ValueError("자료팩을 풀었을 때 크기가 2GB를 넘습니다.")
+
+    members = {}
+    manifest_name = None
+    for info in infos:
+        rel = _pack_rel(info.filename)
+        if rel is None:
+            raise ValueError("자료팩에 앱 폴더 밖을 가리키는 경로가 있습니다.")
+        if rel in members:
+            raise ValueError(f"자료팩에 같은 경로가 두 번 있습니다: {rel}")
+        members[rel] = info.filename
+        if Path(rel).name == "manifest.json" and "/" not in rel:
+            manifest_name = info.filename
+    if not manifest_name:
+        return None
+    try:
+        manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
+    except Exception as e:
+        raise ValueError(f"자료팩 manifest.json을 읽지 못했습니다: {e}") from e
+    if manifest.get("schema") != DATAPACK_SCHEMA:
+        # 다른 도구가 넣은 일반 manifest는 기존 자료팩 호환을 위해 무시한다.
+        return None
+
+    declared, fingerprint_rows = set(), []
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise ValueError("자료팩 manifest의 files가 목록이 아닙니다.")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("자료팩 manifest의 파일 항목 모양이 잘못됐습니다.")
+        rel = _pack_rel(entry.get("path", ""))
+        if not rel or rel == "manifest.json" or rel in declared:
+            raise ValueError("자료팩 manifest에 위험하거나 중복된 경로가 있습니다.")
+        member = members.get(rel)
+        if not member:
+            raise ValueError(f"자료팩 내용이 빠졌습니다: {rel}")
+        raw = archive.read(member)
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != int(entry.get("size", -1)) or digest != entry.get("sha256"):
+            raise ValueError(f"자료팩 내용 검사가 실패했습니다: {rel}")
+        declared.add(rel)
+        fingerprint_rows.append(f"{rel}\t{len(raw)}\t{digest}")
+    fingerprint = hashlib.sha256(
+        "\n".join(sorted(fingerprint_rows)).encode("utf-8")
+    ).hexdigest()
+    if manifest.get("content_sha256") != fingerprint:
+        raise ValueError("자료팩 전체 내용 지문이 manifest와 다릅니다.")
+
+    # manifest 밖에 숨은 자료 파일이 있으면 검사를 우회할 수 있다. 사용법 문서처럼
+    # 앱이 읽지 않는 파일은 허용하지만, 실제 장착 대상은 모두 선언돼야 한다.
+    known_lists = set(_datapack_lists())
+    known_whole = set(_datapack_whole_files())
+    for rel in members:
+        stem = Path(rel).name
+        is_data = (
+            stem in known_lists
+            or stem in known_whole
+            or rel.startswith(("세팅/", "태그/", "수집/이미지캐시/"))
+        )
+        if is_data and rel not in declared:
+            raise ValueError(f"manifest에 기록되지 않은 자료가 들어 있습니다: {rel}")
+    return {
+        "id": str(manifest.get("id") or ""),
+        "name": str(manifest.get("name") or ""),
+        "version": str(manifest.get("version") or ""),
+        "content_sha256": fingerprint,
+        "files": len(declared),
+    }
+
+
 def import_datapack_bytes(data, filename="", overwrite=False):
     """자료팩 ZIP 이든 낱개 JSON 이든 받아 자료 종류별 제자리에 넣는다.
 
@@ -3588,8 +3905,9 @@ def import_datapack_bytes(data, filename="", overwrite=False):
     report, files = [], 0
     batch_id = f"{int(time.time())}-{os.urandom(4).hex()}"
     batch = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
-             "file": Path(filename).name or "자료팩",
-             "id": batch_id, "lists": {}, "files": {}, "installed": []}
+              "file": Path(filename).name or "자료팩",
+              "id": batch_id, "lists": {}, "files": {}, "installed": [],
+              "archive_sha256": hashlib.sha256(data).hexdigest()}
 
     def take_whole(label, raw, dest):
         """후보사전·규격·옵션·세팅 파일 하나를 검증한 뒤 원자적으로 설치한다.
@@ -3658,6 +3976,14 @@ def import_datapack_bytes(data, filename="", overwrite=False):
 
     if data[:2] == b"PK":
         with zipfile.ZipFile(io.BytesIO(data)) as z:
+            manifest = _validate_datapack_manifest(z)
+            if manifest:
+                batch["manifest"] = manifest
+                report.append(
+                    f"자료팩 확인: {manifest['name'] or manifest['id'] or '이름 없음'}"
+                    f" · 파일 {manifest['files']}개 · SHA-256 "
+                    f"{manifest['content_sha256'][:12]}"
+                )
             # ZIP 순서와 무관하게 목록 JSON을 읽기 전에 모든 로컬 그림의 실제
             # 내용 주소를 계산한다. 그래야 JSON이 그림보다 앞에 있어도 참조를 고친다.
             image_payloads = {}
@@ -3764,7 +4090,11 @@ def import_datapack_bytes(data, filename="", overwrite=False):
 def pack_log_brief():
     """되돌리기 화면용 — 큰 id 목록은 빼고 요약만."""
     return [{"id": b.get("id"), "at": b.get("at"), "file": b.get("file"),
-             "새로": b.get("새로", 0), "요약": b.get("요약", "")}
+             "새로": b.get("새로", 0), "요약": b.get("요약", ""),
+             "pack_id": (b.get("manifest") or {}).get("id", ""),
+             "pack_name": (b.get("manifest") or {}).get("name", ""),
+             "content_sha256": (b.get("manifest") or {}).get(
+                 "content_sha256", b.get("archive_sha256", ""))}
             for b in reversed(load_pack_log())]
 
 
@@ -8059,6 +8389,15 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </label>
         <div id="packMsg" class="hint" style="margin-top:8px;"></div>
         <div id="packLog" style="margin-top:10px;"></div>
+        <div class="bar" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
+          align-items:flex-start;">
+          <div id="dataStorageStatus" class="hint" style="flex:1;min-width:0;">
+            자료 저장 위치를 확인하는 중입니다.
+          </div>
+          <button type="button" id="dataIndexBuild">자료 색인 다시 만들기</button>
+        </div>
+        <p class="hint" style="margin-top:6px;">색인은 자료 파일의 경로·크기·SHA-256만 다시 세는
+        파생 목록입니다. 원본을 옮기거나 지우지 않으며, 대용량 자료에서는 시간이 걸릴 수 있습니다.</p>
       </div>
 
       <div class="card">
@@ -11925,18 +12264,19 @@ function esc(s){ return String(s).replace(/[&<>"]/g, c =>
 function renderPackLog(log){
   const host = $('packLog'); if(!host) return;
   if(!log || !log.length){ host.innerHTML = ''; return; }
-  host.innerHTML = '<div class="hint" style="margin-bottom:4px;">가져온 기록</div>' +
+  host.innerHTML = '<div class="hint" style="margin-bottom:4px;">장착한 자료팩</div>' +
     log.map(b => `<div class="bar" style="gap:8px;align-items:flex-start;
         padding:6px 0;border-top:1px solid var(--line);">
       <div style="flex:1;min-width:0;">
-        <div style="font-size:var(--fs-sm);">${esc(b.at)} · ${esc(b.file)}
+        <div style="font-size:var(--fs-sm);">${esc(b.at)} · ${esc(b.pack_name || b.file)}
           <b>새로 ${b['새로']||0}</b></div>
-        <div class="hint" style="font-size:var(--fs-2xs);">${esc(b['요약']||'')}</div>
+        <div class="hint" style="font-size:var(--fs-2xs);">${esc(b['요약']||'')}
+          ${b.content_sha256 ? ` · SHA-256 ${esc(b.content_sha256.slice(0,12))}` : ''}</div>
       </div>
-      <button data-undo="${esc(b.id)}" title="이때 새로 들어온 것만 뺍니다">되돌리기</button>
+      <button data-undo="${esc(b.id)}" title="이 팩으로 새로 들어온 것만 뺍니다">해제</button>
     </div>`).join('');
   host.querySelectorAll('[data-undo]').forEach(btn => btn.addEventListener('click', async () => {
-    if(!confirm('이때 새로 들어온 자료만 뺍니다. 되돌릴까요?')) return;
+    if(!confirm('이 자료팩으로 새로 들어온 것만 뺍니다. 개인 자료는 그대로 둡니다. 해제할까요?')) return;
     btn.disabled = true;
     const r = await (await fetch('/api/pack_undo', {method:'POST',
       body: JSON.stringify({id: btn.dataset.undo})})).json();
@@ -11944,6 +12284,39 @@ function renderPackLog(log){
     renderPackLog(r.log); await reloadConfig();
   }));
 }
+
+async function loadDataStorageStatus(){
+  const host = $('dataStorageStatus'); if(!host) return;
+  try{
+    const r = await (await fetch('/api/data_storage')).json();
+    if(!r.ok){ host.textContent = r.error || '자료 저장 위치를 확인하지 못했습니다.'; return; }
+    const where = r.separated ? '<b>프로그램과 분리됨</b>' : '<b>소스·휴대 모드</b>';
+    const idx = r.index
+      ? ` · 마지막 색인 ${Number(r.index.files||0).toLocaleString()}개`
+        + ` / ${(Number(r.index.bytes||0)/1024/1024).toFixed(1)}MB`
+        + ` · ${esc(r.index.generated_at||'')}`
+      : ' · 아직 만든 색인 없음';
+    const moved = r.migration && Number(r.migration.copied||0)
+      ? ` · 옛 설치 자료 ${Number(r.migration.copied).toLocaleString()}개를 원본을 남긴 채 복사함`
+      : '';
+    host.innerHTML = `<div>${where}${idx}</div>
+      <div style="margin-top:3px;">개인 자료 폴더
+        <span style="font-family:var(--mono);word-break:break-all;">${esc(r.data_dir)}</span>
+        ${moved}</div>`;
+  }catch(e){ host.textContent = '자료 저장 위치 확인 실패: ' + e; }
+}
+
+if($('dataIndexBuild')) $('dataIndexBuild').addEventListener('click', async () => {
+  const btn = $('dataIndexBuild');
+  btn.disabled = true;
+  $('dataStorageStatus').textContent = '원본을 바꾸지 않고 파일별 SHA-256 색인을 만드는 중입니다...';
+  try{
+    const r = await (await fetch('/api/data_index_rebuild', {method:'POST', body:'{}'})).json();
+    if(!r.ok){ $('dataStorageStatus').textContent = r.error || '자료 색인 생성 실패'; return; }
+    await loadDataStorageStatus();
+  }catch(e){ $('dataStorageStatus').textContent = '자료 색인 생성 실패: ' + e; }
+  finally{ btn.disabled = false; }
+});
 
 async function sendPack(files){
   if(!files.length) return;
@@ -11984,6 +12357,7 @@ if($('packDrop')){
   /* 화면을 처음 열 때 지난 기록을 보여 준다 (앱을 껐다 켜도 남아 있다) */
   fetch('/api/pack_log').then(r => r.json())
     .then(r => renderPackLog(r.log)).catch(() => {});
+  loadDataStorageStatus();
 }
 
 $('setImport').addEventListener('click', () => $('setImportFile').click());
@@ -15303,6 +15677,11 @@ class ConfigServer:
                         self._json({"ok": True, "log": pack_log_brief()})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/data_storage"):
+                    try:
+                        self._json(data_storage_status())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/img_origins"):
                     # 원격 캐시는 **주소 해시**로 파일을 만든다. 주소가 달라도 같은 그림이면
                     # 두 벌이 남는데, 내려받을 때 적어 둔 **내용 해시**로 그걸 찾아낸다.
@@ -15522,6 +15901,17 @@ class ConfigServer:
                         data = json.loads(body or b"{}")
                         self._json(rollback_local_image_normalize(
                             data.get("id", "")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/data_index_rebuild"):
+                    try:
+                        index = rebuild_data_index()
+                        self._json({
+                            "ok": True,
+                            "files": index["files"],
+                            "bytes": index["bytes"],
+                            "fingerprint": index["fingerprint"],
+                        })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/save"):
