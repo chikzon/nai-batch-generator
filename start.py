@@ -6722,6 +6722,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vSettings" style="display:none;">
+      <span id="compareClassicHome" hidden aria-hidden="true"></span>
       <div class="card" id="compareCard">
         <h2><span class="n">비교 생성</span>내 자료를 같은 조건으로 한 장씩 보기
           <span class="count" id="cmpCounts" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
@@ -6918,6 +6919,18 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vLibrary" style="display:none;">
+      <div id="studioLibraryNav" class="studio-subnav hidden" aria-label="자료 작업 선택">
+        <div class="studio-subnav-copy">
+          <span class="eyebrow">Library workspace</span>
+          <strong>자료를 찾고 정리한 뒤, 같은 조건으로 비교합니다</strong>
+        </div>
+        <div class="studio-subnav-actions" role="tablist" aria-label="자료 작업">
+          <button type="button" data-library-work="browse" role="tab">찾기·정리</button>
+          <button type="button" data-library-work="compare" role="tab">비교·선별</button>
+        </div>
+      </div>
+      <span id="studioCompareHome" hidden aria-hidden="true"></span>
+      <div id="studioLibraryBrowse">
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
       <div class="card">
         <h2><span class="n">생성물</span>탐색기 · 선별
@@ -7038,6 +7051,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <h2><span class="n">편집</span>캐릭터 상세</h2>
         <div id="charList"></div>
         <div id="folderList"></div>
+      </div>
       </div>
     </div>
 
@@ -8245,11 +8259,55 @@ document.querySelectorAll('[data-ovl]').forEach(b => b.addEventListener('click',
 document.querySelectorAll('[data-ovl-close]').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.ovl').forEach(o => o.classList.add('hidden'));
 }));
+
+/* 작업실의 자료 화면은 "찾기·정리 → 비교·선별" 흐름으로 나눈다.
+   비교 생성의 DOM·이벤트·설정은 복제하지 않고 카드 하나를 옮긴다. 기존 화면으로
+   돌아가면 원래 세팅 탭의 앵커로 즉시 복원되므로 두 구현이 어긋나지 않는다. */
+function bindStudioLibraryNav(){
+  const nav = $('studioLibraryNav');
+  if(!nav || nav._bound) return;
+  nav._bound = true;
+  nav.querySelectorAll('[data-library-work]').forEach(button => {
+    button.addEventListener('click', () => {
+      STATE.ui = STATE.ui || {};
+      STATE.ui.library_work = button.dataset.libraryWork === 'compare' ? 'compare' : 'browse';
+      arrangeStudioWorkspace();
+      save();
+    });
+  });
+}
+function arrangeStudioWorkspace(){
+  if(!STATE) return;
+  bindStudioLibraryNav();
+  const card = $('compareCard');
+  const classicHome = $('compareClassicHome');
+  const studioHome = $('studioCompareHome');
+  const nav = $('studioLibraryNav');
+  const browse = $('studioLibraryBrowse');
+  if(!card || !classicHome || !studioHome || !nav || !browse) return;
+
+  const studio = (STATE.ui || {}).layout === 'studio';
+  const work = (STATE.ui || {}).library_work === 'compare' ? 'compare' : 'browse';
+  const home = studio ? studioHome : classicHome;
+  if(home.nextElementSibling !== card) home.insertAdjacentElement('afterend', card);
+
+  nav.classList.toggle('hidden', !studio);
+  browse.classList.toggle('hidden', studio && work === 'compare');
+  card.classList.toggle('hidden',
+    studio && (document.body.dataset.mode !== 'library' || work !== 'compare'));
+  nav.querySelectorAll('[data-library-work]').forEach(button => {
+    const on = button.dataset.libraryWork === work;
+    button.classList.toggle('on', on);
+    button.setAttribute('aria-selected', on ? 'true' : 'false');
+    button.tabIndex = on ? 0 : -1;
+  });
+}
 function setMode(m){
   document.body.dataset.mode = m;
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   ['preview','settings','builder','library','system'].forEach(x =>
     $('v' + x[0].toUpperCase() + x.slice(1)).style.display = (x === m ? '' : 'none'));
+  arrangeStudioWorkspace();
 }
 document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
 document.querySelectorAll('[data-mode-jump]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.modeJump)));
@@ -11723,6 +11781,7 @@ function applyUI(){
   u.accent ? r.setAttribute('data-accent', u.accent) : r.removeAttribute('data-accent');
   u.fs ? r.setAttribute('data-fs', u.fs) : r.removeAttribute('data-fs');
   u.radius ? r.setAttribute('data-radius', u.radius) : r.removeAttribute('data-radius');
+  arrangeStudioWorkspace();
 }
 function renderUIChips(){
   const mk = (host, list, key) => {

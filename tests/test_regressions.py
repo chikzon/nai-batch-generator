@@ -865,6 +865,20 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('body:not([data-mode="preview"]) .left', css)
         self.assertNotIn("수집", BUILD.ASSET_DIRS)
 
+    def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
+        """비교 생성은 복제하지 않고 작업실/기존 화면 사이에서 같은 DOM을 옮겨야 한다."""
+        page = APP.render_page()
+        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        self.assertEqual(page.count('id="compareCard"'), 1)
+        for marker in ('id="compareClassicHome"', 'id="studioCompareHome"',
+                       'id="studioLibraryNav"', 'id="studioLibraryBrowse"'):
+            self.assertIn(marker, page)
+        self.assertIn("home.insertAdjacentElement('afterend', card)", page)
+        self.assertIn("STATE.ui.library_work = button.dataset.libraryWork", page)
+        self.assertIn("document.body.dataset.mode !== 'library'", page)
+        self.assertIn("arrangeStudioWorkspace();", page)
+        self.assertIn('.studio-subnav-actions button.on', css)
+
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
 
