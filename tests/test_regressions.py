@@ -1109,6 +1109,79 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("chars.splice(Math.min(deleted.index, chars.length), 0, restored);", page)
         self.assertIn("if(chars.some(x => x.id === restored.id)) restored.id = genId();", page)
 
+    def test_newer_external_character_file_is_not_overwritten_by_stale_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            char_dir = root / "캐릭터"
+            char_dir.mkdir()
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [{
+                "id": "same-id", "name": "설정의 옛 이름",
+                "female": "old appearance", "clothed": "old clothes",
+                "negative": "old negative", "enabled": False,
+            }]
+            settings.write_text("{}", encoding="utf-8")
+            external = char_dir / "외부 편집.json"
+            time.sleep(0.01)
+            external.write_text(json.dumps({
+                "id": "same-id", "이름": "외부 편집",
+                "외형": "new appearance", "착의": "new clothes",
+                "네거티브": "new negative", "출처": "user file",
+                "그룹": {"예술적 변형": "watercolor"},
+            }, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "CHAR_DIR", char_dir),
+            ):
+                APP.import_char_files(cfg)
+                APP.sync_chars_to_files(cfg)
+                APP.save_config(cfg)
+                saved_file = json.loads(
+                    (char_dir / "외부 편집.json").read_text(encoding="utf-8"))
+                saved_settings = json.loads(settings.read_text(encoding="utf-8"))
+
+            char = cfg["characters"][0]
+            self.assertEqual(char["name"], "외부 편집")
+            self.assertEqual(char["female"], "new appearance")
+            self.assertEqual(char["clothed"], "new clothes")
+            self.assertEqual(char["negative"], "new negative")
+            self.assertEqual(char["source"], "user file")
+            self.assertEqual(char["groups"], {"예술적 변형": "watercolor"})
+            self.assertFalse(char["enabled"], "화면의 켜기/끄기 상태는 보존해야 한다")
+            self.assertEqual(saved_file["외형"], "new appearance")
+            self.assertEqual(saved_file["착의"], "new clothes")
+            self.assertEqual(
+                saved_settings["characters"][0]["female"], "new appearance")
+
+    def test_older_character_file_does_not_undo_a_newer_ui_save(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            char_dir = root / "캐릭터"
+            char_dir.mkdir()
+            external = char_dir / "옛 파일.json"
+            external.write_text(json.dumps({
+                "id": "same-id", "이름": "옛 파일", "외형": "old appearance",
+            }, ensure_ascii=False), encoding="utf-8")
+            time.sleep(0.01)
+            settings.write_text("{}", encoding="utf-8")
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [{
+                "id": "same-id", "name": "UI 최신값",
+                "female": "new appearance", "enabled": True,
+            }]
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "CHAR_DIR", char_dir),
+            ):
+                APP.import_char_files(cfg)
+
+            self.assertEqual(cfg["characters"][0]["name"], "UI 최신값")
+            self.assertEqual(cfg["characters"][0]["female"], "new appearance")
+
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
 

@@ -4267,10 +4267,20 @@ def _folder_by_name(cfg, name, parent_id=None):
 
 
 def import_char_files(cfg):
-    """캐릭터/ 폴더의 규격 JSON 중 설정에 없는 것을 자동 등록한다."""
+    """캐릭터/ 폴더의 규격 JSON을 등록하고, 더 새 외부 편집은 설정에 반영한다.
+
+    UI 저장은 캐릭터 파일을 먼저 쓰고 설정.json을 나중에 쓰므로 정상 저장 뒤에는
+    설정 쪽 시각이 더 새롭다. 반대로 사용자가 캐릭터 JSON을 직접 고친 경우에만
+    파일 쪽이 더 새로워진다. 같은 id라는 이유로 그 편집을 무시한 뒤 옛 설정으로
+    덮어쓰지 않는다.
+    """
     if not CHAR_DIR.exists():
         return
-    known_ids = {c.get("id") for c in cfg.get("characters", [])}
+    known = {c.get("id"): c for c in cfg.get("characters", []) if c.get("id")}
+    try:
+        settings_mtime = SETTINGS_FILE.stat().st_mtime_ns
+    except OSError:
+        settings_mtime = -1
     for p in sorted(CHAR_DIR.rglob("*.json")):
         try:
             data = load_json_recover(p)
@@ -4280,10 +4290,9 @@ def import_char_files(cfg):
         if not isinstance(data, dict):
             continue
         cid = data.get("id")
-        if cid and cid in known_ids:
-            continue
         female = (data.get("외형") or "").strip() or _compose_from_groups(data.get("그룹"))
-        if not female:
+        clothed = data.get("착의", "")
+        if not (female or str(clothed or "").strip()):
             continue
         rel = p.relative_to(CHAR_DIR).parts[:-1]  # 폴더 경로 (최대 2단계)
         folder_id = subfolder_id = None
@@ -4293,17 +4302,40 @@ def import_char_files(cfg):
         if len(rel) >= 2:
             sub = _folder_by_name(cfg, rel[1], parent_id=folder_id)
             subfolder_id = sub["id"]
+        if cid and cid in known:
+            try:
+                externally_newer = p.stat().st_mtime_ns > settings_mtime
+            except OSError:
+                externally_newer = False
+            if not externally_newer:
+                continue
+            current = known[cid]
+            current.update({
+                "name": data.get("이름") or p.stem,
+                "female": female,
+                "clothed": clothed,
+                "negative": data.get("네거티브", ""),
+                "source": data.get("출처", ""),
+                "folder_id": folder_id,
+                "subfolder_id": subfolder_id,
+            })
+            if data.get("그룹"):
+                current["groups"] = data["그룹"]
+            else:
+                current.pop("groups", None)
+            log.info(f"외부에서 더 새로 편집한 캐릭터 반영: {p.relative_to(CHAR_DIR)}")
+            continue
         new_id = cid or "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         new_char = {
             "id": new_id, "name": data.get("이름") or p.stem,
-            "female": female, "clothed": data.get("착의", ""),
+            "female": female, "clothed": clothed,
             "negative": data.get("네거티브", ""), "source": data.get("출처", ""),
             "enabled": True, "folder_id": folder_id, "subfolder_id": subfolder_id,
         }
         if data.get("그룹"):
             new_char["groups"] = data["그룹"]
         cfg.setdefault("characters", []).append(new_char)
-        known_ids.add(new_id)
+        known[new_id] = new_char
         log.info(f"캐릭터 파일 등록: {p.relative_to(CHAR_DIR)}")
 
 
