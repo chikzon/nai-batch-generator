@@ -2998,8 +2998,9 @@ def _datapack_lists():
     }
 
 
-# 이미지캐시는 SHA-256 내용주소 파일명이라 **이름이 같으면 내용도 같다.**
-# 그래서 있는 파일은 건드리지 않고 없는 것만 복사하면 그게 곧 올바른 병합이다.
+# 새 이미지캐시는 SHA-256 내용주소를 쓰지만, 변환 전 원본 해시를 이름으로 쓴
+# 구 자료도 남아 있다. 따라서 가져올 때 실제 바이트를 재어 새 이름과 JSON 참조를
+# 함께 맞춘다. 기존 캐시는 참조가 살아 있으므로 자동 일괄 개명하지 않는다.
 def _datapack_dirs():
     """{팩 안 경로: (저장위치, 받아들일 확장자)}"""
     return {"수집/이미지캐시": (IMG_CACHE, (".webp", ".png", ".jpg", ".jpeg")),
@@ -3147,6 +3148,33 @@ def _say_counts(n):
     return " · ".join(got) or "들어온 것 없음"
 
 
+def _content_image_name(name, raw):
+    """자료팩 그림의 이름을 실제 바이트의 SHA-256으로 만든다.
+
+    `local:`은 파일명을 내용 주소로 믿는다. 외부 팩의 이름이 틀렸는데 그대로
+    넣으면 같은 이름의 다른 그림을 중복으로 오인하고, JSON 참조도 엉뚱한 바이트를
+    가리킨다. 확장자는 화면의 MIME 판별을 위해 원래 허용 확장자를 유지한다.
+    """
+    suffix = Path(str(name)).suffix.lower()
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    if suffix not in (".webp", ".png", ".jpg"):
+        suffix = ".webp"
+    return hashlib.sha256(raw).hexdigest() + suffix
+
+
+def _rewrite_local_image_refs(value, renamed):
+    """자료팩 안의 `local:옛이름`을 실측한 내용 주소로 재귀 치환한다."""
+    if isinstance(value, str) and value.startswith("local:"):
+        old = Path(value[6:]).name
+        return "local:" + renamed.get(old, old)
+    if isinstance(value, list):
+        return [_rewrite_local_image_refs(x, renamed) for x in value]
+    if isinstance(value, dict):
+        return {k: _rewrite_local_image_refs(v, renamed) for k, v in value.items()}
+    return value
+
+
 def forget_collection_caches():
     """자료가 늘었으니 한 번 읽고 물고 있던 것들을 놓게 한다.
     `load_combos()`·`load_recipes()` 는 `loaded` 깃발을 보고 다시 읽고,
@@ -3239,6 +3267,8 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         files += 1
         return True
 
+    local_image_renames = {}
+
     def take_list(stem, raw):
         nonlocal files
         spot = lists.get(stem)
@@ -3249,6 +3279,8 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         if rows is None:
             report.append(f"{stem}: {how}")
             return True
+        if local_image_renames:
+            rows = _rewrite_local_image_refs(rows, local_image_renames)
         n, keys = _merge_list_json(dest, rows, key, overwrite)
         report.append(f"{stem}: {_say_counts(n)}" + (f" ({how})" if how else ""))
         if keys:
@@ -3258,7 +3290,24 @@ def import_datapack_bytes(data, filename="", overwrite=False):
 
     if data[:2] == b"PK":
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            copied, skipped = {}, {}
+            # ZIP 순서와 무관하게 목록 JSON을 읽기 전에 모든 로컬 그림의 실제
+            # 내용 주소를 계산한다. 그래야 JSON이 그림보다 앞에 있어도 참조를 고친다.
+            image_payloads = {}
+            for n in z.namelist():
+                if n.endswith("/"):
+                    continue
+                rel = _pack_rel(n)
+                if rel is None or not rel.startswith("수집/이미지캐시/"):
+                    continue
+                stem = Path(rel).name
+                if Path(stem).suffix.lower() not in dirs["수집/이미지캐시"][1]:
+                    continue
+                raw = z.read(n)
+                correct = _content_image_name(stem, raw)
+                local_image_renames[stem] = correct
+                image_payloads[n] = (raw, correct)
+
+            copied, skipped, renamed = {}, {}, 0
             for n in z.namelist():
                 if n.endswith("/"):
                     continue
@@ -3277,21 +3326,41 @@ def import_datapack_bytes(data, filename="", overwrite=False):
                     continue
                 for d, (root, exts) in dirs.items():
                     if rel.startswith(d + "/") and stem.lower().endswith(exts):
-                        dest = root / stem      # 한 겹으로 편다 (내용주소라 이름이 곧 열쇠)
-                        if dest.exists():       # 같은 이름 = 같은 파일
+                        raw, saved_name = image_payloads.get(
+                            n, (z.read(n), stem))
+                        if d == "수집/이미지캐시" and saved_name != stem:
+                            renamed += 1
+                        dest = root / saved_name
+                        if dest.exists() and dest.read_bytes() == raw:
                             skipped[d] = skipped.get(d, 0) + 1
+                        elif dest.exists():
+                            # 내용 주소와 실제 바이트가 다른 기존 파일은 없애지 않는다.
+                            # 판 전용 백업에 보존하고, 되돌릴 때 복구할 수 있게 기록한다.
+                            rel_dest = dest.relative_to(BASE_DIR).as_posix()
+                            backup = BASE_DIR / "수집" / "가져온백업" / batch_id / rel_dest
+                            _atomic_write_bytes(
+                                backup, dest.read_bytes(), keep_backup=False)
+                            _atomic_write_bytes(dest, raw, keep_backup=False)
+                            copied[d] = copied.get(d, 0) + 1
+                            batch["installed"].append({
+                                "path": rel_dest,
+                                "backup": backup.relative_to(BASE_DIR).as_posix(),
+                                "sha256": hashlib.sha256(raw).hexdigest(),
+                            })
                         else:
                             dest.parent.mkdir(parents=True, exist_ok=True)
                             _atomic_write_bytes(
-                                dest, z.read(n), keep_backup=False)
+                                dest, raw, keep_backup=False)
                             copied[d] = copied.get(d, 0) + 1
-                            batch["files"].setdefault(d, []).append(stem)
+                            batch["files"].setdefault(d, []).append(saved_name)
                         break
             for d in dirs:
                 c, s = copied.get(d, 0), skipped.get(d, 0)
                 if c or s:
                     files += c
                     report.append(f"{d}: 새로 {c}개" + (f" · 이미 있음 {s}개" if s else ""))
+            if renamed:
+                report.append(f"이미지 내용 주소: 이름이 달랐던 {renamed}개를 바로잡음")
     else:
         stem = Path(filename).name
         if stem in whole:

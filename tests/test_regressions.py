@@ -1491,6 +1491,66 @@ class RegressionTests(unittest.TestCase):
                 {"mode": "keep-me", "value": 17},
             )
 
+    def test_datapack_rewrites_wrong_local_image_name_to_content_hash(self):
+        image = io.BytesIO()
+        Image.new("RGB", (3, 2), (90, 40, 10)).save(image, "WEBP")
+        payload = image.getvalue()
+        correct = hashlib.sha256(payload).hexdigest() + ".webp"
+        styles = [{
+            "id": "wrong-local-name",
+            "base": "1girl",
+            "images": ["local:not-the-content-hash.webp"],
+        }]
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as z:
+            # JSON이 그림보다 먼저 와도 사전 실측으로 참조가 고쳐져야 한다.
+            z.writestr("수집/그림체.json", json.dumps(
+                styles, ensure_ascii=False))
+            z.writestr("수집/이미지캐시/not-the-content-hash.webp", payload)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "STYLE_FILE", root / "수집" / "그림체.json"), \
+                    patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"):
+                result = APP.import_datapack_bytes(
+                    archive.getvalue(), "wrong-name.zip")
+                self.assertTrue(result["ok"])
+                self.assertTrue((APP.IMG_CACHE / correct).exists())
+                self.assertFalse(
+                    (APP.IMG_CACHE / "not-the-content-hash.webp").exists())
+                saved = json.loads(APP.STYLE_FILE.read_text(encoding="utf-8"))
+                self.assertEqual(saved[0]["images"], ["local:" + correct])
+                fetched, content_type = APP.fetch_cached_image(
+                    saved[0]["images"][0])
+                self.assertEqual(fetched, payload)
+                self.assertEqual(content_type, "image/webp")
+                self.assertTrue(any(
+                    "이름이 달랐던 1개" in line for line in result["report"]))
+
+    def test_datapack_preserves_and_restores_conflicting_local_image(self):
+        incoming = b"actual image payload"
+        previous = b"pre-existing damaged payload"
+        correct = hashlib.sha256(incoming).hexdigest() + ".webp"
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("수집/이미지캐시/" + correct, incoming)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "수집" / "이미지캐시"
+            cache.mkdir(parents=True)
+            (cache / correct).write_bytes(previous)
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "IMG_CACHE", cache):
+                result = APP.import_datapack_bytes(
+                    archive.getvalue(), "conflict.zip")
+                self.assertTrue(result["ok"])
+                self.assertEqual((cache / correct).read_bytes(), incoming)
+                undone = APP.undo_datapack(result["batch"])
+                self.assertTrue(undone["ok"])
+                self.assertEqual((cache / correct).read_bytes(), previous)
+
     def test_metadata_keeps_each_character_prompt_and_negative_as_whole_text(self):
         values = {
             "v4_prompt": {"caption": {
