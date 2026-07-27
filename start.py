@@ -5483,19 +5483,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .titlebar .stat{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}
 
   /* ── 3단 레이아웃 ── */
-  #app{display:grid;grid-template-columns:var(--lw,360px) minmax(520px,1fr) 280px;height:calc(100vh - 56px);}
+  #app{--colL:var(--lw,360px);--colR:280px;
+       display:grid;grid-template-columns:var(--colL) minmax(520px,1fr) var(--colR);height:calc(100vh - 56px);}
   /* 넓은 화면에서 가운데가 논다 — 1600×1000 실측에서 좌 360 / 중 960 / 우 280 이었고,
      그동안 프롬프트 칸은 보이는 높이 228px 에 내용 1,104px(80% 가 잘림)이었다.
      좌·우를 넓혀 같은 글이 세로로 덜 접히게 한다. `--lw` 는 사용자가 손잡이를 끌면
      localStorage 에 남으므로, **직접 정한 폭이 있으면 그쪽이 이긴다.** */
   @media (min-width:1200px){
-    #app{grid-template-columns:var(--lw,400px) minmax(520px,1fr) 280px;}
+    #app{--colL:var(--lw,400px);--colR:280px;}
   }
   @media (min-width:1500px){
-    #app{grid-template-columns:var(--lw,440px) minmax(560px,1fr) 300px;}
+    #app{--colL:var(--lw,440px);--colR:300px;
+         grid-template-columns:var(--colL) minmax(560px,1fr) var(--colR);}
   }
   @media (min-width:1900px){
-    #app{grid-template-columns:var(--lw,500px) minmax(640px,1fr) 320px;}
+    #app{--colL:var(--lw,500px);--colR:320px;
+         grid-template-columns:var(--colL) minmax(640px,1fr) var(--colR);}
   }
   .left{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;position:relative;background:var(--paper);box-shadow:2px 0 10px #10182808;z-index:2;}
   /* 왼쪽 패널 폭 조절 손잡이 (Forge 참고) — 드래그로 240~560px */
@@ -5506,6 +5509,31 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .center{min-width:0;overflow-y:auto;padding:22px 24px;scrollbar-gutter:stable;}
   .center>.view{width:100%;max-width:1120px;margin:0 auto;}
   .right{border-left:1px solid var(--line);overflow-y:auto;padding:14px;background:var(--paper);box-shadow:-2px 0 10px #10182808;}
+
+  /* ── 패널 접기 (Forge · blue 둘 다 갖고 있다) ──────────────────────────
+     Forge v1.2.11 `ThreeColumnLayout.tsx:230` 이 `!leftSidebarVisible && "hidden"` 으로
+     좌패널을 통째로 감추고, blue v2.11.2 `stores/layout-store.ts:6-37` 은 **좌·우 둘 다**
+     감추고 그 상태를 저장한다. 우리는 폭 손잡이만 있어 자료·세팅 탭에서 프롬프트 칸이
+     차지한 자리를 되찾을 방법이 없었다 (1600 에서 좌 440 + 우 300 = 46%).
+     ⚠ 접었을 때 **폭을 0 으로 만들지 않고 열에서 뺀다** — `grid-template-columns` 를
+       다시 써야 가운데가 그 자리를 실제로 가져간다. 폭만 0 으로 하면 padding·border 가
+       남아 몇 px 이 뜨고 손잡이도 잡히는 채로 남는다. */
+  /* ⚠ 세 패널의 **열을 못박아야** 한다. `display:none` 은 항목을 격자 흐름에서 빼므로
+     열을 안 정해 두면 자동 배치가 한 칸씩 당겨져, 좌패널을 접었을 때 가운데가 1번 열
+     (0px)로 밀리고 오른쪽이 `1fr` 을 차지한다 — 실측에서 중 860→48 · 우 300→1300 이었다. */
+  .left{grid-column:1;} .center{grid-column:2;} .right{grid-column:3;}
+  #app[data-lhide="1"] .left{display:none;}
+  #app[data-rhide="1"] .right{display:none;}
+  /* 폭은 `--colL`·`--colR` 한 곳에서만 정한다. 접기는 그 변수를 0 으로 만들 뿐이라
+     화면 폭 단계(1200·1500·1900)에서 정한 값이 그대로 보존된다.
+     열 정의를 여기서 다시 쓰면 넓은 화면의 우 300·320 이 280 으로 되돌아간다. */
+  #app[data-lhide="1"]{--colL:0;}
+  #app[data-rhide="1"]{--colR:0;}
+  .paneltog{display:inline-flex;align-items:center;justify-content:center;width:26px;height:24px;
+    border:1px solid var(--line);background:var(--paper);color:var(--muted);cursor:pointer;
+    border-radius:var(--radius);font-size:var(--fs-xs);line-height:1;padding:0;}
+  .paneltog:hover{color:var(--fg);border-color:var(--accent);}
+  .paneltog[aria-pressed="true"]{color:var(--accent);border-color:var(--accent);background:var(--accent-dim);}
 
   /* ── 왼쪽: 프롬프트 패널 (NAIS3 구조) ── */
   .preset-bar{display:flex;gap:8px;padding:12px 14px 10px;border-bottom:1px solid var(--line);background:var(--paper);}
@@ -5614,6 +5642,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .pv-img{width:min(100%,720px);max-height:calc(100vh - 190px);aspect-ratio:1/1;background:#080a0f;border-radius:calc(var(--radius) + 4px);overflow:hidden;
     display:flex;align-items:center;justify-content:center;border:1px solid #000;box-shadow:0 10px 32px #10182824;}
   .pv-img img{width:100%;height:100%;object-fit:contain;}
+  /* ── 아직 아무것도 안 뽑았을 때 ────────────────────────────────────────
+     그림이 들어오면 어두운 바탕이 맞다(그림을 보는 자리다). 그런데 **빈 채로도**
+     720×720 검은 정사각형이 서 있어서, 첫 화면에서 가장 큰 시각 요소가 빈 상자였다.
+     1600 실측에서 미리보기 720×620 + 우패널 300×930 이 모두 빈 자리였다.
+     그래서 **비었을 때만** 낮고 옅은 자리표시로 바꾼다 — 기능은 그대로고 모양만 바뀐다.
+     ⚠ `pvImg` 는 한 번 채워지면 다시 비지 않으므로(`innerHTML` 로 넣기만 한다)
+       `:has(img)` 로 갈라도 깜빡이지 않는다. `:has` 를 모르는 브라우저에서는
+       이 규칙만 통째로 무시되어 예전 모습으로 돌아갈 뿐 깨지지 않는다. */
+  .pv-img:not(:has(img)){
+    aspect-ratio:auto;min-height:190px;background:var(--paper2);
+    border:1px dashed var(--line);box-shadow:none;}
   .pv-meta{width:100%;max-width:720px;}
   .pv-meta .nm{font-weight:700;color:var(--accent);font-size:var(--fs);}
   .pv-meta .fn{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);margin-top:3px;}
@@ -5686,6 +5725,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="spacer"></div>
   <div class="stat" id="topStat">-</div>
+  <!-- 패널 접기 — Forge 는 타이틀바 우측에 같은 것을 둔다 (`CustomTitleBar.tsx:110-`) -->
+  <button class="paneltog" id="togLeft" aria-pressed="false"
+    title="프롬프트 패널 접기 / 펴기 (Alt+[)">◧</button>
+  <button class="paneltog" id="togRight" aria-pressed="false"
+    title="최근 생성 패널 접기 / 펴기 (Alt+])">◨</button>
 </div>
 
 <div class="app" id="app">
@@ -5700,7 +5744,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="psec-head" data-fold="pPos"><span class="chev">▾</span><span class="t">프롬프트</span>
         <span class="count" id="posTok">0</span>
         <span class="ed" id="tagVerifyBtn" title="단부루에 실제로 있는 태그인지 확인 (없는 태그는 토큰만 먹는다)">✓태그</span>
-        <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄찾바</span>
+        <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄바꾸기</span>
         <span class="ed" id="split3Btn" title="고정 / 가변 / 디테일 세 칸으로 나누기">⋮⋮</span></div>
       <div class="psec-body" id="pPos">
         <textarea id="basePrompt" placeholder="1girl, artist:..., masterpiece"></textarea>
@@ -6314,7 +6358,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div class="field"><label>모서리</label><div id="radiusChips"></div></div>
         </div>
         <div class="field" style="margin-top:8px;">
-          <label>Highlight Emphasis <span class="hint">— 프롬프트 칸의 가중치를 색으로 표시</span></label>
+          <label>가중치 색으로 보기 <span class="hint">— 프롬프트 칸의 강조·약화를 색으로 표시</span></label>
           <select id="uiHighlight"><option value="on">켬</option><option value="off">끔</option></select>
           <p class="hint" style="margin-top:5px;">
             <b style="background:rgba(190,70,70,.42);padding:0 3px;border-radius:3px;">2.0↑ 아주 강함</b>
@@ -10736,6 +10780,43 @@ poll();
     if(!on) return;
     on = false;
     localStorage.setItem('lw', clamp(e.clientX));
+  });
+})();
+
+/* ── 패널 접기 (Forge · blue 둘 다 갖고 있다) ────────────────────────────
+   Forge v1.2.11 는 타이틀바에서 좌패널을 감추고(`CustomTitleBar.tsx:110-`),
+   blue v2.11.2 는 좌·우 둘 다 감추고 그 상태를 저장한다(`layout-store.ts:6-37`).
+   우리는 폭 손잡이만 있어 자료·세팅 탭에서 프롬프트 칸이 차지한 자리를 되찾을 수
+   없었다 (1600 에서 좌 440 + 우 300 = 46% 가 그 탭의 일과 무관하게 고정).
+   ⚠ 저장은 `--lw` 와 같이 **localStorage** 에 둔다. 브라우저별 취향이고,
+     `설정.json` 에 넣으면 옛 설정 파일과 스키마가 갈린다. */
+(function(){
+  const app = $('app');
+  if(!app) return;
+  const PANES = [['togLeft', 'lhide', 'panelL'], ['togRight', 'rhide', 'panelR']];
+  const paint = (btn, hidden) => {
+    if(!btn) return;
+    btn.setAttribute('aria-pressed', hidden ? 'true' : 'false');
+  };
+  PANES.forEach(([id, attr, key]) => {
+    const btn = $(id);
+    const hidden = localStorage.getItem(key) === '1';
+    if(hidden) app.setAttribute('data-' + attr, '1');
+    paint(btn, hidden);
+    if(!btn) return;
+    btn.addEventListener('click', () => {
+      const now = app.getAttribute('data-' + attr) === '1';
+      if(now) app.removeAttribute('data-' + attr);
+      else app.setAttribute('data-' + attr, '1');
+      localStorage.setItem(key, now ? '0' : '1');
+      paint(btn, !now);
+    });
+  });
+  /* Alt+[ / Alt+] — 탭 전환이 Alt+1~5 라 같은 결로 맞췄다 */
+  document.addEventListener('keydown', e => {
+    if(!e.altKey || e.ctrlKey || e.metaKey) return;
+    if(e.key === '[' && $('togLeft')){ e.preventDefault(); $('togLeft').click(); }
+    if(e.key === ']' && $('togRight')){ e.preventDefault(); $('togRight').click(); }
   });
 })();
 

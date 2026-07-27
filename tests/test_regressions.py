@@ -333,6 +333,42 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("fatalErrorBar", page)
         self.assertIn("새로고침", page)
 
+    def test_collapsible_panels_pin_their_grid_columns(self):
+        """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
+
+        `display:none` 은 항목을 격자 흐름에서 뺀다. 세 패널의 `grid-column` 을
+        정해 두지 않으면 좌패널을 접었을 때 자동 배치가 한 칸씩 당겨져 가운데가
+        1번 열(0px)로 밀리고 오른쪽이 `1fr` 을 가져간다 — 브라우저 실측에서
+        중 860→48 · 우 300→1300 이었다. 화면 없이도 지킬 수 있게 여기서 막는다."""
+        page = APP.render_page()
+        squished = page.replace(" ", "")
+        # ⚠ 실패해도 페이지를 통째로 덤프하지 않게 참/거짓으로 잰다 (300KB 가 쏟아진다)
+        for sel in (".left{grid-column:1;}", ".center{grid-column:2;}",
+                    ".right{grid-column:3;}"):
+            self.assertTrue(sel in squished, f"패널 열이 안 박혀 있다: {sel}")
+        # 접기는 열 폭 변수만 0 으로 바꾼다 (반응형 폭 단계를 덮어쓰지 않는다)
+        for sel in ('#app[data-lhide="1"]{--colL:0;}', '#app[data-rhide="1"]{--colR:0;}',
+                    "grid-template-columns:var(--colL)"):
+            self.assertTrue(sel in squished, f"접기 규칙이 없다: {sel}")
+        # 토글 단추와 상태 저장이 함께 있어야 실제로 쓸 수 있다
+        for sel in ('id="togLeft"', 'id="togRight"', "localStorage.setItem(key"):
+            self.assertTrue(sel in page, f"패널 접기 조작부가 없다: {sel}")
+
+    def test_ui_labels_are_korean_words_not_invented_abbreviations(self):
+        """화면 라벨은 **읽어서 뜻이 통해야** 한다.
+
+        `⇄찾바` 는 한국어 낱말이 아니라 뜻을 알 수 없었고(모달 제목은
+        `찾아 바꾸기` 로 제대로 돼 있었다), `Highlight Emphasis` 는 전부 한국어인
+        화면에 홀로 영어였다. 되돌아가지 않게 못박는다."""
+        page = APP.render_page()
+        # ⚠ `assertIn`/`assertNotIn` 은 실패하면 **페이지 300KB 를 통째로 덤프**해
+        #   로그를 못 쓰게 만든다. 참/거짓으로 재고 짧은 말로 알린다.
+        self.assertFalse("찾바" in page, "라벨이 `⇄찾바` 로 되돌아갔다 (낱말이 아니다)")
+        self.assertTrue("⇄바꾸기" in page, "`⇄바꾸기` 라벨이 없다")
+        self.assertFalse("Highlight Emphasis <span" in page,
+                         "설정 라벨이 영어(`Highlight Emphasis`)로 되돌아갔다")
+        self.assertTrue("가중치 색으로 보기" in page, "`가중치 색으로 보기` 라벨이 없다")
+
     def test_tag_alias_autocomplete_returns_canonical_tag(self):
         data = {
             "rows": [
