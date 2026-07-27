@@ -3141,7 +3141,16 @@ def import_datapack_bytes(data, filename="", overwrite=False):
     # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
     if batch["lists"] or batch["files"]:
         rows = load_pack_log()
-        batch["id"] = f"{int(time.time())}"
+        # ⚠ 판 id 는 **초 단위 시간만으로 지으면 안 된다.** 화면의 `sendPack` 은 여러 파일을
+        #   반복문으로 잇달아 넣으므로 두 파일을 함께 끌어다 놓으면 **같은 초**에 들어가
+        #   id 가 겹친다. 겹치면 `undo_datapack` 이 먼저 들어온 판을 집어 **엉뚱한 자료를
+        #   지우고**, 기록에서 겹친 판이 함께 빠져 나머지를 **영영 되돌릴 수 없게** 된다
+        #   (되돌리기에는 휴지통이 없다). 그래서 시간 뒤에 난수를 붙인다 —
+        #   앞의 시간은 사람이 읽고 정렬하기 위한 것이고, 겹침을 막는 것은 뒤의 난수다.
+        #   `random` 이 아니라 `os.urandom` 을 쓰는 것은 **프로필 두 개를 나란히 돌려도**
+        #   (서로 다른 프로세스) 겹치지 않게 하기 위해서다.
+        #   옛 기록의 숫자만 있는 id 도 그대로 읽히고 되돌려진다 (문자열로 견준다).
+        batch["id"] = f"{int(time.time())}-{os.urandom(4).hex()}"
         batch["새로"] = files
         batch["요약"] = " · ".join(report)
         rows.append(batch)
@@ -3199,7 +3208,11 @@ def undo_datapack(batch_id):
                 pass
         if gone:
             said.append(f"{d}: {gone}개 지움")
-    save_pack_log([b for b in rows if str(b.get("id")) != str(batch_id)])
+    # ⚠ **되돌린 그 판만** 뺀다. 예전에는 id 가 같은 것을 모두 걸러냈는데,
+    #   이미 겹쳐 있는 옛 기록(위 참조)에서는 손대지도 않은 판의 기록까지 사라져
+    #   그 자료를 **영영 되돌릴 수 없게** 됐다. 객체로 견주면 옛 기록도 한 번에 한 판씩
+    #   차례로 되돌릴 수 있다.
+    save_pack_log([b for b in rows if b is not hit])
     forget_collection_caches()
     return {"ok": True, "report": said or ["되돌릴 것이 없었습니다"],
             "log": pack_log_brief()}

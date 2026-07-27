@@ -1011,6 +1011,81 @@ class RegressionTests(unittest.TestCase):
             server.httpd.shutdown()
             server.httpd.server_close()
 
+    def test_packs_imported_in_the_same_second_undo_independently(self):
+        """한 번에 두 팩을 넣어도 판 id 가 겹치지 않고 **각각 따로** 되돌려진다.
+
+        화면의 `sendPack` 은 고른 파일을 반복문으로 잇달아 넣는다. 판 id 가
+        초 단위 시간뿐이면 두 팩이 **같은 초**에 들어가 id 가 겹쳤고, 그러면
+        `undo_datapack` 이 먼저 들어온 판을 집어 **엉뚱한 자료를 지운 뒤**
+        기록에서 겹친 판이 함께 빠져 나머지를 되돌릴 길이 사라졌다.
+        되돌리기에는 휴지통이 없어 그 자료는 복구할 수 없었다."""
+        def rows(prefix, n):
+            return [{"id": f"{prefix}-{i}", "combo": f"artist:{prefix}{i}",
+                     "artists": [f"{prefix}{i}"]} for i in range(n)]
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            with patch.object(APP, "BASE_DIR", base), \
+                    patch.object(APP, "STYLE_FILE", base / "수집" / "그림체.json"), \
+                    patch.object(APP, "IMG_CACHE", base / "수집" / "이미지캐시"):
+                def styles():
+                    return [x["id"] for x in json.loads(
+                        APP.STYLE_FILE.read_text(encoding="utf-8"))]
+
+                blob = lambda o: json.dumps(o, ensure_ascii=False).encode("utf-8")
+                first = APP.import_datapack_bytes(blob(rows("first", 3)), "그림체.json")
+                second = APP.import_datapack_bytes(blob(rows("second", 5)), "그림체.json")
+
+                # 같은 초에 들어가도 id 가 겹치지 않는다 (이것이 회귀의 핵심이다).
+                self.assertNotEqual(first["batch"], second["batch"])
+                self.assertEqual(len(styles()), 8)
+                self.assertEqual(len(APP.pack_log_brief()), 2)
+
+                # 둘째 판만 되돌린다 — 첫째 판 자료는 온전해야 한다.
+                undone = APP.undo_datapack(second["batch"])
+                self.assertTrue(undone["ok"])
+                self.assertEqual(styles(), [f"first-{i}" for i in range(3)])
+                log_ids = [b["id"] for b in APP.pack_log_brief()]
+                self.assertEqual(log_ids, [first["batch"]])
+
+                # 남은 첫째 판도 여전히 되돌려진다 (기록이 함께 지워지지 않았다).
+                self.assertTrue(APP.undo_datapack(first["batch"])["ok"])
+                self.assertEqual(styles(), [])
+                self.assertEqual(APP.pack_log_brief(), [])
+
+    def test_legacy_pack_log_with_colliding_ids_still_undoes_one_batch_at_a_time(self):
+        """id 가 이미 겹쳐 있는 **옛 기록**도 읽히고, 한 번에 한 판씩 되돌려진다.
+
+        고치기 전에 만들어진 `가져온기록.json` 에는 겹친 id 가 남아 있을 수 있다.
+        그때 id 로 기록을 걸러내면 손대지도 않은 판의 기록까지 사라졌다."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            with patch.object(APP, "BASE_DIR", base), \
+                    patch.object(APP, "STYLE_FILE", base / "수집" / "그림체.json"), \
+                    patch.object(APP, "IMG_CACHE", base / "수집" / "이미지캐시"):
+                APP.STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                APP.STYLE_FILE.write_text(json.dumps(
+                    [{"id": "a-1"}, {"id": "b-1"}], ensure_ascii=False), encoding="utf-8")
+                # 옛 판 id — 숫자만 있고 둘이 똑같다
+                APP.save_pack_log([
+                    {"id": "1785136158", "at": "옛날", "file": "가.json",
+                     "lists": {"그림체.json": ["a-1"]}, "files": {}},
+                    {"id": "1785136158", "at": "옛날", "file": "나.json",
+                     "lists": {"그림체.json": ["b-1"]}, "files": {}},
+                ])
+                self.assertEqual(len(APP.pack_log_brief()), 2)
+
+                self.assertTrue(APP.undo_datapack("1785136158")["ok"])
+                left = json.loads(APP.STYLE_FILE.read_text(encoding="utf-8"))
+                self.assertEqual([x["id"] for x in left], ["b-1"])
+                # 나머지 한 판의 기록이 남아 있어야 그 자료도 되돌릴 수 있다
+                self.assertEqual(len(APP.pack_log_brief()), 1)
+
+                self.assertTrue(APP.undo_datapack("1785136158")["ok"])
+                self.assertEqual(json.loads(
+                    APP.STYLE_FILE.read_text(encoding="utf-8")), [])
+                self.assertEqual(APP.pack_log_brief(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
