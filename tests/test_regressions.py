@@ -118,6 +118,14 @@ class RegressionTests(unittest.TestCase):
         ]
         self.assertEqual(len(negative_steps), 1)
         self.assertEqual(negative_steps[0].get("출력"), "negative")
+        combo_slots = [
+            slot
+            for step in builder["베이스단계"]
+            for slot in (step.get("슬롯") or [])
+            if slot.get("라벨") == "작가 조합"
+        ]
+        self.assertEqual(len(combo_slots), 1)
+        self.assertTrue(combo_slots[0].get("조합전용"))
 
         page = APP.PAGE_TEMPLATE
         self.assertIn('data-output="${output}"', page)
@@ -334,6 +342,40 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(item["images"], ["first.webp"])
         for unused in ("characters", "rest", "weights"):
             self.assertNotIn(unused, item)
+
+    def test_combo_search_loads_artist_ratings_once_per_request(self):
+        rows = [
+            {"id": f"s{i}", "combo": f"artist:a{i}", "artists": [f"a{i}"]}
+            for i in range(200)
+        ]
+        calls = []
+
+        def ratings():
+            calls.append(1)
+            return {}
+
+        with (
+            patch.object(APP, "load_combos", return_value=rows),
+            patch.object(APP, "load_ratings", side_effect=ratings),
+        ):
+            result = APP.search_combos(limit=200)
+        self.assertEqual(len(result["items"]), 200)
+        self.assertEqual(len(calls), 1)
+
+    def test_builder_combo_picker_preserves_builder_and_recipes_load_lazily(self):
+        page = APP.PAGE_TEMPLATE
+        paint = page[page.index("function paint(){"):
+                     page.index("/* ── 자료 비교 생성")]
+        self.assertNotIn("loadRecipes(false)", paint)
+        self.assertIn("new IntersectionObserver", page)
+        self.assertIn("RECIPES_OBSERVER.observe(target)", page)
+        self.assertIn("while($('modalBody').firstChild) saved.appendChild", page)
+        self.assertIn("$('modalBody').replaceChildren(back.body)", page)
+        self.assertIn("returnToBuilder(val)", page)
+        self.assertIn("작가 조합을 넣고 빌더로 돌아왔습니다", page)
+        self.assertIn("const name = $('bldName'); if(name) name.focus()", page)
+        self.assertIn("WELCOME_COUNT_TIMER = setTimeout", page)
+        self.assertIn("clearTimeout(WELCOME_COUNT_TIMER)", page)
 
     def test_concurrent_combo_requests_parse_the_collection_once(self):
         """첫 화면 개수 조회와 모달 열기가 겹쳐도 큰 JSON을 중복 파싱하지 않는다."""

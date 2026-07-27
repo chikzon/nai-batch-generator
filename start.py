@@ -2310,9 +2310,9 @@ def blocked_artists_in(text):
     return sorted(blocked & names)
 
 
-def style_rating(rec):
+def style_rating(rec, ratings=None):
     """그림체 한 줄의 평가 요약 — 작가들의 평균 별점·즐겨찾기·차단 포함 여부."""
-    d = load_ratings()
+    d = load_ratings() if ratings is None else ratings
     arts = [artist_key(a) for a in (rec.get("artists") or [])]
     vals = [d.get(a) for a in arts if d.get(a)]
     scores = [v["score"] for v in vals if v.get("score")]
@@ -2329,6 +2329,7 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
     """그림체 검색. q=제목/작가/프롬프트, tab=NAI·R18_NAI, source=아카·도랑·내 이미지,
     sort=recommend|views|newest|oldest|artists, seeded=1 이면 설정값 완비된 것만."""
     rows = load_combos()
+    ratings = load_ratings()
     q = (q or "").strip().lower()
     hit = rows
     if q:
@@ -2345,11 +2346,11 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
     # 평가 필터 — fav(즐겨찾기만) · rated(별점 매긴 것만) · hideblock(차단 숨김)
     if rating:
         if rating == "fav":
-            hit = [r for r in hit if style_rating(r)["fav"]]
+            hit = [r for r in hit if style_rating(r, ratings)["fav"]]
         elif rating == "rated":
-            hit = [r for r in hit if style_rating(r)["score"]]
+            hit = [r for r in hit if style_rating(r, ratings)["score"]]
         elif rating == "hideblock":
-            hit = [r for r in hit if not style_rating(r)["block"]]
+            hit = [r for r in hit if not style_rating(r, ratings)["block"]]
     if sort in STYLE_SORTS and sort != "default":
         rev = sort in {"newest"}
         hit = sorted(hit, key=STYLE_SORTS[sort], reverse=rev)
@@ -2376,7 +2377,7 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
         item = {k: r[k] for k in card_fields if k in r}
         if isinstance(item.get("images"), list):
             item["images"] = item["images"][:1]
-        item["_rate"] = style_rating(r)
+        item["_rate"] = style_rating(r, ratings)
         items.append(item)
     return {"total": len(rows), "matched": len(hit),
             "sources": tally("source", "도랑"), "tabs": tally("tab"),
@@ -2640,6 +2641,14 @@ def load_builder():
                         chars.append(step)
                     else:
                         base.append(step)
+                # 기존 후보사전의 첫 슬롯은 이름만 "작가 조합"이고 후보가 비어 있다.
+                # 별도 표시값이 없어 빌더 화면에는 조합 라이브러리를 여는 버튼이 0개였다.
+                # 사용자가 고친 후보사전과도 호환되게, 이 명확한 빈 전용 슬롯만 연결한다.
+                for step in base:
+                    for slot in (step.get("슬롯") or []) if isinstance(step, dict) else []:
+                        if (slot.get("라벨") == "작가 조합"
+                                and not (slot.get("후보") or [])):
+                            slot.setdefault("조합전용", True)
                 data["캐릭터단계"] = chars
                 data["베이스단계"] = base
                 return data
@@ -7818,10 +7827,10 @@ function paint(){
     $('qty').addEventListener('input', () => anlasRefresh(false));
   }
   anlasRefresh(false);
-  loadRecipes(false);
-  $('recQ').addEventListener('input', () => { clearTimeout(recT); recT = setTimeout(() => loadRecipes(false), 300); });
-  $('recAxis').addEventListener('change', () => loadRecipes(false));
-  $('recMore').addEventListener('click', () => loadRecipes(true));
+  /* 레시피 6,388건은 자료 탭에서 그 영역을 실제로 볼 때 읽는다.
+     첫 화면에서 미리 읽고 이미지 60장을 예열하면, 사용자가 먼저 누른
+     작가 조합 빌더와 디스크·네트워크 작업이 겹쳐 화면이 멈춘다. */
+  bindRecipes();
   applyUI(); renderUIChips();
   if($('notifySound')) $('notifySound').checked = !!(STATE.ui||{}).notify_sound;
   if($('notifySystem')) $('notifySystem').checked = !!(STATE.ui||{}).notify_system;
@@ -11173,7 +11182,7 @@ function openLib(it){
 /* ── 그림체 라이브러리 ──────────────────────────────────────────────
    한 그림체 = 작가 조합 + 베이스 + 네거티브 + 생성 설정값 전부(시드·CFG·
    리스케일·스텝·샘플러·스케줄러·해상도·Variety+). 셋이 합쳐져야 그림체다. */
-let comboOffset = 0, comboT = null;
+let comboOffset = 0, comboT = null, COMBO_RETURN = null, WELCOME_COUNT_TIMER = null;
 const CARD_PX = {small: 74, medium: 116, large: 190};
 function cq(){ return {
   q: ($('comboQ')||{}).value || '', tab: ($('comboTab')||{}).value || '',
@@ -11183,10 +11192,31 @@ function cq(){ return {
   size: +(($('comboSize')||{}).value || 50) }; }
 
 function openCombos(target){
+  if(WELCOME_COUNT_TIMER){
+    clearTimeout(WELCOME_COUNT_TIMER);
+    WELCOME_COUNT_TIMER = null;
+  }
+  /* 빌더 안에서 열면 기존 빌더 DOM을 지우지 않고 잠시 떼어 둔다.
+     예전에는 innerHTML로 빌더를 지운 뒤 이미 사라진 select를 target으로 들고 있어,
+     '이 조합 쓰기'를 눌러도 아무 일도 하지 못했다. */
+  if(target && document.body.contains(target)){
+    const saved = document.createDocumentFragment();
+    while($('modalBody').firstChild) saved.appendChild($('modalBody').firstChild);
+    COMBO_RETURN = {
+      body:saved, target, mode:window._mm,
+      title:$('modalTitle').textContent, flash:$('modalFlash').textContent,
+      saveDisplay:$('modalSave').style.display,
+    };
+  }else{
+    COMBO_RETURN = null;
+    target = null;
+  }
   window._mm = 'combo';
   window._comboTarget = target || null;   // 빌더 슬롯이면 select, 아니면 설정에 적용
+  $('modalSave').style.display = 'none';
   $('modalTitle').textContent = '🎨 그림체 — 프롬프트·네거티브·설정값 한 세트';
   $('modalBody').innerHTML = `
+    ${COMBO_RETURN ? '<div class="bar"><button type="button" id="comboBack">← 빌더로 돌아가기</button></div>' : ''}
     <p class="hint">작가 조합만이 아니라 <b>베이스 + 네거티브 + 설정값(CFG·리스케일·스텝·샘플러·시드)</b>이
     합쳐진 한 세트입니다. <b>쪼개지 않고 통째로만</b> 적용합니다 —
     일부만 가져오면 원래 그림이 재현되지 않기 때문입니다.</p>
@@ -11231,6 +11261,7 @@ function openCombos(target){
     <div id="comboTidyMsg" class="hint"></div>
     <div id="comboList"></div>
     <div class="bar"><button id="comboMore" style="flex:1;">더 보기 ▾</button></div>`;
+  if($('comboBack')) $('comboBack').addEventListener('click', () => returnToBuilder());
   bindTidy();
   $('comboQ').addEventListener('input', () => { clearTimeout(comboT); comboT = setTimeout(() => loadCombos(false), 300); });
   ['comboSort','comboTab','comboSrc','comboSize','comboSeeded','comboRate'].forEach(id =>
@@ -11244,6 +11275,38 @@ function openCombos(target){
   loadCombos(false);
   $('modalFlash').textContent = '';
   $('modalBg').style.display = 'flex';
+}
+
+function returnToBuilder(comboValue){
+  const back = COMBO_RETURN;
+  if(!back) return false;
+  $('modalBody').replaceChildren(back.body);
+  $('modalTitle').textContent = back.title;
+  window._mm = back.mode;
+  $('modalSave').style.display = back.saveDisplay;
+  window._comboTarget = null;
+  COMBO_RETURN = null;
+  const target = back.target;
+  if(comboValue != null && document.body.contains(target)){
+    if(![...target.options].some(o => o.value === comboValue)){
+      const option = document.createElement('option');
+      option.value = comboValue;
+      option.textContent = comboValue.slice(0, 60) + (comboValue.length > 60 ? '…' : '');
+      target.insertBefore(option, target.options[1] || null);
+    }
+    target.value = comboValue;
+    if(window._bldRefresh) window._bldRefresh();
+    $('modalFlash').textContent = '작가 조합을 넣고 빌더로 돌아왔습니다 ✓';
+  }else{
+    $('modalFlash').textContent = back.flash || '';
+  }
+  return true;
+}
+
+function discardComboReturn(){
+  COMBO_RETURN = null;
+  window._comboTarget = null;
+  $('modalSave').style.display = '';
 }
 
 /* ── 그림에서 읽은 그림체 보여 주기 ────────────────────────────────
@@ -11634,16 +11697,7 @@ async function loadCombos(append){
   added.flatMap(card => [...card.querySelectorAll('[data-cuse]')]).forEach(btn => {
     btn.addEventListener('click', () => {
       const val = (btn.closest('.row')._comboRecord || {}).combo || '';
-      const tg = window._comboTarget;
-      if(!(tg && document.body.contains(tg))) return;
-      if(![...tg.options].some(o => o.value === val)){
-        const o = document.createElement('option');
-        o.value = val; o.textContent = val.slice(0, 60) + '…';
-        tg.insertBefore(o, tg.options[1] || null);
-      }
-      tg.value = val;
-      if(window._bldRefresh) window._bldRefresh();
-      $('modalFlash').textContent = '빌더 항목에 적용됨 ✓';
+      returnToBuilder(val);
     });
   });
   added.flatMap(card => [...card.querySelectorAll('[data-cfull]')]).forEach(b =>
@@ -11765,10 +11819,13 @@ function bindWelcome(){
   const loadWelcomeCount = () => fetch('/api/combos?limit=0').then(r => r.json()).then(r => {
     if(r.ok && $('welcomeCount')) $('welcomeCount').textContent = r.total.toLocaleString();
   }).catch(() => {});
-  /* 사용자가 먼저 빌더를 누르면 그 일이 우선이다. 첫 화면의 숫자 하나 때문에
-     같은 그림체 파일을 동시에 읽지 않도록 브라우저가 한가할 때 조회한다. */
-  if('requestIdleCallback' in window) requestIdleCallback(loadWelcomeCount, {timeout:2500});
-  else setTimeout(loadWelcomeCount, 1200);
+  /* requestIdleCallback은 첫 페인트 직후 곧바로 실행될 수 있어 사용자가 누른
+     조합 요청보다 먼저 같은 파일을 잡았다. 숫자는 기능이 아니므로 2.5초 뒤로
+     미루고, 사용자가 조합 창을 먼저 열면 취소한다. */
+  WELCOME_COUNT_TIMER = setTimeout(() => {
+    WELCOME_COUNT_TIMER = null;
+    loadWelcomeCount();
+  }, 2500);
 }
 
 
@@ -11865,12 +11922,56 @@ const AXIS_KO = {artist:'작가', style:'화풍', camera:'카메라', background
   hair:'머리', outfit:'의상', body:'신체', body_state:'신체상태', expression:'표정',
   pose:'포즈', action:'행동', sexual_action:'성행위', character:'캐릭터', unknown:'기타'};
 let recT = null, recOffset = 0;
+let RECIPES_READY = false, RECIPES_LOADING = false, RECIPES_OBSERVER = null;
+
+function bindRecipes(){
+  const q = $('recQ'), grid = $('recGrid');
+  if(!q || !grid || q._bound) return;
+  q._bound = true;
+  const request = () => {
+    clearTimeout(recT);
+    recT = setTimeout(() => RECIPES_READY ? loadRecipes(false) : ensureRecipes(), 300);
+  };
+  q.addEventListener('input', request);
+  $('recAxis').addEventListener('change', () =>
+    RECIPES_READY ? loadRecipes(false) : ensureRecipes());
+  $('recMore').addEventListener('click', () => loadRecipes(true));
+  const target = grid.closest('.card') || grid;
+  if('IntersectionObserver' in window){
+    RECIPES_OBSERVER = new IntersectionObserver(entries => {
+      if(entries.some(entry => entry.isIntersecting)){
+        RECIPES_OBSERVER.disconnect();
+        RECIPES_OBSERVER = null;
+        ensureRecipes();
+      }
+    }, {rootMargin:'240px 0px'});
+    RECIPES_OBSERVER.observe(target);
+  }else{
+    /* 구형 브라우저에서도 첫 화면과 겹치지 않게 충분히 뒤로 미룬다. */
+    setTimeout(ensureRecipes, 2500);
+  }
+}
+
+async function ensureRecipes(){
+  if(RECIPES_READY || RECIPES_LOADING) return;
+  RECIPES_LOADING = true;
+  if($('recStat')) $('recStat').textContent = '레시피를 불러오는 중...';
+  try{
+    await loadRecipes(false);
+    RECIPES_READY = true;
+  }catch(e){
+    if($('recStat')) $('recStat').textContent = '레시피를 불러오지 못했습니다. 검색하면 다시 시도합니다.';
+  }finally{
+    RECIPES_LOADING = false;
+  }
+}
+
 async function loadRecipes(append){
   const q = ($('recQ') || {}).value || '';
   const ax = ($('recAxis') || {}).value || '';
   if(!append) recOffset = 0;
   const r = await (await fetch(`/api/recipes?q=${encodeURIComponent(q)}&axis=${encodeURIComponent(ax)}&limit=60&offset=${recOffset}`)).json();
-  if(!r.ok) return;
+  if(!r.ok) throw new Error(r.error || '레시피 불러오기 실패');
   $('recStat').textContent = `${r.matched.toLocaleString()} / ${r.total.toLocaleString()}건`;
   const sel = $('recAxis');
   if(sel.options.length <= 1){
@@ -11993,6 +12094,7 @@ function bindTagSearch(scope){
 /* ── 빌더 (드롭다운 + 잠금 + 랜덤) ── */
 function openBuilder(kind){
   window._mm = kind;
+  $('modalSave').style.display = '';
   const steps = BUILDER[kind === 'char' ? '캐릭터단계' : '베이스단계'] || [];
   const ko = BUILDER['한글'] || {};
   const isBase = kind !== 'char';
@@ -12241,7 +12343,7 @@ function openBuilder(kind){
   refresh();
   $('modalFlash').textContent = '';
   $('modalBg').style.display = 'flex';
-  setTimeout(() => $('bldName').focus(), 0);
+  setTimeout(() => { const name = $('bldName'); if(name) name.focus(); }, 0);
 }
 $('bCombo').addEventListener('click', () => openCombos(null));
 $('bStyle').addEventListener('click', () => openBuilder('style'));
@@ -12411,18 +12513,24 @@ async function optSave(option, op, name, value){
 
 /* ── 모달 저장/닫기 ── */
 $('modalClose').addEventListener('click', () => {
+  if(window._mm === 'combo') discardComboReturn();
   $('modalBg').style.display = 'none';
   $('modalBody').closest('.modal').classList.remove('builder-modal');
 });
 $('modalBg').addEventListener('click', e => {
   if(e.target.id === 'modalBg'){
+    if(window._mm === 'combo') discardComboReturn();
     $('modalBg').style.display = 'none';
     $('modalBody').closest('.modal').classList.remove('builder-modal');
   }
 });
 $('modalSave').addEventListener('click', async () => {
   const m = window._mm;
-  if(m === 'lib' || m === 'opts' || m === 'recipe' || m === 'combo'){ $('modalBg').style.display = 'none'; return; }
+  if(m === 'lib' || m === 'opts' || m === 'recipe' || m === 'combo'){
+    if(m === 'combo') discardComboReturn();
+    $('modalBg').style.display = 'none';
+    return;
+  }
   if(m === 'scene'){
     const u = {};
     /* textarea 뿐 아니라 숫자칸(해상도)도 함께 모은다. `_res` 셀렉트는 보내지 않는다
