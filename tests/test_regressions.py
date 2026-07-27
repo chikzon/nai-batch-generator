@@ -36,6 +36,120 @@ BUILD_SPEC.loader.exec_module(BUILD)
 
 
 class RegressionTests(unittest.TestCase):
+    def test_over_limit_prompts_are_preserved_in_actual_payload(self):
+        base = ", ".join(f"base_tag_{i}" for i in range(900))
+        char = ", ".join(f"character_tag_{i}" for i in range(500))
+        negative = ", ".join(f"negative_tag_{i}" for i in range(900))
+        char_negative = ", ".join(f"character_negative_{i}" for i in range(500))
+        self.assertGreater(APP.nai_tokens(base) + APP.nai_tokens(char), 512)
+        self.assertGreater(
+            APP.nai_tokens(negative) + APP.nai_tokens(char_negative), 512)
+
+        png = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(png, "PNG")
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as archive:
+            archive.writestr("image.png", png.getvalue())
+
+        class Response:
+            status_code = 200
+            content = zipped.getvalue()
+            text = ""
+
+        payloads = []
+
+        def fake_post(_url, json=None, **_kwargs):
+            payloads.append(json)
+            return Response()
+
+        with patch.object(APP.requests, "post", side_effect=fake_post):
+            APP.call_nai_api(
+                "pst-fixture", base, "", "", negative, 832, 1216,
+                seed=1,
+                params={"model": "nai-diffusion-4-5-full", "uc_preset": 4},
+                chars=[{"prompt": char, "negative": char_negative}],
+            )
+
+        params = payloads[0]["parameters"]
+        self.assertEqual(payloads[0]["input"], base)
+        self.assertEqual(
+            params["v4_prompt"]["caption"]["base_caption"], base)
+        self.assertEqual(
+            params["v4_prompt"]["caption"]["char_captions"][0]["char_caption"],
+            char,
+        )
+        self.assertEqual(
+            params["v4_negative_prompt"]["caption"]["base_caption"], negative)
+        self.assertEqual(
+            params["v4_negative_prompt"]["caption"]["char_captions"][0]["char_caption"],
+            char_negative,
+        )
+        self.assertIn("⚠ 입력은 보존", APP.PAGE_TEMPLATE)
+        self.assertNotIn("뒷부분이 잘립니다", APP.PAGE_TEMPLATE)
+
+    def test_weight_highlight_does_not_draw_text_twice(self):
+        page = APP.PAGE_TEMPLATE
+        self.assertIn(".hl .w-num{color:transparent;}", page)
+        self.assertNotIn(
+            ".hl .w-num{color:var(--accent);opacity:.95;}", page)
+
+    def test_style_and_setting_files_recover_from_last_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            style_file = root / "수집" / "그림체.json"
+            combo_file = root / "수집" / "작가조합.json"
+            settings_dir = root / "세팅"
+            old_cache = copy.deepcopy(APP._COMBOS)
+            try:
+                with (
+                    patch.object(APP, "STYLE_FILE", style_file),
+                    patch.object(APP, "COMBO_FILE", combo_file),
+                    patch.object(APP, "SETTINGS_DIR", settings_dir),
+                ):
+                    APP._COMBOS.update({"loaded": False, "rows": []})
+                    APP.add_style({
+                        "id": "first", "artists": ["first"], "params": {"seed": 1}})
+                    APP.add_style({
+                        "id": "second", "artists": ["second"], "params": {"seed": 2}})
+                    style_file.write_text("{broken", encoding="utf-8")
+                    APP._COMBOS.update({"loaded": False, "rows": []})
+                    recovered = APP.load_combos()
+                    self.assertEqual([x["id"] for x in recovered], ["first"])
+                    self.assertEqual(
+                        json.loads(style_file.read_text(encoding="utf-8"))[0]["id"],
+                        "first",
+                    )
+
+                    made = APP.new_setting("안전", mode="단독")
+                    self.assertTrue(made["ok"])
+                    self.assertTrue(
+                        APP.setting_add_set("안전", "시험 세트")["ok"])
+                    APP.setting_meta_save("안전", {"방식": "남녀"})
+                    setting = settings_dir / "안전.json"
+                    setting.write_text("{broken", encoding="utf-8")
+                    listed = APP.list_settings()
+                    self.assertEqual(len(listed), 1)
+                    self.assertEqual(listed[0]["name"], "안전")
+                    removed = APP.setting_delete("안전")
+                    self.assertTrue(removed["ok"])
+                    self.assertFalse(setting.exists())
+                    self.assertTrue((settings_dir / removed["backup"]).exists())
+            finally:
+                APP._COMBOS.clear()
+                APP._COMBOS.update(old_cache)
+
+    def test_generated_image_is_published_only_after_complete_encoding(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "result.png"
+            image = Image.new("RGB", (8, 8), "white")
+            image.nai_comment = json.dumps({"prompt": "whole"}, ensure_ascii=False)
+            saved = APP.save_with_meta(image, target, fmt="png")
+            self.assertEqual(saved, target)
+            with Image.open(saved) as check:
+                check.load()
+                self.assertEqual(check.size, (8, 8))
+            self.assertFalse(list(Path(td).glob(".*.tmp")))
+
     def test_combo_cards_do_not_duplicate_full_records_into_html_attributes(self):
         page = APP.PAGE_TEMPLATE
         self.assertIn("el._comboRecord = c", page)

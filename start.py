@@ -292,16 +292,36 @@ def atomic_write_json(path, data, indent=2, keep_backup=True):
     _atomic_write_bytes(path, raw, keep_backup=keep_backup)
 
 
+def atomic_write_text(path, text, encoding="utf-8", keep_backup=True):
+    """조각처럼 JSON이 아닌 사용자 자료도 반쪽 파일이 남지 않게 저장한다."""
+    _atomic_write_bytes(
+        path, str(text).encode(encoding), keep_backup=keep_backup)
+
+
+def recoverable_remove(path, label="삭제"):
+    """사용자 자료를 즉시 지우지 않고 같은 폴더의 목록 밖 백업으로 옮긴다."""
+    path = Path(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.{label}-{stamp}.bak")
+    serial = 2
+    while backup.exists():
+        backup = path.with_name(
+            f"{path.name}.{label}-{stamp}-{serial}.bak")
+        serial += 1
+    os.replace(path, backup)
+    return backup
+
+
 def load_json_recover(path):
     """주 파일이 잘렸으면 마지막 정상 .bak을 읽고 주 파일도 복구한다."""
     path = Path(path)
     with _JSON_IO_LOCK:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as first:
             bak = path.with_name(path.name + ".bak")
             try:
-                data = json.loads(bak.read_text(encoding="utf-8"))
+                data = json.loads(bak.read_text(encoding="utf-8-sig"))
             except (OSError, json.JSONDecodeError):
                 raise first
             log.error(f"손상된 {path.name} 대신 백업을 복구했습니다: {first}")
@@ -405,12 +425,12 @@ def migrate_legacy_selections(cfg):
         if not p:
             return
         try:
-            pack = json.loads(p.read_text(encoding="utf-8"))
+            pack = load_json_recover(p)
             role = pack.setdefault("상대역", {})
             for k, v in role_updates.items():
                 if v and not role.get(k):
                     role[k] = v
-            p.write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(p, pack)
         except Exception as e:
             log.warning(f"상대역 이전 실패({name}): {e}")
     if cfg.get("male_prompt"):
@@ -468,13 +488,13 @@ DEFAULT_OPTIONS = {
 def load_options():
     if OPTIONS_FILE.exists():
         try:
-            data = json.loads(OPTIONS_FILE.read_text(encoding="utf-8"))
+            data = load_json_recover(OPTIONS_FILE)
             if isinstance(data, dict):
                 return data
         except Exception as e:
             log.warning(f"옵션.json 손상 — 기본 옵션 사용: {e}")
         return json.loads(json.dumps(DEFAULT_OPTIONS))
-    OPTIONS_FILE.write_text(json.dumps(DEFAULT_OPTIONS, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(OPTIONS_FILE, DEFAULT_OPTIONS, keep_backup=False)
     return json.loads(json.dumps(DEFAULT_OPTIONS))
 
 
@@ -491,7 +511,7 @@ def list_scene_presets():
         return presets
     for p in sorted(SCENESET_DIR.glob("*.json")):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
             if isinstance(data, dict):
                 presets.append({"name": p.stem, "data": data})
         except Exception:
@@ -510,7 +530,7 @@ def load_recipes():
     rows = []
     if RECIPE_FILE.exists():
         try:
-            rows = json.loads(RECIPE_FILE.read_text(encoding="utf-8"))
+            rows = load_json_recover(RECIPE_FILE)
             log.info(f"레시피 라이브러리 로드: {len(rows):,}건")
         except Exception as e:
             log.warning(f"레시피 로드 실패: {e}")
@@ -1133,7 +1153,8 @@ def prepare_vibes(cfg, token):
                 continue
             enc = encode_vibe(token, img_p.read_bytes(), ie,
                               cfg.get("model") or "nai-diffusion-4-5-full")
-            enc_p.write_text(enc, encoding="ascii")
+            atomic_write_text(
+                enc_p, enc, encoding="ascii", keep_backup=False)
             v["encoded_ie"] = ie
             newly += 1
             changed = True
@@ -1827,7 +1848,9 @@ def fetch_cached_image(url):
         r = requests.get(url, timeout=25, headers=headers_for(url))
         ct = r.headers.get("content-type", "")
         if r.status_code == 200 and ct.startswith("image/"):
-            p.write_bytes(r.content)
+            # 중간 종료 때 잘린 캐시가 정상 파일처럼 남으면 이후에도 계속 그 파일을
+            # 돌려주게 된다. 캐시도 완성된 바이트만 이름을 얻는다.
+            _atomic_write_bytes(p, r.content, keep_backup=False)
             note_image_origin(url, r.content)
             return r.content, ct
         log.warning(f"이미지 응답 이상 [{r.status_code} {ct}]: {url[:80]}")
@@ -1857,7 +1880,7 @@ def load_image_origins():
     p = _img_origin_path()
     if p.exists():
         try:
-            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            d = load_json_recover(p)
             return d if isinstance(d, dict) else {}
         except Exception:
             return {}
@@ -1882,7 +1905,7 @@ def note_image_origin(url, data, pack=""):
             book[sha] = row
             p = _img_origin_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(p, book, indent=None)
     except Exception as e:
         log.warning(f"출처 기록 실패: {e}")
     return sha
@@ -1989,7 +2012,7 @@ def load_combos():
             if not f.exists():
                 continue
             try:
-                rows = json.loads(f.read_text(encoding="utf-8"))
+                rows = load_json_recover(f)
                 log.info(f"그림체 로드: {len(rows)}개 ({f.name})")
                 break
             except Exception as e:
@@ -2012,7 +2035,7 @@ def add_style(rec):
     else:
         rows.insert(0, rec)
     STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STYLE_FILE.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(STYLE_FILE, rows, indent=None)
     return len(rows)
 
 
@@ -2031,7 +2054,7 @@ def _load_styles_raw():
     if not STYLE_FILE.exists():
         return []
     try:
-        d = json.loads(STYLE_FILE.read_text(encoding="utf-8-sig"))
+        d = load_json_recover(STYLE_FILE)
         return d if isinstance(d, list) else []
     except Exception:
         return []
@@ -2039,7 +2062,7 @@ def _load_styles_raw():
 
 def _write_styles_raw(rows):
     STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STYLE_FILE.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(STYLE_FILE, rows, indent=None)
     forget_collection_caches()
 
 
@@ -2057,7 +2080,7 @@ def delete_styles(ids):
     old = []
     if p.exists():
         try:
-            got = json.loads(p.read_text(encoding="utf-8-sig"))
+            got = load_json_recover(p)
             old = got if isinstance(got, list) else []
         except Exception:
             old = []
@@ -2067,7 +2090,7 @@ def delete_styles(ids):
         r["_지운때"] = stamp
         old.append(r)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(old[-5000:], ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(p, old[-5000:], indent=None)
     _write_styles_raw(keep)
     return {"ok": True, "지움": len(gone), "남음": len(keep), "되살릴수있음": len(old)}
 
@@ -2078,7 +2101,7 @@ def restore_styles(ids=None):
     if not p.exists():
         return {"ok": False, "error": "지운 그림체가 없습니다."}
     try:
-        trash = json.loads(p.read_text(encoding="utf-8-sig"))
+        trash = load_json_recover(p)
     except Exception:
         return {"ok": False, "error": "지운 목록을 읽지 못했습니다."}
     if not isinstance(trash, list) or not trash:
@@ -2102,7 +2125,7 @@ def restore_styles(ids=None):
         rows.insert(0, r)
         added += 1
     _write_styles_raw(rows)
-    p.write_text(json.dumps(rest, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(p, rest, indent=None)
     return {"ok": True, "되살림": added, "남은휴지통": len(rest)}
 
 
@@ -2186,7 +2209,7 @@ def load_ratings():
             d = {}
             if RATINGS_FILE.exists():
                 try:
-                    d = json.loads(RATINGS_FILE.read_text(encoding="utf-8")) or {}
+                    d = load_json_recover(RATINGS_FILE) or {}
                 except Exception as e:
                     log.warning(f"작가평가.json 읽기 실패: {e}")
                     return _RATINGS["data"]        # 깨진 파일로 기억을 지우지 않는다
@@ -2555,7 +2578,7 @@ def search_tags(spec, kind, slot, q, limit=60):
 def load_builder():
     if BUILDER_FILE.exists():
         try:
-            data = json.loads(BUILDER_FILE.read_text(encoding="utf-8"))
+            data = load_json_recover(BUILDER_FILE)
             if isinstance(data, dict):
                 return data
         except Exception as e:
@@ -2595,15 +2618,15 @@ def ensure_settings_migration():
         if not src.exists():
             continue
         try:
-            data = json.loads(src.read_text(encoding="utf-8"))
+            data = load_json_recover(src)
         except Exception as e:
             log.warning(f"{kind} 변환 실패: {e}")
             continue
         out = {"이름": name, "방식": mode, "씬": data.get("씬", {}),
                "옵션": data.get("옵션", {}),
                "상대역": {"외형": "", "착의": "", "네거티브": "", "의상": ""}}
-        (SETTINGS_DIR / f"{name}.json").write_text(
-            json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(
+            SETTINGS_DIR / f"{name}.json", out, keep_backup=False)
     log.info("세팅/ 폴더 생성 완료 (씬규격에서 변환)")
 
 
@@ -2615,7 +2638,7 @@ def list_settings():
         return out
     for p in sorted(SETTINGS_DIR.glob("*.json")):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
             if isinstance(data, dict) and data.get("씬"):
                 out.append({"file": p.name, "name": data.get("이름") or p.stem,
                             "mode": data.get("방식", "단독"), "data": data})
@@ -2698,7 +2721,7 @@ def duplicate_setting_group(name, gid):
     p = setting_path(name)
     if not p:
         return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
-    d = json.loads(p.read_text(encoding="utf-8"))
+    d = load_json_recover(p)
     scenes = d.get("씬", {})
     group = next((g for g in derive_setting_catalog(scenes) if g["id"] == int(gid)), None)
     if not group:
@@ -2719,7 +2742,7 @@ def duplicate_setting_group(name, gid):
         sc["name"] = f"{head} 사본 {tail}" if head else f"{nm} 사본"
         scenes[str(start + i)] = sc
     d["씬"] = scenes
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(p, d, indent=1)
     return {"ok": True, "new_id": start, "count": span}
 
 
@@ -2752,7 +2775,7 @@ def new_setting(name, mode="단독", stages=None):
         "씬": {},
         "상대역": {},
     }
-    target.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(target, data, indent=1, keep_backup=False)
     return {"ok": True, "name": target.stem, "file": target.name}
 
 
@@ -2761,7 +2784,7 @@ def setting_add_set(name, label, category="", width=832, height=1216, stages=Non
     p = setting_path(name)
     if not p:
         return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = json.loads(p.read_text(encoding="utf-8"))
+    d = load_json_recover(p)
     stages = [x for x in (stages or d.get("단계명") or ["시작", "중간", "끝"]) if str(x).strip()]
     label = (label or "새 세트").strip()
     scenes = d.setdefault("씬", {})
@@ -2777,7 +2800,7 @@ def setting_add_set(name, label, category="", width=832, height=1216, stages=Non
             "width": int(width), "height": int(height),
             "category": category or "",
         }
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(p, d, indent=1)
     return {"ok": True, "start": start, "count": len(stages)}
 
 
@@ -2786,7 +2809,7 @@ def setting_meta_save(name, patch):
     p = setting_path(name)
     if not p:
         return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = json.loads(p.read_text(encoding="utf-8"))
+    d = load_json_recover(p)
     for k in ("방식", "단계명", "계열이름", "옵션규격", "옵션", "상대역"):
         if k in patch:
             d[k] = patch[k]
@@ -2800,11 +2823,13 @@ def setting_meta_save(name, patch):
         if tgt.exists() and tgt != p:
             return {"ok": False, "error": f"'{safe}' 이름이 이미 있습니다."}
         d["이름"] = safe
-        p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-        p.rename(tgt)
+        # 새 이름의 완성본을 먼저 만든 뒤 옛 이름을 치운다. 중간 종료라면 두 벌이
+        # 남을 수는 있어도 세팅 내용 자체가 사라지지는 않는다.
+        atomic_write_json(tgt, d, indent=1, keep_backup=False)
+        recoverable_remove(p, label="이름변경")
         return {"ok": True, "name": safe, "renamed": True}
     d["이름"] = d.get("이름") or p.stem
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(p, d, indent=1)
     return {"ok": True, "name": d["이름"]}
 
 
@@ -2813,7 +2838,7 @@ def setting_renumber(name, start=None):
     p = setting_path(name)
     if not p:
         return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = json.loads(p.read_text(encoding="utf-8"))
+    d = load_json_recover(p)
     scenes = d.get("씬", {})
     order = []
     for g in derive_setting_catalog(scenes):
@@ -2827,7 +2852,7 @@ def setting_renumber(name, start=None):
     for i, old in enumerate(order):
         new[str(start + i)] = scenes[str(old)]
     d["씬"] = new
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(p, d, indent=1)
     return {"ok": True, "start": start, "count": len(new), "clashes": scene_num_clashes()}
 
 
@@ -2835,8 +2860,8 @@ def setting_delete(name):
     p = setting_path(name)
     if not p:
         return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    p.unlink()
-    return {"ok": True}
+    backup = recoverable_remove(p)
+    return {"ok": True, "backup": backup.name}
 
 
 def export_settings_zip(names=None):
@@ -2876,7 +2901,7 @@ def import_settings_bytes(data, filename=""):
             k += 1
         if target.stem != base:
             d["이름"] = target.stem          # 파일명과 세팅 이름을 맞춰 둔다
-        target.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        atomic_write_json(target, d, indent=1, keep_backup=False)
         added.append(target.stem)
 
     if data[:2] == b"PK":
@@ -2994,10 +3019,13 @@ def _merge_list_json(path, incoming, key, overwrite=False):
     old = []
     if path.exists():
         try:
-            got = json.loads(path.read_text(encoding="utf-8-sig"))
+            got = load_json_recover(path)
             old = got if isinstance(got, list) else []
         except Exception:
-            old = []                     # 깨진 파일은 새로 쓴다 (사본은 아래에서 남긴다)
+            # 주 파일과 백업을 둘 다 못 읽으면 빈 목록으로 덮어쓰지 않는다.
+            # 사용자가 가진 자료 전체를 "새 파일"로 오인해 날리는 것보다 가져오기를
+            # 실패시키는 편이 안전하다.
+            raise ValueError(f"{path.name}과 백업을 읽지 못해 가져오기를 중단했습니다.")
     idx = {}
     for i, x in enumerate(old):
         if isinstance(x, dict):
@@ -3028,13 +3056,8 @@ def _merge_list_json(path, incoming, key, overwrite=False):
         n["새로"] += 1
     added = n["새로"] + n["덮어씀"]
     if added:
-        if path.exists():                # 되돌릴 수 있게 한 판 남긴다
-            try:
-                shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-            except Exception:
-                pass
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, old, indent=None)
     return n, added_keys
 
 
@@ -3068,7 +3091,7 @@ def load_pack_log():
     p = _pack_log_path()
     if p.exists():
         try:
-            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            d = load_json_recover(p)
             return d if isinstance(d, list) else []
         except Exception:
             return []
@@ -3078,7 +3101,7 @@ def load_pack_log():
 def save_pack_log(rows):
     p = _pack_log_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rows[-50:], ensure_ascii=False, indent=1), encoding="utf-8")
+    atomic_write_json(p, rows[-50:], indent=1)
 
 
 def import_datapack_bytes(data, filename="", overwrite=False):
@@ -3131,8 +3154,8 @@ def import_datapack_bytes(data, filename="", overwrite=False):
                             skipped[d] = skipped.get(d, 0) + 1
                         else:
                             dest.parent.mkdir(parents=True, exist_ok=True)
-                            with z.open(n) as src, open(dest, "wb") as out:
-                                shutil.copyfileobj(src, out)
+                            _atomic_write_bytes(
+                                dest, z.read(n), keep_backup=False)
                             copied[d] = copied.get(d, 0) + 1
                             batch["files"].setdefault(d, []).append(stem)
                         break
@@ -3196,7 +3219,7 @@ def undo_datapack(batch_id):
         if not path.exists():
             continue
         try:
-            old = json.loads(path.read_text(encoding="utf-8-sig"))
+            old = load_json_recover(path)
         except Exception:
             continue
         drop = set(map(str, keys))
@@ -3204,7 +3227,7 @@ def undo_datapack(batch_id):
                 if not (isinstance(x, dict) and _row_key(x, key)[0] in drop)]
         gone = len(old) - len(kept)
         if gone:
-            path.write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(path, kept, indent=None)
             said.append(f"{stem}: {gone}건 뺌")
     for d, names in (hit.get("files") or {}).items():
         root = dirs.get(d, (None, ()))[0]
@@ -3215,7 +3238,9 @@ def undo_datapack(batch_id):
             p = root / nm
             try:
                 if p.exists():
-                    p.unlink()
+                    # 가져온 판을 되돌릴 때도 즉시 삭제하지 않는다. 잘못 고른 판이면
+                    # 같은 폴더의 목록 밖 백업에서 원본 파일을 되찾을 수 있다.
+                    recoverable_remove(p, label="자료팩되돌리기")
                     gone += 1
             except Exception:
                 pass
@@ -3234,7 +3259,7 @@ def undo_datapack(batch_id):
 def setting_path(name):
     for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
         try:
-            d = json.loads(p.read_text(encoding="utf-8"))
+            d = load_json_recover(p)
             if (d.get("이름") or p.stem) == name:
                 return p
         except Exception:
@@ -3273,7 +3298,7 @@ def ensure_schema_split():
         d = SCHEMA_DIR / kind
         d.mkdir(parents=True, exist_ok=True)
         data = {"종류": kind, "씬": buckets[kind], "옵션": opts[kind]}
-        (d / "기본.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(d / "기본.json", data, keep_backup=False)
     log.info(f"씬 규격 분리 완료: 체위 {len(buckets['체위'])} / 표정 {len(buckets['표정'])} / 백합 {len(buckets['백합'])}씬")
 
 
@@ -3291,8 +3316,7 @@ def load_kind(cfg, kind):
     if not p.exists():
         return {"종류": kind, "씬": {}, "옵션": {}}
     try:
-        with open(p, encoding="utf-8") as f:
-            data = json.load(f)
+        data = load_json_recover(p)
         # 다른 프로그램 형식 관용: scenes 키도 인정
         if "씬" not in data and "scenes" in data:
             data["씬"] = data["scenes"]
@@ -3358,14 +3382,14 @@ STYLE_DIR = BASE_DIR / "그림체"
 def load_spec():
     if SPEC_FILE.exists():
         try:
-            data = json.loads(SPEC_FILE.read_text(encoding="utf-8"))
+            data = load_json_recover(SPEC_FILE)
             merged = dict(DEFAULT_SPEC)
             merged.update(data)
             return merged
         except Exception as e:
             log.warning(f"규격.json 손상 — 기본 규격 사용: {e}")
             return dict(DEFAULT_SPEC)
-    SPEC_FILE.write_text(json.dumps(DEFAULT_SPEC, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(SPEC_FILE, DEFAULT_SPEC, keep_backup=False)
     return dict(DEFAULT_SPEC)
 
 
@@ -3387,7 +3411,7 @@ def list_styles(spec):
     order = [g["이름"] for g in spec.get("그림체_그룹", [])]
     for p in sorted(STYLE_DIR.glob("*.json")):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
         except Exception:
             continue
         if not isinstance(data, dict):
@@ -3410,8 +3434,8 @@ def save_style_file(name, prompt="", groups=None, settings=None, negative=""):
         data["설정"] = settings
     if negative:
         data["네거티브"] = negative
-    (STYLE_DIR / f"{_safe_name(name)}.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(
+        STYLE_DIR / f"{_safe_name(name)}.json", data)
 
 
 class RateLimitError(Exception):
@@ -3641,7 +3665,7 @@ def import_char_files(cfg):
     known_ids = {c.get("id") for c in cfg.get("characters", [])}
     for p in sorted(CHAR_DIR.rglob("*.json")):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
         except Exception:
             log.warning(f"캐릭터 파일 손상(건너뜀): {p.name}")
             continue
@@ -3698,7 +3722,7 @@ def sync_chars_to_files(cfg):
         if c.get("source"):
             data["출처"] = c["source"]
         try:
-            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(p, data)
             keep.add(p.resolve())
         except OSError as e:
             log.warning(f"캐릭터 파일 저장 실패({p.name}): {e}")
@@ -3708,11 +3732,13 @@ def sync_chars_to_files(cfg):
         if p.resolve() in keep:
             continue
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
         except Exception:
             continue
         if isinstance(data, dict) and data.get("id") and data["id"] in ids:
-            p.unlink()  # 같은 캐릭터의 옛 위치 파일
+            # 같은 캐릭터의 새 위치 파일이 먼저 확정된 뒤 옛 위치는 복구 가능한
+            # 백업으로 옮긴다. 이동 중 중단돼도 캐릭터 원문은 남는다.
+            recoverable_remove(p, label="옛위치")
 
 
 def delete_char_files(cfg, removed_ids):
@@ -3721,11 +3747,11 @@ def delete_char_files(cfg, removed_ids):
         return
     for p in list(CHAR_DIR.rglob("*.json")):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = load_json_recover(p)
         except Exception:
             continue
         if isinstance(data, dict) and data.get("id") in removed_ids:
-            p.unlink()
+            recoverable_remove(p)
 
 
 def save_config(cfg):
@@ -4709,6 +4735,26 @@ def out_clean(cfg):
     return True, int(c.get("save_max_side", 0) or 0), int(c.get("save_quality", 92) or 92)
 
 
+def _atomic_save_image(path, writer):
+    """생성 결과도 완전히 인코딩된 뒤에만 최종 파일명으로 보이게 한다."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        writer(tmp)
+        # Windows의 fsync는 읽기 전용 핸들을 거부할 수 있어 쓰기 가능한 핸들로 연다.
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return path
+
+
 def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
     """생성 결과를 저장하면서 NAI 메타데이터(시드·프롬프트·설정)를 EXIF 로 심는다.
     이렇게 해두면 나중에 이 그림을 앱에 끌어다 놓아 그림체를 복원할 수 있다.
@@ -4728,12 +4774,14 @@ def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
             path = path.with_suffix(".png")
             flat = Image.new("RGB", img.size)
             flat.putdata(list(img.convert("RGB").getdata()))
-            flat.save(path, "PNG")            # pnginfo 를 안 넘기므로 청크가 없다
+            _atomic_save_image(
+                path, lambda tmp: flat.save(tmp, "PNG"))
         else:
             path = path.with_suffix(".webp")
             flat = Image.new("RGB", img.size)
             flat.putdata(list(img.convert("RGB").getdata()))
-            flat.save(path, "WEBP", quality=quality)   # exif 를 안 넘긴다
+            _atomic_save_image(
+                path, lambda tmp: flat.save(tmp, "WEBP", quality=quality))
         return path
     path = Path(path)
     if fmt == "png" and path.suffix.lower() != ".png":
@@ -4752,24 +4800,29 @@ def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
         log.warning(f"EXIF 준비 실패(그림은 그대로 저장): {e}")
     if fmt == "png":
         # PNG 는 NAI 와 같은 방식으로 텍스트 청크에 넣는다 (EXIF 보다 널리 읽힌다)
-        try:
-            from PIL import PngImagePlugin
-            info = PngImagePlugin.PngInfo()
-            if comment:
-                info.add_text("Comment", comment)
-                info.add_text("Software", "NovelAI")
-            img.save(path, "PNG", pnginfo=info)
-        except Exception as e:
-            log.warning(f"PNG 메타 심기 실패(그림은 그대로 저장): {e}")
-            img.save(path, "PNG")
+        def save_png(tmp):
+            try:
+                from PIL import PngImagePlugin
+                info = PngImagePlugin.PngInfo()
+                if comment:
+                    info.add_text("Comment", comment)
+                    info.add_text("Software", "NovelAI")
+                img.save(tmp, "PNG", pnginfo=info)
+            except Exception as e:
+                log.warning(f"PNG 메타 심기 실패(그림은 그대로 저장): {e}")
+                img.save(tmp, "PNG")
+        _atomic_save_image(path, save_png)
         return path
-    try:
-        if exif_bytes:
-            img.save(path, "WEBP", quality=quality, exif=exif_bytes)
-        else:
-            img.save(path, "WEBP", quality=quality)
-    except Exception:
-        img.save(path, "WEBP", quality=quality)    # EXIF 때문에 실패하면 메타 없이라도 저장
+    def save_webp(tmp):
+        try:
+            if exif_bytes:
+                img.save(tmp, "WEBP", quality=quality, exif=exif_bytes)
+            else:
+                img.save(tmp, "WEBP", quality=quality)
+        except Exception:
+            # EXIF 때문에 실패하면 메타 없이라도 저장
+            img.save(tmp, "WEBP", quality=quality)
+    _atomic_save_image(path, save_webp)
     return path
 
 
@@ -5018,7 +5071,7 @@ def strip_and_save(data, filename="image.png", max_side=0, quality=95, force_web
     while target.exists():
         target = _dir / f"{stem} ({k}){ext}"
         k += 1
-    target.write_bytes(blob)
+    _atomic_write_bytes(target, blob, keep_backup=False)
     # 정말 지워졌는지 스스로 확인한다 (스텔스까지).
     # ⚠ extract_nai_metadata 는 **아무것도 없어도 dict 를 돌려준다.**
     #   bool() 로 재면 늘 '남아 있음' 이 되므로 알맹이를 봐야 한다.
@@ -5060,8 +5113,9 @@ def list_fragments():
 def save_fragment(name, lines):
     FRAG_DIR.mkdir(exist_ok=True)
     safe = _safe_name(name) or "조각"
-    (FRAG_DIR / f"{safe}.txt").write_text(
-        "\n".join(x.strip() for x in lines if x.strip()) + "\n", encoding="utf-8")
+    atomic_write_text(
+        FRAG_DIR / f"{safe}.txt",
+        "\n".join(x.strip() for x in lines if x.strip()) + "\n")
     return safe
 
 
@@ -5160,7 +5214,8 @@ def import_fragments_bytes(data, filename=""):
         while target.exists():
             target = FRAG_DIR / f"{base} ({k}).txt"
             k += 1
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(
+            target, "\n".join(lines) + "\n", keep_backup=False)
         added.append(target.stem)
 
     if data[:2] == b"PK":
@@ -5444,7 +5499,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 .hl .w-dn1{background:rgba(74,124,196,.22);}    /* 0.5~1.0 — 약함 */
 .hl .w-dn2{background:rgba(64,108,196,.32);}    /* 0.5 미만 — 많이 약함 */
 .hl .w-neg{background:rgba(48,96,204,.46);}     /* 음수 — 빼기 (가장 진한 파랑) */
-.hl .w-num{color:var(--accent);opacity:.95;}    /* 가중치 숫자 자체 */
+/* textarea 원문이 이미 위에서 그려진다. 숫자를 아래 레이어에서도 색칠하면 두 글자가
+   겹쳐 보여 번진다. 배경 강조만 남기고 하이라이트 레이어의 글자는 투명하게 둔다. */
+.hl .w-num{color:transparent;}
 
 /* 창 아무 데나 그림을 떨어뜨릴 때 뜨는 안내 */
 #dropOverlay{position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;
@@ -5487,6 +5544,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     border-bottom:1px solid var(--line);background:var(--paper);box-shadow:0 1px 4px #1018280b;position:relative;z-index:30;}
   .titlebar .app{font-weight:800;font-size:var(--fs-lg);letter-spacing:-.01em;white-space:nowrap;}
   .titlebar .app span{color:var(--accent);}
+  .titlebar .app .save-state{display:inline-block;margin-left:8px;padding:2px 6px;
+    border:1px solid var(--line);border-radius:var(--radius-pill);color:var(--muted);
+    font-size:var(--fs-2xs);font-weight:600;vertical-align:2px;}
+  .titlebar .app .save-state.busy{color:var(--accent);border-color:var(--accent);}
+  .titlebar .app .save-state.fail{color:var(--danger);border-color:var(--danger);}
   .modes{display:flex;align-self:stretch;gap:2px;}
   .modes button{padding:0 16px;border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;font-size:var(--fs-sm);font-weight:600;}
   /* 켜진 탭은 칠해서 확실히 구분한다 (테두리 색만 바꾸면 밝은 테마에서 잘 안 보였다) */
@@ -5726,7 +5788,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 <body data-mode="preview">
 
 <div class="titlebar">
-  <div class="app">NAI <span>배치 생성기</span>__PROFBADGE__</div>
+  <div class="app">NAI <span>배치 생성기</span>__PROFBADGE__
+    <span class="save-state" id="saveState" title="설정.json 자동저장 상태">저장됨 ✓</span></div>
   <!-- 계획서의 5탭 순서 그대로: 기본 생성 · 자료 · 빌더 · 세팅 · 기타.
        숫자키 1~5 로도 옮긴다. -->
   <div class="modes" id="modes">
@@ -6696,11 +6759,14 @@ async function naiTokens(){
       const approx = r.exact === false ? '≈' : '';
       $('posTok').innerHTML = `${approx}${r.base} 토큰`
         + (chars.length ? ` <span style="opacity:.7">+캐릭터 ${r.shared - r.base}</span>` : '')
-        + ` <span style="color:${over ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>`;
+        + ` <span style="color:${over ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>`
+        + (over ? ' <span style="color:#e0574e">⚠ 입력은 보존</span>' : '');
       $('posTok').title = (r.finalized ? '조각·품질·UC 반영값입니다. 무작위 조각은 실제 선택에 따라 달라질 수 있습니다. ' : '')
         + (approx ? 't5_tokenizer.json 이 없어 어림값입니다 (≈). ' : '')
-        + (over ? `512 토큰을 ${r.shared - r.limit} 초과 — 뒷부분이 잘립니다`
-                : '베이스 + 캐릭터 프롬프트가 512 토큰을 함께 씁니다');
+        + (over
+          ? `약 512 토큰을 ${r.shared - r.limit} 초과했습니다. 입력·저장·API 전송은 원문 그대로 하지만, `
+            + '모델이 참고할 수 있는 문맥은 베이스와 모든 캐릭터를 합쳐 약 512 토큰이라 뒤쪽 영향이 약해지거나 무시될 수 있습니다.'
+          : '베이스 + 모든 캐릭터 프롬프트가 약 512 T5 토큰을 함께 씁니다');
       // 네거티브가 부실한데 UC 프리셋이 None 이면 NAI 가 아무것도 안 보태서
       // 그림이 흐릿하고 뭉개진다. 실제로 확인한 조합이라 경고를 띄운다.
       const ucNone = Number((STATE.uc_preset ?? 4)) === 4;
@@ -6709,14 +6775,20 @@ async function naiTokens(){
       const negOver = negShared > r.limit;
       $('negTok').innerHTML = `${approx}${r.negative} 토큰`
         + (negShared > r.negative
-            ? ` <span style="opacity:.7">+캐릭터 ${negShared - r.negative}</span>`
-              + ` <span style="color:${negOver ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>` : '')
+            ? ` <span style="opacity:.7">+캐릭터 ${negShared - r.negative}</span>` : '')
+        + ` <span style="color:${negOver ? '#e0574e' : 'var(--muted)'}">/ ${r.limit}</span>`
+        + (negOver ? ' <span style="color:#e0574e">⚠ 입력은 보존</span>' : '')
         + (ucNone && weak ? ' <span style="color:#e0a04e">⚠ UC 프리셋이 None</span>' : '');
-      $('negTok').title = ucNone && weak
-        ? '네거티브가 너무 짧고 UC 프리셋이 None 입니다 — NAI 가 품질 태그를 하나도 보태지 '
-          + '않아 그림이 흐려질 수 있습니다. 네거티브를 채우거나 파라미터에서 UC 프리셋을 '
-          + 'Heavy/Human Focus 로 바꾸세요.'
-        : '';
+      const negNotes = [];
+      if(negOver) negNotes.push(
+        `약 512 토큰을 ${negShared - r.limit} 초과했습니다. 입력·저장·API 전송은 원문 그대로 하지만, `
+        + '네거티브와 캐릭터별 네거티브가 같은 문맥 한도를 쓰므로 뒤쪽 영향이 약해지거나 무시될 수 있습니다.');
+      else negNotes.push('네거티브 + 모든 캐릭터별 네거티브가 약 512 T5 토큰을 함께 씁니다.');
+      if(ucNone && weak) negNotes.push(
+        '네거티브가 너무 짧고 UC 프리셋이 None 입니다 — NAI 가 품질 태그를 하나도 보태지 '
+        + '않아 그림이 흐려질 수 있습니다. 네거티브를 채우거나 파라미터에서 UC 프리셋을 '
+        + 'Heavy/Human Focus 로 바꾸세요.');
+      $('negTok').title = negNotes.join(' ');
     }catch(e){}
   }, 350);
 }
@@ -7301,15 +7373,32 @@ function readParams(){
 
 /* ── 저장 ── */
 let saveT = null, saveBusy = false, saveQueued = false;
-function save(){ clearTimeout(saveT); saveT = setTimeout(doSave, 350); }
+function save(){
+  clearTimeout(saveT);
+  saveState('busy', '저장 대기…');
+  /* 자동완성은 160ms 뒤 시작하며 첫 색인은 22만 태그를 읽는다.
+     저장을 그보다 먼저 보내 새 설치의 첫 입력도 색인 예열 뒤로 밀리지 않게 한다. */
+  saveT = setTimeout(doSave, 100);
+}
+function saveState(kind, text, detail=''){
+  const el = $('saveState'); if(!el) return;
+  el.className = 'save-state' + (kind ? ' ' + kind : '');
+  el.textContent = text;
+  el.title = detail || '설정.json 자동저장 상태';
+}
 async function doSave(){
+  saveT = null;
   /* 앞 요청보다 옛 STATE가 늦게 도착해 새 값을 덮지 않도록 한 번에 하나만 보낸다. */
   if(saveBusy){ saveQueued = true; return; }
   saveBusy = true;
+  saveState('busy', '저장 중…');
   try{
     const r = await (await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(STATE)})).json();
-    if(r && r.conflict){ flash(r.error || '다른 화면에서 설정이 변경됐습니다. 새로고침해주세요.'); return; }
+    if(r && r.conflict){
+      const msg = r.error || '다른 화면에서 설정이 변경됐습니다. 새로고침해주세요.';
+      saveState('fail', '저장 충돌 ⚠', msg); flash(msg); return;
+    }
     if(r && r.revision != null) STATE._revision = r.revision;
     const f = (r && r.fixed) || {};
     const ids = {width:'pWidth',height:'pHeight',steps:'pSteps',cfg_scale:'pScale',
@@ -7329,12 +7418,25 @@ async function doSave(){
     if(note) note.textContent = wh.length
       ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${wh.map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`).join(' · ')}` : '';
     if(r && r.rejected && r.rejected.length) flash(`저장하지 않은 잘못된 값: ${r.rejected.join(', ')}`);
-  }catch(e){ console.warn('설정 저장 실패', e); }
+    saveState('', '저장됨 ✓');
+  }catch(e){
+    console.warn('설정 저장 실패', e);
+    saveState('fail', '저장 실패 ⚠',
+      '설정.json에 저장하지 못했습니다. 앱을 닫지 말고 연결 상태와 생성.log를 확인하세요.');
+  }
   finally{
     saveBusy = false;
     if(saveQueued){ saveQueued = false; doSave(); }
   }
 }
+/* 입력 직후 100ms 안에 탭을 닫아도 마지막 변경을 서버에 넘긴다.
+   입력 원문은 그대로 보내며 길이 제한을 두지 않는다. */
+window.addEventListener('pagehide', () => {
+  if(!saveT || saveBusy || !navigator.sendBeacon) return;
+  clearTimeout(saveT); saveT = null;
+  navigator.sendBeacon('/api/save',
+    new Blob([JSON.stringify(STATE)], {type:'application/json'}));
+});
 ['basePrompt','negPrompt','token','pScale','pRescale','pSteps','pSeed','pNaiSeed','pSampler','pSched','pVariety'].forEach(id => {
   const el = $(id);
   const h = () => {
@@ -11757,7 +11859,8 @@ class ConfigServer:
             im = Image.open(io.BytesIO(body))
             if kind == "vibe":
                 p, _ = vibe_paths(rid)
-                im.convert("RGB").save(p, "PNG")
+                converted = im.convert("RGB")
+                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
                 item = {"id": rid, "name": name, "enabled": True,
                         "strength": 0.6, "info_extracted": 0.7, "encoded_ie": None}
                 self.cfg.setdefault("vibes", []).append(item)
@@ -11773,7 +11876,8 @@ class ConfigServer:
                 return {"ok": True, "item": item, "vibes": self.cfg["vibes"]}
             else:
                 p = VIBE_DIR / f"{rid}.ref.png"
-                im.convert("RGB").save(p, "PNG")
+                converted = im.convert("RGB")
+                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
                 item = {"id": rid, "name": name, "enabled": True,
                         "ref_type": "character&style", "strength": 0.6, "fidelity": 0.6}
                 self.cfg.setdefault("char_refs", []).append(item)
@@ -11796,7 +11900,8 @@ class ConfigServer:
                 for gone in set(old) - {x.get("id") for x in new}:
                     for p in (VIBE_DIR / f"{gone}.png", VIBE_DIR / f"{gone}.vibe",
                               VIBE_DIR / f"{gone}.ref.png"):
-                        p.unlink(missing_ok=True)
+                        if p.exists():
+                            recoverable_remove(p)
                 # 정보추출이 바뀌면 캐시를 버려 다음 생성에서 다시 인코딩
                 for x in new:
                     o = old.get(x.get("id"))
@@ -11842,9 +11947,12 @@ class ConfigServer:
                 p = d / f"{stem}_{tool}_{i}.{ext}"
                 i += 1
             if keep_alpha:
-                img.convert("RGBA").save(p, "PNG")
+                converted = img.convert("RGBA")
+                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
             else:
-                img.convert("RGB").save(p, "WEBP", quality=95)
+                converted = img.convert("RGB")
+                _atomic_save_image(
+                    p, lambda tmp: converted.save(tmp, "WEBP", quality=95))
             self.live.set_image(img.convert("RGB"))
             self.live.update(filename=p.name, char_name=f"디렉터 · {tool}",
                              status_text="디렉터 툴 완료")
@@ -11925,9 +12033,11 @@ class ConfigServer:
                 self.cfg[key] = used
                 accepted.append(key)
             new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-            delete_char_files(self.cfg, old_ids - new_ids)
             sync_chars_to_files(self.cfg)
+            # 새 설정과 남은 캐릭터 파일이 먼저 디스크에 확정된 뒤 삭제본을 목록 밖
+            # 백업으로 옮긴다. 중간 종료 시 삭제가 취소될 수는 있어도 원문이 사라지지 않는다.
             save_config(self.cfg)
+            delete_char_files(self.cfg, old_ids - new_ids)
             self.config_revision += 1
             if rejected:
                 log.warning(f"설정 저장에서 잘못된 키/값을 거절함: {', '.join(sorted(rejected))}")
@@ -12572,7 +12682,7 @@ class ConfigServer:
                         d.mkdir(parents=True, exist_ok=True)
                         n = len(list(d.glob("*.png"))) + 1
                         f = d / f"{n:04d}.png"
-                        f.write_bytes(body)
+                        _atomic_write_bytes(f, body, keep_backup=False)
                         self._json({"ok": True, "file": f.name, "bytes": len(body)})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
@@ -12605,7 +12715,9 @@ class ConfigServer:
                         old = (d.get("old") or "").strip()
                         name = save_fragment(d.get("name", ""), d.get("lines") or [])
                         if old and old != name:
-                            (FRAG_DIR / f"{old}.txt").unlink(missing_ok=True)
+                            old_path = FRAG_DIR / f"{old}.txt"
+                            if old_path.exists():
+                                recoverable_remove(old_path, label="이름변경")
                         self._json({"ok": True, "name": name,
                                     "fragments": list_fragments()})
                     except Exception as e:
@@ -12613,7 +12725,9 @@ class ConfigServer:
                 elif self.path.startswith("/api/frag_del"):
                     try:
                         d = json.loads(body or b"{}")
-                        (FRAG_DIR / f"{Path(d.get('name','')).name}.txt").unlink(missing_ok=True)
+                        path = FRAG_DIR / f"{Path(d.get('name','')).name}.txt"
+                        if path.exists():
+                            recoverable_remove(path)
                         self._json({"ok": True, "fragments": list_fragments()})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
