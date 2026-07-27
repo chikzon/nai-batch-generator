@@ -1940,6 +1940,141 @@ def add_style(rec):
     return len(rows)
 
 
+# ── 그림체 정리 ────────────────────────────────────────────────────────────
+# 자료를 몇천 건 넣고 나면 **지울 수 있어야** 정리가 된다. 여기까지 없었다 —
+# 목록(`/api/combos`)·한 건 추가(`style_save`)·별점(`rate`) 뿐이라 한 번 들어온 것을
+# 뺄 방법이 없었다.
+#
+# ⚠ 지운 것은 **`수집/지운그림체.json` 으로 옮긴다**(되살릴 수 있게).
+#   몇천 건을 훑다 잘못 고르는 일은 반드시 생긴다.
+def _trashed_style_path():
+    return BASE_DIR / "수집" / "지운그림체.json"
+
+
+def _load_styles_raw():
+    if not STYLE_FILE.exists():
+        return []
+    try:
+        d = json.loads(STYLE_FILE.read_text(encoding="utf-8-sig"))
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def _write_styles_raw(rows):
+    STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STYLE_FILE.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    forget_collection_caches()
+
+
+def delete_styles(ids):
+    """고른 그림체를 지운다 → 지운그림체.json 으로 옮긴다."""
+    want = {str(x) for x in (ids or []) if str(x)}
+    if not want:
+        return {"ok": False, "error": "고른 것이 없습니다."}
+    rows = _load_styles_raw()
+    keep = [r for r in rows if str(r.get("id")) not in want]
+    gone = [r for r in rows if str(r.get("id")) in want]
+    if not gone:
+        return {"ok": False, "error": "그 그림체를 못 찾았습니다."}
+    p = _trashed_style_path()
+    old = []
+    if p.exists():
+        try:
+            got = json.loads(p.read_text(encoding="utf-8-sig"))
+            old = got if isinstance(got, list) else []
+        except Exception:
+            old = []
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    for r in gone:
+        r = dict(r)
+        r["_지운때"] = stamp
+        old.append(r)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(old[-5000:], ensure_ascii=False), encoding="utf-8")
+    _write_styles_raw(keep)
+    return {"ok": True, "지움": len(gone), "남음": len(keep), "되살릴수있음": len(old)}
+
+
+def restore_styles(ids=None):
+    """지운 것을 되살린다. ids 가 없으면 **가장 최근에 지운 묶음** 전부."""
+    p = _trashed_style_path()
+    if not p.exists():
+        return {"ok": False, "error": "지운 그림체가 없습니다."}
+    try:
+        trash = json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"ok": False, "error": "지운 목록을 읽지 못했습니다."}
+    if not isinstance(trash, list) or not trash:
+        return {"ok": False, "error": "지운 그림체가 없습니다."}
+    if ids:
+        want = {str(x) for x in ids}
+    else:
+        last = trash[-1].get("_지운때")          # 마지막 묶음만 되살린다
+        want = {str(r.get("id")) for r in trash if r.get("_지운때") == last}
+    back = [r for r in trash if str(r.get("id")) in want]
+    rest = [r for r in trash if str(r.get("id")) not in want]
+    if not back:
+        return {"ok": False, "error": "되살릴 것을 못 찾았습니다."}
+    rows = _load_styles_raw()
+    have = {str(r.get("id")) for r in rows}
+    added = 0
+    for r in back:
+        if str(r.get("id")) in have:
+            continue
+        r = {k: v for k, v in r.items() if k != "_지운때"}
+        rows.insert(0, r)
+        added += 1
+    _write_styles_raw(rows)
+    p.write_text(json.dumps(rest, ensure_ascii=False), encoding="utf-8")
+    return {"ok": True, "되살림": added, "남은휴지통": len(rest)}
+
+
+def _combo_fingerprint(r):
+    """같은 그림체인지 보는 지문 — 작가 조합을 **가중치·순서 빼고** 본다.
+    id 는 출처마다 다르게 붙으므로(`arca-3297` · `dorang-…`) id 로는 못 잡는다."""
+    arts = r.get("artists")
+    if arts:
+        return " ".join(sorted((str(a) or "").strip().lower() for a in arts if a))
+    combo = (r.get("combo") or "").lower()
+    names = re.findall(r"artist:([^,:]+)", combo)
+    if names:
+        return " ".join(sorted(n.strip() for n in names))
+    return re.sub(r"\s+", "", combo)
+
+
+def find_style_dupes():
+    """같은 작가 조합인데 여러 건인 것을 묶어서 돌려준다.
+    출처가 다른 자료를 합치면 반드시 생긴다 — id 가 달라 자동 병합이 못 잡는다."""
+    rows = _load_styles_raw()
+    groups = {}
+    for r in rows:
+        fp = _combo_fingerprint(r)
+        if not fp:
+            continue
+        groups.setdefault(fp, []).append(r)
+    out = []
+    for fp, rs in groups.items():
+        if len(rs) < 2:
+            continue
+        # 설정값이 있고 정보가 많은 것을 앞에 둔다 — '남길 것' 을 고르기 쉽게
+        rs = sorted(rs, key=lambda r: (
+            0 if (r.get("params") or {}).get("seed") else 1,
+            -len(json.dumps(r, ensure_ascii=False))))
+        out.append({
+            "지문": fp[:120],
+            "건수": len(rs),
+            "항목": [{"id": r.get("id"), "title": r.get("title"),
+                      "source": r.get("source"),
+                      "설정값": bool((r.get("params") or {}).get("seed")),
+                      "작가수": r.get("count") or len(r.get("artists") or [])}
+                     for r in rs],
+        })
+    out.sort(key=lambda g: -g["건수"])
+    return {"ok": True, "묶음": len(out),
+            "겹친항목": sum(g["건수"] for g in out), "전체": len(rows), "목록": out[:300]}
+
+
 STYLE_SORTS = {
     "recommend": lambda r: (-(r.get("recommend") or -1), -(r.get("count") or 0)),
     "views":     lambda r: (-(r.get("views") or -1), -(r.get("count") or 0)),
@@ -2717,26 +2852,103 @@ def _pack_rel(name):
     return "/".join(parts)
 
 
-def _merge_list_json(path, incoming, key):
-    """key 기준으로 없는 것만 더한다 → (더함, 이미있음)"""
+def _read_rows(raw):
+    """남이 정리한 자료도 읽어 낸다 → (목록, 어떻게 읽었는지) · 못 읽으면 (None, 까닭).
+
+    사람마다 내보내는 모양이 달라서, 흔한 세 가지를 다 받는다:
+    ① 그냥 목록 `[...]`  ② 감싼 것 `{"styles":[...]}`  ③ 줄마다 한 건(NDJSON).
+    ⚠ 윈도우에서 만든 파일은 **BOM 이 붙어 있는 일이 흔하다**. `utf-8-sig` 로 읽어야
+      `json.loads` 가 안 터진다 (이걸 안 하면 멀쩡한 파일이 '깨짐' 으로 나온다)."""
+    try:
+        text = raw.decode("utf-8-sig")
+    except Exception:
+        try:
+            text = raw.decode("cp949")           # 옛 한글 윈도우에서 만든 것
+        except Exception:
+            return None, "글자를 못 읽었습니다 (UTF-8·CP949 둘 다 아님)"
+    text = text.strip()
+    if not text:
+        return None, "빈 파일입니다"
+    try:
+        d = json.loads(text)
+    except Exception:
+        rows, bad = [], 0
+        for line in text.splitlines():           # ③ NDJSON
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                bad += 1
+        if rows and bad == 0:
+            return rows, "줄마다 한 건(NDJSON)"
+        return None, "JSON 으로 못 읽었습니다"
+    if isinstance(d, list):
+        return d, ""
+    if isinstance(d, dict):                      # ② 감싼 것 — 가장 큰 목록을 고른다
+        best, bk = None, ""
+        for k, v in d.items():
+            if isinstance(v, list) and (best is None or len(v) > len(best)):
+                best, bk = v, k
+        if best is not None:
+            return best, f"'{bk}' 안의 목록을 꺼냄"
+        return None, "목록이 들어 있지 않습니다"
+    return None, "목록이 아닙니다"
+
+
+def _row_key(x, key):
+    """합칠 열쇠. 없으면 **내용으로 만들어 준다** — 남이 다르게 정리한 자료도
+    버리지 않으면서, 같은 것을 두 번 넣어도 중복이 안 생기게."""
+    k = x.get(key)
+    if k not in (None, ""):
+        return str(k), False
+    blob = json.dumps(x, ensure_ascii=False, sort_keys=True)
+    return "가져옴-" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12], True
+
+
+def _merge_list_json(path, incoming, key, overwrite=False):
+    """열쇠 기준으로 합친다 → 무슨 일이 있었는지 세어서 돌려준다.
+
+    ⚠ **'못 넣음' 을 '이미 있음' 으로 뭉뚱그리지 않는다.** 예전엔 열쇠 없는 항목이
+      조용히 버려지면서 '이미 있음' 으로 세어져, 아무것도 안 들어왔는데 중복인 것처럼
+      보였다 (실제로 겪은 거짓 보고다)."""
     old = []
     if path.exists():
         try:
-            got = json.loads(path.read_text(encoding="utf-8"))
+            got = json.loads(path.read_text(encoding="utf-8-sig"))
             old = got if isinstance(got, list) else []
         except Exception:
             old = []                     # 깨진 파일은 새로 쓴다 (사본은 아래에서 남긴다)
-    have = {str(x.get(key)) for x in old if isinstance(x, dict) and x.get(key) is not None}
-    added = 0
+    idx = {}
+    for i, x in enumerate(old):
+        if isinstance(x, dict):
+            kk, _ = _row_key(x, key)
+            idx.setdefault(kk, i)
+    n = {"새로": 0, "같음": 0, "다름": 0, "열쇠없음": 0, "항목아님": 0, "덮어씀": 0}
+    added_keys = []
     for x in incoming:
         if not isinstance(x, dict):
+            n["항목아님"] += 1
             continue
-        k = x.get(key)
-        if k is None or str(k) in have:
+        kk, made = _row_key(x, key)
+        if made:
+            n["열쇠없음"] += 1           # 버리진 않는다 — 내용 열쇠로 넣는다
+        if kk in idx:
+            same = old[idx[kk]] == x
+            if same:
+                n["같음"] += 1
+            elif overwrite:
+                old[idx[kk]] = x
+                n["덮어씀"] += 1
+            else:
+                n["다름"] += 1           # 기존 것을 지킨다. 몇 건인지는 알려 준다
             continue
-        have.add(str(k))
+        idx[kk] = len(old)
         old.append(x)
-        added += 1
+        added_keys.append(kk)
+        n["새로"] += 1
+    added = n["새로"] + n["덮어씀"]
     if added:
         if path.exists():                # 되돌릴 수 있게 한 판 남긴다
             try:
@@ -2745,7 +2957,17 @@ def _merge_list_json(path, incoming, key):
                 pass
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
-    return added, len(incoming) - added
+    return n, added_keys
+
+
+def _say_counts(n):
+    """센 것을 사람 말로. 0 인 항목은 말하지 않는다 (읽기 어려워진다)."""
+    order = [("새로", "새로 {}건"), ("덮어씀", "덮어씀 {}건"), ("같음", "이미 있음 {}건"),
+             ("다름", "같은 이름인데 내용이 달라 그대로 둠 {}건"),
+             ("열쇠없음", "이름표가 없어 내용으로 넣음 {}건"),
+             ("항목아님", "모양이 아니라 건너뜀 {}건")]
+    got = [t.format(n[k]) for k, t in order if n.get(k)]
+    return " · ".join(got) or "들어온 것 없음"
 
 
 def forget_collection_caches():
@@ -2760,12 +2982,39 @@ def forget_collection_caches():
         pass
 
 
-def import_datapack_bytes(data, filename=""):
-    """자료팩 ZIP 이든 낱개 JSON 이든 받아 수집/·태그/ 에 **합친다**(덮어쓰지 않음)."""
+def _pack_log_path():
+    return BASE_DIR / "수집" / "가져온기록.json"
+
+
+def load_pack_log():
+    p = _pack_log_path()
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            return d if isinstance(d, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def save_pack_log(rows):
+    p = _pack_log_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rows[-50:], ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def import_datapack_bytes(data, filename="", overwrite=False):
+    """자료팩 ZIP 이든 낱개 JSON 이든 받아 수집/·태그/ 에 **합친다**(기본은 덮어쓰지 않음).
+
+    무엇이 들어왔는지 `수집/가져온기록.json` 에 남겨 **통째로 되돌릴 수 있게** 한다.
+    자료를 넣고 나서 정리하려면 '무엇이 이번에 들어왔나' 를 알아야 하기 때문이다."""
     import io
     import zipfile
     lists, dirs = _datapack_lists(), _datapack_dirs()
     report, files = [], 0
+    batch = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+             "file": Path(filename).name or "자료팩",
+             "lists": {}, "files": {}}
 
     def take_list(stem, raw):
         nonlocal files
@@ -2773,17 +3022,15 @@ def import_datapack_bytes(data, filename=""):
         if not spot:
             return False
         dest, key = spot
-        try:
-            d = json.loads(raw.decode("utf-8"))
-        except Exception:
-            report.append(f"{stem}: JSON 이 아니라 건너뜀")
+        rows, how = _read_rows(raw)
+        if rows is None:
+            report.append(f"{stem}: {how}")
             return True
-        if not isinstance(d, list):
-            report.append(f"{stem}: 목록이 아니라 건너뜀")
-            return True
-        add, dup = _merge_list_json(dest, d, key)
-        report.append(f"{stem}: 새로 {add}건" + (f" · 이미 있음 {dup}건" if dup else ""))
-        files += add
+        n, keys = _merge_list_json(dest, rows, key, overwrite)
+        report.append(f"{stem}: {_say_counts(n)}" + (f" ({how})" if how else ""))
+        if keys:
+            batch["lists"][stem] = keys
+        files += n["새로"] + n["덮어씀"]
         return True
 
     if data[:2] == b"PK":
@@ -2809,6 +3056,7 @@ def import_datapack_bytes(data, filename=""):
                             with z.open(n) as src, open(dest, "wb") as out:
                                 shutil.copyfileobj(src, out)
                             copied[d] = copied.get(d, 0) + 1
+                            batch["files"].setdefault(d, []).append(stem)
                         break
             for d in dirs:
                 c, s = copied.get(d, 0), skipped.get(d, 0)
@@ -2826,7 +3074,70 @@ def import_datapack_bytes(data, filename=""):
         return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
     # 알아본 자료가 있으면 성공이다. 같은 팩을 다시 넣어 **전부 중복이어도 실패가 아니다**
     # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
-    return {"ok": True, "added": files, "report": report}
+    if batch["lists"] or batch["files"]:
+        rows = load_pack_log()
+        batch["id"] = f"{int(time.time())}"
+        batch["새로"] = files
+        batch["요약"] = " · ".join(report)
+        rows.append(batch)
+        save_pack_log(rows)
+    return {"ok": True, "added": files, "report": report,
+            "batch": batch.get("id"), "log": pack_log_brief()}
+
+
+def pack_log_brief():
+    """되돌리기 화면용 — 큰 id 목록은 빼고 요약만."""
+    return [{"id": b.get("id"), "at": b.get("at"), "file": b.get("file"),
+             "새로": b.get("새로", 0), "요약": b.get("요약", "")}
+            for b in reversed(load_pack_log())]
+
+
+def undo_datapack(batch_id):
+    """가져온 것을 통째로 되돌린다 — **그때 새로 들어온 것만** 지운다.
+    원래 갖고 있던 자료는 건드리지 않는다(열쇠를 그때 기록해 뒀다)."""
+    rows = load_pack_log()
+    hit = next((b for b in rows if str(b.get("id")) == str(batch_id)), None)
+    if not hit:
+        return {"ok": False, "error": "그 기록을 못 찾았습니다."}
+    lists, dirs = _datapack_lists(), _datapack_dirs()
+    said = []
+    for stem, keys in (hit.get("lists") or {}).items():
+        spot = lists.get(stem)
+        if not spot or not keys:
+            continue
+        path, key = spot
+        if not path.exists():
+            continue
+        try:
+            old = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        drop = set(map(str, keys))
+        kept = [x for x in old
+                if not (isinstance(x, dict) and _row_key(x, key)[0] in drop)]
+        gone = len(old) - len(kept)
+        if gone:
+            path.write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+            said.append(f"{stem}: {gone}건 뺌")
+    for d, names in (hit.get("files") or {}).items():
+        root = dirs.get(d, (None, ()))[0]
+        if not root:
+            continue
+        gone = 0
+        for nm in names:
+            p = root / nm
+            try:
+                if p.exists():
+                    p.unlink()
+                    gone += 1
+            except Exception:
+                pass
+        if gone:
+            said.append(f"{d}: {gone}개 지움")
+    save_pack_log([b for b in rows if str(b.get("id")) != str(batch_id)])
+    forget_collection_caches()
+    return {"ok": True, "report": said or ["되돌릴 것이 없었습니다"],
+            "log": pack_log_brief()}
 
 
 def setting_path(name):
@@ -5835,7 +6146,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           여기에 <b>자료팩.zip</b> 을 끌어다 놓거나 눌러서 고르세요
         </div>
         <input type="file" id="packFile" accept=".zip,.json" multiple style="display:none;">
+        <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+          <input type="checkbox" id="packOver">
+          같은 이름이면 <b>새 것으로 바꾸기</b> (기본은 갖고 있던 것을 지킵니다)
+        </label>
         <div id="packMsg" class="hint" style="margin-top:8px;"></div>
+        <div id="packLog" style="margin-top:10px;"></div>
       </div>
 
       <div class="card">
@@ -8866,20 +9182,52 @@ $('setExport').addEventListener('click', () => {
 /* ── 자료팩 넣기 ───────────────────────────────────────────────────
    배포본에 수집물을 넣지 않으므로 여기로 받는다. 서버가 합쳐 주고(덮어쓰지 않음)
    무엇이 몇 건 들어왔는지 그대로 보여 준다. */
+function esc(s){ return String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* 가져온 기록 — 넣고 나서 정리하려면 '이번에 무엇이 들어왔나' 를 볼 수 있어야 한다.
+   되돌리기는 **그때 새로 들어온 것만** 뺀다 (원래 갖고 있던 자료는 안 건드린다). */
+function renderPackLog(log){
+  const host = $('packLog'); if(!host) return;
+  if(!log || !log.length){ host.innerHTML = ''; return; }
+  host.innerHTML = '<div class="hint" style="margin-bottom:4px;">가져온 기록</div>' +
+    log.map(b => `<div class="bar" style="gap:8px;align-items:flex-start;
+        padding:6px 0;border-top:1px solid var(--line);">
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:var(--fs-sm);">${esc(b.at)} · ${esc(b.file)}
+          <b>새로 ${b['새로']||0}</b></div>
+        <div class="hint" style="font-size:var(--fs-2xs);">${esc(b['요약']||'')}</div>
+      </div>
+      <button data-undo="${esc(b.id)}" title="이때 새로 들어온 것만 뺍니다">되돌리기</button>
+    </div>`).join('');
+  host.querySelectorAll('[data-undo]').forEach(btn => btn.addEventListener('click', async () => {
+    if(!confirm('이때 새로 들어온 자료만 뺍니다. 되돌릴까요?')) return;
+    btn.disabled = true;
+    const r = await (await fetch('/api/pack_undo', {method:'POST',
+      body: JSON.stringify({id: btn.dataset.undo})})).json();
+    $('packMsg').innerHTML = r.error ? esc(r.error) : (r.report||[]).map(esc).join('<br>');
+    renderPackLog(r.log); await reloadConfig();
+  }));
+}
+
 async function sendPack(files){
   if(!files.length) return;
   const lines = [];
+  let log = null;
+  const over = $('packOver') && $('packOver').checked ? '?overwrite=1' : '';
   for(const f of files){
     $('packMsg').textContent = f.name + ' 넣는 중... (큰 팩은 시간이 걸립니다)';
     let r;
     try{
-      r = await (await fetch('/api/pack_import', {method:'POST',
+      r = await (await fetch('/api/pack_import' + over, {method:'POST',
         headers:{'X-Filename': encodeURIComponent(f.name)}, body: f})).json();
     }catch(e){ r = {ok:false, error:String(e)}; }
     if(r.error) lines.push(f.name + ': ' + r.error);
     else (r.report || []).forEach(x => lines.push(x));
+    if(r.log) log = r.log;
   }
-  $('packMsg').innerHTML = lines.join('<br>') || '들어온 것 없음';
+  $('packMsg').innerHTML = lines.map(esc).join('<br>') || '들어온 것 없음';
+  if(log) renderPackLog(log);
   await reloadConfig();
 }
 if($('packDrop')){
@@ -8898,6 +9246,9 @@ if($('packDrop')){
     e.preventDefault(); $('packDrop').style.borderColor = '';
     await sendPack([...(e.dataTransfer.files || [])]);
   });
+  /* 화면을 처음 열 때 지난 기록을 보여 준다 (앱을 껐다 켜도 남아 있다) */
+  fetch('/api/pack_log').then(r => r.json())
+    .then(r => renderPackLog(r.log)).catch(() => {});
 }
 
 $('setImport').addEventListener('click', () => $('setImportFile').click());
@@ -9060,8 +9411,21 @@ function openCombos(target){
       <div class="hint" style="margin-top:4px;">NAI로 만든 PNG/WebP를 여기에 끌어다 놓거나 눌러서 고르세요.
       프롬프트·네거티브·설정값을 통째로 읽어옵니다. (novelai.net/inspect 와 같은 데이터)</div>
       <input type="file" id="comboFile" accept="image/png,image/webp" multiple style="display:none;"></div>
+    <div class="bar" style="gap:8px;flex-wrap:wrap;">
+      <label class="hint"><input type="checkbox" id="comboTidy"> 🧹 정리하기</label>
+      <span id="comboTidyBar" class="hidden" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+        <button id="comboAll" class="mini">보이는 것 전부</button>
+        <button id="comboNone" class="mini">고르기 해제</button>
+        <button id="comboDupes" class="mini">🔁 겹친 것 찾기</button>
+        <button id="comboDel" class="mini" style="color:var(--bad);">고른 것 지우기</button>
+        <button id="comboUndo" class="mini">↩ 되살리기</button>
+        <span id="comboPickN" class="hint"></span>
+      </span>
+    </div>
+    <div id="comboTidyMsg" class="hint"></div>
     <div id="comboList"></div>
     <div class="bar"><button id="comboMore" style="flex:1;">더 보기 ▾</button></div>`;
+  bindTidy();
   $('comboQ').addEventListener('input', () => { clearTimeout(comboT); comboT = setTimeout(() => loadCombos(false), 300); });
   ['comboSort','comboTab','comboSrc','comboSize','comboSeeded','comboRate'].forEach(id =>
     $(id).addEventListener('change', () => loadCombos(false)));
@@ -9346,6 +9710,100 @@ function applyStyle(c, pick){
   flash(msg);
 }
 
+/* ── 그림체 정리 ───────────────────────────────────────────────────
+   자료를 몇천 건 넣고 나면 **지울 수 있어야** 정리가 된다.
+   지운 것은 지운그림체.json 으로 가므로 되살릴 수 있다. */
+const PICKED = new Set();
+
+function tidyOn(){ return $('comboTidy') && $('comboTidy').checked; }
+
+function paintPicks(){
+  const host = $('comboList'); if(!host) return;
+  host.querySelectorAll('[data-pick]').forEach(b => {
+    const on = PICKED.has(b.dataset.pick);
+    b.textContent = on ? '☑' : '☐';
+    b.closest('.row,.card,div').style.outline = on ? '2px solid var(--accent)' : '';
+  });
+  if($('comboPickN')) $('comboPickN').textContent = PICKED.size ? PICKED.size + '개 고름' : '';
+}
+
+/* 카드마다 고르기 단추를 붙인다. 카드 마크업은 건드리지 않는다 —
+   정리를 끌 때 원래 모습으로 정확히 돌아가야 하기 때문이다. */
+function addPickBoxes(){
+  const host = $('comboList'); if(!host) return;
+  host.querySelectorAll('[data-cfull]').forEach(b => {
+    const box = b.closest('.row') || b.parentElement;
+    if(!box || box.querySelector('[data-pick]')) return;
+    let id = '';
+    try { id = String(JSON.parse(b.dataset.cfull).id || ''); } catch(e){}
+    if(!id) return;
+    const t = document.createElement('button');
+    t.dataset.pick = id; t.className = 'mini'; t.title = '고르기';
+    t.style.cssText = 'margin-right:6px;';
+    t.addEventListener('click', e => {
+      e.stopPropagation();
+      PICKED.has(id) ? PICKED.delete(id) : PICKED.add(id);
+      paintPicks();
+    });
+    box.insertBefore(t, box.firstChild);
+  });
+  paintPicks();
+}
+
+function clearPickBoxes(){
+  const host = $('comboList'); if(!host) return;
+  host.querySelectorAll('[data-pick]').forEach(b => {
+    const box = b.closest('.row,.card,div'); if(box) box.style.outline = '';
+    b.remove();
+  });
+}
+
+async function tidyDupes(){
+  $('comboTidyMsg').textContent = '겹친 것 찾는 중...';
+  const r = await (await fetch('/api/style_dupes')).json();
+  if(!r.ok){ $('comboTidyMsg').textContent = r.error || '실패'; return; }
+  if(!r['묶음']){ $('comboTidyMsg').textContent = '겹친 것이 없습니다.'; return; }
+  /* 각 묶음의 **첫째를 남기고 나머지를 고른다** — 첫째는 설정값이 있고
+     정보가 많은 것으로 서버가 정렬해 뒀다. 지우기 전에 눈으로 볼 수 있다. */
+  PICKED.clear();
+  r['목록'].forEach(g => g['항목'].slice(1).forEach(it => PICKED.add(String(it.id))));
+  paintPicks();
+  $('comboTidyMsg').innerHTML =
+    `같은 작가 조합이 <b>${r['묶음']}종 ${r['겹친항목']}건</b> (전체 ${r['전체']}건). ` +
+    `묶음마다 <b>가장 정보가 많은 하나를 남기고</b> ${PICKED.size}건을 골라 뒀습니다. ` +
+    `목록에서 확인한 뒤 '고른 것 지우기' 를 누르세요. (지워도 되살릴 수 있습니다)`;
+}
+
+function bindTidy(){
+  if(!$('comboTidy')) return;
+  $('comboTidy').addEventListener('change', () => {
+    $('comboTidyBar').classList.toggle('hidden', !tidyOn());
+    if(tidyOn()) addPickBoxes();
+    else { PICKED.clear(); clearPickBoxes(); $('comboTidyMsg').textContent = ''; }
+  });
+  $('comboAll').addEventListener('click', () => {
+    $('comboList').querySelectorAll('[data-pick]').forEach(b => PICKED.add(b.dataset.pick));
+    paintPicks();
+  });
+  $('comboNone').addEventListener('click', () => { PICKED.clear(); paintPicks(); });
+  $('comboDupes').addEventListener('click', tidyDupes);
+  $('comboDel').addEventListener('click', async () => {
+    if(!PICKED.size){ $('comboTidyMsg').textContent = '고른 것이 없습니다.'; return; }
+    if(!confirm(PICKED.size + '개를 지웁니다. (되살릴 수 있습니다)')) return;
+    const r = await (await fetch('/api/style_del', {method:'POST',
+      body: JSON.stringify({ids:[...PICKED]})})).json();
+    $('comboTidyMsg').textContent = r.error ? r.error
+      : `${r['지움']}건 지움 · 남은 그림체 ${r['남음']}건 · 되살릴 수 있는 것 ${r['되살릴수있음']}건`;
+    PICKED.clear(); await loadCombos(false); if(tidyOn()) addPickBoxes();
+  });
+  $('comboUndo').addEventListener('click', async () => {
+    const r = await (await fetch('/api/style_restore', {method:'POST', body:'{}'})).json();
+    $('comboTidyMsg').textContent = r.error ? r.error
+      : `${r['되살림']}건 되살림 · 휴지통에 ${r['남은휴지통']}건 남음`;
+    await loadCombos(false); if(tidyOn()) addPickBoxes();
+  });
+}
+
 async function loadCombos(append){
   const f = cq();
   if(!append) comboOffset = 0;
@@ -9388,6 +9846,7 @@ async function loadCombos(append){
   });
   host.querySelectorAll('[data-cfull]').forEach(b =>
     b.addEventListener('click', () => applyStyle(JSON.parse(b.dataset.cfull))));
+  if(tidyOn()) addPickBoxes();      /* 더 보기로 이어 붙인 카드에도 붙는다 */
   host.querySelectorAll('[data-crate]').forEach(b => b.addEventListener('click', () => {
     const arts = JSON.parse(b.dataset.crate || '[]');
     if(!arts.length){ flash('이 조합에는 작가 태그가 없습니다.'); return; }
@@ -11456,6 +11915,18 @@ class ConfigServer:
                     # 부루 썸네일은 브라우저가 직접 받는다 (Cloudflare 때문에
                     # 서버에서 미리 받아 두면 전부 403 이 되어 헛일이다).
                     self._json(res)
+                elif self.path.startswith("/api/style_dupes"):
+                    # 출처가 다른 자료를 합치면 같은 조합이 여러 번 들어온다 (id 가 달라
+                    # 자동 병합이 못 잡는다). 묶어서 보여 주고 고르게 한다.
+                    try:
+                        self._json(find_style_dupes())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/pack_log"):
+                    try:
+                        self._json({"ok": True, "log": pack_log_brief()})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/combos"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
@@ -11994,7 +12465,8 @@ class ConfigServer:
                     from urllib.parse import unquote
                     try:
                         r = import_datapack_bytes(
-                            body, unquote(self.headers.get("X-Filename", "")))
+                            body, unquote(self.headers.get("X-Filename", "")),
+                            overwrite="overwrite=1" in self.path)
                         if r.get("ok"):
                             # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
                             # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
@@ -12002,6 +12474,28 @@ class ConfigServer:
                         self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/pack_undo"):
+                    # 넣고 나서 아니다 싶으면 통째로 물린다 (그때 들어온 것만).
+                    try:
+                        d = json.loads(body or b"{}")
+                        self._json(undo_datapack(d.get("id")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/style_del"):
+                    # 몇천 건을 넣고 나면 지울 수 있어야 정리가 된다.
+                    try:
+                        d = json.loads(body or b"{}")
+                        self._json(delete_styles(d.get("ids")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/style_restore"):
+                    try:
+                        d = json.loads(body or b"{}")
+                        self._json(restore_styles(d.get("ids")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                # ⚠ style_dupes · pack_log 는 **읽기라 GET 분기**에 있다.
+                #    여기(POST)에 두면 화면의 fetch(기본 GET)가 빈 응답을 받는다.
                 elif self.path.startswith("/api/setting_dup"):
                     try:
                         d = json.loads(body or b"{}")
