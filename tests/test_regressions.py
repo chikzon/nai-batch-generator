@@ -98,6 +98,12 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn(
             ".hl .w-num{color:var(--accent);opacity:.95;}", page)
         self.assertNotIn(".hl b{font-weight:400;border-radius:3px;padding:0 1px;}", page)
+        self.assertIn(
+            ".hlwrap .hl{position:absolute;top:0;left:0;", page)
+        self.assertIn(
+            "padding:8px 10px;border:1px solid transparent;", page)
+        self.assertIn("layer.style.width = (ta.clientWidth + 2) + 'px';", page)
+        self.assertIn("layer.style.height = (ta.clientHeight + 2) + 'px';", page)
 
     def test_builder_routes_character_variants_and_negative_separately(self):
         """캐릭터 외형을 바꾸는 후보는 베이스에, 네거티브 후보는 양성에 섞지 않는다."""

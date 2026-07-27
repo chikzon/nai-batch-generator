@@ -5963,12 +5963,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 /* textarea 의 줄바꿈 규칙과 완전히 같아야 한다.
    word-break:break-word 를 쓰면 긴 줄에서 줄바꿈 위치가 달라져 하이라이트가 어긋난다.
    폭은 스크롤바를 뺀 clientWidth 로 JS 가 맞춰준다. */
-/* top/left 1px = textarea 의 테두리 두께. 레이어 자체는 테두리를 두지 않아
-   글자 상자가 textarea 의 것과 정확히 겹친다. */
-.hlwrap .hl{position:absolute;top:1px;left:1px;z-index:1;overflow:hidden;pointer-events:none;
+/* textarea 와 같은 투명 테두리·여백을 둔다. 예전의 top/left 1px + padding 7/9px은
+   실제 글자 시작점보다 가로·세로 모두 1px 앞서 배경띠가 두 겹 글자처럼 보였다. */
+.hlwrap .hl{position:absolute;top:0;left:0;z-index:1;overflow:hidden;pointer-events:none;
   white-space:pre-wrap;word-break:normal;overflow-wrap:break-word;color:transparent;
   -webkit-text-fill-color:transparent;text-shadow:none;
-  padding:7px 9px;border:0;border-radius:var(--radius);
+  padding:8px 10px;border:1px solid transparent;border-radius:var(--radius);
   font-family:var(--mono);font-size:var(--fs-sm);line-height:1.55;
   box-sizing:border-box;tab-size:8;}
 .psec-body .hlwrap .hl{line-height:1.55;}
@@ -7656,9 +7656,11 @@ function attachHL(ta){
   wrap.appendChild(layer); wrap.appendChild(ta);
   ta._hl = layer;
   const sync = () => {
-    // 스크롤바 때문에 textarea 의 실제 글자 폭이 줄어든다 → 레이어도 같은 폭으로
-    layer.style.width = ta.clientWidth + 'px';
-    layer.style.height = ta.clientHeight + 'px';
+    // clientWidth/Height 는 textarea 테두리를 뺀 값이다. 거울층에도 같은 1px 테두리를
+    // 두므로 양쪽 테두리 2px를 되붙여야 내용 폭·줄바꿈·스크롤 위치가 정확히 같다.
+    // 세로 스크롤바가 나타나면 clientWidth가 줄어드는 것도 그대로 따라간다.
+    layer.style.width = (ta.clientWidth + 2) + 'px';
+    layer.style.height = (ta.clientHeight + 2) + 'px';
     layer.scrollTop = ta.scrollTop;
     layer.scrollLeft = ta.scrollLeft;
   };
