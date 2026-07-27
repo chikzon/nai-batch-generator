@@ -13,6 +13,8 @@ import importlib.util
 import json
 import socket
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -216,6 +218,68 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn('data-csave="${escA(JSON.stringify(c))}"', page)
         self.assertNotIn('data-crate="${escA(JSON.stringify(c.artists||[]))}"', page)
         self.assertIn("const fragment = document.createDocumentFragment()", page)
+        self.assertIn('<option selected>20</option><option>50</option>', page)
+        self.assertIn('className = \'row combo-card\'', page)
+        self.assertIn('loading="lazy" decoding="async" fetchpriority="low"', page)
+        self.assertIn("content-visibility:auto", page)
+
+    def test_combo_list_payload_omits_heavy_fields_unused_by_cards(self):
+        """목록에서 캐릭터 원문까지 보내 멈추지 말되 그림체 묶음 적용값은 보존한다."""
+        row = {
+            "id": "style-1", "title": "Style", "combo": "artist:a",
+            "artists": ["a"], "base": "whole base", "negative": "whole negative",
+            "params": {"scale": 5.5}, "images": ["first.webp", "second.webp"],
+            "characters": [{"prompt": "x" * 10000}],
+            "rest": "y" * 10000, "weights": {"a": 1.0},
+        }
+        with (
+            patch.object(APP, "load_combos", return_value=[row]),
+            patch.object(APP, "style_rating", return_value={
+                "score": 0, "fav": False, "block": False, "rated": 0,
+            }),
+        ):
+            item = APP.search_combos(limit=20)["items"][0]
+        self.assertEqual(item["base"], "whole base")
+        self.assertEqual(item["negative"], "whole negative")
+        self.assertEqual(item["params"], {"scale": 5.5})
+        self.assertEqual(item["images"], ["first.webp"])
+        for unused in ("characters", "rest", "weights"):
+            self.assertNotIn(unused, item)
+
+    def test_concurrent_combo_requests_parse_the_collection_once(self):
+        """첫 화면 개수 조회와 모달 열기가 겹쳐도 큰 JSON을 중복 파싱하지 않는다."""
+        old_cache = copy.deepcopy(APP._COMBOS)
+        calls, results = [], []
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                style_file = Path(td) / "그림체.json"
+                style_file.write_text("[]", encoding="utf-8")
+
+                def slow_load(_path):
+                    calls.append(1)
+                    time.sleep(0.08)
+                    return [{"id": "only", "combo": "artist:a"}]
+
+                APP._COMBOS.update({"loaded": False, "rows": []})
+                with (
+                    patch.object(APP, "STYLE_FILE", style_file),
+                    patch.object(APP, "COMBO_FILE", Path(td) / "없음.json"),
+                    patch.object(APP, "load_json_recover", side_effect=slow_load),
+                ):
+                    workers = [
+                        threading.Thread(target=lambda: results.append(APP.load_combos()))
+                        for _ in range(4)
+                    ]
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join()
+        finally:
+            APP._COMBOS.clear()
+            APP._COMBOS.update(old_cache)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(rows[0]["id"] == "only" for rows in results))
 
     def test_distribution_separates_program_from_all_content_data(self):
         self.assertIn("t5_tokenizer.json", BUILD.ASSETS)

@@ -1968,6 +1968,7 @@ def prewarm_images(items, n=48):
 STYLE_FILE = BASE_DIR / "수집" / "그림체.json"
 COMBO_FILE = BASE_DIR / "수집" / "작가조합.json"
 _COMBOS = {"loaded": False, "rows": []}
+_COMBOS_LOCK = threading.Lock()
 
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
@@ -2009,7 +2010,14 @@ def parse_artist_combo(text):
 
 
 def load_combos():
-    if not _COMBOS["loaded"]:
+    if _COMBOS["loaded"]:
+        return _COMBOS["rows"]
+    # 첫 화면의 개수 조회와 사용자의 모달 열기가 겹쳐도 732건 JSON을 두 번 동시에
+    # 읽고 파싱하지 않는다. ThreadingHTTPServer라 잠금이 없으면 둘 다 loaded=False를
+    # 보고 같은 큰 파일을 잡아 메인 화면까지 버벅였다.
+    with _COMBOS_LOCK:
+        if _COMBOS["loaded"]:
+            return _COMBOS["rows"]
         rows = []
         for f in (STYLE_FILE, COMBO_FILE):
             if not f.exists():
@@ -2327,10 +2335,19 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
         return out
 
     page = hit[offset:offset + limit]
-    # 카드에 평가(별점·즐겨찾기·차단)를 실어 준다 — 화면에서 바로 보이게
+    # 목록 카드가 실제로 쓰는 값만 보낸다. 원본에는 캐릭터 전체 프롬프트·rest·weights가
+    # 함께 있어 20~50개만 열어도 응답과 JSON 파싱이 불필요하게 커졌다. 그림체 적용에
+    # 필요한 베이스·네거티브·생성 설정은 그대로 보존하고, 썸네일도 첫 장만 보낸다.
+    card_fields = (
+        "id", "title", "source", "tab", "posted_at", "recommend", "views", "url",
+        "count", "combo", "artists", "base", "negative", "negative_full", "params",
+        "images",
+    )
     items = []
     for r in page:
-        item = dict(r)
+        item = {k: r[k] for k in card_fields if k in r}
+        if isinstance(item.get("images"), list):
+            item["images"] = item["images"][:1]
         item["_rate"] = style_rating(r)
         items.append(item)
     return {"total": len(rows), "matched": len(hit),
@@ -3105,7 +3122,8 @@ def forget_collection_caches():
     """자료가 늘었으니 한 번 읽고 물고 있던 것들을 놓게 한다.
     `load_combos()`·`load_recipes()` 는 `loaded` 깃발을 보고 다시 읽고,
     자동완성 색인은 `_TAG_CACHE` 를 비우면 다음 호출에 다시 만든다."""
-    _COMBOS["loaded"] = False
+    with _COMBOS_LOCK:
+        _COMBOS["loaded"] = False
     _RECIPES["loaded"] = False
     try:
         _TAG_CACHE.clear()
@@ -6138,6 +6156,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .card h2{font-size:calc(var(--fs) + 1px);margin:0 0 6px;display:flex;align-items:center;gap:9px;letter-spacing:-.01em;}
   .card h2 .n{font-family:var(--mono);font-size:var(--fs-xs);color:var(--accent);background:var(--accent-dim);
     border-radius:var(--radius-pill);padding:2px 7px;}
+  .combo-card{content-visibility:auto;contain-intrinsic-size:auto 154px;}
   .hint{color:var(--muted);font-size:var(--fs-xs);margin:0 0 12px;line-height:1.65;}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:11px;}
   .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;}
@@ -10480,7 +10499,7 @@ function openCombos(target){
         <option value="NAI">NAI</option><option value="R18_NAI">🔞 NAI</option></select>
       <select id="comboSrc" title="출처"><option value="all">전체 출처</option></select>
       <select id="comboSize" title="표시 개수">
-        <option>20</option><option selected>50</option><option>100</option><option>200</option></select>
+        <option selected>20</option><option>50</option><option>100</option><option>200</option></select>
       <select id="comboCard" title="카드 크기">
         <option value="small">작게</option><option value="medium" selected>보통</option>
         <option value="large">크게</option></select>
@@ -10699,14 +10718,14 @@ function styleCard(c){
   if(c.views != null) meta.push(`조회 ${c.views}`);
   if(c.posted_at) meta.push(c.posted_at);
   const el = document.createElement('div');
-  el.className = 'row';
+  el.className = 'row combo-card';
   // 전체 레코드를 data-* 문자열로 버튼마다 복제하지 않는다.
   // 긴 프롬프트·메타데이터가 있는 50개 카드에서 HTML이 수백 KB로 불어나고,
   // 파싱·속성 디코딩·JSON 재파싱이 메인 스레드를 막았다.
   el._comboRecord = c;
   el.innerHTML = `<div class="tag">${esc(c.source||'도랑')}${c.tab ? ' · '+esc(c.tab) : ''} · 작가 ${c.count}명${c.title ? ' · '+esc(c.title.slice(0,34)) : ''}${meta.length ? ' · '+esc(meta.join(' · ')) : ''}</div>
     <div style="display:flex;gap:9px;">
-      ${(c.images && c.images[0]) ? `<img src="/img?u=${encodeURIComponent(c.images[0])}" loading="lazy" alt="" onerror="this.style.display='none'" style="width:${px}px;height:${px}px;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);flex:none;background:#0004;">` : ''}
+      ${(c.images && c.images[0]) ? `<img src="/img?u=${encodeURIComponent(c.images[0])}" loading="lazy" decoding="async" fetchpriority="low" alt="" onerror="this.style.display='none'" style="width:${px}px;height:${px}px;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);flex:none;background:#0004;">` : ''}
       <div style="flex:1;min-width:0;">
         <div style="font-family:var(--mono);font-size:var(--fs-xs);line-height:1.5;max-height:66px;overflow:auto;">${esc(c.combo || '(작가 태그 없음)')}</div>
         ${bits.length ? `<div class="hint" style="margin-top:5px;">⚙ ${esc(bits.join(' · '))}</div>` : ''}
@@ -11042,9 +11061,13 @@ function bindWelcome(){
     STATE.ui = STATE.ui || {}; STATE.ui.welcome_off = true;
     save(); refreshWelcome(); $('basePrompt').focus();
   });
-  fetch('/api/combos?limit=1').then(r => r.json()).then(r => {
+  const loadWelcomeCount = () => fetch('/api/combos?limit=0').then(r => r.json()).then(r => {
     if(r.ok && $('welcomeCount')) $('welcomeCount').textContent = r.total.toLocaleString();
   }).catch(() => {});
+  /* 사용자가 먼저 빌더를 누르면 그 일이 우선이다. 첫 화면의 숫자 하나 때문에
+     같은 그림체 파일을 동시에 읽지 않도록 브라우저가 한가할 때 조회한다. */
+  if('requestIdleCallback' in window) requestIdleCallback(loadWelcomeCount, {timeout:2500});
+  else setTimeout(loadWelcomeCount, 1200);
 }
 
 
