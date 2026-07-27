@@ -6963,6 +6963,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <label style="display:flex;align-items:center;gap:6px;flex:1;">
             <input type="checkbox" id="cmpConfirm" style="width:auto;flex:none;">
             <span id="cmpConfirmText">장수와 API 호출 횟수를 확인했습니다.</span></label>
+          <button type="button" id="cmpOpenResults">▦ 최근 결과 선별</button>
           <button class="go" id="cmpStart" disabled>▶ 비교 생성 시작</button>
         </div>
       </div>
@@ -7664,6 +7665,22 @@ function bindComparison(){
   });
   $('cmpConfirm').addEventListener('change', () => {
     $('cmpStart').disabled = !(CMP_PLAN && CMP_PLAN.ok && CMP_PLAN.count && $('cmpConfirm').checked);
+  });
+  $('cmpOpenResults').addEventListener('click', async () => {
+    const r = await (await fetch('/api/compare_progress')).json();
+    if(!r.ok){
+      $('cmpSummary').textContent = r.error || '아직 선별할 비교 결과가 없습니다.';
+      return;
+    }
+    STATE.ui = STATE.ui || {};
+    STATE.ui.library_work = 'browse';
+    setMode('library');
+    arrangeStudioWorkspace();
+    await expLoad(r.folder);
+    const done = Number(r.completed || 0).toLocaleString();
+    const total = Number(r.total || 0).toLocaleString();
+    $('expStat').textContent = `최근 비교 결과 ${done}/${total}장 · 선별을 시작하세요.`;
+    $('expGrid').scrollIntoView({behavior:'smooth', block:'start'});
   });
   $('cmpStart').addEventListener('click', async () => {
     if(!(CMP_PLAN && CMP_PLAN.ok && $('cmpConfirm').checked)) return;
@@ -13637,6 +13654,11 @@ class ConfigServer:
                         self._json(image_origin_stats())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_progress"):
+                    try:
+                        self._json(comparison_progress_summary(server.cfg))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/combos"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
@@ -14459,6 +14481,29 @@ def _comparison_progress_load():
     except Exception as e:
         log.warning(f"비교 생성 진행 기록을 읽지 못했습니다: {e}")
         return {}
+
+
+def comparison_progress_summary(cfg):
+    """최근 비교 실행을 탐색기에서 열 수 있는 최소 정보만 돌려준다."""
+    progress = _comparison_progress_load()
+    rel = str(progress.get("folder") or "").strip().replace("\\", "/").strip("/")
+    if not rel:
+        return {"ok": False, "error": "아직 비교 생성 결과가 없습니다."}
+    root = out_root(cfg).resolve()
+    folder = (root / rel).resolve()
+    if not _path_is_inside(folder, root) or not folder.is_dir():
+        return {"ok": False, "error": "최근 비교 결과 폴더를 찾지 못했습니다."}
+    completed = progress.get("completed")
+    completed_n = len(completed) if isinstance(completed, dict) else 0
+    plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
+    return {
+        "ok": True,
+        "folder": folder.relative_to(root).as_posix(),
+        "status": str(progress.get("status") or ""),
+        "completed": completed_n,
+        "total": int(plan.get("count") or completed_n),
+        "mode_label": str(progress.get("mode_label") or ""),
+    }
 
 
 def _comparison_progress_save(progress, folder):

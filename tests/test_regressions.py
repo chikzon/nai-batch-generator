@@ -568,6 +568,37 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="cmpConfirm"', page)
         self.assertIn("confirmed_count:CMP_PLAN.count", page)
         self.assertIn("중지하거나 일일 상한에 닿아도 같은 계획으로 다시 누르면 이어집니다.", page)
+        self.assertIn('id="cmpOpenResults"', page)
+        self.assertIn("await expLoad(r.folder);", page)
+
+    def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "output"
+            run = out / "비교생성" / "run-1"
+            run.mkdir(parents=True)
+            progress_file = root / "비교생성-진행.json"
+            progress_file.write_text(json.dumps({
+                "folder": "비교생성/run-1",
+                "status": "stopped",
+                "mode_label": "그림체 × 캐릭터",
+                "plan": {"count": 12},
+                "completed": {"a": {"file": "비교생성/run-1/a.webp"}},
+            }, ensure_ascii=False), encoding="utf-8")
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = str(out)
+            with patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file):
+                summary = APP.comparison_progress_summary(cfg)
+                progress_file.write_text(json.dumps({
+                    "folder": "../outside", "completed": {},
+                }), encoding="utf-8")
+                escaped = APP.comparison_progress_summary(cfg)
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["folder"], "비교생성/run-1")
+        self.assertEqual(summary["completed"], 1)
+        self.assertEqual(summary["total"], 12)
+        self.assertFalse(escaped["ok"])
 
     def test_build_main_writes_the_data_pack_beside_the_program(self):
         with tempfile.TemporaryDirectory() as td:
