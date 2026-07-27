@@ -104,6 +104,14 @@ class RegressionTests(unittest.TestCase):
             "padding:8px 10px;border:1px solid transparent;", page)
         self.assertIn("layer.style.width = (ta.clientWidth + 2) + 'px';", page)
         self.assertIn("layer.style.height = (ta.clientHeight + 2) + 'px';", page)
+        self.assertIn(
+            "function hlOn(){ return (STATE.ui || {}).highlight === true; }",
+            page,
+        )
+        self.assertIn(
+            '<select id="uiHighlight"><option value="off">끔 (선명한 원문)</option>',
+            page,
+        )
 
     def test_builder_routes_character_variants_and_negative_separately(self):
         """캐릭터 외형을 바꾸는 후보는 베이스에, 네거티브 후보는 양성에 섞지 않는다."""
@@ -1671,16 +1679,29 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("fatalErrorBar", page)
         self.assertIn("새로고침", page)
 
-    def test_studio_layout_is_opt_in_and_external_program_asset(self):
-        """전면 UI 실험은 기존 화면을 덮지 않고 설정 한 번으로 되돌릴 수 있어야 한다."""
+    def test_studio_layout_is_default_and_classic_remains_compatible(self):
+        """작업실을 기본으로 쓰되 설정 한 번으로 기존 호환 화면을 복원해야 한다."""
         page = APP.render_page()
         css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
         self.assertIn('href="/ui/studio.css"', page)
         self.assertIn('id="layoutChips"', page)
-        self.assertIn("const LAYOUTS = [['','기존'],['studio','작업실 (실험)']]", page)
-        self.assertIn("setAttribute('data-layout', u.layout)", page)
+        self.assertIn(
+            "const LAYOUTS = [['studio','작업실'],['classic','기존 호환']]",
+            page,
+        )
+        self.assertIn(
+            "const layout = u.layout === 'classic' ? 'classic' : 'studio'",
+            page,
+        )
+        self.assertIn(
+            "const studio = (STATE.ui || {}).layout !== 'classic'",
+            page,
+        )
+        self.assertIn("r.setAttribute('data-layout', 'studio')", page)
+        self.assertIn("r.removeAttribute('data-layout')", page)
         self.assertIn(':root[data-layout="studio"] .titlebar', css)
         self.assertIn('body:not([data-mode="preview"]) .left', css)
+        self.assertIn('@media (max-width: 1479px)', css)
         self.assertNotIn("수집", BUILD.ASSET_DIRS)
 
     def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):

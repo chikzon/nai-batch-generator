@@ -7328,8 +7328,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .bld-search{flex:1;min-width:120px;width:auto;}
   }
   </style>
-  <!-- 새 화면 구성은 거대한 PAGE_TEMPLATE에 다시 덧붙이지 않는다.
-       설정에서 `작업실(실험)`을 골랐을 때만 적용되고 파일이 없어도 기존 UI는 동작한다. -->
+  <!-- 작업실 화면 구성은 별도 자산으로 유지한다. 파일이 없어도 기존 호환 UI는 동작한다. -->
   <link rel="stylesheet" href="/ui/studio.css">
   </head>
 <body data-mode="preview">
@@ -8153,7 +8152,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <h2><span class="n">02</span>화면 · 디자인</h2>
         <p class="hint">화면 구성과 색 테마·강조색·글씨 크기·모서리를 바꿀 수 있습니다. 즉시 반영되고 저장됩니다.</p>
         <div class="field"><label>화면 구성</label><div id="layoutChips"></div>
-          <p class="hint" style="margin-top:5px;">작업실은 기능은 그대로 두고 탭마다 필요한 작업면만 크게 쓰는 실험 화면입니다. 언제든 기존으로 돌아올 수 있습니다.</p>
+          <p class="hint" style="margin-top:5px;">작업실은 기능을 줄이지 않고 탭마다 필요한 작업면을 크게 씁니다. 익숙한 배치가 필요하면 기존 호환으로 돌아갈 수 있습니다.</p>
         </div>
         <div class="field"><label>테마</label><div id="themeChips"></div></div>
         <div class="grid3">
@@ -8163,7 +8162,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="field" style="margin-top:8px;">
           <label>가중치 색으로 보기 <span class="hint">— 프롬프트 칸의 강조·약화를 색으로 표시</span></label>
-          <select id="uiHighlight"><option value="on">켬</option><option value="off">끔</option></select>
+          <select id="uiHighlight"><option value="off">끔 (선명한 원문)</option><option value="on">켬</option></select>
           <p class="hint" style="margin-top:5px;">
             <b style="background:rgba(190,70,70,.42);padding:0 3px;border-radius:3px;">2.0↑ 아주 강함</b>
             <b style="background:rgba(180,74,74,.30);padding:0 3px;border-radius:3px;">1.4~2.0</b>
@@ -9003,7 +9002,9 @@ function attachHL(ta){
   ta._hlDraw = draw;
   draw();
 }
-function hlOn(){ return (STATE.ui || {}).highlight !== false; }   // 기본 켬
+/* 겹친 거울층은 브라우저·배율에 따라 글자가 번져 보일 수 있다. 기본은 원문 한 층만
+   쓰고, 사용자가 기타 → 화면에서 직접 켰을 때만 가중치 배경을 그린다. */
+function hlOn(){ return (STATE.ui || {}).highlight === true; }
 function redrawHL(){
   document.querySelectorAll('textarea').forEach(t => { if(t._hlDraw) t._hlDraw(); });
 }
@@ -9649,7 +9650,7 @@ function arrangeStudioWorkspace(){
   if(!STATE) return;
   bindStudioLibraryNav();
   bindStudioSettingsNav();
-  const studio = (STATE.ui || {}).layout === 'studio';
+  const studio = (STATE.ui || {}).layout !== 'classic';
 
   const card = $('compareCard');
   const classicHome = $('compareClassicHome');
@@ -13670,7 +13671,7 @@ const THEMES = [
   ['mono','모노크롬','#141414','#1c1c1c','#d8d8d8'],
   ['wine','와인','#170f14','#20161c','#e05780'],
 ];
-const LAYOUTS = [['','기존'],['studio','작업실 (실험)']];
+const LAYOUTS = [['studio','작업실'],['classic','기존 호환']];
 const ACCENTS = [['','기본'],['blue','파랑'],['violet','보라'],['pink','분홍'],['green','초록'],['amber','앰버'],['cyan','시안'],['red','빨강']];
 const FSIZES = [['s','작게'],['','보통'],['l','크게'],['xl','아주 크게']];
 const RADII = [['','기본'],['soft','살짝 둥글게'],['round','둥글게']];
@@ -13681,7 +13682,10 @@ function applyUI(){
      그냥 두면 칩 강조가 어긋나므로 빈 값으로 접어 준다. */
   if(u.theme === 'slate') u.theme = '';
   if(u.radius === 'sharp') u.radius = '';
-  u.layout ? r.setAttribute('data-layout', u.layout) : r.removeAttribute('data-layout');
+  const layout = u.layout === 'classic' ? 'classic' : 'studio';
+  layout === 'studio'
+    ? r.setAttribute('data-layout', 'studio')
+    : r.removeAttribute('data-layout');
   u.theme ? r.setAttribute('data-theme', u.theme) : r.removeAttribute('data-theme');
   u.accent ? r.setAttribute('data-accent', u.accent) : r.removeAttribute('data-accent');
   u.fs ? r.setAttribute('data-fs', u.fs) : r.removeAttribute('data-fs');
@@ -13694,7 +13698,10 @@ function renderUIChips(){
     h.innerHTML = '';
     list.forEach(([v, label, bg, card, accent]) => {
       const c = document.createElement('span');
-      c.className = 'chip' + (((STATE.ui||{})[key]||'') === v ? ' on' : '');
+      const current = key === 'layout'
+        ? ((STATE.ui||{}).layout === 'classic' ? 'classic' : 'studio')
+        : ((STATE.ui||{})[key]||'');
+      c.className = 'chip' + (current === v ? ' on' : '');
       if(bg){
         /* 테마 칩은 그 테마의 배경·카드·강조색을 작은 점으로 미리 보여 준다 */
         c.innerHTML = `<span style="display:inline-flex;gap:2px;vertical-align:-1px;margin-right:5px;">
