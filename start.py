@@ -17714,7 +17714,11 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 save_state(state)
                 progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 _comparison_progress_save(progress, folder)
-                server.live.update(daily=daily_count(state))
+                server.live.update(
+                    daily=daily_count(state),
+                    completed=len(completed),
+                    index=len(completed),
+                )
                 ok = True
                 break
             except RateLimitError as e:
