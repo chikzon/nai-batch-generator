@@ -10042,8 +10042,12 @@ async function inspectImages(files){
   flash(`${ok}개 추출 완료${fail ? `, ${fail}개는 생성 정보가 없었습니다` : ''}`);
   if(ok){
     if($('comboList')){ $('comboQ').value = ''; $('comboSrc').value = '내 이미지'; await loadCombos(false); }
-    /* 통째로 덮어쓰지 않고 **무엇을 가져올지 고르게** 한다 (SDStudio 의 항목별 적용).
-       한 장이면 고르기 창, 여러 장이면 마지막 것을 예전처럼 통째로 적용한다. */
+    /* 한 장이면 **읽은 내용을 보여 준 뒤** 넣고, 여러 장이면 마지막 것을 바로 넣는다.
+       ⚠ 예전 주석은 "무엇을 가져올지 고르게 한다(SDStudio 의 항목별 적용)" 였는데
+         **지금은 고르는 길이 없다.** 그림체는 베이스+네거티브+생성 설정이 한 덩어리라
+         쪼개 넣으면 원래 그림이 재현되지 않아서다(`29cf044` 에서 없앴다).
+         `openApplyPicker` 는 **읽기 전용 요약 + `통째로 적용` 단추 하나**뿐이다
+         (실측: 항목별 체크박스 0개 · 단추 1개). 낡은 설명이 남아 있어 바로잡는다. */
     if(last) (imgs.length === 1 ? openApplyPicker(last) : applyStyle(last));
   }
   return ok;
