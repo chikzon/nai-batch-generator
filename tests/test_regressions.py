@@ -418,6 +418,7 @@ class RegressionTests(unittest.TestCase):
                 merged = json.loads(settings.read_text(encoding="utf-8"))
                 self.assertTrue(saved_a["ok"])
                 self.assertTrue(saved_b["ok"])
+                self.assertEqual(saved_b["external_changes"], ["base_prompt"])
                 self.assertEqual(merged["base_prompt"], "A FULL")
                 self.assertEqual(merged["negative_prompt"], "B FULL")
 
@@ -444,6 +445,8 @@ class RegressionTests(unittest.TestCase):
         page = APP.render_page()
         self.assertIn("function stateSavePatch()", page)
         self.assertIn("body: JSON.stringify(patch)", page)
+        self.assertIn("reloadAfterSave = true", page)
+        self.assertIn("location.reload()", page)
 
     def test_two_servers_merge_reference_lists_without_losing_the_other_kind(self):
         with tempfile.TemporaryDirectory() as td:

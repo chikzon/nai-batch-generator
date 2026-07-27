@@ -9967,7 +9967,7 @@ function readParams(){
     el.addEventListener('change', changed); el.addEventListener('input', changed); });
 
 /* ── 저장 ── */
-let saveT = null, saveBusy = false, saveQueued = false;
+let saveT = null, saveBusy = false, saveQueued = false, reloadAfterSave = false;
 function stateSavePatch(){
   const patch = {_revision: STATE._revision, _base:{}};
   for(const [key, value] of Object.entries(STATE || {})){
@@ -10035,6 +10035,10 @@ async function doSave(){
       ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${wh.map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`).join(' · ')}` : '';
     if(r && r.rejected && r.rejected.length) flash(`저장하지 않은 잘못된 값: ${r.rejected.join(', ')}`);
     rememberSavedKeys((r && r.accepted) || changed);
+    if(r && r.external_changes && r.external_changes.length){
+      reloadAfterSave = true;
+      flash(`다른 실행본의 변경 ${r.external_changes.length}개도 반영했습니다. 화면을 맞추는 중입니다.`);
+    }
     saveState('', '저장됨 ✓');
   }catch(e){
     console.warn('설정 저장 실패', e);
@@ -10044,6 +10048,15 @@ async function doSave(){
   finally{
     saveBusy = false;
     if(saveQueued){ saveQueued = false; doSave(); }
+    else if(reloadAfterSave){
+      const pending = Object.keys(stateSavePatch()).some(key => !key.startsWith('_'));
+      if(pending){
+        if(!saveT) save();
+      }else{
+        reloadAfterSave = false;
+        location.reload();
+      }
+    }
   }
 }
 /* 입력 직후 100ms 안에 탭을 닫아도 마지막 변경을 서버에 넘긴다.
@@ -15673,10 +15686,15 @@ class ConfigServer:
             # 잠금을 얻은 뒤 디스크 최신판을 다시 읽고, 이번 요청이 실제로 바꾼
             # top-level 키만 그 위에 적용한다. 같은 키가 시작값과 달라졌다면 조용히
             # 덮지 않고 충돌로 돌려준다.
+            local_before = dict(self.cfg)
             merged = self.latest_config_from_disk()
             allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
             allowed |= {"booru_keys"}
             allowed -= {"male_prompt"}
+            external_changes = sorted(
+                key for key in allowed
+                if key not in data and local_before.get(key) != merged.get(key)
+            )
             conflicts = [
                 key for key, incoming in data.items()
                 if key in allowed and key in base_values
@@ -15722,7 +15740,8 @@ class ConfigServer:
             if fixed_vals:
                 log.info(f"설정값을 허용 범위로 맞췄습니다: {fixed_vals}")
             return {"ok": True, "accepted": accepted, "rejected": rejected,
-                    "fixed": fixed_vals, "revision": self.config_revision}
+                    "fixed": fixed_vals, "revision": self.config_revision,
+                    "external_changes": external_changes}
 
     @serialized_setting_write
     def handle_scene_save(self, body):
