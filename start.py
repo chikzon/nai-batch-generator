@@ -6770,6 +6770,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vSettings" style="display:none;">
+      <div id="studioSettingsNav" class="studio-subnav hidden" aria-label="세팅 작업 선택">
+        <div class="studio-subnav-copy">
+          <span class="eyebrow">Setting workspace</span>
+          <strong>골라 쓰고, 가볍게 변주하고, 필요할 때만 구조를 편집합니다</strong>
+        </div>
+        <div class="studio-subnav-actions" role="tablist" aria-label="세팅 작업">
+          <button type="button" data-settings-work="select" role="tab">씬 고르기</button>
+          <button type="button" data-settings-work="quick" role="tab">빠른 변주</button>
+          <button type="button" data-settings-work="build" role="tab">세팅 만들기</button>
+        </div>
+      </div>
       <span id="compareClassicHome" hidden aria-hidden="true"></span>
       <div class="card" id="compareCard">
         <h2><span class="n">비교 생성</span>내 자료를 같은 조건으로 한 장씩 보기
@@ -6826,7 +6837,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="settingSelectCard">
         <h2><span class="n">세팅</span>씬 세트 <span class="count" id="setCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">세팅 = 씬 모음 + 부속 옵션 + 상대역이 담긴 <b>세팅/ 폴더의 파일</b>. 파일을 넣고 빼면 목록이 바뀝니다.
         각 세팅의 <b>전용 캐스트</b>를 비우면 왼쪽 [캐릭터]의 인물로 생성됩니다.</p>
@@ -6846,7 +6857,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <!-- 씬 모드 — 세팅과 별도로 병존한다. 세팅을 대체하지 않는다. -->
-      <div class="card">
+      <div class="card" id="sceneQuickCard">
         <h2><span class="n">씬</span>씬 모드 (가벼운 낱개 변주)
           <span class="count" id="sceneCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">세팅이 <b>5장 묶음 + 문맥에 반응하는 옵션</b>이라면, 씬은 <b>이름·프롬프트·해상도만 있는 낱개</b>입니다.
@@ -6861,7 +6872,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <!-- 세팅 빌더 — 세팅을 앱 안에서 만들고 고친다 -->
-      <div class="card">
+      <div class="card" id="settingBuilderCard">
         <h2><span class="n">빌더</span>세팅 빌더
           <span class="count" id="sbClash" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--danger);"></span></h2>
         <p class="hint">세팅은 <b>세트(묶음)</b>의 모음입니다. 세트는 <b>단계명마다 씬 하나</b>로 이루어지고,
@@ -8332,31 +8343,70 @@ function bindStudioLibraryNav(){
     });
   });
 }
+function bindStudioSettingsNav(){
+  const nav = $('studioSettingsNav');
+  if(!nav || nav._bound) return;
+  nav._bound = true;
+  nav.querySelectorAll('[data-settings-work]').forEach(button => {
+    button.addEventListener('click', () => {
+      const next = button.dataset.settingsWork;
+      if(!['select','quick','build'].includes(next)) return;
+      STATE.ui = STATE.ui || {};
+      STATE.ui.settings_work = next;
+      arrangeStudioWorkspace();
+      save();
+    });
+  });
+}
 function arrangeStudioWorkspace(){
   if(!STATE) return;
   bindStudioLibraryNav();
+  bindStudioSettingsNav();
+  const studio = (STATE.ui || {}).layout === 'studio';
+
   const card = $('compareCard');
   const classicHome = $('compareClassicHome');
   const studioHome = $('studioCompareHome');
-  const nav = $('studioLibraryNav');
+  const libraryNav = $('studioLibraryNav');
   const browse = $('studioLibraryBrowse');
-  if(!card || !classicHome || !studioHome || !nav || !browse) return;
+  if(card && classicHome && studioHome && libraryNav && browse){
+    const libraryWork = (STATE.ui || {}).library_work === 'compare' ? 'compare' : 'browse';
+    const home = studio ? studioHome : classicHome;
+    if(home.nextElementSibling !== card) home.insertAdjacentElement('afterend', card);
 
-  const studio = (STATE.ui || {}).layout === 'studio';
-  const work = (STATE.ui || {}).library_work === 'compare' ? 'compare' : 'browse';
-  const home = studio ? studioHome : classicHome;
-  if(home.nextElementSibling !== card) home.insertAdjacentElement('afterend', card);
+    libraryNav.classList.toggle('hidden', !studio);
+    browse.classList.toggle('hidden', studio && libraryWork === 'compare');
+    card.classList.toggle('hidden',
+      studio && (document.body.dataset.mode !== 'library' || libraryWork !== 'compare'));
+    libraryNav.querySelectorAll('[data-library-work]').forEach(button => {
+      const on = button.dataset.libraryWork === libraryWork;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-selected', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+    });
+  }
 
-  nav.classList.toggle('hidden', !studio);
-  browse.classList.toggle('hidden', studio && work === 'compare');
-  card.classList.toggle('hidden',
-    studio && (document.body.dataset.mode !== 'library' || work !== 'compare'));
-  nav.querySelectorAll('[data-library-work]').forEach(button => {
-    const on = button.dataset.libraryWork === work;
-    button.classList.toggle('on', on);
-    button.setAttribute('aria-selected', on ? 'true' : 'false');
-    button.tabIndex = on ? 0 : -1;
-  });
+  const settingsNav = $('studioSettingsNav');
+  const settingsCards = {
+    select: $('settingSelectCard'),
+    quick: $('sceneQuickCard'),
+    build: $('settingBuilderCard'),
+  };
+  if(settingsNav && Object.values(settingsCards).every(Boolean)){
+    const savedSettingsWork = (STATE.ui || {}).settings_work;
+    const settingsWork = ['select','quick','build'].includes(savedSettingsWork)
+      ? savedSettingsWork : 'select';
+    settingsNav.classList.toggle('hidden', !studio);
+    Object.entries(settingsCards).forEach(([key, settingsCard]) => {
+      settingsCard.classList.toggle('hidden', studio && key !== settingsWork);
+    });
+    settingsNav.querySelectorAll('[data-settings-work]').forEach(button => {
+      const on = button.dataset.settingsWork === settingsWork;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-selected', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+    });
+  }
 }
 function setMode(m){
   document.body.dataset.mode = m;

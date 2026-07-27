@@ -1032,6 +1032,22 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("arrangeStudioWorkspace();", page)
         self.assertIn('.studio-subnav-actions button.on', css)
 
+    def test_studio_settings_separates_existing_cards_and_classic_shows_all(self):
+        """작업실은 세 작업을 나누되 기존 화면에서는 원래 카드가 모두 복원돼야 한다."""
+        page = APP.render_page()
+        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        settings_view = page[
+            page.index('id="vSettings"'):page.index('id="vBuilder"')
+        ]
+        for marker in ('id="studioSettingsNav"', 'id="settingSelectCard"',
+                       'id="sceneQuickCard"', 'id="settingBuilderCard"'):
+            self.assertEqual(page.count(marker), 1)
+            self.assertIn(marker, settings_view)
+        self.assertIn("STATE.ui.settings_work = next", page)
+        self.assertIn("settingsCard.classList.toggle('hidden', studio && key !== settingsWork)", page)
+        self.assertIn("settingsNav.classList.toggle('hidden', !studio)", page)
+        self.assertIn("#studioSettingsNav .studio-subnav-actions", css)
+
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
 

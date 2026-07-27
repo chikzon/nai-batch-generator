@@ -341,6 +341,10 @@
     grid-template-columns: 1fr 1fr;
   }
 
+  :root[data-layout="studio"] #studioSettingsNav .studio-subnav-actions {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   :root[data-layout="studio"] .navico {
     display: none;
   }
