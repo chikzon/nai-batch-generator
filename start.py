@@ -567,7 +567,13 @@ def load_settings_recover(path):
             backup = path.with_name(path.name + ".bak")
             try:
                 data = read_dict(backup)
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            except FileNotFoundError:
+                raise first
+            except OSError:
+                # 정상일 수도 있는 백업을 권한·디스크 오류 때문에 손상으로 단정하지 않는다.
+                # 호출자가 오류를 그대로 보여 주고 두 파일을 제자리에 보존하게 한다.
+                raise
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 raise first
             log.error("손상된 %s 대신 객체형 백업을 복구했습니다: %s", path.name, first)
             atomic_write_json(path, data, keep_backup=False)
@@ -17744,6 +17750,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
     state = load_state()
     jobs = iter_comparison_jobs(cfg, plan, styles, chars)
     done_n = len(completed)
+    run_failed = set()
     server.live.update(
         index=done_n, total=plan["count"], char_name=plan["mode_label"],
         filename="", status_text=(f"자료 비교 생성 준비 중 — {done_n:,}/{plan['count']:,}"),
@@ -17782,7 +17789,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 f"{_safe_name(style_label)[:38]}__{_safe_name(char_label)[:32]}"
                 f"{seed_suffix}")
         target = available_output_path(folder / f"{stem}.webp", out_format(cfg))
-        done_n = len(completed)
+        done_n = len(completed) + len(run_failed)
         server.live.update(
             index=done_n + 1, total=plan["count"], filename=target.name,
             char_name=f"{style_label} × {char_label}",
@@ -17845,7 +17852,8 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 server.live.update(
                     daily=daily_count(state),
                     completed=len(completed),
-                    index=len(completed),
+                    failed=len(run_failed),
+                    index=len(completed) + len(run_failed),
                 )
                 ok = True
                 break
@@ -17889,6 +17897,13 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 "index": job["index"], "style": style_label,
                 "character": char_label, "error": last_error or "중지됨",
             }
+            run_failed.add(key)
+            server.live.update(
+                index=len(completed) + len(run_failed),
+                failed=len(run_failed),
+                last_error=last_error or "중지됨",
+                can_retry=True,
+            )
             progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             _comparison_progress_save(progress, folder)
             if fatal or final_status in ("stopped", "daily_limit"):

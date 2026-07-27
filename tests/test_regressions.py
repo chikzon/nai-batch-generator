@@ -77,7 +77,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(parser.scripts)
         node = shutil.which("node")
         if not node:
-            self.skipTest("Node.js가 없어 렌더된 페이지의 JavaScript 구문 검사를 건너뜁니다.")
+            self.fail("배포 smoke에는 렌더된 JavaScript를 검사할 Node.js가 필요합니다.")
         with tempfile.TemporaryDirectory() as td:
             script = Path(td) / "rendered-page.js"
             script.write_text("\n".join(parser.scripts), encoding="utf-8")
@@ -997,6 +997,76 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(live["phase"], "completed")
             self.assertEqual((live["completed"], live["failed"]), (4, 0))
 
+    def test_comparison_eta_marks_a_failed_job_before_the_next_job_starts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(
+                token="pst-fixture",
+                out_dir=str(root / "output"),
+                characters=[
+                    {"id": key, "name": key.upper(), "female": f"character {key}"}
+                    for key in ("a", "b", "c")
+                ],
+                pace={"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            )
+            styles = [{
+                "id": "s1", "_compare_id": "s1", "_compare_name": "Style",
+                "base": "style base", "negative": "", "params": {},
+            }]
+            chars = APP.comparison_characters(cfg)
+            plan = APP.comparison_plan(
+                cfg, {"mode": "both", "width": 512, "height": 512},
+                opus=True)
+            plan.update(
+                ok=True, errors=[], styles=1, characters=3,
+                combinations=3, seed_count=1, total=3, count=3,
+                limited=False, mode_label=APP.COMPARE_MODE_LABELS["both"],
+            )
+            state = {
+                "seeds": {}, "progress": {}, "daily": {},
+                "total_generated": 0,
+            }
+            server = APP.ConfigServer(cfg)
+            token = server.live.try_claim("자료 비교 생성", "library")
+            calls = 0
+            third_snapshot = {}
+
+            def fake_generate(*_args, **_kwargs):
+                nonlocal calls, third_snapshot
+                calls += 1
+                if calls == 2:
+                    raise APP.APIError("fixture failure", retryable=False)
+                if calls == 3:
+                    server.live.started_at = time.time() - 30
+                    third_snapshot = server.live.snapshot()
+                image = Image.new("RGB", (2, 2), "white")
+                image.nai_seed = 1
+                return image
+
+            with (
+                patch.object(
+                    APP, "COMPARE_PROGRESS_FILE",
+                    root / "비교생성-진행.json"),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=fake_generate),
+            ):
+                APP._run_comparison(server, cfg, plan, styles, chars)
+            server.live.release(token)
+
+            self.assertEqual(calls, 3)
+            self.assertEqual(third_snapshot["completed"], 1)
+            self.assertEqual(third_snapshot["failed"], 1)
+            self.assertEqual(third_snapshot["total"], 3)
+            self.assertAlmostEqual(
+                third_snapshot["eta_seconds"], 30.0, delta=1.0)
+            live = server.live.snapshot()
+            self.assertEqual(live["phase"], "partial")
+            self.assertEqual((live["completed"], live["failed"]), (2, 1))
+
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
         page = APP.render_page()
         for value in ("styles", "characters", "both"):
@@ -1189,6 +1259,34 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual((kept / "설정.json").read_bytes(), primary_bytes)
                 self.assertEqual(
                     (kept / "설정.json.bak").read_bytes(), backup_bytes)
+
+    def test_temporary_backup_read_error_is_not_misclassified_as_corruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            backup = root / "설정.json.bak"
+            primary_bytes = b"{broken-primary"
+            backup_bytes = b'{"base_prompt":"NORMAL BACKUP"}'
+            settings.write_bytes(primary_bytes)
+            backup.write_bytes(backup_bytes)
+            real_read_text = Path.read_text
+
+            def guarded_read_text(path, *args, **kwargs):
+                if Path(path) == backup:
+                    raise PermissionError("fixture: backup is temporarily locked")
+                return real_read_text(path, *args, **kwargs)
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(Path, "read_text", new=guarded_read_text),
+                patch.object(APP, "STARTUP_RECOVERY_NOTICE", None),
+            ):
+                with self.assertRaises(PermissionError):
+                    APP.load_or_init_config()
+                self.assertIsNone(APP.STARTUP_RECOVERY_NOTICE)
+            self.assertEqual(settings.read_bytes(), primary_bytes)
+            self.assertEqual(backup.read_bytes(), backup_bytes)
+            self.assertFalse((root / "복구보관").exists())
 
     def test_single_generation_failure_is_visible_without_paid_network(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
