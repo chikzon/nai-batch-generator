@@ -10796,6 +10796,8 @@ async function picksSave(){
     })});
 }
 let EXP_RECIPE_UNDO = null;
+let EXP_APPLIED_RECIPE = null;
+let EXP_APPLIED_PATH = '';
 const EXP_RECIPE_KEYS = [
   'base_prompt','negative_prompt','style_name','nai_seed','char_slots','char_centers',
   'vibes','char_refs','model','width','height','cfg_scale','cfg_rescale','steps',
@@ -10819,6 +10821,67 @@ function comparisonRecipePaint(){
   tokens();
   save();
 }
+function expRecipeActions(message){
+  if(!EXP_APPLIED_RECIPE) return;
+  const hasCharacters = (EXP_APPLIED_RECIPE.char_slots || []).length > 0;
+  $('expStat').innerHTML = `${esc(message)}`
+    + ` <button type="button" id="expGoGenerate" class="primary">생성 화면으로</button>`
+    + ` <button type="button" id="expPromoteStyle">그림체 묶음으로 저장</button>`
+    + (hasCharacters
+      ? ` <button type="button" id="expPromoteChars">캐릭터를 각각 저장</button>` : '')
+    + ` <button type="button" id="expUndoRecipe">적용 전으로 되돌리기</button>`
+    + ` <span class="hint">세팅은 이 비교에 포함되지 않아 그림에서 추정해 저장하지 않습니다.</span>`;
+  $('expGoGenerate').addEventListener('click', () => setMode('preview'));
+  $('expPromoteStyle').addEventListener('click', async () => {
+    const suggested = EXP_APPLIED_RECIPE.style_name || '비교 결과 그림체';
+    const name = prompt(
+      '그림체 이름 (베이스+네거티브+생성 설정을 한 묶음으로 저장):',
+      suggested
+    );
+    if(!name) return;
+    const r = await (await fetch('/api/compare_promote', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:EXP_APPLIED_PATH, kind:'style', name})
+    })).json();
+    if(!r.ok){ expRecipeActions(r.error || '그림체를 저장하지 못했습니다.'); return; }
+    if(r.styles) STYLES = r.styles;
+    renderPresets(); renderLibrary();
+    expRecipeActions(r.saved
+      ? `그림체 '${r.names[0]}'에 베이스·네거티브·생성 설정을 함께 저장했습니다.`
+      : `같은 내용의 그림체 '${r.names[0]}'가 있어 중복 저장하지 않았습니다.`);
+  });
+  if(hasCharacters) $('expPromoteChars').addEventListener('click', async () => {
+    const count = EXP_APPLIED_RECIPE.char_slots.length;
+    if(!confirm(
+      `이 결과의 캐릭터 ${count}명을 각각 전체 프롬프트로 저장할까요?\n`
+      + '같은 외형·착의·네거티브가 이미 있으면 중복 저장하지 않습니다.'
+    )) return;
+    const r = await (await fetch('/api/compare_promote', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:EXP_APPLIED_PATH, kind:'characters'})
+    })).json();
+    if(!r.ok){ expRecipeActions(r.error || '캐릭터를 저장하지 못했습니다.'); return; }
+    if(r.characters) STATE.characters = r.characters;
+    if(r.revision != null) STATE._revision = r.revision;
+    renderLibrary();
+    expRecipeActions(
+      `캐릭터 ${r.saved}명 저장`
+      + (r.existing ? ` · 같은 내용 ${r.existing}명은 중복 생략` : '')
+      + ` (${(r.names || []).join(', ')})`
+    );
+  });
+  $('expUndoRecipe').addEventListener('click', () => {
+    if(!EXP_RECIPE_UNDO) return;
+    Object.entries(EXP_RECIPE_UNDO).forEach(([key, value]) => {
+      STATE[key] = JSON.parse(JSON.stringify(value));
+    });
+    EXP_RECIPE_UNDO = null;
+    EXP_APPLIED_RECIPE = null;
+    EXP_APPLIED_PATH = '';
+    comparisonRecipePaint();
+    $('expStat').textContent = '비교 결과를 적용하기 전 설정으로 되돌렸습니다.';
+  });
+}
 async function expApplyPickedRecipe(){
   const visible = await expEnsureAll();
   const chosen = visible.filter(file => EXP.picked.has(file.path));
@@ -10839,6 +10902,8 @@ async function expApplyPickedRecipe(){
     + '적용 직후 이 화면에서 되돌릴 수 있습니다.'
   )) return;
   EXP_RECIPE_UNDO = comparisonRecipeSnapshot();
+  EXP_APPLIED_RECIPE = JSON.parse(JSON.stringify(recipe));
+  EXP_APPLIED_PATH = chosen[0].path;
   STATE.base_prompt = recipe.base_prompt || '';
   STATE.negative_prompt = recipe.negative_prompt || '';
   STATE.style_name = recipe.style_name || '';
@@ -10858,19 +10923,7 @@ async function expApplyPickedRecipe(){
     }
   });
   comparisonRecipePaint();
-  $('expStat').innerHTML = `선별 결과 원문을 현재 생성에 적용했습니다.`
-    + ` <button type="button" id="expGoGenerate" class="primary">생성 화면으로</button>`
-    + ` <button type="button" id="expUndoRecipe">적용 전으로 되돌리기</button>`;
-  $('expGoGenerate').addEventListener('click', () => setMode('preview'));
-  $('expUndoRecipe').addEventListener('click', () => {
-    if(!EXP_RECIPE_UNDO) return;
-    Object.entries(EXP_RECIPE_UNDO).forEach(([key, value]) => {
-      STATE[key] = JSON.parse(JSON.stringify(value));
-    });
-    EXP_RECIPE_UNDO = null;
-    comparisonRecipePaint();
-    $('expStat').textContent = '비교 결과를 적용하기 전 설정으로 되돌렸습니다.';
-  });
+  expRecipeActions('선별 결과 원문을 현재 생성에 적용했습니다.');
 }
 /* 크게 보기 — 여기서 ←→ F C Esc 가 먹는다 */
 function expOpen(i){
@@ -14535,6 +14588,25 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def handle_compare_promote(self, body):
+        """비교 결과의 서버 원문을 기존 그림체/캐릭터 자료 형식으로 명시적으로 저장."""
+        try:
+            data = json.loads(body or b"{}")
+            with self.config_lock:
+                result = promote_comparison_recipe_assets(
+                    self.cfg,
+                    data.get("path"),
+                    data.get("kind"),
+                    name=data.get("name"),
+                    spec=self.spec,
+                )
+                if result.get("changed_config"):
+                    self.config_revision += 1
+                result["revision"] = self.config_revision
+                return result
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def handle_compare_preview(self, body):
         """자료 비교 생성의 실제 장수·비용 범위를 계산한다. 생성이나 저장은 하지 않는다."""
         try:
@@ -15342,6 +15414,8 @@ class ConfigServer:
                             server.cfg, data.get("path")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_promote"):
+                    self._json(server.handle_compare_promote(body))
                 elif self.path.startswith("/api/compare_preview"):
                     self._json(server.handle_compare_preview(body))
                 elif self.path.startswith("/api/compare_run"):
@@ -16243,6 +16317,144 @@ def comparison_recipe_for_output(cfg, rel):
                 "character": (character or {}),
             },
         },
+    }
+
+
+def _unique_library_name(directory, requested, fallback, existing_names=()):
+    """표시 이름과 안전 파일명이 모두 겹치지 않는 가장 가까운 이름을 고른다."""
+    base = str(requested or "").strip() or fallback
+    used = {str(name).casefold() for name in existing_names if str(name).strip()}
+    candidate = base
+    suffix = 2
+    while (
+        candidate.casefold() in used
+        or (directory / f"{_safe_name(candidate)}.json").exists()
+    ):
+        candidate = f"{base} ({suffix})"
+        suffix += 1
+    return candidate
+
+
+def _style_signature(prompt, negative, settings):
+    clean_settings = {
+        key: value for key, value in (settings or {}).items()
+        if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
+    }
+    return json.dumps(
+        {
+            "prompt": str(prompt or ""),
+            "negative": str(negative or ""),
+            "settings": clean_settings,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
+    """선택 결과를 중복·덮어쓰기 없이 기존 그림체 또는 캐릭터 자료로 승격한다.
+
+    세팅은 비교 생성에 사용되지 않고 manifest에도 상태가 없으므로 그림 한 장에서
+    역추정하지 않는다. 생성 설정은 그림체의 일부로 함께 저장한다.
+    """
+    restored = comparison_recipe_for_output(cfg, rel)
+    recipe = restored["recipe"]
+    kind = str(kind or "").strip().lower()
+    if kind == "setting":
+        return {
+            "ok": False,
+            "error": "이 비교 결과에는 세팅 선택 상태가 없습니다. 그림만 보고 세팅을 추정해 저장하지 않습니다.",
+        }
+    if kind == "style":
+        prompt = recipe.get("base_prompt") or ""
+        negative = recipe.get("negative_prompt") or ""
+        settings = {
+            key: value for key, value in (recipe.get("settings") or {}).items()
+            if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
+        }
+        wanted = _style_signature(prompt, negative, settings)
+        styles = list_styles(spec or load_spec())
+        same = next((
+            item for item in styles
+            if _style_signature(
+                item.get("prompt"), item.get("negative"), item.get("settings")
+            ) == wanted
+        ), None)
+        if same is not None:
+            return {
+                "ok": True, "kind": "style", "saved": 0, "existing": 1,
+                "names": [same.get("name") or "기존 그림체"],
+                "styles": styles, "changed_config": False,
+            }
+        final_name = _unique_library_name(
+            STYLE_DIR,
+            name or recipe.get("style_name"),
+            "비교 결과 그림체",
+            (item.get("name") for item in styles),
+        )
+        save_style_file(
+            final_name, prompt=prompt, negative=negative, settings=settings)
+        return {
+            "ok": True, "kind": "style", "saved": 1, "existing": 0,
+            "names": [final_name],
+            "styles": list_styles(spec or load_spec()),
+            "changed_config": False,
+        }
+    if kind != "characters":
+        return {"ok": False, "error": "저장할 자료 종류가 올바르지 않습니다."}
+
+    slots = [
+        slot for slot in (recipe.get("char_slots") or [])
+        if isinstance(slot, dict) and slot_prompt(slot).strip()
+    ]
+    if not slots:
+        return {"ok": False, "error": "이 비교 결과에는 저장할 캐릭터가 없습니다."}
+    characters = cfg.setdefault("characters", [])
+    names, saved, existing = [], 0, 0
+    for index, slot in enumerate(slots, 1):
+        prompt = str(slot.get("prompt") or "")
+        outfit = str(slot.get("outfit") or "")
+        negative = str(slot.get("negative") or "")
+        same = next((
+            item for item in characters
+            if str(item.get("female") or "") == prompt
+            and str(item.get("clothed") or "") == outfit
+            and str(item.get("negative") or "") == negative
+        ), None)
+        if same is not None:
+            names.append(same.get("name") or f"기존 캐릭터 {index}")
+            existing += 1
+            continue
+        requested = slot.get("name") or (
+            f"{name} {index}" if name and len(slots) > 1 else name)
+        final_name = _unique_library_name(
+            CHAR_DIR,
+            requested,
+            f"비교 결과 캐릭터 {index}",
+            (item.get("name") for item in characters),
+        )
+        characters.append({
+            "id": "".join(random.choices(
+                string.ascii_lowercase + string.digits, k=8)),
+            "name": final_name,
+            "female": prompt,
+            "clothed": outfit,
+            "negative": negative,
+            "enabled": True,
+            "folder_id": None,
+            "subfolder_id": None,
+            "source": f"비교 결과: {restored['file']}",
+        })
+        names.append(final_name)
+        saved += 1
+    if saved:
+        sync_chars_to_files(cfg)
+        save_config(cfg)
+    return {
+        "ok": True, "kind": "characters", "saved": saved, "existing": existing,
+        "names": names, "characters": characters,
+        "changed_config": bool(saved),
     }
 
 

@@ -689,8 +689,83 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("await openComparisonFolder(", page)
         self.assertIn('id="expApplyPicked"', page)
         self.assertIn("fetch('/api/compare_recipe'", page)
+        self.assertIn("fetch('/api/compare_promote'", page)
+        self.assertIn("그림체 묶음으로 저장", page)
+        self.assertIn("캐릭터를 각각 저장", page)
+        self.assertIn("세팅은 이 비교에 포함되지 않아", page)
         self.assertIn("EXP_RECIPE_UNDO", page)
         self.assertIn("적용 전으로 되돌리기", page)
+
+    def test_comparison_recipe_promotion_preserves_bundles_and_skips_duplicates(self):
+        recipe = {
+            "base_prompt": "style base\n1.2::detail::",
+            "negative_prompt": "style negative",
+            "style_name": "승자",
+            "settings": {
+                "model": "nai-diffusion-4-5-full",
+                "width": 512, "height": 512,
+                "cfg_scale": 6.5, "steps": 28,
+            },
+            "char_slots": [
+                {"name": "기존", "prompt": "char a", "outfit": "red dress",
+                 "negative": "bad hands", "enabled": True},
+                {"name": "신규", "prompt": "char b", "outfit": "blue dress",
+                 "negative": "bad feet", "enabled": True},
+            ],
+        }
+        restored = {
+            "ok": True, "file": "비교생성/run/winner.webp",
+            "recipe": recipe,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            style_dir = root / "그림체"
+            char_dir = root / "캐릭터"
+            settings_file = root / "설정.json"
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [{
+                "id": "existing", "name": "기존 저장본",
+                "female": "char a", "clothed": "red dress",
+                "negative": "bad hands", "enabled": True,
+            }]
+            with (
+                patch.object(APP, "STYLE_DIR", style_dir),
+                patch.object(APP, "CHAR_DIR", char_dir),
+                patch.object(APP, "SETTINGS_FILE", settings_file),
+                patch.object(
+                    APP, "comparison_recipe_for_output",
+                    return_value=restored),
+            ):
+                style_first = APP.promote_comparison_recipe_assets(
+                    cfg, "ignored.webp", "style", name="승자",
+                    spec={"그림체_그룹": []})
+                style_again = APP.promote_comparison_recipe_assets(
+                    cfg, "ignored.webp", "style", name="다른 이름",
+                    spec={"그림체_그룹": []})
+                chars = APP.promote_comparison_recipe_assets(
+                    cfg, "ignored.webp", "characters",
+                    spec={"그림체_그룹": []})
+                setting = APP.promote_comparison_recipe_assets(
+                    cfg, "ignored.webp", "setting",
+                    spec={"그림체_그룹": []})
+
+            saved_style = json.loads(
+                (style_dir / "승자.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_style["프롬프트"], recipe["base_prompt"])
+            self.assertEqual(saved_style["네거티브"], recipe["negative_prompt"])
+            self.assertEqual(saved_style["설정"], recipe["settings"])
+            self.assertEqual((style_first["saved"], style_first["existing"]), (1, 0))
+            self.assertEqual((style_again["saved"], style_again["existing"]), (0, 1))
+            self.assertEqual(len(list(style_dir.glob("*.json"))), 1)
+            self.assertEqual((chars["saved"], chars["existing"]), (1, 1))
+            self.assertEqual(len(cfg["characters"]), 2)
+            self.assertEqual(cfg["characters"][1]["female"], "char b")
+            self.assertEqual(cfg["characters"][1]["clothed"], "blue dress")
+            self.assertEqual(cfg["characters"][1]["negative"], "bad feet")
+            self.assertEqual(len(list(char_dir.glob("*.json"))), 2)
+            self.assertTrue(settings_file.is_file())
+            self.assertFalse(setting["ok"])
+            self.assertIn("추정", setting["error"])
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
