@@ -848,9 +848,20 @@ def _prompt_parts(values):
     for e in (cap.get("char_captions") or []) if isinstance(cap.get("char_captions"), list) else []:
         if isinstance(e, dict) and e.get("char_caption"):
             chars.append({"prompt": normalize_prompt(e["char_caption"]),
+                          "negative": "",
                           "centers": e.get("centers") if isinstance(e.get("centers"), list) else []})
     v4n = values.get("v4_negative_prompt") if isinstance(values.get("v4_negative_prompt"), dict) else {}
     ncap = v4n.get("caption") if isinstance(v4n.get("caption"), dict) else {}
+    neg_chars = (ncap.get("char_captions") or []) if isinstance(
+        ncap.get("char_captions"), list) else []
+    # 캐릭터 1·2는 세부 태그로 다시 쪼개지 않고, 메타데이터에 든 각 캐릭터의
+    # 전체 프롬프트와 전용 네거티브를 같은 순서로 그대로 묶어 둔다.
+    for i, e in enumerate(neg_chars):
+        if not isinstance(e, dict):
+            continue
+        while len(chars) <= i:
+            chars.append({"prompt": "", "negative": "", "centers": []})
+        chars[i]["negative"] = normalize_prompt(e.get("char_caption") or "")
     neg = normalize_prompt(ncap.get("base_caption") or values.get("uc")
                            or values.get("negative_prompt")
                            or values.get("undesired_content") or "")
@@ -2211,7 +2222,9 @@ def rate_artist(name, **fields):
                     except (TypeError, ValueError):
                         cur[k] = 0
                 elif k == "memo":
-                    cur[k] = str(fields[k] or "")[:500]
+                    # 메모도 사용자 원문이다. 화면·API 어디에도 500자 제한을 알리지
+                    # 않으면서 저장할 때만 자르면 다시 복구할 수 없다.
+                    cur[k] = str(fields[k] or "")
                 else:
                     v = fields[k]
                     # "false"·0·"" 같은 값이 참으로 읽히면 애먼 작가가 차단된다 (R4-01)
@@ -11692,19 +11705,26 @@ class ConfigServer:
                 "negative": user_neg if ucp is not None else m["negative"],
                 "negative_full": m["negative"],
                 "characters": m["characters"],
+                # 지금 버전이 모르는 필드도 버리지 않는다. 생성 요청에는 보내지 않고
+                # 원본 메타데이터 보존·후속 버전의 재해석에만 쓴다.
+                "metadata_raw": m["raw"],
                 "params": params, "images": [],
             }
             # 썸네일도 캐시에 넣어 목록에서 바로 보이게
             try:
-                import hashlib
-                key = hashlib.sha1(body).hexdigest()[:32] + ".webp"
+                # local: 이름은 실제로 저장하는 WebP 바이트의 SHA-256이다.
+                # 원본 PNG의 SHA-1으로 이름을 만들면 같은 내용 해시라는 자료팩 규칙과
+                # 달라지고, 파일 무결성도 이름만으로 확인할 수 없다.
+                thumb_io = io.BytesIO()
+                with Image.open(io.BytesIO(body)) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((512, 512), Image.LANCZOS)
+                    im.save(thumb_io, "WEBP", quality=74, method=4)
+                thumb = thumb_io.getvalue()
+                key = hashlib.sha256(thumb).hexdigest() + ".webp"
                 out = IMG_CACHE / key
                 if not out.exists():
-                    IMG_CACHE.mkdir(parents=True, exist_ok=True)
-                    with Image.open(io.BytesIO(body)) as im:
-                        im = im.convert("RGB")
-                        im.thumbnail((512, 512), Image.LANCZOS)
-                        im.save(out, "WEBP", quality=74, method=4)
+                    _atomic_write_bytes(out, thumb, keep_backup=False)
                 rec["images"] = [f"local:{key}"]
             except Exception as e:
                 log.warning(f"추출 썸네일 실패: {e}")

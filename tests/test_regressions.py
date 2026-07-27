@@ -7,6 +7,7 @@ audit and are intentionally runnable with the Python standard test runner.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import importlib.util
 import json
@@ -218,6 +219,12 @@ class RegressionTests(unittest.TestCase):
 
     def test_retry_after_and_http_retryability_are_classified(self):
         self.assertEqual(APP.retry_after_seconds("7"), 7)
+        # HTTP-date는 숫자형과 똑같이 1~600초로 제한한다. 과거 날짜가
+        # 음수 대기나 즉시 재시도 루프가 되면 안 된다.
+        self.assertEqual(
+            APP.retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), 1.0)
+        self.assertEqual(
+            APP.retry_after_seconds("Wed, 21 Oct 2037 07:28:00 GMT"), 600.0)
 
         class Response:
             content = b""
@@ -741,6 +748,92 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result["style"]["base"], "1girl")
         self.assertTrue(result["style"]["params"]["quality_toggle"])
         self.assertEqual(result["style"]["negative"], "bad anatomy")
+
+    def test_metadata_thumbnail_local_name_matches_saved_webp_sha256(self):
+        metadata = PngInfo()
+        metadata.add_text("Comment", json.dumps({
+            "prompt": "1girl, exact thumbnail hash",
+            "uc": "bad anatomy",
+            "seed": 123,
+            "software": "NovelAI",
+            "future_setting_not_known_yet": {"mode": "keep-me", "value": 17},
+        }))
+        source = io.BytesIO()
+        Image.new("RGB", (640, 960), (12, 34, 56)).save(
+            source, "PNG", pnginfo=metadata)
+
+        with tempfile.TemporaryDirectory() as td, patch.object(
+                APP, "IMG_CACHE", Path(td)):
+            result = APP.ConfigServer(
+                copy.deepcopy(APP.DEFAULT_CONFIG)
+            ).handle_inspect(source.getvalue(), "fixture.png", "")
+            self.assertTrue(result["ok"])
+            local_ref = result["style"]["images"][0]
+            self.assertTrue(local_ref.startswith("local:"))
+            cached = Path(td) / local_ref.removeprefix("local:")
+            payload = cached.read_bytes()
+            self.assertEqual(cached.stem, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(len(cached.stem), 64)
+            fetched, content_type = APP.fetch_cached_image(local_ref)
+            self.assertEqual(fetched, payload)
+            self.assertEqual(content_type, "image/webp")
+            self.assertEqual(
+                json.loads(json.dumps(result["style"]))["metadata_raw"][
+                    "future_setting_not_known_yet"],
+                {"mode": "keep-me", "value": 17},
+            )
+
+    def test_metadata_keeps_each_character_prompt_and_negative_as_whole_text(self):
+        values = {
+            "v4_prompt": {"caption": {
+                "base_caption": "2girls, outdoors",
+                "char_captions": [
+                    {"char_caption": "character one, red hair, 1.2::smile::",
+                     "centers": [{"x": 0.2, "y": 0.5}]},
+                    {"char_caption": "character two, blue hair, {hat|ribbon}",
+                     "centers": [{"x": 0.8, "y": 0.5}]},
+                ],
+            }},
+            "v4_negative_prompt": {"caption": {
+                "base_caption": "bad anatomy",
+                "char_captions": [
+                    {"char_caption": "character one negative, closed eyes"},
+                    {"char_caption": "character two negative, monochrome"},
+                ],
+            }},
+        }
+        _, _, characters = APP._prompt_parts(values)
+        self.assertEqual(characters, [
+            {
+                "prompt": "character one, red hair, 1.2::smile::",
+                "negative": "character one negative, closed eyes",
+                "centers": [{"x": 0.2, "y": 0.5}],
+            },
+            {
+                "prompt": "character two, blue hair, {hat|ribbon}",
+                "negative": "character two negative, monochrome",
+                "centers": [{"x": 0.8, "y": 0.5}],
+            },
+        ])
+
+    def test_artist_memo_round_trip_does_not_silently_truncate(self):
+        memo = (
+            "작가 메모 원문\n" + "가중치 1.2::artist:test:: | 설명 🙂 \\\\ " * 80
+        )
+        self.assertGreater(len(memo), 500)
+        with tempfile.TemporaryDirectory() as td, patch.object(
+                APP, "RATINGS_FILE", Path(td) / "작가평가.json"):
+            old_cache = copy.deepcopy(APP._RATINGS)
+            try:
+                APP._RATINGS.update({"mtime": -1, "data": {}})
+                saved = APP.rate_artist("Test Artist", memo=memo)
+                self.assertEqual(saved["memo"], memo)
+                APP._RATINGS.update({"mtime": -1, "data": {}})
+                self.assertEqual(
+                    APP.load_ratings()["test artist"]["memo"], memo)
+            finally:
+                APP._RATINGS.clear()
+                APP._RATINGS.update(old_cache)
 
     def test_legacy_middle_quality_suffix_is_removed_once(self):
         suffix = APP.quality_suffix_text("nai-diffusion-4-5-full")
