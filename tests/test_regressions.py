@@ -756,6 +756,146 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("sessionStorage.removeItem('naisBackupRollback')", page)
         self.assertGreaterEqual(page.count("setTimeout(() => location.reload(), 700)"), 2)
 
+    def test_local_image_audit_separates_legacy_names_from_damage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            collect = root / "수집"
+            cache = collect / "이미지캐시"
+            cache.mkdir(parents=True)
+            image = io.BytesIO()
+            Image.new("RGB", (4, 3), (20, 40, 60)).save(image, "WEBP")
+            payload = image.getvalue()
+            legacy = "f" * 64 + ".webp"
+            orphan = "orphan.webp"
+            (cache / legacy).write_bytes(payload)
+            # 같은 내용의 미사용 파일은 중복이지만 삭제 가능 판정은 아니다.
+            (cache / orphan).write_bytes(payload)
+            (collect / "그림체.json").write_text(json.dumps([{
+                "id": "legacy-style",
+                "images": ["local:" + legacy],
+            }], ensure_ascii=False), encoding="utf-8")
+
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "IMG_CACHE", cache):
+                result = APP.local_image_integrity()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["unique_references"], 1)
+            self.assertEqual(result["missing"], 0)
+            self.assertEqual(result["unreadable_references"], 0)
+            self.assertEqual(result["referenced_legacy_names"], 1)
+            self.assertEqual(result["unreferenced"], 1)
+            self.assertEqual(result["duplicate_groups"], 1)
+            self.assertFalse(result["normalization"]["blocked"])
+            self.assertIn("자동 삭제하지 않습니다", result["note"])
+
+    def test_local_image_normalize_preserves_old_file_and_rolls_back_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            collect = root / "수집"
+            cache = collect / "이미지캐시"
+            cache.mkdir(parents=True)
+            image = io.BytesIO()
+            Image.new("RGB", (5, 4), (70, 30, 10)).save(image, "WEBP")
+            payload = image.getvalue()
+            legacy = "legacy-before-webp-conversion.webp"
+            canonical = hashlib.sha256(payload).hexdigest() + ".webp"
+            source = cache / legacy
+            source.write_bytes(payload)
+            data_file = collect / "그림체.json"
+            original = [{"id": "a", "images": ["local:" + legacy]}]
+            data_file.write_text(json.dumps(original, ensure_ascii=False),
+                                 encoding="utf-8")
+
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "IMG_CACHE", cache):
+                preview = APP.local_image_integrity()
+                applied = APP.normalize_local_image_refs(
+                    preview["fingerprint"])
+                normalized = json.loads(data_file.read_text(encoding="utf-8"))
+                self.assertTrue(applied["ok"])
+                self.assertEqual(
+                    normalized[0]["images"], ["local:" + canonical])
+                self.assertEqual(source.read_bytes(), payload)
+                self.assertEqual((cache / canonical).read_bytes(), payload)
+
+                undone = APP.rollback_local_image_normalize(applied["batch"])
+                restored = json.loads(data_file.read_text(encoding="utf-8"))
+                self.assertTrue(undone["ok"])
+                self.assertEqual(restored, original)
+                self.assertTrue(source.exists())
+                self.assertFalse((cache / canonical).exists())
+                held = (root / "수집" / "이미지무결성기록"
+                        / applied["batch"] / "되돌린-새이름" / canonical)
+                self.assertEqual(held.read_bytes(), payload)
+
+    def test_local_image_normalize_refuses_missing_references(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            collect = root / "수집"
+            cache = collect / "이미지캐시"
+            cache.mkdir(parents=True)
+            data_file = collect / "그림체.json"
+            data_file.write_text(
+                '[{"images":["local:missing.webp"]}]', encoding="utf-8")
+
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "IMG_CACHE", cache):
+                preview = APP.local_image_integrity()
+                result = APP.normalize_local_image_refs(
+                    preview["fingerprint"])
+
+            self.assertEqual(preview["missing"], 1)
+            self.assertTrue(preview["normalization"]["blocked"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                json.loads(data_file.read_text(encoding="utf-8")),
+                [{"images": ["local:missing.webp"]}],
+            )
+
+    def test_local_image_rollback_does_not_overwrite_later_user_edit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            collect = root / "수집"
+            cache = collect / "이미지캐시"
+            cache.mkdir(parents=True)
+            image = io.BytesIO()
+            Image.new("RGB", (3, 3), (1, 2, 3)).save(image, "WEBP")
+            payload = image.getvalue()
+            legacy = "legacy.webp"
+            (cache / legacy).write_bytes(payload)
+            data_file = collect / "그림체.json"
+            data_file.write_text(json.dumps(
+                [{"id": "before", "images": ["local:" + legacy]}]),
+                encoding="utf-8")
+
+            with patch.object(APP, "BASE_DIR", root), \
+                    patch.object(APP, "IMG_CACHE", cache):
+                preview = APP.local_image_integrity()
+                applied = APP.normalize_local_image_refs(
+                    preview["fingerprint"])
+                edited = [{"id": "edited-after-normalize", "images": []}]
+                data_file.write_text(json.dumps(edited), encoding="utf-8")
+                undone = APP.rollback_local_image_normalize(applied["batch"])
+
+            self.assertTrue(undone["ok"])
+            self.assertEqual(undone["restored"], 0)
+            self.assertEqual(undone["skipped"], 1)
+            self.assertEqual(
+                json.loads(data_file.read_text(encoding="utf-8")), edited)
+
+    def test_local_image_integrity_ui_has_scan_normalize_and_rollback(self):
+        page = APP.PAGE_TEMPLATE
+        for element_id in (
+            "localImageCard", "localImageScan", "localImageNormalize",
+            "localImageRollback", "localImageMsg",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("/api/local_image_integrity", page)
+        self.assertIn("/api/local_image_normalize", page)
+        self.assertIn("/api/local_image_rollback", page)
+        self.assertIn("옛 파일은 지우지 않고", page)
+
     def test_build_main_writes_the_data_pack_beside_the_program(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
