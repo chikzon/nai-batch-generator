@@ -4301,6 +4301,13 @@ COMPARE_MODE_LABELS = {
     "both": "그림체 × 캐릭터",
 }
 COMPARE_MAX_JOBS = 2_000_000
+COMPARE_RECIPE_SETTING_KEYS = (
+    "model", "width", "height", "cfg_scale", "cfg_rescale", "steps",
+    "sampler", "scheduler", "variety", "uc_preset", "quality_toggle",
+    "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
+    "controlnet_strength", "prefer_brownian",
+    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
+)
 
 
 def _comparison_id(prefix, *parts):
@@ -4669,12 +4676,58 @@ def comparison_job_values(cfg, plan, job):
                    "negative": char.get("negative", "") or ""}]
         centers = [{"x": 0.5, "y": 0.5}]
     else:
-        slots = [
-            s for s in (cfg.get("char_slots") or [])
-            if slot_prompt(s).strip() and s.get("enabled") is not False
-        ]
-        people, centers = active_people(slots, cfg.get("char_centers"))
+        # active_people가 원래 칸 index로 좌표를 함께 거른다. 슬롯을 먼저 줄이면
+        # 꺼진 캐릭터 뒤의 인물이 앞 캐릭터 좌표를 받는다.
+        people, centers = active_people(
+            cfg.get("char_slots") or [], cfg.get("char_centers"))
     return used, base, negative, people, centers
+
+
+def comparison_recipe_context(cfg, plan, styles, chars):
+    """비교 결과가 현재 자료 변경 뒤에도 재현되도록 원문을 한 번만 스냅샷한다."""
+    options = plan.get("options") or {}
+    all_slots = cfg.get("char_slots") or []
+    active_slots = [
+        dict(slot) for slot in all_slots
+        if isinstance(slot, dict) and slot_prompt(slot).strip()
+        and slot.get("enabled") is not False
+    ][:MAX_CHARS]
+    _, active_centers = active_people(
+        all_slots, cfg.get("char_centers"))
+    config = {
+        key: cfg.get(key) for key in (
+            "base_prompt", "negative_prompt", "style_name",
+            *COMPARE_RECIPE_SETTING_KEYS,
+        )
+    }
+    if options.get("include_refs"):
+        config["vibes"] = cfg.get("vibes") or []
+        config["char_refs"] = cfg.get("char_refs") or []
+    return {
+        "version": 1,
+        "options": options,
+        "config": config,
+        "char_slots": active_slots,
+        "char_centers": active_centers,
+        "styles": [{
+            "id": item.get("_compare_id"),
+            "name": item.get("_compare_name"),
+            "kind": item.get("_compare_kind"),
+            "base": item.get("base") or item.get("combo") or "",
+            "negative": item.get("negative") or "",
+            "params": item.get("params") or {},
+        } for item in styles
+            if options.get("mode") in ("styles", "both")],
+        "characters": [{
+            "id": item.get("_compare_id"),
+            "name": item.get("_compare_name"),
+            "female": item.get("female") or "",
+            "clothed": item.get("clothed") or "",
+            "negative": item.get("negative") or "",
+            "source": item.get("source") or "",
+        } for item in chars
+            if options.get("mode") in ("characters", "both")],
+    }
 
 
 class RateLimitError(Exception):
@@ -7883,6 +7936,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button id="expCup" title="보이는 그림들을 1:1 로 붙여 순위를 매깁니다 (SDStudio 의 이미지 월드컵)">🏆 월드컵</button>
           <button id="expCompare">🔍 비교함 보기 (<span id="expCmpN">0</span>)</button>
           <button id="expCmpClear">비교함 비우기</button>
+          <button id="expApplyPicked" title="이 폴더에서 선별한 비교 결과 한 장의 원문 설정을 생성 화면에 적용합니다">↳ 선별 1장 생성에 적용</button>
           <span class="n" id="expStat"></span>
           <button id="expDelUnpicked" class="danger" title="이 폴더에서 선별 안 된 것을 실제로 지웁니다">선별 외 삭제</button>
         </div>
@@ -10651,6 +10705,83 @@ async function picksSave(){
   await fetch('/api/picks_save', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({picked:[...EXP.picked], fav:[...EXP.fav], ranks: EXP.ranks || {}})});
 }
+let EXP_RECIPE_UNDO = null;
+const EXP_RECIPE_KEYS = [
+  'base_prompt','negative_prompt','style_name','nai_seed','char_slots','char_centers',
+  'vibes','char_refs','model','width','height','cfg_scale','cfg_rescale','steps',
+  'sampler','scheduler','variety','uc_preset','quality_toggle','smea','smea_dyn',
+  'dynamic_thresholding','uncond_scale','controlnet_strength','prefer_brownian',
+  'deliberate_euler_ancestral_bug','legacy_v3_extend','use_coords'
+];
+function comparisonRecipeSnapshot(){
+  const out = {};
+  EXP_RECIPE_KEYS.forEach(key => {
+    out[key] = JSON.parse(JSON.stringify(STATE[key] === undefined ? null : STATE[key]));
+  });
+  return out;
+}
+function comparisonRecipePaint(){
+  $('basePrompt').value = STATE.base_prompt || '';
+  $('negPrompt').value = STATE.negative_prompt || '';
+  paintParams();
+  renderSlots();
+  renderRefs();
+  tokens();
+  save();
+}
+async function expApplyPickedRecipe(){
+  const visible = await expEnsureAll();
+  const chosen = visible.filter(file => EXP.picked.has(file.path));
+  if(chosen.length !== 1){
+    $('expStat').textContent = chosen.length
+      ? `이 폴더에서 선별한 ${chosen.length}장 중 적용할 한 장만 남겨주세요.`
+      : '이 폴더에서 비교 결과 한 장을 먼저 선별해주세요.';
+    return;
+  }
+  const r = await (await fetch('/api/compare_recipe', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:chosen[0].path})})).json();
+  if(!r.ok){ $('expStat').textContent = r.error || '원문 레시피를 읽지 못했습니다.'; return; }
+  const recipe = r.recipe || {};
+  const people = (recipe.char_slots || []).length;
+  if(!confirm(
+    `선택한 결과의 그림체·네거티브·생성 설정·시드·캐릭터 ${people}명을 현재 생성에 적용할까요?\n`
+    + '적용 직후 이 화면에서 되돌릴 수 있습니다.'
+  )) return;
+  EXP_RECIPE_UNDO = comparisonRecipeSnapshot();
+  STATE.base_prompt = recipe.base_prompt || '';
+  STATE.negative_prompt = recipe.negative_prompt || '';
+  STATE.style_name = recipe.style_name || '';
+  STATE.nai_seed = Number(recipe.nai_seed) || 0;
+  STATE.char_slots = JSON.parse(JSON.stringify(recipe.char_slots || []));
+  STATE.char_centers = JSON.parse(JSON.stringify(recipe.char_centers || []));
+  if(recipe.include_refs){
+    STATE.vibes = JSON.parse(JSON.stringify(recipe.vibes || []));
+    STATE.char_refs = JSON.parse(JSON.stringify(recipe.char_refs || []));
+  }else{
+    STATE.vibes = (STATE.vibes || []).map(item => Object.assign({}, item, {enabled:false}));
+    STATE.char_refs = (STATE.char_refs || []).map(item => Object.assign({}, item, {enabled:false}));
+  }
+  Object.entries(recipe.settings || {}).forEach(([key, value]) => {
+    if(EXP_RECIPE_KEYS.includes(key) && value !== null && value !== undefined){
+      STATE[key] = value;
+    }
+  });
+  comparisonRecipePaint();
+  $('expStat').innerHTML = `선별 결과 원문을 현재 생성에 적용했습니다.`
+    + ` <button type="button" id="expGoGenerate" class="primary">생성 화면으로</button>`
+    + ` <button type="button" id="expUndoRecipe">적용 전으로 되돌리기</button>`;
+  $('expGoGenerate').addEventListener('click', () => setMode('preview'));
+  $('expUndoRecipe').addEventListener('click', () => {
+    if(!EXP_RECIPE_UNDO) return;
+    Object.entries(EXP_RECIPE_UNDO).forEach(([key, value]) => {
+      STATE[key] = JSON.parse(JSON.stringify(value));
+    });
+    EXP_RECIPE_UNDO = null;
+    comparisonRecipePaint();
+    $('expStat').textContent = '비교 결과를 적용하기 전 설정으로 되돌렸습니다.';
+  });
+}
 /* 크게 보기 — 여기서 ←→ F C Esc 가 먹는다 */
 function expOpen(i){
   const vis = expVisible();
@@ -10714,6 +10845,8 @@ if($('expUp')){
   $('expSize').addEventListener('change', expDraw);
   $('expCmpClear').addEventListener('click', () => { EXP.cmp.clear(); expDraw(); });
   if($('expCup')) $('expCup').addEventListener('click', cupStart);
+  if($('expApplyPicked')) $('expApplyPicked').addEventListener(
+    'click', expApplyPickedRecipe);
   $('expCompare').addEventListener('click', () => {
     if(!EXP.cmp.size){ $('expStat').textContent = '비교함이 비어 있습니다 (그림을 열고 C)'; return; }
     let ov = document.createElement('div');
@@ -15069,6 +15202,13 @@ class ConfigServer:
                             server.cfg, data.get("folder")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_recipe"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        self._json(comparison_recipe_for_output(
+                            server.cfg, data.get("path")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_preview"):
                     self._json(server.handle_compare_preview(body))
                 elif self.path.startswith("/api/compare_run"):
@@ -15859,6 +15999,111 @@ def activate_comparison_run(cfg, folder):
     }
 
 
+def comparison_recipe_for_output(cfg, rel):
+    """선택한 비교 이미지가 실제로 사용한 원문·설정·캐릭터를 manifest에서 복원한다."""
+    image_path = output_file_for_preview(cfg, rel)
+    if image_path is None:
+        raise ValueError("선택한 비교 결과 파일을 찾지 못했습니다.")
+    root = out_root(cfg).resolve()
+    runs_root = (root / "비교생성").resolve()
+    folder = image_path.parent.resolve()
+    if not _path_is_inside(folder, runs_root):
+        raise ValueError("비교 생성 결과만 현재 생성에 적용할 수 있습니다.")
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("이 결과의 비교 manifest를 찾지 못했습니다.")
+    progress = load_json_recover(manifest_path)
+    completed = progress.get("completed")
+    if not isinstance(completed, dict):
+        raise ValueError("비교 결과 기록 형식이 올바르지 않습니다.")
+    wanted = image_path.relative_to(root).as_posix()
+    record = next((
+        item for item in completed.values()
+        if isinstance(item, dict)
+        and str(item.get("file") or "").replace("\\", "/") == wanted
+    ), None)
+    if record is None:
+        raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
+    context = progress.get("recipe_context")
+    if not isinstance(context, dict):
+        raise ValueError(
+            "이 결과는 원문 레시피 기록 기능 이전에 만들어져 자동 적용할 수 없습니다.")
+    context_cfg = dict(DEFAULT_CONFIG)
+    context_cfg.update(
+        context.get("config") if isinstance(context.get("config"), dict) else {})
+    options = context.get("options")
+    if not isinstance(options, dict):
+        plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
+        options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
+    styles = context.get("styles") if isinstance(context.get("styles"), list) else []
+    chars = (context.get("characters")
+             if isinstance(context.get("characters"), list) else [])
+    style_id = record.get("style_id")
+    character_id = record.get("character_id")
+    style = next((
+        item for item in styles
+        if isinstance(item, dict)
+        and str(item.get("id")) == str(style_id)
+    ), None) if style_id is not None else None
+    character = next((
+        item for item in chars
+        if isinstance(item, dict)
+        and str(item.get("id")) == str(character_id)
+    ), None) if character_id is not None else None
+    used = comparison_style_config(context_cfg, style, options)
+    base = ((style or {}).get("base")
+            or context_cfg.get("base_prompt") or "1girl").strip()
+    negative = ((style or {}).get("negative")
+                if style is not None
+                else context_cfg.get("negative_prompt", ""))
+    negative = negative or ""
+    if character is not None:
+        char_slots = [{
+            "name": character.get("name") or record.get("character") or "캐릭터",
+            "prompt": character.get("female") or "",
+            "outfit": character.get("clothed") or "",
+            "negative": character.get("negative") or "",
+            "enabled": True,
+        }]
+        char_centers = [{"x": 0.5, "y": 0.5}]
+    else:
+        char_slots = [
+            dict(slot) for slot in (context.get("char_slots") or [])
+            if isinstance(slot, dict)
+        ]
+        char_centers = [
+            dict(center) for center in (context.get("char_centers") or [])
+            if isinstance(center, dict)
+        ]
+    include_refs = bool(options.get("include_refs"))
+    return {
+        "ok": True,
+        "file": wanted,
+        "recipe": {
+            "version": 1,
+            "mode": str(progress.get("mode") or options.get("mode") or ""),
+            "base_prompt": base,
+            "negative_prompt": negative,
+            "style_name": ((style or {}).get("name")
+                           or context_cfg.get("style_name")
+                           or record.get("style") or ""),
+            "settings": {
+                key: used.get(key) for key in COMPARE_RECIPE_SETTING_KEYS
+            },
+            "char_slots": char_slots,
+            "char_centers": char_centers,
+            "nai_seed": int(record.get("seed") or 0),
+            "include_refs": include_refs,
+            "vibes": context_cfg.get("vibes") or [] if include_refs else [],
+            "char_refs": context_cfg.get("char_refs") or [] if include_refs else [],
+            "source": {
+                "style": (style or {}),
+                "character": (character or {}),
+            },
+        },
+    }
+
+
 def _comparison_progress_save(progress, folder):
     """재개용 기록과 사람이 읽을 결과 폴더 manifest를 함께 원자 저장한다."""
     atomic_write_json(COMPARE_PROGRESS_FILE, progress, indent=1)
@@ -15895,6 +16140,8 @@ def _comparison_progress_start(cfg, plan, styles, chars):
                      if k not in ("sample_styles", "sample_characters")},
             "base_seed": int(plan["options"].get("seed") or 0)
                          or random.randint(1, 2**32 - 1),
+            "recipe_context": comparison_recipe_context(
+                cfg, plan, styles, chars),
             "completed": {},
             "errors": {},
         }
@@ -15902,6 +16149,9 @@ def _comparison_progress_start(cfg, plan, styles, chars):
         progress = old
         progress["status"] = "running"
         progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if not isinstance(progress.get("recipe_context"), dict):
+            progress["recipe_context"] = comparison_recipe_context(
+                cfg, plan, styles, chars)
         log.info("중단된 자료 비교 생성을 이어서 합니다: %s", folder)
 
     # 기록만 있고 파일이 사라진 항목은 완료로 보지 않는다.
@@ -16011,6 +16261,9 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 completed[key] = {
                     "index": job["index"], "file": rel,
                     "style": style_label, "character": char_label,
+                    "style_id": ((job.get("style") or {}).get("_compare_id")),
+                    "character_id": (
+                        (job.get("character") or {}).get("_compare_id")),
                     "seed_index": seed_index,
                     "seed": seed, "width": int(used["width"]),
                     "height": int(used["height"]),

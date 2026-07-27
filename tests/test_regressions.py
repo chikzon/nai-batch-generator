@@ -521,6 +521,32 @@ class RegressionTests(unittest.TestCase):
                 {"mode": "styles", "fixed_size": False}, cfg))
         self.assertEqual((no_lock["width"], no_lock["height"]), (1024, 1024))
 
+    def test_comparison_keeps_coordinates_aligned_after_disabled_character(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["char_slots"] = [
+            {"name": "off", "prompt": "off character", "enabled": False},
+            {"name": "on", "prompt": "on character", "enabled": True},
+        ]
+        cfg["char_centers"] = [
+            {"x": 0.1, "y": 0.2},
+            {"x": 0.8, "y": 0.9},
+        ]
+        plan = {"options": APP.normalize_comparison_options(
+            {"mode": "styles"}, cfg)}
+        job = {
+            "style": {
+                "_compare_id": "style", "_compare_name": "Style",
+                "base": "style base", "negative": "",
+            },
+            "character": None,
+        }
+
+        _, _, _, people, centers = APP.comparison_job_values(
+            cfg, plan, job)
+
+        self.assertEqual(people, [{"prompt": "on character", "negative": ""}])
+        self.assertEqual(centers, [{"x": 0.8, "y": 0.9}])
+
     def test_comparison_requires_the_exact_recounted_job_confirmation(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["token"] = "pst-fixture"
@@ -603,6 +629,12 @@ class RegressionTests(unittest.TestCase):
                 server.live.stop_req = False
                 APP._run_comparison(server, cfg, plan, styles, chars)
                 final = json.loads(progress_file.read_text(encoding="utf-8"))
+                first_record = min(
+                    final["completed"].values(),
+                    key=lambda item: item["index"],
+                )
+                restored = APP.comparison_recipe_for_output(
+                    cfg, first_record["file"])
 
             self.assertEqual(len(calls), 4)
             self.assertEqual(final["status"], "complete")
@@ -621,6 +653,19 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(all(x["scale"] == 6.5 for x in calls))
             self.assertEqual(len(list((root / "output").rglob("*.webp"))), 4)
             self.assertEqual(len(list((root / "output").rglob("manifest.json"))), 1)
+            recipe = restored["recipe"]
+            self.assertEqual(recipe["base_prompt"], "style base")
+            self.assertEqual(recipe["negative_prompt"], "style negative")
+            self.assertEqual(recipe["settings"]["cfg_scale"], 6.5)
+            self.assertEqual(
+                (recipe["settings"]["width"], recipe["settings"]["height"]),
+                (512, 512),
+            )
+            self.assertEqual(recipe["char_slots"][0]["prompt"], "character a")
+            self.assertEqual(recipe["char_slots"][0]["outfit"], "red dress")
+            self.assertEqual(recipe["nai_seed"], calls[0]["seed"])
+            self.assertEqual(
+                recipe["source"]["style"]["id"], "s1")
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
         page = APP.render_page()
@@ -642,6 +687,10 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("fetch('/api/compare_runs')", page)
         self.assertIn("fetch('/api/compare_activate'", page)
         self.assertIn("await openComparisonFolder(", page)
+        self.assertIn('id="expApplyPicked"', page)
+        self.assertIn("fetch('/api/compare_recipe'", page)
+        self.assertIn("EXP_RECIPE_UNDO", page)
+        self.assertIn("적용 전으로 되돌리기", page)
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
