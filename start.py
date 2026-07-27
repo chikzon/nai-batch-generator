@@ -7255,6 +7255,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .pv-meta{width:100%;max-width:720px;}
   .pv-meta .nm{font-weight:700;color:var(--accent);font-size:var(--fs);}
   .pv-meta .fn{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);margin-top:3px;}
+  .pv-status{font-size:var(--fs-xs);margin-top:5px;line-height:1.45;}
+  .phase-pill{display:inline-flex;align-items:center;padding:2px 7px;border-radius:var(--radius-pill);
+    font-size:var(--fs-2xs);font-weight:700;background:var(--paper2);color:var(--muted);}
+  .phase-pill[data-phase="running"],.phase-pill[data-phase="stopping"]{color:var(--warn);}
+  .phase-pill[data-phase="completed"]{color:var(--good);}
+  .phase-pill[data-phase="partial"],.phase-pill[data-phase="failed"]{color:var(--danger);}
   .pbar{height:6px;border-radius:var(--radius-pill);background:var(--paper2);overflow:hidden;margin-top:9px;}
   .pbar div{height:100%;background:var(--good);width:0;transition:width .3s;}
 
@@ -7631,10 +7637,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="pv-img" id="pvImg"><span style="color:var(--muted);font-size:var(--fs-xs);text-align:center;">
           왼쪽에서 프롬프트·캐릭터를 넣고<br>[생성]을 누르면 여기에 표시됩니다.</span></div>
         <div class="pv-meta">
-          <div class="nm" id="pvName">대기 중</div>
+          <div class="bar"><div class="nm" id="pvName">대기 중</div>
+            <span class="phase-pill" id="pvPhase" data-phase="idle">대기</span></div>
           <div class="fn" id="pvFile">-</div>
+          <div class="pv-status" id="pvStatus">설정을 준비하고 있습니다.</div>
           <div class="bar" style="margin:8px 0 0;"><span class="n" id="pvProg">0 / 0</span>
-            <span style="font-size:var(--fs-2xs);color:var(--muted);" id="pvDaily"></span></div>
+            <span class="n" id="pvCounts"></span>
+            <span style="font-size:var(--fs-2xs);color:var(--muted);" id="pvDaily"></span>
+            <button id="pvReturn" class="hidden">다시 실행할 화면</button></div>
           <div class="bar" id="pvSeedRow" style="margin:6px 0 0;display:none;">
             <span class="n" id="pvSeed" title="이 그림의 NAI 시드"></span>
             <button id="pvSeedCopy" title="시드 복사">복사</button>
@@ -13711,13 +13721,29 @@ function renderUIChips(){
 /* ── 상태 폴링 ── */
 let lastFile = '';
 let WAS_RUNNING = false;
+let LAST_LIVE_STATUS = null;
+const LIVE_PHASE_LABEL = {
+  idle:'대기', running:'진행 중', stopping:'중지 중', completed:'완료',
+  partial:'일부 실패', failed:'실패', stopped:'중지됨'
+};
+if($('pvReturn')) $('pvReturn').addEventListener('click', () => {
+  const mode = LAST_LIVE_STATUS && LAST_LIVE_STATUS.retry_mode;
+  setMode(['preview','settings','builder','library','system'].includes(mode) ? mode : 'preview');
+});
 async function poll(){
   try{
     const s = await (await fetch('/status.json', {cache:'no-store'})).json();
-    $('pvName').textContent = s.char_name || '대기 중';
-    $('pvFile').textContent = s.filename || (s.status_text || '-');
+    LAST_LIVE_STATUS = s;
+    $('pvName').textContent = s.operation || s.char_name || '대기 중';
+    $('pvFile').textContent = s.filename || '아직 저장된 파일 없음';
+    $('pvStatus').textContent = s.status_text || '-';
+    $('pvPhase').dataset.phase = s.phase || 'idle';
+    $('pvPhase').textContent = LIVE_PHASE_LABEL[s.phase] || s.phase || '대기';
     $('pvProg').textContent = `${s.index} / ${s.total}`;
+    $('pvCounts').textContent = `성공 ${s.completed || 0} · 실패 ${s.failed || 0}`
+      + (s.retry_count ? ` · 자동 재시도 ${s.retry_count}` : '');
     $('pvDaily').textContent = `오늘 ${s.daily} / ${s.daily_cap}`;
+    $('pvReturn').classList.toggle('hidden', !s.can_retry || !!s.running);
     $('pvBar').style.width = (s.total ? Math.round(s.index/s.total*100) : 0) + '%';
     lastSeed = s.seed || 0;
     $('pvSeedRow').style.display = lastSeed ? 'flex' : 'none';
@@ -14033,16 +14059,32 @@ class LiveState:
         self.stop_req = False  # 중지 요청 — 실행권과 별개다 (CQA-001)
         self.seed = 0          # 마지막으로 생성한 그림의 실제 NAI 시드
         self.seed_key = ""     # 배치 회차 번호 (01, 02 …)
+        self.operation = "대기"
+        self.phase = "idle"    # idle/running/stopping/completed/partial/failed/stopped
+        self.completed = 0
+        self.failed = 0
+        self.retry_count = 0
+        self.last_error = ""
+        self.can_retry = False
+        self.retry_mode = "preview"
+        self.started_at = 0.0
+        self.finished_at = 0.0
 
     def update(self, **kwargs):
         with self.lock:
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
+    def note_retry(self, error=""):
+        with self.lock:
+            self.retry_count += 1
+            if error:
+                self.last_error = str(error)
+
     # 이중 POST 레이스 방지 (라운드04 — Forge 가 실사용에서 겪은 함정과 같은 계열).
     # 예전에는 `if running: 거절` 검사와 스레드 안의 `running=True` 사이에 틈이 있어
     # 빠른 이중 요청이 둘 다 통과했고, 먼저 끝난 쪽 finally 가 남의 running 을 껐다.
-    def try_claim(self):
+    def try_claim(self, operation="생성", retry_mode="preview"):
         """실행권 원자 선점 — 성공하면 소유 토큰, 이미 실행 중이면 None.
         ⚠ 중지 요청이 와도 실행권은 owner 가 release 할 때까지 잡혀 있다 (CQA-001) —
         중지 직후 재시작해도 옛 작업이 실제로 끝나기 전에는 새 작업이 못 들어온다."""
@@ -14052,12 +14094,28 @@ class LiveState:
             self.running = True
             self.stop_req = False
             self._owner += 1
+            self.operation = str(operation or "생성")
+            self.phase = "running"
+            self.completed = 0
+            self.failed = 0
+            self.retry_count = 0
+            self.last_error = ""
+            self.can_retry = False
+            self.retry_mode = str(retry_mode or "preview")
+            self.started_at = time.time()
+            self.finished_at = 0.0
             return self._owner
 
     def release(self, token):
         """소유 토큰이 맞을 때만 running 을 끈다 — 옛 작업이 새 작업 상태를 못 끄게."""
         with self.lock:
             if self._owner == token:
+                if self.stop_req and self.phase in ("running", "stopping"):
+                    self.phase = "stopped"
+                    self.can_retry = True
+                elif self.phase in ("running", "stopping"):
+                    self.phase = "completed"
+                self.finished_at = time.time()
                 self.running = False
                 self.stop_req = False
 
@@ -14077,6 +14135,7 @@ class LiveState:
             if not self.running:
                 return False
             self.stop_req = True
+            self.phase = "stopping"
             self.status_text = "중지 요청 — 이번 장까지 마치고 멈춥니다."
             return True
 
@@ -14100,6 +14159,14 @@ class LiveState:
                 "stopping": self.stop_req,
                 "has_image": self.image_bytes is not None,
                 "seed": self.seed, "seed_key": self.seed_key,
+                "operation": self.operation, "phase": self.phase,
+                "completed": self.completed, "failed": self.failed,
+                "retry_count": self.retry_count,
+                "last_error": self.last_error,
+                "can_retry": self.can_retry,
+                "retry_mode": self.retry_mode,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
             }
 
     def image(self):
@@ -14174,7 +14241,7 @@ class ConfigServer:
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-        tok = self.live.try_claim()
+        tok = self.live.try_claim("단독 생성", "preview")
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -14184,7 +14251,8 @@ class ConfigServer:
             try:
                 okp, why = pace_gate(cfg, self.live, "단독")   # 밴 예방 (CQA-013)
                 if not okp:
-                    self.live.update(status_text=why)
+                    self.live.update(
+                        status_text=why, phase="stopped", can_retry=True)
                     return
                 style = (cfg.get("base_prompt") or "").strip()
                 base = style or "1girl"
@@ -14212,10 +14280,14 @@ class ConfigServer:
                 self.live.set_image(img)
                 bump_daily(state)
                 save_state(state)
-                self.live.update(status_text=f"단독 생성 완료 ✓ (output/단독/{n:04d}.webp)")
+                self.live.update(
+                    status_text=f"단독 생성 완료 ✓ (output/단독/{n:04d}.webp)",
+                    completed=1, phase="completed")
             except Exception as e:
                 log.error(f"단독 생성 실패: {e}")
-                self.live.update(status_text=f"단독 생성 실패: {e}")
+                self.live.update(
+                    status_text=f"단독 생성 실패: {e}", failed=1,
+                    last_error=str(e), can_retry=True, phase="failed")
             finally:
                 self.live.release(tok)
 
@@ -14247,7 +14319,7 @@ class ConfigServer:
             return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
         # NAI 는 64 의 배수를 원한다
         w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
-        tok = self.live.try_claim()
+        tok = self.live.try_claim(mode, "preview")
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -14257,7 +14329,8 @@ class ConfigServer:
             try:
                 okp, why = pace_gate(cfg, self.live, mode)     # 밴 예방 (CQA-013)
                 if not okp:
-                    self.live.update(status_text=why)
+                    self.live.update(
+                        status_text=why, phase="stopped", can_retry=True)
                     return
                 slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
@@ -14284,11 +14357,14 @@ class ConfigServer:
                                 quality=out_clean(cfg)[2])
                 self.live.set_image(img)
                 st = load_state(); bump_daily(st); save_state(st)
-                self.live.update(status_text=f"{mode} 완료 ✓ (output/{mode}/{n:04d}.webp · 시드 {seed})",
-                                 seed=seed)
+                self.live.update(
+                    status_text=f"{mode} 완료 ✓ (output/{mode}/{n:04d}.webp · 시드 {seed})",
+                    seed=seed, completed=1, phase="completed")
             except Exception as e:
                 log.error(f"{mode} 실패: {e}")
-                self.live.update(status_text=f"{mode} 실패: {e}")
+                self.live.update(
+                    status_text=f"{mode} 실패: {e}", failed=1,
+                    last_error=str(e), can_retry=True, phase="failed")
             finally:
                 self.live.release(tok)
 
@@ -14337,7 +14413,7 @@ class ConfigServer:
         if not jobs:
             return {"ok": False, "error": "메타데이터가 있는 그림이 없습니다. "
                                           "(카톡·디스코드를 거친 그림은 정보가 지워집니다)"}
-        tok = self.live.try_claim()
+        tok = self.live.try_claim("그림체 복구", "library")
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -14345,6 +14421,8 @@ class ConfigServer:
             out_dir = out_sub(cfg, "복구")
             state = load_state()
             done = 0
+            failed = 0
+            blocked = False
             self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
             try:
                 for i, (f, raw, meta_model) in enumerate(jobs, 1):
@@ -14385,6 +14463,7 @@ class ConfigServer:
                     okp, why = pace_gate(cfg, self.live, "복구")
                     if not okp:
                         self.live.update(status_text=why)
+                        blocked = True
                         break
                     try:
                         try:
@@ -14403,7 +14482,10 @@ class ConfigServer:
                             pace_complete()
                     except Exception as e:
                         log.error(f"복구 실패 {f.name}: {e}")
-                        self.live.update(status_text=f"{f.name} 실패: {e}")
+                        failed += 1
+                        self.live.update(
+                            status_text=f"{f.name} 실패: {e}", failed=failed,
+                            last_error=str(e))
                         continue
                     tag = "_i2i" if mode == "img2img" else ""
                     save_with_meta(img, out_dir / f"{f.stem}{tag}.webp",
@@ -14412,7 +14494,21 @@ class ConfigServer:
                     self.live.set_image(img)
                     bump_daily(state); save_state(state)
                     done += 1
-                self.live.update(status_text=f"그림체 복구 완료 ✓ {done}/{len(jobs)}장 (output/복구/)")
+                if self.live.stop_req:
+                    phase = "stopped"
+                    text = f"그림체 복구 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
+                elif blocked:
+                    phase = "stopped"
+                    text = self.live.status_text
+                elif failed:
+                    phase = "partial"
+                    text = f"그림체 복구 일부 완료 — 성공 {done} · 실패 {failed}"
+                else:
+                    phase = "completed"
+                    text = f"그림체 복구 완료 ✓ {done}/{len(jobs)}장 (output/복구/)"
+                self.live.update(
+                    status_text=text, completed=done, failed=failed, phase=phase,
+                    can_retry=bool(failed or blocked or self.live.stop_req))
             finally:
                 self.live.release(tok)
 
@@ -14432,7 +14528,7 @@ class ConfigServer:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-        tok = self.live.try_claim()
+        tok = self.live.try_claim("씬 모드", "settings")
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -14450,6 +14546,8 @@ class ConfigServer:
             base_seed = state["seeds"][seed_key]
             style = (cfg.get("base_prompt") or "").strip()
             done = 0
+            failed = 0
+            blocked = False
             self.live.update(total=len(jobs), index=0, char_name="씬 모드")
             try:
                 for i, (sc, copy) in enumerate(jobs, 1):
@@ -14458,6 +14556,7 @@ class ConfigServer:
                     okp, why = pace_gate(cfg, self.live, "씬")   # 밴 예방 (CQA-013)
                     if not okp:
                         self.live.update(status_text=why)
+                        blocked = True
                         break
                     suffix = "" if copy == 1 else f"_{copy}벌"
                     seed = seed_for(cfg, base_seed, i + (copy - 1) * 100003)
@@ -14506,7 +14605,10 @@ class ConfigServer:
                             pace_complete()
                     except Exception as e:
                         log.error(f"씬 '{sc['name']}' 실패: {e}")
-                        self.live.update(status_text=f"'{sc['name']}' 실패: {e}")
+                        failed += 1
+                        self.live.update(
+                            status_text=f"'{sc['name']}' 실패: {e}", failed=failed,
+                            last_error=str(e))
                         continue
                     saved_path = save_with_meta(img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                                                 max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
@@ -14515,7 +14617,21 @@ class ConfigServer:
                     bump_daily(state)
                     save_state(state)
                     done += 1
-                self.live.update(status_text=f"씬 모드 완료 ✓ {done}/{len(jobs)}장 (output/씬/)")
+                if self.live.stop_req:
+                    phase = "stopped"
+                    text = f"씬 모드 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
+                elif blocked:
+                    phase = "stopped"
+                    text = self.live.status_text
+                elif failed:
+                    phase = "partial"
+                    text = f"씬 모드 일부 완료 — 성공 {done} · 실패 {failed}"
+                else:
+                    phase = "completed"
+                    text = f"씬 모드 완료 ✓ {done}/{len(jobs)}장 (output/씬/)"
+                self.live.update(
+                    status_text=text, completed=done, failed=failed, phase=phase,
+                    can_retry=bool(failed or blocked or self.live.stop_req))
             finally:
                 cfg.pop("_frag_counters", None)
                 self.live.release(tok)
@@ -14643,7 +14759,7 @@ class ConfigServer:
             return {"ok": False, "error":
                     f"실행 직전 장수 확인이 필요합니다. 현재 계획은 {plan['count']:,}장입니다.",
                     "plan": plan}
-        tok = self.live.try_claim()
+        tok = self.live.try_claim("자료 비교 생성", "library")
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -14657,7 +14773,10 @@ class ConfigServer:
             except Exception as e:
                 log.error(f"자료 비교 생성 실패: {e}")
                 log.error(traceback.format_exc())
-                self.live.update(status_text=f"자료 비교 생성 실패: {e}")
+                self.live.update(
+                    status_text=f"자료 비교 생성 실패: {e}",
+                    failed=max(1, self.live.failed), last_error=str(e),
+                    can_retry=True, phase="failed")
             finally:
                 self.live.release(tok)
 
@@ -16632,6 +16751,9 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 break
             except RateLimitError as e:
                 last_error = str(e)
+                if attempt >= 2:
+                    break
+                server.live.note_retry(e)
                 server.live.update(status_text=f"429 — {e.retry_after:g}초 뒤 재시도")
                 if server.live.wait_cancelable(e.retry_after):
                     final_status = "stopped"
@@ -16645,14 +16767,19 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 last_error = str(e)
                 if not e.retryable:
                     break
+                if attempt >= 2:
+                    break
                 wait = min(5 * (2 ** attempt), 30)
+                server.live.note_retry(e)
                 server.live.update(status_text=f"서버 오류 — {wait}초 뒤 재시도")
-                if attempt < 2 and server.live.wait_cancelable(wait):
+                if server.live.wait_cancelable(wait):
                     final_status = "stopped"
                     break
             except Exception as e:
                 last_error = str(e)
                 log.error("자료 비교 %s 실패(%d/3): %s", target.name, attempt + 1, e)
+                if attempt < 2:
+                    server.live.note_retry(e)
                 if attempt < 2 and server.live.wait_cancelable(30):
                     final_status = "stopped"
                     break
@@ -16686,7 +16813,19 @@ def _run_comparison(server, cfg, plan, styles, chars):
         text = f"일일 상한 도달 — {len(completed):,}/{plan['count']:,}장 (내일 이어짐)"
     else:
         text = f"자료 비교 중단 — {len(completed):,}/{plan['count']:,}장"
-    server.live.update(index=len(completed), total=plan["count"], status_text=text)
+    phase = {
+        "complete": "completed",
+        "partial": "partial",
+        "stopped": "stopped",
+        "daily_limit": "stopped",
+        "fatal": "failed",
+    }.get(final_status, "failed")
+    server.live.update(
+        index=len(completed), total=plan["count"], status_text=text,
+        completed=len(completed), failed=len(errors), phase=phase,
+        last_error=(next(reversed(errors.values())).get("error", "")
+                    if errors else ""),
+        can_retry=final_status != "complete")
     log.info(text)
 
 
@@ -16717,22 +16856,41 @@ def main():
     while True:
         server.start_event.wait()  # '생성 시작' 클릭까지 대기
         # 단독 생성 등이 그 틈에 실행권을 가져갔다면 배치를 겹쳐 돌리지 않는다
-        tok = server.live.try_claim()
+        tok = server.live.try_claim("세팅 배치 생성", "settings")
         if tok is None:
             server.start_event.clear()
             server.live.update(status_text="다른 생성이 도는 중입니다 — 끝난 뒤 '생성 시작'을 다시 눌러주세요.")
             continue
         try:
             _run_generation(server)
-            log.info("═══ 이번 실행 완료 — 설정을 바꾸고 '생성 시작'을 다시 누르면 계속할 수 있습니다 ═══")
-            server.live.update(status_text="완료! 다시 '생성 시작'을 누르면 계속할 수 있습니다.")
-        except FatalStopError:
+            if server.live.stop_req:
+                server.live.update(
+                    status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.",
+                    phase="stopped", can_retry=True)
+            elif server.live.failed:
+                server.live.update(
+                    status_text=(
+                        f"일부 완료 — 성공 {server.live.completed} · "
+                        f"실패 {server.live.failed} (다시 실행하면 실패분 재시도)"
+                    ),
+                    phase="partial", can_retry=True)
+            else:
+                log.info("═══ 이번 실행 완료 — 설정을 바꾸고 '생성 시작'을 다시 누르면 계속할 수 있습니다 ═══")
+                server.live.update(
+                    status_text="완료! 다시 '생성 시작'을 누르면 계속할 수 있습니다.",
+                    phase="completed")
+        except FatalStopError as e:
+            server.live.update(
+                status_text=f"즉시 중단: {e}", failed=max(1, server.live.failed),
+                last_error=str(e), phase="failed", can_retry=True)
             break
         except Exception as e:
             log.critical(f"예기치 못한 오류로 중단되었습니다: {e}")
             log.critical(traceback.format_exc())
-            server.live.update(status_text=f"오류로 중단됨: {e}")
-            input("오류가 발생했습니다. 위 내용을 확인하고 엔터를 누르면 프로그램을 종료합니다...")
+            server.live.update(
+                status_text=f"오류로 중단됨: {e}",
+                failed=max(1, server.live.failed), last_error=str(e),
+                phase="failed", can_retry=True)
             break
         finally:
             server.live.release(tok)
@@ -16818,7 +16976,9 @@ def _run_generation(server):
     while True:
         if server.live.stop_req:   # /api/stop — 장 경계에서 멈춘다 (실행권은 finally 가 푼다)
             log.info("■ 중지되었습니다 — '생성 시작'을 다시 누르면 이어서 합니다.")
-            server.live.update(status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.")
+            server.live.update(
+                status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.",
+                phase="stopped", can_retry=True)
             save_state(state)
             return
         cfg = server.cfg  # 매 루프마다 최신 설정을 다시 읽는다 (실시간 반영 핵심)
@@ -16831,7 +16991,9 @@ def _run_generation(server):
 
         if daily_count(state) >= pace(cfg)["daily_cap"]:
             log.warning(f"일일 {pace(cfg)['daily_cap']}장 한도 도달. 내일 다시 실행하면 이어서 합니다.")
-            server.live.update(status_text="일일 한도 도달 — 종료")
+            server.live.update(
+                status_text="일일 한도 도달 — 내일 다시 실행하면 이어집니다.",
+                phase="stopped", can_retry=True)
             save_state(state)
             return
 
@@ -16881,8 +17043,10 @@ def _run_generation(server):
         except Exception as e:
             log.error(f"[{completed+1}/{total_now}] 프롬프트/폴더 준비 중 오류로 이 컷 건너뜀: {e}")
             log.error(traceback.format_exc())
-            server.live.update(status_text=f"오류(건너뜀): {e}")
             skip_set.add((cid, num, copy))
+            server.live.update(
+                status_text=f"오류(건너뜀): {e}", failed=len(skip_set),
+                last_error=str(e), can_retry=True)
             if server.live.wait_cancelable(1):
                 return
             continue
@@ -16930,29 +17094,41 @@ def _run_generation(server):
             except RateLimitError as e:
                 wait = e.retry_after
                 log.warning(f"  429 — 서버 지시대로 {wait:g}초 대기 후 재시도")
+                if attempt >= 2:
+                    break
+                server.live.note_retry(e)
                 server.live.update(status_text=f"429 — {wait:g}초 대기 중...")
                 if server.live.wait_cancelable(wait):
                     break                      # 중지 — 재시도하지 않는다
             except (AccountBannedError, AuthError) as e:
                 log.critical(f"  {e}")
-                server.live.update(status_text=f"중단됨: {e}")
+                server.live.update(
+                    status_text=f"중단됨: {e}", failed=max(1, len(skip_set)),
+                    last_error=str(e), phase="failed", can_retry=True)
                 save_state(state)
-                input("엔터를 누르면 프로그램을 종료합니다...")
                 raise FatalStopError(str(e))
             except APIError as e:
                 log.error(f"  시도 {attempt+1} 실패: {e}")
                 if not e.retryable:
                     server.live.update(
-                        status_text=f"재시도하지 않는 요청 오류: {e}")
+                        status_text=f"재시도하지 않는 요청 오류: {e}",
+                        last_error=str(e))
+                    break
+                if attempt >= 2:
                     break
                 wait = min(5 * (2 ** attempt), 30)
+                server.live.note_retry(e)
                 server.live.update(
                     status_text=f"서버 오류 — {wait}초 뒤 재시도 ({attempt+1}/3)")
-                if attempt < 2 and server.live.wait_cancelable(wait):
+                if server.live.wait_cancelable(wait):
                     break
             except Exception as e:
                 log.error(f"  시도 {attempt+1} 실패: {e}")
-                server.live.update(status_text=f"재시도 중... ({attempt+1}/3)")
+                if attempt < 2:
+                    server.live.note_retry(e)
+                    server.live.update(
+                        status_text=f"재시도 중... ({attempt+1}/3)",
+                        last_error=str(e))
                 if attempt < 2 and server.live.wait_cancelable(30):
                     break                      # 중지 — 재시도하지 않는다
 
@@ -16966,13 +17142,17 @@ def _run_generation(server):
             rec[:] = [item for item in rec if progress_item_key(item) != (num, copy)]
             rec.append(record)
             bump_daily(state)
-            server.live.update(daily=daily_count(state))
             completed += 1
+            server.live.update(
+                daily=daily_count(state), completed=completed,
+                failed=len(skip_set))
             # 매 장 저장한다 — 중지·강제 종료 후 재개가 정확해야 하고 파일은 몇 KB 다
             save_state(state)
         else:
             skip_set.add((cid, num, copy))
-            server.live.update(status_text=f"실패 — 건너뜀: {fname}")
+            server.live.update(
+                status_text=f"실패 — 건너뜀: {fname}",
+                failed=len(skip_set), can_retry=True)
 
 
 if __name__ == "__main__":

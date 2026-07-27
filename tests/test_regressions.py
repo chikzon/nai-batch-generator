@@ -666,6 +666,9 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(recipe["nai_seed"], calls[0]["seed"])
             self.assertEqual(
                 recipe["source"]["style"]["id"], "s1")
+            live = server.live.snapshot()
+            self.assertEqual(live["phase"], "completed")
+            self.assertEqual((live["completed"], live["failed"]), (4, 0))
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
         page = APP.render_page()
@@ -695,6 +698,76 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("세팅은 이 비교에 포함되지 않아", page)
         self.assertIn("EXP_RECIPE_UNDO", page)
         self.assertIn("적용 전으로 되돌리기", page)
+
+    def test_shared_live_state_tracks_owner_stop_retry_and_outcome(self):
+        live = APP.LiveState()
+        token = live.try_claim("자료 비교 생성", "library")
+        self.assertIsNotNone(token)
+        self.assertIsNone(live.try_claim("겹친 생성", "preview"))
+        running = live.snapshot()
+        self.assertTrue(running["running"])
+        self.assertEqual(running["operation"], "자료 비교 생성")
+        self.assertEqual(running["phase"], "running")
+        self.assertEqual(running["retry_mode"], "library")
+
+        live.note_retry("HTTP 500")
+        live.update(
+            completed=2, failed=1, phase="partial",
+            last_error="한 장 실패", can_retry=True)
+        live.release(token)
+        partial = live.snapshot()
+        self.assertFalse(partial["running"])
+        self.assertEqual(partial["phase"], "partial")
+        self.assertEqual(partial["retry_count"], 1)
+        self.assertEqual((partial["completed"], partial["failed"]), (2, 1))
+        self.assertTrue(partial["can_retry"])
+
+        second = live.try_claim("씬 모드", "settings")
+        self.assertTrue(live.request_stop())
+        self.assertEqual(live.snapshot()["phase"], "stopping")
+        live.release(second)
+        stopped = live.snapshot()
+        self.assertEqual(stopped["phase"], "stopped")
+        self.assertTrue(stopped["can_retry"])
+
+    def test_single_generation_failure_is_visible_without_paid_network(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["token"] = "pst-fixture"
+        server = APP.ConfigServer(cfg)
+        with (
+            patch.object(APP, "pace_gate", return_value=(True, "")),
+            patch.object(APP, "pace_complete", return_value=None),
+            patch.object(APP, "load_state", return_value={
+                "seeds": {}, "progress": {}, "daily": {},
+                "total_generated": 0,
+            }),
+            patch.object(
+                APP, "call_nai_api",
+                side_effect=APP.APIError("fixture failure")),
+        ):
+            result = server.handle_generate_one()
+            deadline = time.time() + 2
+            while server.live.running and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertTrue(result["ok"])
+        status = server.live.snapshot()
+        self.assertFalse(status["running"])
+        self.assertEqual(status["operation"], "단독 생성")
+        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(status["failed"], 1)
+        self.assertTrue(status["can_retry"])
+        self.assertIn("fixture failure", status["last_error"])
+
+    def test_preview_exposes_operation_phase_status_and_retry_navigation(self):
+        page = APP.render_page()
+        for element_id in ("pvPhase", "pvStatus", "pvCounts", "pvReturn"):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("LIVE_PHASE_LABEL", page)
+        self.assertIn("s.operation || s.char_name", page)
+        self.assertIn("s.status_text || '-'", page)
+        self.assertIn("자동 재시도 ${s.retry_count}", page)
+        self.assertIn("!s.can_retry || !!s.running", page)
 
     def test_comparison_recipe_promotion_preserves_bundles_and_skips_duplicates(self):
         recipe = {
