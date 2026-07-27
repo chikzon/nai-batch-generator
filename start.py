@@ -6212,8 +6212,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <input type="file" id="packFile" accept=".zip,.json" multiple style="display:none;">
         <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;">
-          <input type="checkbox" id="packOver">
-          같은 이름이면 <b>새 것으로 바꾸기</b> (기본은 갖고 있던 것을 지킵니다)
+          <input type="checkbox" id="packOver" style="width:auto;flex:none;margin:0;">
+          <span>같은 이름이면 <b>새 것으로 바꾸기</b> (기본은 갖고 있던 것을 지킵니다)</span>
         </label>
         <div id="packMsg" class="hint" style="margin-top:8px;"></div>
         <div id="packLog" style="margin-top:10px;"></div>
@@ -9449,7 +9449,8 @@ function openCombos(target){
   $('modalTitle').textContent = '🎨 그림체 — 프롬프트·네거티브·설정값 한 세트';
   $('modalBody').innerHTML = `
     <p class="hint">작가 조합만이 아니라 <b>베이스 + 네거티브 + 설정값(CFG·리스케일·스텝·샘플러·시드)</b>이
-    합쳐진 한 세트입니다. 카드의 버튼으로 원하는 만큼만 가져가세요.</p>
+    합쳐진 한 세트입니다. <b>쪼개지 않고 통째로만</b> 적용합니다 —
+    일부만 가져오면 원래 그림이 재현되지 않기 때문입니다.</p>
     <div class="filterbar">
       <input type="text" id="comboQ" placeholder="🔍 작가·제목·프롬프트 검색 (띄어쓰기로 여러 단어)">
       <select id="comboSort" title="정렬">
@@ -9476,8 +9477,9 @@ function openCombos(target){
       <div class="hint" style="margin-top:4px;">NAI로 만든 PNG/WebP를 여기에 끌어다 놓거나 눌러서 고르세요.
       프롬프트·네거티브·설정값을 통째로 읽어옵니다. (novelai.net/inspect 와 같은 데이터)</div>
       <input type="file" id="comboFile" accept="image/png,image/webp" multiple style="display:none;"></div>
-    <div class="bar" style="gap:8px;flex-wrap:wrap;">
-      <label class="hint"><input type="checkbox" id="comboTidy"> 🧹 정리하기</label>
+    <div class="filterbar" style="gap:8px;flex-wrap:wrap;">
+      <label class="hint" style="display:flex;align-items:center;gap:4px;white-space:nowrap;">
+        <input type="checkbox" id="comboTidy" style="width:auto;flex:none;"> 🧹 정리하기</label>
       <span id="comboTidyBar" class="hidden" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
         <button id="comboAll" class="mini">보이는 것 전부</button>
         <button id="comboNone" class="mini">고르기 해제</button>
