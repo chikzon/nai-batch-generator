@@ -60,3 +60,8 @@ Thumbs.db
 설정.txt
 # 작가조합.json 은 남의 프롬프트 조합 수집물 (그림체.json 과 같은 계열)
 수집/작가조합.json
+
+# 빌드 산출물 (빌드.py)
+build/
+dist/
+*.spec

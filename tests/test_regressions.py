@@ -71,6 +71,26 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(estimate["free"])
             self.assertGreater(estimate["total"], 0)
 
+    def test_opus_character_reference_keeps_free_generation_and_costs_five_each(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(width=832, height=1216, steps=28)
+        estimate = APP.anlas_estimate(
+            cfg, count=3, mode="t2i", opus=True, char_refs=1)
+        self.assertTrue(estimate["generation_free"])
+        self.assertFalse(estimate["free"])
+        self.assertEqual(estimate["char_ref_fee"], 5)
+        self.assertEqual(estimate["per_image"], 5)
+        self.assertEqual(estimate["total"], 15)
+        self.assertIn("Opus 무료 생성", estimate["why"])
+
+    def test_anlas_reason_does_not_blame_free_size_when_tier_is_unknown(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(width=832, height=1216, steps=28)
+        estimate = APP.anlas_estimate(cfg, opus=False)
+        self.assertFalse(estimate["free"])
+        self.assertIn("Opus 적용 여부", estimate["why"])
+        self.assertNotIn("무료 조건 초과", estimate["why"])
+
     def test_variety_sigma_tracks_model_generation(self):
         self.assertEqual(APP.variety_sigma("nai-diffusion-4-5-full"), 58.0)
         self.assertEqual(APP.variety_sigma("nai-diffusion-4-5-curated"), 58.0)
@@ -146,6 +166,8 @@ class RegressionTests(unittest.TestCase):
                 )
 
     def test_quality_and_uc_text_are_model_specific_and_round_trip(self):
+        self.assertNotIn(
+            "location", APP.QUALITY_SUFFIX_TEXT["nai-diffusion-4-5-full"])
         for model, quality in APP.QUALITY_SUFFIX_TEXT.items():
             with self.subTest(model=model, kind="quality"):
                 merged = APP.merge_quality_suffix("user prompt", model)
@@ -172,6 +194,129 @@ class RegressionTests(unittest.TestCase):
         )
         # V4 Full에는 Human Focus 공식 프리셋이 없으므로 V4.5 값을 대신 넣지 않는다.
         self.assertEqual(APP.uc_preset_text("nai-diffusion-4-full", 3), "")
+
+    def test_saved_comment_embeds_quality_and_uc_state_for_exact_restore(self):
+        original = json.dumps({
+            "prompt": "1girl, very aesthetic, masterpiece, no text",
+            "uc": "lowres",
+            "source": "NovelAI Diffusion V4.5",
+            "steps": 28,
+        })
+        annotated = APP.annotate_nai_comment(original, True, 3)
+        values = json.loads(annotated)
+        self.assertTrue(values["qualityToggle"])
+        self.assertEqual(values["ucPreset"], 3)
+
+        image = Image.new("RGB", (2, 2), "white")
+        metadata = PngInfo()
+        metadata.add_text("Comment", annotated)
+        blob = io.BytesIO()
+        image.save(blob, "PNG", pnginfo=metadata)
+        extracted = APP.extract_nai_metadata(blob.getvalue(), "image/png")
+        self.assertTrue(extracted["params"]["quality_toggle"])
+        self.assertEqual(extracted["params"]["uc_preset"], 3)
+
+    def test_retry_after_and_http_retryability_are_classified(self):
+        self.assertEqual(APP.retry_after_seconds("7"), 7)
+
+        class Response:
+            content = b""
+            text = "fixture"
+            headers = {}
+
+        bad_request = Response()
+        bad_request.status_code = 400
+        with patch.object(APP.requests, "post", return_value=bad_request):
+            with self.assertRaises(APP.APIError) as caught:
+                APP.call_nai_api(
+                    "pst-fixture", "base", "", "", "negative", 832, 1216)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.status_code, 400)
+
+        limited = Response()
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "3"}
+        with patch.object(APP.requests, "post", return_value=limited):
+            with self.assertRaises(APP.RateLimitError) as caught:
+                APP.call_nai_api(
+                    "pst-fixture", "base", "", "", "negative", 832, 1216)
+        self.assertEqual(caught.exception.retry_after, 3)
+
+    def test_output_delete_moves_to_recoverable_trash_and_restores_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            source = root / "단독" / "one.png"
+            outside = Path(td) / "outside.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"old")
+            outside.write_bytes(b"outside")
+            cfg = {"out_dir": str(root)}
+
+            result = APP.trash_output_files(
+                cfg, ["단독/one.png", "../outside.png"])
+            self.assertEqual(result["deleted"], 1)
+            self.assertFalse(source.exists())
+            self.assertEqual(outside.read_bytes(), b"outside")
+            listing = APP.list_output("", cfg)
+            self.assertNotIn(
+                APP.TRASH_DIR_NAME, [item["name"] for item in listing["dirs"]])
+            self.assertFalse(
+                APP.list_output(APP.TRASH_DIR_NAME, cfg)["ok"])
+
+            # 같은 이름이 다시 생겨도 복원 파일로 덮어쓰지 않는다.
+            source.write_bytes(b"new")
+            restored = APP.restore_trash_batch(cfg, result["batch_id"])
+            self.assertEqual(restored["restored"], 1)
+            self.assertEqual(source.read_bytes(), b"new")
+            restored_path = root / restored["paths"][0]
+            self.assertEqual(restored_path.read_bytes(), b"old")
+
+    def test_setout_serves_normal_output_but_blocks_trashed_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            safe = root / "safe.png"
+            trashed = root / APP.TRASH_DIR_NAME / "batch" / "hidden.png"
+            safe.parent.mkdir(parents=True)
+            trashed.parent.mkdir(parents=True)
+            safe.write_bytes(b"safe")
+            trashed.write_bytes(b"hidden")
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = str(root)
+
+            self.assertEqual(APP.output_file_for_preview(cfg, "safe.png"), safe)
+            self.assertIsNone(APP.output_file_for_preview(
+                cfg, f"{APP.TRASH_DIR_NAME}/batch/hidden.png"))
+            self.assertIsNone(APP.output_file_for_preview(
+                cfg, ".nai-휴지통/batch/hidden.png"))
+            self.assertIsNone(APP.output_file_for_preview(
+                cfg, f"{APP.TRASH_DIR_NAME}/../safe.png"))
+
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            server = APP.ConfigServer(cfg)
+            with (
+                patch.object(APP, "PREVIEW_PORT_RANGE", (port,)),
+                patch.object(APP.webbrowser, "open", return_value=None),
+            ):
+                url = server.start()
+            try:
+                with urllib.request.urlopen(url + "setout?p=safe.png", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b"safe")
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(
+                        url + "setout?p=.NAI-%ED%9C%B4%EC%A7%80%ED%86%B5/"
+                        "batch/hidden.png", timeout=3)
+                self.assertEqual(denied.exception.code, 404)
+                with self.assertRaises(urllib.error.HTTPError) as denied_lower:
+                    urllib.request.urlopen(
+                        url + "setout?p=.nai-%ED%9C%B4%EC%A7%80%ED%86%B5/"
+                        "batch/hidden.png", timeout=3)
+                self.assertEqual(denied_lower.exception.code, 404)
+            finally:
+                server.httpd.shutdown()
+                server.httpd.server_close()
 
     def test_every_generation_path_builds_call_local_reference_params(self):
         source = (ROOT / "start.py").read_text(encoding="utf-8")

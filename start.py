@@ -24,6 +24,7 @@ import math
 import os
 import random
 import re
+import shutil
 import string
 import struct
 import sys
@@ -34,6 +35,7 @@ import webbrowser
 import zipfile
 import zlib
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,7 +44,12 @@ from PIL import Image
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_DIR = Path(__file__).parent
+# ⚠ exe 로 묶었을 때(`빌드.py`) `__file__` 은 PyInstaller 가 푼 **임시 폴더**를 가리킨다.
+#   거기에 설정·생성물을 쓰면 종료할 때 통째로 사라진다. 그래서 묶인 경우에만
+#   **exe 가 있는 자리**를 쓴다 — 자산도 그 옆에 두므로 나머지 코드는 손댈 필요가 없다.
+#   스크립트로 그냥 실행하면 `sys.frozen` 이 없어 예전과 완전히 같다.
+BASE_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+            else Path(__file__).parent)
 
 # ── 프로필 (계정 여러 개를 한 폴더에서) ───────────────────────────────
 #   실행.bat 이나 명령줄에 `--profile 둘째` 를 주면 그 프로필의
@@ -900,6 +907,13 @@ def extract_nai_metadata(data, content_type=""):
         params["seed"] = str(params["seed"])
     if "skip_cfg_above_sigma" in values:
         params["variety_plus"] = bool(values.get("skip_cfg_above_sigma"))
+    if values.get("ucPreset") is not None:
+        try:
+            params["uc_preset"] = int(values["ucPreset"])
+        except (TypeError, ValueError):
+            pass
+    if values.get("qualityToggle") is not None:
+        params["quality_toggle"] = bool(values["qualityToggle"])
     model = values.get("model") or values.get("source") or ""
     if model:
         params["model"] = str(model)
@@ -996,7 +1010,8 @@ TOKENIZER_FILE = BASE_DIR / "t5_tokenizer.json"
 
 # ══════════════════════════════════════════════════════════════════════
 #  Anlas 비용 — NAIS3 src/shared/anlas.ts 의 공식 그대로
-#  Opus 무료 조건: 1024² 이하 · 28스텝 이하 · 캐릭터 레퍼런스 없음
+#  Opus 무료 생성 조건: 1024² 이하 · 28스텝 이하 · 베이스 이미지 없음.
+#  캐릭터 레퍼런스는 무료 생성을 깨지 않고 참조 1개당 장당 5 Anlas만 별도 과금된다.
 # ══════════════════════════════════════════════════════════════════════
 ANLAS_A = 2.951823174884865e-6
 ANLAS_B = 5.753298233447344e-7
@@ -1020,23 +1035,38 @@ def anlas_estimate(cfg, count=1, width=None, height=None, opus=False, char_refs=
     steps = int(cfg.get("steps", 28))
     px = max(w * h, 65536)
     uses_base = mode in ("img2img", "infill")
-    free = (bool(opus) and px <= OPUS_FREE_PX and steps <= OPUS_FREE_STEPS
-            and not char_refs and not uses_base)
-    per = anlas_per_image(w, h, steps, strength if uses_base else 1.0, char_refs)
+    free_eligible = (px <= OPUS_FREE_PX
+                     and steps <= OPUS_FREE_STEPS and not uses_base)
+    generation_free = bool(opus) and free_eligible
+    base_per = anlas_per_image(
+        w, h, steps, strength if uses_base else 1.0, char_refs=0)
+    ref_fee = 5 * max(int(char_refs), 0)
+    per = (0 if generation_free else base_per) + ref_fee
+    total_free = per == 0
+    if generation_free and ref_fee:
+        why = (f"Opus 무료 생성 + 캐릭터 레퍼런스 {int(char_refs)}개 "
+               f"장당 {ref_fee} Anlas")
+    elif total_free:
+        why = "Opus 무료 (1024² 이하 · 28스텝 이하)"
+    elif uses_base:
+        why = "원본 그림을 쓰는 작업은 Opus 무료가 아닙니다 (img2img·인페인트)"
+    elif not opus and px <= OPUS_FREE_PX and steps <= OPUS_FREE_STEPS:
+        why = "무료 크기·스텝 범위지만 Opus 적용 여부가 확인되지 않았습니다"
+    else:
+        why = (f"무료 조건 초과 — {w}×{h}·{steps}스텝 "
+               f"(무료는 1024² 이하·28스텝 이하)")
     return {
-        "per_image": 0 if free else per,
-        "per_image_paid": per,
-        "total": 0 if free else per * max(int(count), 0),
+        "per_image": per,
+        "per_image_paid": base_per + ref_fee,
+        "total": per * max(int(count), 0),
         "count": int(count),
-        "free": free,
+        "free": total_free,
+        "free_eligible": free_eligible,
+        "generation_free": generation_free,
+        "char_ref_fee": ref_fee,
         "mode": mode,
         "width": w, "height": h, "steps": steps,
-        "why": ("Opus 무료 (1024² 이하 · 28스텝 이하)" if free else
-                ("원본 그림을 쓰는 작업은 Opus 무료가 아닙니다 (img2img·인페인트)"
-                 if uses_base else
-                 "캐릭터 레퍼런스가 있어 유료" if char_refs else
-                 f"무료 조건 초과 — {w}×{h}·{steps}스텝 "
-                 f"(무료는 1024² 이하·28스텝 이하)")),
+        "why": why,
     }
 
 
@@ -1044,7 +1074,7 @@ def anlas_estimate(cfg, count=1, width=None, height=None, opus=False, char_refs=
 #  바이브 트랜스퍼 / 캐릭터 레퍼런스
 #   바이브   : 그림의 '분위기'를 옮긴다. encode-vibe 로 한 번 인코딩(2 Anlas)해
 #              캐시해 두면 그 뒤로는 공짜로 계속 쓴다 → 배치 생성에 딱 맞다.
-#   캐릭레퍼 : 캐릭터 생김새를 참조한다. 장당 5 Anlas 가 붙고 Opus 무료도 깨진다.
+#   캐릭레퍼 : 캐릭터 생김새를 참조한다. 무료 생성은 유지되고 참조당 장당 5 Anlas가 붙는다.
 #  (NAIS3 구현과 같은 필드·같은 캐시 무효화 규칙)
 # ══════════════════════════════════════════════════════════════════════
 ENCODE_VIBE_URL = "https://image.novelai.net/ai/encode-vibe"
@@ -2781,7 +2811,9 @@ def save_style_file(name, prompt="", groups=None, settings=None, negative=""):
 
 
 class RateLimitError(Exception):
-    pass
+    def __init__(self, message, retry_after=60):
+        super().__init__(message)
+        self.retry_after = max(1.0, min(float(retry_after or 60), 600.0))
 
 
 class AccountBannedError(Exception):
@@ -2793,7 +2825,26 @@ class AuthError(Exception):
 
 
 class APIError(Exception):
-    pass
+    def __init__(self, message, status_code=None, retryable=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = bool(retryable)
+
+
+def retry_after_seconds(value, default=60):
+    """Retry-After의 초/HTTP-date 두 형식을 읽고 비정상 값은 안전한 기본값으로."""
+    text = str(value or "").strip()
+    if not text:
+        return float(default)
+    try:
+        return max(1.0, min(float(text), 600.0))
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+            now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+            return max(1.0, min((when - now).total_seconds(), 600.0))
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
 
 
 class FatalStopError(Exception):
@@ -3492,9 +3543,9 @@ def model_id_from_metadata(value, fallback="nai-diffusion-4-5-full"):
 #   https://docs.novelai.net/en/image/undesiredcontent/
 QUALITY_SUFFIX_TEXT = {
     "nai-diffusion-4-5-full":
-        "location, very aesthetic, masterpiece, no text",
+        "very aesthetic, masterpiece, no text",
     "nai-diffusion-4-5-curated":
-        "location, masterpiece, no text, -0.8::feet::, rating:general",
+        "masterpiece, no text, -0.8::feet::, rating:general",
     "nai-diffusion-4-full":
         "no text, best quality, very aesthetic, absurdres",
     "nai-diffusion-4-curated-preview":
@@ -3510,6 +3561,19 @@ QUALITY_SUFFIX = ", " + QUALITY_SUFFIX_TEXT["nai-diffusion-4-5-full"]
 
 def quality_suffix_text(model):
     return QUALITY_SUFFIX_TEXT.get(str(model or ""), "")
+
+
+def annotate_nai_comment(comment, quality_toggle, uc_preset):
+    """NAI가 생략하는 UI 토글 두 값을 결과 Comment JSON에 명시해 왕복을 보장한다."""
+    try:
+        data = json.loads(str(comment or ""))
+        if not isinstance(data, dict):
+            return comment
+        data["qualityToggle"] = bool(quality_toggle)
+        data["ucPreset"] = int(uc_preset)
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return comment
 
 
 def merge_quality_suffix(prompt, model):
@@ -3528,8 +3592,11 @@ def split_quality_suffix(prompt, model=None):
         candidates.append(quality_suffix_text(model))
     else:
         candidates.extend(QUALITY_SUFFIX_TEXT.values())
-    # 이전 배포본이 넣던 축약 V4.5 Full 문구도 되읽기는 계속 지원한다.
-    candidates.append("very aesthetic, masterpiece, no text")
+    # 이전 배포본이 넣던 잘못된 location 포함 문구도 가져오기 때만 떼어낸다.
+    candidates.extend([
+        "location, very aesthetic, masterpiece, no text",
+        "location, masterpiece, no text, -0.8::feet::, rating:general",
+    ])
     for text in sorted(set(candidates), key=len, reverse=True):
         if raw == text:
             return "", True
@@ -3971,13 +4038,18 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     }
     resp = requests.post(NAI_API_URL, json=payload, headers=headers, timeout=120)
     if resp.status_code == 429:
-        raise RateLimitError("429 Too Many Requests")
+        wait = retry_after_seconds(resp.headers.get("Retry-After"), 60)
+        raise RateLimitError(f"429 Too Many Requests — {wait:g}초 뒤 재시도", wait)
     if resp.status_code == 403:
         raise AccountBannedError("403 Forbidden — 계정 보호를 위해 즉시 중단합니다.")
     if resp.status_code == 401:
         raise AuthError("401 — 토큰이 만료되었거나 잘못되었습니다.")
     if resp.status_code != 200:
-        raise APIError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        raise APIError(
+            f"HTTP {resp.status_code}: {resp.text[:200]}",
+            status_code=resp.status_code,
+            retryable=(resp.status_code == 408 or resp.status_code >= 500),
+        )
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         raw = zf.read(zf.namelist()[0])
@@ -3986,7 +4058,11 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     # 저장할 때 WebP EXIF 로 심어서, 나중에 그림만 보고도 시드·설정을 되찾을 수 있게 한다.
     chunks = png_text_chunks(raw)
     img.nai_seed = seed
-    img.nai_comment = next((chunks[k] for k in chunks if k.lower() == "comment"), "")
+    img.nai_comment = annotate_nai_comment(
+        next((chunks[k] for k in chunks if k.lower() == "comment"), ""),
+        p.get("quality_toggle", False),
+        uc_preset,
+    )
     return img
 
 
@@ -4125,6 +4201,102 @@ def save_picks(d):
     return d
 
 
+TRASH_DIR_NAME = ".NAI-휴지통"
+
+
+def _path_is_inside(path, root):
+    path, root = Path(path).resolve(), Path(root).resolve()
+    try:
+        return path.is_relative_to(root)
+    except AttributeError:
+        return os.path.commonpath((str(path), str(root))) == str(root)
+
+
+def output_file_for_preview(cfg, rel):
+    """탐색기에서 보여 줄 출력 파일만 돌려준다.
+
+    휴지통은 목록뿐 아니라 `/setout` 직접 URL에서도 열리지 않아야 한다.
+    원래 경로를 복원하기 전까지는 삭제된 파일로 취급한다.
+    """
+    rel = str(rel or "").replace("\\", "/")
+    if (not rel
+            or TRASH_DIR_NAME.casefold() in
+            {part.casefold() for part in Path(rel).parts}):
+        return None
+    root = out_root(cfg).resolve()
+    trash_root = (root / TRASH_DIR_NAME).resolve()
+    candidate = (root / rel).resolve()
+    if (not _path_is_inside(candidate, root)
+            or _path_is_inside(candidate, trash_root)
+            or not candidate.is_file()):
+        return None
+    return candidate
+
+
+def trash_output_files(cfg, targets, keep=()):
+    """출력물을 즉시 지우지 않고 같은 출력 루트의 복구 가능한 묶음으로 옮긴다."""
+    root = out_root(cfg).resolve()
+    trash_root = (root / TRASH_DIR_NAME).resolve()
+    keep = set(keep or ())
+    batch_id = (datetime.now().strftime("%Y%m%d-%H%M%S")
+                + f"-{time.time_ns() % 1_000_000:06d}")
+    batch_dir = trash_root / batch_id
+    moved = []
+    for rel in targets or ():
+        rel = str(rel or "").replace("\\", "/").lstrip("/")
+        if not rel or rel in keep or rel.startswith(TRASH_DIR_NAME + "/"):
+            continue
+        source = (root / rel).resolve()
+        if not _path_is_inside(source, root) or not source.is_file():
+            continue
+        dest = (batch_dir / rel).resolve()
+        if not _path_is_inside(dest, batch_dir):
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(dest))
+        moved.append({"original": rel, "trashed": dest.relative_to(root).as_posix()})
+    if moved:
+        atomic_write_json(batch_dir / "manifest.json", {
+            "batch_id": batch_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "items": moved,
+        }, indent=2)
+    return {"deleted": len(moved), "batch_id": batch_id if moved else None}
+
+
+def restore_trash_batch(cfg, batch_id):
+    """지운 묶음을 원래 위치로 복원한다. 충돌하면 번호를 붙여 기존 파일을 보존한다."""
+    root = out_root(cfg).resolve()
+    trash_root = (root / TRASH_DIR_NAME).resolve()
+    batch = (trash_root / str(batch_id or "")).resolve()
+    if not _path_is_inside(batch, trash_root):
+        raise ValueError("잘못된 휴지통 묶음입니다.")
+    manifest_path = batch / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError("복원할 휴지통 묶음을 찾을 수 없습니다.")
+    manifest = load_json_recover(manifest_path)
+    restored = []
+    for item in manifest.get("items") or []:
+        source = (root / str(item.get("trashed") or "")).resolve()
+        target = (root / str(item.get("original") or "")).resolve()
+        if (not _path_is_inside(source, batch)
+                or not _path_is_inside(target, root)
+                or not source.is_file()):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            stem, suffix, serial = target.stem, target.suffix, 2
+            while target.exists():
+                target = target.with_name(f"{stem}_{serial}{suffix}")
+                serial += 1
+        shutil.move(str(source), str(target))
+        restored.append(target.relative_to(root).as_posix())
+    manifest["restored_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["restored"] = restored
+    atomic_write_json(manifest_path, manifest, indent=2)
+    return {"restored": len(restored), "paths": restored}
+
+
 _DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각) — CQA-002 부분 조치
 
 
@@ -4147,14 +4319,18 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
     limit>0 이면 정렬·필터 뒤 해당 페이지만 반환한다. 기본 0은 내부 호환용 전체 반환."""
     root = out_root(cfg).resolve()
     base = (root / sub).resolve() if sub else root
+    trash_root = (root / TRASH_DIR_NAME).resolve()
     try:
         inside = base.is_relative_to(root)
     except AttributeError:
         inside = str(base).startswith(str(root))
-    if not (inside and base.is_dir()):
+    if (not (inside and base.is_dir())
+            or base == trash_root or _path_is_inside(base, trash_root)):
         return {"ok": False, "error": "그런 폴더가 없습니다."}
     dirs, files = [], []
     for p in sorted(base.iterdir()):
+        if p.name == TRASH_DIR_NAME:
+            continue
         rel = str(p.relative_to(root)).replace("\\", "/")
         if p.is_dir():
             dirs.append({"name": p.name, "path": rel, "count": _dir_img_count(p)})
@@ -4541,12 +4717,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   :root{
     /* 기본 = 슬레이트 (밝고 가시성 높은 쪽). NAIS3 도 :root 가 밝은 테마다.
        어두운 쪽은 data-theme="midnight" 로 골라 쓴다. */
-    --bg:#e9ecef;--paper:#ffffff;--paper2:#f1f3f5;--line:#ced4da;
-    --text:#212529;--muted:#5c636a;--accent:#2563eb;--accent-dim:#2563eb1a;
-    --good:#0f9d76;--danger:#d92d20;--gold:#b8860b;
+    --bg:#edf1f7;--paper:#ffffff;--paper2:#f6f8fb;--line:#d6dee9;
+    --text:#172033;--muted:#667085;--accent:#3158c9;--accent-dim:#3158c918;
+    --good:#087a5b;--danger:#c4322b;--gold:#3158c9;
     /* 모서리 기본 = 각짐. --radius-pill 은 알약/칩용(각짐일 땐 같이 각진다) */
-    --radius:2px;--radius-pill:3px;
-    --fs:14px;--fs-sm:12.5px;--fs-xs:11.5px;
+    --radius:6px;--radius-pill:999px;
+    --fs:15px;--fs-sm:13.5px;--fs-xs:12px;
     --mono:'JetBrains Mono','Consolas',monospace;
     --sans:-apple-system,'Pretendard','Malgun Gothic',sans-serif;
   }
@@ -4596,25 +4772,27 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   :root[data-accent="cyan"]{--accent:#3ec9e0;--accent-dim:#3ec9e026;}
   :root[data-accent="red"]{--accent:#ff6b6b;--accent-dim:#ff6b6b26;}
   /* ── 글씨 크기 ── */
-  :root[data-fs="s"]{--fs:12px;--fs-sm:10.5px;--fs-xs:9.5px;}
-  :root[data-fs="l"]{--fs:14.5px;--fs-sm:12.5px;--fs-xs:11.5px;}
-  :root[data-fs="xl"]{--fs:16px;--fs-sm:14px;--fs-xs:12.5px;}
+  :root[data-fs="s"]{--fs:13.5px;--fs-sm:12px;--fs-xs:11px;}
+  :root[data-fs="l"]{--fs:16px;--fs-sm:14.5px;--fs-xs:13px;}
+  :root[data-fs="xl"]{--fs:17px;--fs-sm:15.5px;--fs-xs:14px;}
   /* ── 모서리 ── ('' = 각짐이 기본) */
   :root[data-radius="soft"]{--radius:8px;--radius-pill:99px;}
   :root[data-radius="round"]{--radius:16px;--radius-pill:99px;}
   *{box-sizing:border-box;}
   html,body{height:100%;}
-  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:var(--fs);overflow:hidden;transition:background .2s,color .2s;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:var(--fs);overflow:hidden;transition:background .2s,color .2s;line-height:1.45;}
   button{font-family:var(--sans);font-size:var(--fs-sm);background:var(--paper2);color:var(--text);
-    border:1px solid var(--line);border-radius:var(--radius);padding:7px 11px;cursor:pointer;font-size:var(--fs-sm);}
-  button:hover{border-color:var(--accent);color:var(--accent);}
-  button.primary{background:var(--gold);border-color:var(--gold);color:#12131a;font-weight:700;}
-  button.primary:hover{filter:brightness(1.1);color:#12131a;}
-  button.danger{color:var(--danger);border-color:#4a2a2a;}
+    border:1px solid var(--line);border-radius:var(--radius);padding:8px 12px;min-height:34px;cursor:pointer;font-size:var(--fs-sm);transition:border-color .15s,background .15s,color .15s,transform .08s;}
+  button:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim);}
+  button:active{transform:translateY(1px);}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;}
+  button.primary:hover{filter:brightness(1.06);color:#fff;background:var(--accent);}
+  button.danger{color:var(--danger);border-color:var(--danger);}
   button:disabled{opacity:.45;cursor:not-allowed;}
   input,textarea,select{width:100%;background:var(--paper2);border:1px solid var(--line);color:var(--text);
-    border-radius:var(--radius);padding:7px 9px;font-family:var(--mono);font-size:var(--fs-sm);resize:none;}
-  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);}
+    border-radius:var(--radius);padding:8px 10px;min-height:34px;font-family:var(--mono);font-size:var(--fs-sm);resize:none;}
+  input:focus,textarea:focus,select:focus{outline:2px solid var(--accent-dim);outline-offset:1px;border-color:var(--accent);}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
   select{font-family:var(--sans);cursor:pointer;}
 /* Highlight Emphasis — 프롬프트 칸의 가중치를 색으로 보여준다.
    투명 textarea 를 하이라이트 레이어 위에 겹치는 방식이므로
@@ -4680,43 +4858,44 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   label{display:block;font-size:var(--fs-xs);color:var(--muted);margin-bottom:4px;}
 
   /* ── 타이틀바 ── */
-  .titlebar{height:42px;display:flex;align-items:center;gap:14px;padding:0 14px;
-    border-bottom:1px solid var(--line);background:var(--paper);}
-  .titlebar .app{font-weight:700;font-size:var(--fs);letter-spacing:.02em;}
+  .titlebar{height:56px;display:flex;align-items:center;gap:22px;padding:0 18px;
+    border-bottom:1px solid var(--line);background:var(--paper);box-shadow:0 1px 4px #1018280b;position:relative;z-index:30;}
+  .titlebar .app{font-weight:800;font-size:16px;letter-spacing:-.01em;white-space:nowrap;}
   .titlebar .app span{color:var(--accent);}
-  .modes{display:flex;gap:4px;}
-  .modes button{padding:7px 14px;border-radius:var(--radius);font-size:var(--fs);}
+  .modes{display:flex;align-self:stretch;gap:2px;}
+  .modes button{padding:0 16px;border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;font-size:var(--fs-sm);font-weight:600;}
   /* 켜진 탭은 칠해서 확실히 구분한다 (테두리 색만 바꾸면 밝은 테마에서 잘 안 보였다) */
-  .modes button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;}
-  .modes button.on:hover{color:#fff;}
+  .modes button.on{background:var(--accent-dim);border-bottom-color:var(--accent);color:var(--accent);font-weight:800;}
+  .modes button.on:hover{color:var(--accent);}
   .titlebar .spacer{flex:1;}
-  .titlebar .stat{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);}
+  .titlebar .stat{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}
 
   /* ── 3단 레이아웃 ── */
-  .app{display:grid;grid-template-columns:var(--lw,320px) 1fr 250px;height:calc(100vh - 42px);}
-  .left{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;position:relative;background:var(--paper);}
+  #app{display:grid;grid-template-columns:var(--lw,360px) minmax(520px,1fr) 280px;height:calc(100vh - 56px);}
+  .left{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;position:relative;background:var(--paper);box-shadow:2px 0 10px #10182808;z-index:2;}
   /* 왼쪽 패널 폭 조절 손잡이 (Forge 참고) — 드래그로 240~560px */
   /* ⚠ right:-3px 로 패널 밖에 두면 문서 폭이 3px 늘어 좁은 창에서 가로 스크롤이 생긴다.
      안쪽으로 붙이고 폭을 넉넉히 준다 (잡기 쉬움은 유지). */
   #lwDrag{position:absolute;top:0;right:0;width:6px;height:100%;cursor:col-resize;z-index:5;}
   #lwDrag:hover{background:var(--accent-dim);}
-  .center{min-width:0;overflow-y:auto;padding:16px;}
-  .right{border-left:1px solid var(--line);overflow-y:auto;padding:10px;background:var(--paper);}
+  .center{min-width:0;overflow-y:auto;padding:22px 24px;scrollbar-gutter:stable;}
+  .center>.view{width:100%;max-width:1120px;margin:0 auto;}
+  .right{border-left:1px solid var(--line);overflow-y:auto;padding:14px;background:var(--paper);box-shadow:-2px 0 10px #10182808;}
 
   /* ── 왼쪽: 프롬프트 패널 (NAIS3 구조) ── */
-  .preset-bar{display:flex;gap:6px;padding:10px 12px 8px;border-bottom:1px solid var(--line);}
+  .preset-bar{display:flex;gap:8px;padding:12px 14px 10px;border-bottom:1px solid var(--line);background:var(--paper);}
   .preset-bar select{flex:1;font-size:var(--fs-sm);padding:6px 8px;}
   .preset-bar button{padding:6px 9px;font-size:var(--fs-xs);}
   .psec{display:flex;flex-direction:column;min-height:0;}
-  .psec-head{display:flex;align-items:center;gap:7px;padding:8px 12px 5px;cursor:pointer;user-select:none;}
-  .psec-head .t{font-size:var(--fs-sm);color:var(--muted);font-weight:600;}
+  .psec-head{display:flex;align-items:center;gap:8px;padding:10px 14px 7px;cursor:pointer;user-select:none;}
+  .psec-head .t{font-size:var(--fs-sm);color:var(--text);font-weight:750;}
   .psec-head .chev{font-size:var(--fs-xs);color:var(--muted);transition:transform .15s;}
   .psec-head.closed .chev{transform:rotate(-90deg);}
   .psec-head .count{margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);}
-  .psec-body{padding:0 12px 8px;flex:1;min-height:0;display:flex;}
+  .psec-body{padding:0 14px 10px;flex:1;min-height:0;display:flex;}
   .psec-body.hidden{display:none;}
   .psec-body textarea{flex:1;min-height:90px;line-height:1.55;}
-  .tools{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:8px 12px;border-top:1px solid var(--line);}
+  .tools{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:10px 14px;border-top:1px solid var(--line);}
   .tools.jumps{grid-template-columns:repeat(2,1fr);border-top:0;padding-top:0;}
   .tool.jump{background:transparent;color:var(--muted);}
   .tool .ar{position:absolute;right:4px;top:3px;font-size:var(--fs-xs);color:var(--muted);}
@@ -4731,18 +4910,18 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .acrow.on{background:var(--accent-dim);color:var(--accent);}
   .setthumb{width:26px;height:26px;object-fit:cover;border-radius:var(--radius);
     border:1px solid var(--line);flex:none;background:var(--paper2);}
-  .tool{position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;
-    padding:9px 2px;font-size:var(--fs-xs);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .tool .ico{font-size:15px;line-height:1;}
+  .tool{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;
+    padding:10px 3px;font-size:var(--fs-xs);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .tool .ico{font-size:17px;line-height:1;}
   .tool.on{border-color:var(--accent);color:var(--accent);background:var(--accent-dim);}
   .tool .badge{position:absolute;right:1px;top:1px;min-width:16px;height:16px;border-radius:var(--radius-pill);
     background:var(--danger);color:#12131a;font-size:var(--fs-xs);font-weight:700;display:flex;align-items:center;
     justify-content:center;padding:0 4px;font-family:var(--mono);}
-  .genrow{display:flex;align-items:center;gap:7px;padding:10px 12px 12px;border-top:1px solid var(--line);}
+  .genrow{display:flex;align-items:center;gap:9px;padding:11px 14px 13px;border-top:1px solid var(--line);}
   .genrow .qty{display:flex;align-items:center;border:1px solid var(--line);border-radius:var(--radius);background:var(--paper2);}
   .genrow .qty button{border:none;background:none;padding:6px 9px;border-radius:0;}
   .genrow .qty input{width:38px;border:none;background:none;text-align:center;padding:6px 0;font-size:var(--fs-sm);}
-  .genrow .go{flex:1;padding:10px;font-size:var(--fs);}
+  .genrow .go{flex:1;padding:11px;font-size:var(--fs);min-height:42px;}
 
   /* ── 왼쪽 오버레이 (캐릭터/캐스트 편집) ── */
   .ovl{position:absolute;inset:0;background:var(--paper);z-index:20;display:flex;flex-direction:column;}
@@ -4757,11 +4936,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .slot textarea{min-height:52px;margin-bottom:4px;}
 
   /* ── 가운데 공통 ── */
-  .card{background:var(--paper);border:1px solid var(--line);border-radius:calc(var(--radius) + 2px);padding:15px 17px;margin-bottom:13px;}
-  .card h2{font-size:var(--fs);margin:0 0 4px;display:flex;align-items:center;gap:8px;}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:calc(var(--radius) + 4px);padding:18px 20px;margin-bottom:16px;box-shadow:0 2px 8px #1018280a;}
+  .card h2{font-size:calc(var(--fs) + 1px);margin:0 0 6px;display:flex;align-items:center;gap:9px;letter-spacing:-.01em;}
   .card h2 .n{font-family:var(--mono);font-size:var(--fs-xs);color:var(--accent);background:var(--accent-dim);
     border-radius:var(--radius-pill);padding:2px 7px;}
-  .hint{color:var(--muted);font-size:var(--fs-xs);margin:0 0 11px;line-height:1.6;}
+  .hint{color:var(--muted);font-size:var(--fs-xs);margin:0 0 12px;line-height:1.65;}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:11px;}
   .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;}
   .field{margin-bottom:10px;}
@@ -4771,7 +4950,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     border-radius:var(--radius-pill);font-size:var(--fs-xs);cursor:pointer;margin:0 5px 5px 0;background:var(--paper2);color:var(--muted);}
   .chip.on{border-color:var(--accent);color:var(--accent);background:var(--accent-dim);}
   .chip:hover{border-color:var(--accent);}
-  .row{border:1px solid var(--line);border-radius:var(--radius);padding:11px 13px;margin-bottom:9px;background:var(--paper2);}
+  .row{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;background:var(--paper2);}
   .row .tag{font-family:var(--mono);font-size:var(--fs-xs);color:var(--accent);margin-bottom:7px;}
   .items{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:1px;}
   .item{display:flex;align-items:center;gap:6px;padding:5px 7px;border-radius:var(--radius);font-size:var(--fs-xs);cursor:pointer;}
@@ -4782,7 +4961,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .item .ed:hover{color:var(--accent);background:var(--accent-dim);}
   .sec{border:1px solid var(--line);border-radius:var(--radius);margin-bottom:9px;overflow:hidden;background:var(--paper2);}
   .sec-head{display:flex;align-items:center;gap:9px;padding:9px 12px;cursor:pointer;user-select:none;}
-  .sec-head:hover{background:#20242e;}
+  .sec-head:hover{background:var(--accent-dim);}
   .sec-head .badge{font-family:var(--mono);font-size:var(--fs-xs);color:#12131a;background:var(--accent);
     border-radius:var(--radius);padding:2px 6px;font-weight:700;}
   .sec-head .nm{font-weight:600;font-size:var(--fs-sm);}
@@ -4802,20 +4981,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .sw input:checked + .sl::before{transform:translateX(14px);background:var(--accent);}
 
   /* ── 가운데: 미리보기 ── */
-  .pv{display:flex;flex-direction:column;align-items:center;gap:12px;}
-  .pv-img{width:100%;max-width:760px;aspect-ratio:1/1;background:#000;border-radius:var(--radius);overflow:hidden;
-    display:flex;align-items:center;justify-content:center;border:1px solid var(--line);}
+  .pv{display:flex;flex-direction:column;align-items:center;gap:14px;}
+  .pv-img{width:min(100%,720px);max-height:calc(100vh - 190px);aspect-ratio:1/1;background:#080a0f;border-radius:calc(var(--radius) + 4px);overflow:hidden;
+    display:flex;align-items:center;justify-content:center;border:1px solid #000;box-shadow:0 10px 32px #10182824;}
   .pv-img img{width:100%;height:100%;object-fit:contain;}
-  .pv-meta{width:100%;max-width:760px;}
+  .pv-meta{width:100%;max-width:720px;}
   .pv-meta .nm{font-weight:700;color:var(--accent);font-size:var(--fs);}
   .pv-meta .fn{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);margin-top:3px;}
   .pbar{height:6px;border-radius:var(--radius-pill);background:var(--paper2);overflow:hidden;margin-top:9px;}
   .pbar div{height:100%;background:var(--good);width:0;transition:width .3s;}
 
   /* ── 오른쪽: 히스토리 ── */
-  .hist-t{font-size:var(--fs-xs);color:var(--muted);margin-bottom:8px;padding:2px;}
-  .hist-g{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+  .hist-t{font-size:var(--fs-xs);color:var(--muted);margin-bottom:10px;padding:4px 2px 8px;border-bottom:1px solid var(--line);font-weight:700;}
+  .hist-g{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
   .hist-g img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);cursor:pointer;}
+  .hist-g:empty::before{content:"생성된 이미지가 여기에 쌓입니다.";grid-column:1/-1;color:var(--muted);
+    font-size:var(--fs-xs);line-height:1.6;padding:14px 4px;}
 
   /* ── 모달 ── */
   .modal-bg{position:fixed;inset:0;background:#000c;z-index:60;display:flex;align-items:flex-start;
@@ -4823,9 +5004,43 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .modal{background:var(--paper);border:1px solid var(--line);border-radius:calc(var(--radius) + 2px);max-width:880px;width:100%;padding:20px;}
   .modal h3{margin:0 0 13px;font-size:var(--fs);}
   .flash{font-family:var(--mono);font-size:var(--fs-xs);color:var(--good);}
-  @media(max-width:1200px){ .app{grid-template-columns:1fr;height:auto;} body{overflow:auto;} .left,.right{border:none;} }
+  @media(max-width:1200px){
+    body{overflow:auto;}
+    #app{display:flex;flex-direction:column;height:auto;min-height:calc(100vh - 56px);}
+    body[data-mode="preview"] .left{order:1;}
+    body[data-mode="preview"] .center{order:2;}
+    body:not([data-mode="preview"]) .center{order:1;}
+    body:not([data-mode="preview"]) .left{order:2;}
+    .right{order:3;}
+    .left,.right{border:none;border-bottom:1px solid var(--line);box-shadow:none;}
+    .left{min-height:680px;}
+    .center{overflow:visible;padding:20px;}
+    .right{min-height:120px;}
+    #lwDrag{display:none;}
+  }
+  @media(max-width:700px){
+    .titlebar{height:auto;min-height:98px;padding:8px 10px;gap:7px;display:grid;
+      grid-template-columns:1fr auto;grid-template-rows:32px 46px;position:sticky;top:0;}
+    .titlebar .app{font-size:14px;grid-column:1;grid-row:1;}
+    .titlebar .stat{max-width:180px;text-align:right;grid-column:2;grid-row:1;}
+    .titlebar .spacer{display:none;}
+    .modes{grid-column:1/-1;grid-row:2;width:100%;overflow-x:auto;gap:2px;}
+    .modes button{flex:1 0 68px;padding:0 7px;font-size:12px;white-space:nowrap;}
+    #app{min-height:calc(100vh - 98px);}
+    .center{padding:14px 10px;}
+    .card{padding:15px 13px;margin-bottom:12px;}
+    .grid2,.grid3{grid-template-columns:1fr;}
+    .left{min-height:0;}
+    .psec-body textarea{min-height:82px;max-height:150px;}
+    .tools{gap:6px;padding-inline:10px;}
+    .tool{padding:9px 2px;}
+    .pv-img{width:100%;max-height:none;border-radius:var(--radius);}
+    .right{padding:12px 10px;}
+    .modal-bg{padding:12px 7px;}
+    .modal{padding:15px 12px;}
+  }
 </style></head>
-<body>
+<body data-mode="preview">
 
 <div class="titlebar">
   <div class="app">NAI <span>배치 생성기</span>__PROFBADGE__</div>
@@ -4891,7 +5106,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
     <div class="genrow">
       <div class="qty">
-        <button id="qtyM">−</button><input id="qty" value="1"><button id="qtyP">+</button>
+        <button id="qtyM" title="수량 줄이기">−</button>
+        <input id="qty" type="number" value="1" min="1" max="99" step="1"
+          inputmode="numeric" aria-label="빠른 생성 수량 (1~99)">
+        <button id="qtyP" title="수량 늘리기 (최대 99)">+</button>
       </div>
       <button class="primary go" id="genBtn">생성</button>
       <button class="danger go hidden" id="stopBtn" title="도는 작업을 장 경계에서 멈춥니다 (전송 중인 장은 마저 받음)"
@@ -4953,8 +5171,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="ovl-body">
         <p class="hint"><b>바이브</b>는 그림의 분위기를 옮깁니다. 처음 한 번만 인코딩(2 Anlas)하고
         그 뒤로는 <b>공짜로 계속</b> 쓰입니다 — 배치 생성에 딱 맞습니다.<br>
-        <b>캐릭터 레퍼런스</b>는 생김새를 참조합니다. <b>장당 5 Anlas</b>가 붙고
-        Opus 무료가 깨집니다.</p>
+        <b>캐릭터 레퍼런스</b>는 생김새를 참조합니다. Opus 무료 생성은 유지되며
+        <b>레퍼런스 1개당 장당 5 Anlas</b>만 별도로 붙습니다.</p>
         <div class="reftabs">
           <button class="on" data-reftab="vibe">바이브 <span id="bgVibe">0</span></button>
           <button data-reftab="cref">캐릭터 레퍼런스 <span id="bgCref">0</span></button>
@@ -6433,6 +6651,7 @@ document.querySelectorAll('[data-ovl-close]').forEach(b => b.addEventListener('c
   document.querySelectorAll('.ovl').forEach(o => o.classList.add('hidden'));
 }));
 function setMode(m){
+  document.body.dataset.mode = m;
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   ['preview','settings','builder','library','system'].forEach(x =>
     $('v' + x[0].toUpperCase() + x.slice(1)).style.display = (x === m ? '' : 'none'));
@@ -6723,11 +6942,20 @@ $('slotLib').addEventListener('change', () => {
 });
 
 /* ── 생성 ── */
-$('qtyM').addEventListener('click', () => { $('qty').value = Math.max(1, (+$('qty').value||1) - 1); });
-$('qtyP').addEventListener('click', () => { $('qty').value = (+$('qty').value||1) + 1; });
+const QUICK_QTY_MAX = 99;
+function quickQty(value, notify=false){
+  const raw = Number(value);
+  const clean = Math.min(QUICK_QTY_MAX, Math.max(1, Number.isFinite(raw) ? Math.trunc(raw) : 1));
+  if(notify && clean !== raw) flash(`빠른 생성 수량은 1~${QUICK_QTY_MAX}장으로 맞췄습니다.`);
+  $('qty').value = clean;
+  return clean;
+}
+$('qtyM').addEventListener('click', () => quickQty((+$('qty').value||1) - 1));
+$('qtyP').addEventListener('click', () => quickQty((+$('qty').value||1) + 1, true));
+$('qty').addEventListener('change', () => quickQty($('qty').value, true));
 $('genBtn').addEventListener('click', async () => {
   await doSave();
-  const n = Math.max(1, +$('qty').value || 1);
+  const n = quickQty($('qty').value, true);
   setMode('preview');
   for(let i = 0; i < n; i++){
     const r = await (await fetch('/api/generate_one', {method:'POST'})).json();
@@ -7538,11 +7766,20 @@ if($('expUp')){
     const vis = await expEnsureAll();
     const targets = vis.map(f => f.path).filter(p => !EXP.picked.has(p));
     if(!targets.length){ $('expStat').textContent = '지울 것이 없습니다 (전부 선별됨)'; return; }
-    if(!confirm(`선별 안 된 ${targets.length}장을 정말 지울까요?\n파일이 실제로 사라집니다 (되돌릴 수 없음).`)) return;
+    if(!confirm(`선별 안 된 ${targets.length}장을 휴지통으로 옮길까요?\n바로 다음 안내에서 되돌릴 수 있습니다.`)) return;
     const r = await (await fetch('/api/picks_del', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({targets, keep:[...EXP.picked]})})).json();
-    $('expStat').textContent = r.ok ? `${r.deleted}장 지움` : (r.error || '실패');
+    if(!r.ok){ $('expStat').textContent = r.error || '실패'; return; }
+    $('expStat').innerHTML = `${r.deleted}장 휴지통으로 이동`
+      + (r.batch_id ? ` <button id="expUndoDelete" class="primary">되돌리기</button>` : '');
+    if(r.batch_id) $('expUndoDelete').addEventListener('click', async () => {
+      const rr = await (await fetch('/api/picks_restore', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({batch_id:r.batch_id})})).json();
+      $('expStat').textContent = rr.ok ? `${rr.restored}장 복원됨` : (rr.error || '복원 실패');
+      expLoad();
+    });
     expLoad();
   });
 }
@@ -9577,7 +9814,7 @@ const THEMES = [
 ];
 const ACCENTS = [['','기본'],['blue','파랑'],['violet','보라'],['pink','분홍'],['green','초록'],['amber','앰버'],['cyan','시안'],['red','빨강']];
 const FSIZES = [['s','작게'],['','보통'],['l','크게'],['xl','아주 크게']];
-const RADII = [['','각지게'],['soft','살짝 둥글게'],['round','둥글게']];
+const RADII = [['','기본'],['soft','살짝 둥글게'],['round','둥글게']];
 function applyUI(){
   const u = STATE.ui || {};
   const r = document.documentElement;
@@ -10468,17 +10705,15 @@ class ConfigServer:
                         "이 이미지에는 NAI 생성 정보가 없습니다. "
                         "(카톡·디스코드 등을 거치면 지워집니다 — 원본 파일을 넣어주세요)"}
             artists, rest = parse_artist_combo(m["base"])
-            # NAI 는 ucPreset·qualityToggle 을 메타데이터에 남기지 않는다.
-            # 그런데 프리셋 문구는 네거티브 앞에 그대로 들어 있으므로 **거꾸로 알아낼 수 있다.**
-            # 떼어내지 않으면 이 그림체로 다시 뽑을 때 문구가 두 번 붙는다.
-            #   (착안: NAIS3-MM 이 같은 역추적을 한다 — 코드는 가져오지 않았다)
+            # 새 결과에는 우리가 ucPreset·qualityToggle 을 Comment JSON에 직접 기록한다.
+            # 옛 NAI 파일처럼 값이 없을 때만 문구에서 역추적한다.
             params = dict(m["params"] or {})
             source_model = model_id_from_metadata(
                 params.get("model"),
                 self.cfg.get("model") or "nai-diffusion-4-5-full",
             )
             ucp, user_neg = split_uc_preset(m["negative"], source_model)
-            if ucp is not None:
+            if "uc_preset" not in params and ucp is not None:
                 params["uc_preset"] = ucp
                 params["uc_preset_guessed"] = True
             # 퀄리티 접미사도 UC 프리셋처럼 **떼고** 토글만 켠다.
@@ -10486,8 +10721,9 @@ class ConfigServer:
             # (외부 감사 nais_blue B-2 와 같은 계열 — 우리는 이중 추가는 가드가 막았지만
             #  '끄기가 안 듣는' 쪽이 남아 있었다. ai-review/외부감사/ 참고)
             base_txt, qt = split_quality_suffix(m["base"], source_model)
-            params["quality_toggle"] = qt
-            params["quality_toggle_guessed"] = True
+            if "quality_toggle" not in params:
+                params["quality_toggle"] = qt
+                params["quality_toggle_guessed"] = True
             rec = {
                 "id": f"file-{abs(hash(body[:4096])) % 10**10}",
                 "title": Path(name).stem[:80], "source": "내 이미지",
@@ -10830,17 +11066,12 @@ class ConfigServer:
                     self.end_headers()
                     self.wfile.write(data)
                 elif self.path.startswith("/setout"):
-                    # 세트 대표 썸네일 — output/ 아래만, 경로 탈출 차단
+                    # 세트 대표 썸네일 — output/ 아래만, 경로 탈출·휴지통 접근 차단
                     from urllib.parse import urlparse, parse_qs, unquote
                     q = parse_qs(urlparse(self.path).query)
                     rel = unquote(q.get("p", [""])[0])
-                    _root = out_root(server.cfg).resolve()
-                    f = (_root / rel).resolve()
-                    try:
-                        inside = f.is_relative_to(_root)
-                    except AttributeError:                      # 파이썬 3.8 이하
-                        inside = str(f).startswith(str(_root))
-                    if not (rel and inside and f.is_file()):
+                    f = output_file_for_preview(server.cfg, rel)
+                    if f is None:
                         self.send_response(404); self.end_headers(); return
                     data = f.read_bytes()
                     self.send_response(200)
@@ -11152,7 +11383,7 @@ class ConfigServer:
                                              else None)
                         opus = bool(known_balance and known_balance.get("opus"))
                         cfg = server.cfg
-                        # 켜진 캐릭터 레퍼런스 수 — 장당 +5 이고 Opus 무료가 깨진다
+                        # 켜진 캐릭터 레퍼런스 수 — Opus 무료 생성은 유지되고 장당 +5만 별도 과금
                         refs = sum(1 for r in cfg.get("char_refs", []) if r.get("enabled"))
                         # 아직 인코딩 안 된 바이브 — 처음 한 번만 2 Anlas
                         vibe_new = 0
@@ -11170,26 +11401,47 @@ class ConfigServer:
                             acfg = load_asset_config(cfg)
                             pend = compute_pending(cfg, acfg, {}, set())
                             total = 0
-                            free_all = True
+                            eligible_all = True
+                            generation_free_all = True
                             for _, _, num, _ in pend:
                                 sc = acfg["scenes"].get(str(num)) or {}
                                 e1 = anlas_estimate(cfg, 1, sc.get("width"), sc.get("height"),
                                                     opus=opus, char_refs=refs)
                                 total += e1["total"]
-                                free_all = free_all and e1["free"]
+                                eligible_all = eligible_all and e1["free_eligible"]
+                                generation_free_all = (
+                                    generation_free_all and e1["generation_free"])
                             total += 2 * vibe_new        # 바이브 첫 인코딩 (한 번만)
+                            if total == 0:
+                                batch_why = "Opus 무료 (모든 씬이 1024² 이하 · 28스텝 이하)"
+                            elif eligible_all:
+                                parts = []
+                                if known_balance is None:
+                                    parts.append("무료 크기·스텝 범위 · Opus 등급 미확인")
+                                elif not opus:
+                                    parts.append("무료 크기·스텝 범위 · 비Opus 등급")
+                                else:
+                                    parts.append("Opus 무료 생성")
+                                if refs:
+                                    parts.append(
+                                        f"캐릭터 레퍼런스 {refs}개 장당 {5*refs} Anlas")
+                                if vibe_new:
+                                    parts.append(
+                                        f"새 바이브 {vibe_new}개 인코딩 {2*vibe_new} Anlas")
+                                batch_why = " + ".join(parts)
+                            else:
+                                batch_why = (
+                                    f"{cfg.get('steps')}스텝 / 일부 씬 해상도가 무료 조건"
+                                    f"(1024² 이하·28스텝 이하)을 넘습니다")
                             est = {"per_image": None, "total": total, "count": len(pend),
-                                   "free": free_all and total == 0, "batch": True,
+                                   "free": total == 0,
+                                   "free_eligible": eligible_all,
+                                   "generation_free": generation_free_all,
+                                   "batch": True,
                                    "width": None, "height": None,
                                    "steps": int(cfg.get("steps", 28)),
                                    "vibe_encode": 2 * vibe_new, "char_refs": refs,
-                                   "why": ("Opus 무료 (모든 씬이 1024² 이하 · 28스텝 이하)"
-                                           if total == 0 else
-                                           (f"캐릭터 레퍼런스 {refs}개가 켜져 있어 장당 +{5*refs} "
-                                            f"Anlas · Opus 무료가 깨집니다"
-                                            if refs else
-                                            f"{cfg.get('steps')}스텝 / 씬 해상도가 무료 조건"
-                                            f"(1024² 이하·28스텝 이하)을 넘습니다"))}
+                                   "why": batch_why}
                         else:
                             # mode 를 받아 img2img·인페인트면 Opus 무료를 빼고 센다 (CQA-008)
                             est = anlas_estimate(cfg, int(d.get("count") or 1),
@@ -11275,24 +11527,36 @@ class ConfigServer:
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/picks_del"):
-                    # 선별 안 된 것 지우기 — 파일을 실제로 지운다
+                    # 선별 안 된 것 지우기 — 즉시 삭제하지 않고 출력 폴더 휴지통으로 옮긴다.
                     try:
                         d = json.loads(body or b"{}")
                         keep = set(d.get("keep") or [])
-                        root = out_root(cfg).resolve()
-                        gone = 0
-                        for rel in (d.get("targets") or []):
-                            if rel in keep:
-                                continue
-                            f = (root / rel).resolve()
-                            try:
-                                inside = f.is_relative_to(root)
-                            except AttributeError:
-                                inside = str(f).startswith(str(root))
-                            if inside and f.is_file():
-                                f.unlink()
-                                gone += 1
-                        self._json({"ok": True, "deleted": gone})
+                        targets = [str(x) for x in (d.get("targets") or [])
+                                   if str(x) not in keep]
+                        result = trash_output_files(server.cfg, targets, keep)
+                        if result["deleted"]:
+                            gone = set(targets)
+                            with _JSON_IO_LOCK:
+                                picks = load_picks()
+                                picks["picked"] = [
+                                    x for x in picks.get("picked", []) if x not in gone]
+                                picks["fav"] = [
+                                    x for x in picks.get("fav", []) if x not in gone]
+                                picks["ranks"] = {
+                                    k: v for k, v in picks.get("ranks", {}).items()
+                                    if k not in gone}
+                                picks["folders"] = {
+                                    name: [x for x in paths if x not in gone]
+                                    for name, paths in picks.get("folders", {}).items()}
+                                save_picks(picks)
+                        self._json({"ok": True, **result})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/picks_restore"):
+                    try:
+                        d = json.loads(body or b"{}")
+                        result = restore_trash_batch(server.cfg, d.get("batch_id"))
+                        self._json({"ok": True, **result})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/mosaic_save"):
@@ -11878,10 +12142,11 @@ def _run_generation(server):
                 server.live.set_image(img)
                 ok = True
                 break
-            except RateLimitError:
-                log.warning("  429 — 60초 대기 후 재시도")
-                server.live.update(status_text="429 — 60초 대기 중...")
-                if server.live.wait_cancelable(60):
+            except RateLimitError as e:
+                wait = e.retry_after
+                log.warning(f"  429 — 서버 지시대로 {wait:g}초 대기 후 재시도")
+                server.live.update(status_text=f"429 — {wait:g}초 대기 중...")
+                if server.live.wait_cancelable(wait):
                     break                      # 중지 — 재시도하지 않는다
             except (AccountBannedError, AuthError) as e:
                 log.critical(f"  {e}")
@@ -11889,6 +12154,17 @@ def _run_generation(server):
                 save_state(state)
                 input("엔터를 누르면 프로그램을 종료합니다...")
                 raise FatalStopError(str(e))
+            except APIError as e:
+                log.error(f"  시도 {attempt+1} 실패: {e}")
+                if not e.retryable:
+                    server.live.update(
+                        status_text=f"재시도하지 않는 요청 오류: {e}")
+                    break
+                wait = min(5 * (2 ** attempt), 30)
+                server.live.update(
+                    status_text=f"서버 오류 — {wait}초 뒤 재시도 ({attempt+1}/3)")
+                if attempt < 2 and server.live.wait_cancelable(wait):
+                    break
             except Exception as e:
                 log.error(f"  시도 {attempt+1} 실패: {e}")
                 server.live.update(status_text=f"재시도 중... ({attempt+1}/3)")
