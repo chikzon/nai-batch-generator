@@ -2580,6 +2580,20 @@ def load_builder():
         try:
             data = load_json_recover(BUILDER_FILE)
             if isinstance(data, dict):
+                # 후보사전은 사람이 직접 고치는 자료다. 과거에는 캐릭터의 의상·신체·
+                # 성별 변형인 "예술적 변형"이 베이스 목록 안에 들어가 있었다.
+                # `대상`을 명시한 단계는 파일의 물리적 위치와 무관하게 올바른 빌더로
+                # 옮긴다. 이렇게 하면 기존 사용자 후보사전의 순서를 부수지 않으면서도
+                # 화면과 저장 결과는 정확한 캐릭터 경로를 쓴다.
+                chars = list(data.get("캐릭터단계") or [])
+                base = []
+                for step in list(data.get("베이스단계") or []):
+                    if isinstance(step, dict) and step.get("대상") == "캐릭터":
+                        chars.append(step)
+                    else:
+                        base.append(step)
+                data["캐릭터단계"] = chars
+                data["베이스단계"] = base
                 return data
         except Exception as e:
             log.warning(f"후보사전.json 손상: {e}")
@@ -5705,6 +5719,63 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .sec-body{padding:11px 13px;border-top:1px solid var(--line);}
   .sec-body.hidden{display:none;}
   .tagres{max-height:92px;overflow-y:auto;margin:4px 0;}
+  /* ── 빌더: "태그 수천 개"보다 "무엇을 만드는 중인가"가 먼저 보이게 ── */
+  .builder-entry-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:13px;}
+  .builder-entry{display:flex;flex-direction:column;align-items:flex-start;min-height:142px;padding:16px;
+    border:1px solid var(--line);border-radius:calc(var(--radius) + 3px);background:var(--paper2);}
+  .builder-entry.char{background:linear-gradient(145deg,var(--paper2),var(--accent-dim));}
+  .builder-entry .eyebrow{font-family:var(--mono);font-size:var(--fs-2xs);color:var(--accent);
+    letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px;}
+  .builder-entry strong{font-size:calc(var(--fs) + 1px);margin-bottom:5px;}
+  .builder-entry p{font-size:var(--fs-xs);line-height:1.6;color:var(--muted);margin:0 0 13px;}
+  .builder-entry button{margin-top:auto;}
+  .builder-tools{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:12px;padding-top:12px;
+    border-top:1px solid var(--line);}
+  .builder-tools .label{font-size:var(--fs-xs);font-weight:700;color:var(--muted);margin-right:3px;}
+  .modal.builder-modal{max-width:1180px;}
+  .builder-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
+    margin:-2px 0 12px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius);
+    background:var(--paper2);}
+  .builder-intro .flow{font-size:var(--fs-xs);line-height:1.65;color:var(--muted);}
+  .builder-intro .flow b{color:var(--text);}
+  .builder-intro .route{flex:none;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--accent);
+    border:1px solid var(--accent);border-radius:var(--radius-pill);padding:4px 9px;background:var(--accent-dim);}
+  .builder-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+  .builder-toolbar .n{margin-left:auto;}
+  .builder-shell{display:grid;grid-template-columns:minmax(0,1fr) 320px;align-items:start;gap:15px;}
+  .builder-steps{min-width:0;}
+  .builder-steps.builder-core-only .sec:not(.essential){display:none;}
+  .builder-summary{position:sticky;top:0;padding:14px;border:1px solid var(--line);
+    border-radius:calc(var(--radius) + 3px);background:var(--paper2);box-shadow:0 6px 18px #10182810;}
+  .builder-summary h4{margin:0 0 5px;font-size:var(--fs-sm);}
+  .builder-summary .summary-note{font-size:var(--fs-xs);line-height:1.55;color:var(--muted);margin:0 0 12px;}
+  .builder-summary .field{margin-bottom:11px;}
+  .builder-summary textarea{min-height:68px;}
+  .builder-summary #bldPreview{min-height:112px;color:var(--good);}
+  .builder-summary .apply-now{display:flex;align-items:flex-start;gap:8px;padding:9px 10px;
+    border:1px solid var(--accent);border-radius:var(--radius);background:var(--accent-dim);
+    font-size:var(--fs-xs);line-height:1.45;}
+  .builder-summary .apply-now input{width:auto;margin-top:2px;accent-color:var(--accent);}
+  .modal.builder-modal > .bar:last-child{position:sticky;bottom:-20px;z-index:4;margin:12px -20px -20px!important;
+    padding:11px 20px 13px;background:color-mix(in srgb,var(--paper) 94%,transparent);
+    border-top:1px solid var(--line);backdrop-filter:blur(10px);}
+  .builder-progress{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 10px;min-height:22px;}
+  .builder-progress .empty{font-size:var(--fs-2xs);color:var(--muted);}
+  .builder-progress button{padding:3px 7px;font-size:var(--fs-2xs);color:var(--good);
+    border-color:color-mix(in srgb,var(--good) 45%,var(--line));background:var(--paper);}
+  .builder-stage-route{font-family:var(--mono);font-size:var(--fs-2xs);padding:2px 6px;
+    border-radius:var(--radius-pill);border:1px solid var(--line);color:var(--muted);}
+  .builder-stage-route.negative{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--line));}
+  .bld-slot{margin-bottom:12px;padding:10px;border:1px solid color-mix(in srgb,var(--line) 80%,transparent);
+    border-radius:var(--radius);background:var(--paper);}
+  .bld-slot:last-child{margin-bottom:0;}
+  .bld-slot-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:7px;}
+  .bld-slot-head .slot-name{color:var(--accent);font-weight:650;font-size:var(--fs-sm);}
+  .bld-slot-head .slot-count{color:var(--muted);font-size:var(--fs-2xs);}
+  .bld-slot-actions{margin-left:auto;display:flex;gap:4px;align-items:center;}
+  .bld-slot-actions button{padding:4px 7px;font-size:var(--fs-xs);}
+  .bld-search{width:150px;font-size:var(--fs-xs);padding:4px 7px;}
+  .bld-selects select + select{margin-top:5px;}
 
   /* ── 스위치 ── */
   .sw{position:relative;display:inline-block;width:32px;height:18px;flex:none;}
@@ -5763,6 +5834,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .center{overflow:visible;padding:20px;}
     .right{min-height:120px;}
     #lwDrag{display:none;}
+    .builder-shell{grid-template-columns:minmax(0,1fr) 300px;}
+  }
+  @media(max-width:920px){
+    .builder-shell{grid-template-columns:1fr;}
+    .builder-summary{position:static;grid-row:1;}
   }
   @media(max-width:700px){
     .titlebar{height:auto;min-height:98px;padding:8px 10px;gap:7px;display:grid;
@@ -5786,6 +5862,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .right{padding:12px 10px;}
     .modal-bg{padding:12px 7px;}
     .modal{padding:15px 12px;}
+    .modal.builder-modal > .bar:last-child{bottom:-15px;margin:12px -12px -15px!important;padding:10px 12px 12px;}
+    .builder-entry-grid{grid-template-columns:1fr;}
+    .builder-entry{min-height:0;}
+    .builder-intro{display:block;}
+    .builder-intro .route{display:inline-block;margin-top:8px;}
+    .builder-toolbar .n{width:100%;margin-left:0;}
+    .bld-slot-actions{width:100%;margin-left:0;}
+    .bld-search{flex:1;min-width:120px;width:auto;}
   }
 </style></head>
 <body data-mode="preview">
@@ -6293,14 +6377,25 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
     <div class="view" id="vBuilder" style="display:none;">
       <div class="card">
-        <h2><span class="n">빌더</span>규격으로 조립</h2>
-        <p class="hint">수집한 태그 자료(단부루·e621)를 규격 슬롯별로 골라 <b>그림체</b>와 <b>캐릭터</b>를 만듭니다.
-        만든 결과는 파일로 저장되어 라이브러리에 쌓입니다.</p>
-        <div class="bar">
-          <button id="bStyle">🖼️ 베이스 빌더</button>
-          <button id="bChar">👤 캐릭터 빌더</button>
+        <h2><span class="n">빌더</span>그림체와 캐릭터 만들기</h2>
+        <p class="hint">수천 개 태그를 외우지 않아도 됩니다. 만들 대상을 먼저 고른 뒤 필요한 항목만 채우세요.
+        결과는 원문을 줄이지 않고 파일과 라이브러리에 저장합니다.</p>
+        <div class="builder-entry-grid">
+          <div class="builder-entry">
+            <span class="eyebrow">Style set</span><strong>🖼️ 그림체 한 세트</strong>
+            <p>작가·구도·조명·화풍과 <b>네거티브·생성 설정값</b>을 한 묶음으로 보관합니다.</p>
+            <button class="primary" id="bStyle">그림체 만들기</button>
+          </div>
+          <div class="builder-entry char">
+            <span class="eyebrow">Character</span><strong>👤 캐릭터 한 명</strong>
+            <p>정체·외형·머리·의상·원작과 다른 변형을 고릅니다. 저장 후 캐릭터 칸에 바로 넣을 수 있습니다.</p>
+            <button class="primary" id="bChar">캐릭터 만들기</button>
+          </div>
+        </div>
+        <div class="builder-tools">
+          <span class="label">보조 도구</span>
           <button id="bCombo">🎨 작가 조합 고르기</button>
-          <button id="bNorm">📋 프롬프트 규격화 (붙여넣기 → 자동 분류)</button>
+          <button id="bNorm">📋 기존 프롬프트 자동 분류</button>
         </div>
       </div>
       <div class="card">
@@ -10462,76 +10557,121 @@ function openBuilder(kind){
   const steps = BUILDER[kind === 'char' ? '캐릭터단계' : '베이스단계'] || [];
   const ko = BUILDER['한글'] || {};
   const isBase = kind !== 'char';
-  const nSteps = ((isBase ? BUILDER.베이스단계 : BUILDER.캐릭터단계) || []).length;
+  const nSteps = steps.length;
+  const hasPickedNegative = steps.some(st => st['출력'] === 'negative');
+  const charCore = new Set(['인물','역할·종족','얼굴 외형','헤어','상반신 신체',
+    '하반신 신체','옷 — 부위별','예술적 변형 (원작과 다르게)']);
   $('modalTitle').textContent = (isBase ? '🖼️ 베이스 빌더' : '👤 캐릭터 빌더')
     + (nSteps ? ` (${nSteps}단계)` : '');
+  $('modalBody').closest('.modal').classList.add('builder-modal');
   const b = $('modalBody');
-  b.innerHTML = `<p class="hint">항목마다 드롭다운으로 고르고, 필요하면 <b>＋</b>로 같은 항목을 여러 개 선택하세요.
-    🔒는 랜덤에서 제외(고정), 🔍는 태그 사전에서 찾아 그 항목에 추가합니다.</p>
-    <div class="bar">
-      <button id="bldOpenAll">전부 펼치기</button><button id="bldCloseAll">전부 접기</button>
-      <button id="bldRnd">🎲 랜덤 (잠금 제외)</button><button id="bldClear">초기화</button>
-      <span class="n" id="bldStat"></span></div>`;
+  b.innerHTML = `<div class="builder-intro">
+      <div class="flow">${isBase
+        ? '<b>그림체의 뼈대 → 구도·빛·화풍 → 네거티브</b> 순으로 고릅니다. 네거티브와 생성 설정은 그림체에서 분리하지 않습니다.'
+        : '<b>정체 → 외모 → 머리 → 체형 → 의상 → 예술적 변형</b> 순으로 고릅니다. 상황·자세·행동은 필요할 때만 세부 단계에서 더합니다.'}</div>
+      <span class="route">${isBase ? '그림체로 저장' : '캐릭터로 저장'}</span>
+    </div>
+    <div class="builder-toolbar">
+      ${isBase ? '' : '<button id="bldCore" aria-pressed="true">모든 세부 단계 보기</button>'}
+      <button id="bldOpenAll">보이는 단계 펼치기</button><button id="bldCloseAll">전부 접기</button>
+      <button id="bldRnd">${isBase ? '🎲 그림체 초안' : '🎲 캐릭터 초안'}</button>
+      <button id="bldClear">선택 비우기</button><span class="n" id="bldStat"></span>
+    </div>
+    <div class="builder-shell">
+      <section class="builder-steps ${isBase ? '' : 'builder-core-only'}" id="bldSteps"></section>
+      <aside class="builder-summary">
+        <h4>${isBase ? '그림체 묶음' : '캐릭터 한 명'}</h4>
+        <p class="summary-note">${isBase
+          ? '베이스·네거티브·생성 설정을 함께 저장합니다. 설정값은 현재 생성 화면의 값을 사용합니다.'
+          : '이름을 먼저 적고 외형을 고르세요. 의상·예술적 변형도 이 캐릭터 프롬프트에 함께 저장됩니다.'}</p>
+        <div class="field"><label>이름</label><input type="text" id="bldName"
+          placeholder="${isBase ? '예: 시네마틱 야간' : '예: 레이나'}"></div>
+        <div class="builder-progress" id="bldProgress"><span class="empty">아직 고른 단계가 없습니다.</span></div>
+        <div class="field"><label>직접 더할 태그</label>
+          <textarea id="bldExtra" placeholder="목록에 없는 특징을 원문 그대로 입력"></textarea></div>
+        <div class="field"><label>${isBase ? '베이스' : '캐릭터'} 프롬프트 미리보기</label>
+          <textarea id="bldPreview" readonly></textarea></div>
+        ${hasPickedNegative ? `<div class="field"><label>목록에서 고른 네거티브</label>
+          <textarea id="bldNegPick" readonly></textarea></div>` : ''}
+        <div class="field"><label>${isBase ? '네거티브 프롬프트' : '캐릭터 전용 네거티브 (선택)'}</label>
+          <textarea id="bldNeg" placeholder="${isBase ? '직접 더할 네거티브' : '이 인물에만 적용할 네거티브'}"></textarea>
+          ${isBase ? `<div class="bar" style="margin-top:5px;">
+            <button id="bldPreQ">추천 퀄리티 넣기</button><button id="bldPreN">추천 네거티브 넣기</button></div>` : ''}
+        </div>
+        ${isBase ? '' : `<label class="apply-now"><input type="checkbox" id="bldUseNow" checked>
+          <span><b>저장 후 캐릭터 칸에 바로 넣기</b><br>라이브러리에서 다시 찾는 단계를 생략합니다.</span></label>`}
+      </aside>
+    </div>`;
+  const stepsBox = $('bldSteps');
 
   steps.forEach((st, si) => {
+    const output = st['출력'] === 'negative' ? 'negative' : 'positive';
+    const essential = !isBase && charCore.has(st['이름']);
     const sec = document.createElement('div');
-    sec.className = 'sec';
+    sec.className = 'sec' + (essential ? ' essential' : '');
+    sec.dataset.output = output;
+    sec.dataset.stepName = st['이름'];
     const rows = (st['슬롯'] || []).map((sl, li) => {
       const opts = (sl['후보'] || []).map(tg =>
         `<option value="${escA(tg)}">${esc(tg)}${ko[tg] ? ' — ' + esc(ko[tg]) : ''}</option>`).join('');
       const id = `${si}-${li}`;
-      return `<div class="field" data-slot="${id}" style="margin-bottom:9px;">
-        <label style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-          <span style="color:var(--accent);font-weight:600;">${esc(sl['라벨'])}</span>
-          <span style="color:var(--muted);font-size:var(--fs-xs);">${(sl['후보']||[]).length}개</span>
-          <span style="margin-left:auto;display:flex;gap:4px;align-items:center;">
+      return `<div class="bld-slot" data-slot="${id}">
+        <div class="bld-slot-head">
+          <span class="slot-name">${esc(sl['라벨'])}</span>
+          <span class="slot-count">${(sl['후보']||[]).length}개 후보</span>
+          <span class="bld-slot-actions">
             <button data-lock="${id}" title="랜덤에서 제외" style="padding:3px 7px;font-size:var(--fs-xs);">🔓</button>
             <button data-more="${id}" title="같은 항목 하나 더" style="padding:3px 8px;font-size:var(--fs-xs);">＋</button>
             ${sl['조합전용'] ? `<button data-combo="${id}" style="padding:3px 8px;font-size:var(--fs-xs);color:var(--accent);">조합 고르기</button>` : ''}
-            <input type="text" data-tagq="${escA(kind + '|' + st['이름'] + '·' + sl['라벨'])}" placeholder="🔍 사전 검색"
-              style="width:150px;font-size:var(--fs-xs);padding:3px 6px;">
+            <input type="text" data-tagq="${escA(kind + '|' + st['이름'] + '·' + sl['라벨'])}"
+              placeholder="🔍 후보 검색" class="bld-search">
           </span>
-        </label>
+        </div>
         <div data-tagres="${escA(kind + '|' + st['이름'] + '·' + sl['라벨'])}" class="tagres"></div>
-        <div data-sels="${id}"><select data-pick="${id}"><option value="">(선택 안 함)</option>${opts}</select></div>
+        <div data-sels="${id}" class="bld-selects"><select data-pick="${id}" data-output="${output}">
+          <option value="">(선택 안 함)</option>${opts}</select></div>
       </div>`;
     }).join('');
     sec.innerHTML = `<div class="sec-head" data-bstep="${si}">
         <span class="badge">${esc(st['번호'])}</span><span class="nm">${esc(st['이름'])}</span>
         <span class="sub">${(st['슬롯']||[]).length}항목</span>
+        <span class="builder-stage-route ${output}">${output === 'negative' ? '네거티브로' : (isBase ? '베이스로' : '캐릭터로')}</span>
         <span class="cnt" data-bcnt="${si}"></span></div>
-      <div class="sec-body ${si < 2 ? '' : 'hidden'}" data-bbody="${si}">${rows}</div>`;
-    b.appendChild(sec);
+      <div class="sec-body ${si < (isBase ? 2 : 1) ? '' : 'hidden'}" data-bbody="${si}">${rows}</div>`;
+    stepsBox.appendChild(sec);
   });
 
-  b.insertAdjacentHTML('beforeend', `
-    <div class="field" style="margin-top:12px;"><label>추가 태그 (직접 입력)</label>
-      <textarea id="bldExtra" style="min-height:38px;"></textarea></div>
-    <div class="field"><label>조합 미리보기 (규격 순서)</label>
-      <textarea id="bldPreview" readonly style="min-height:58px;color:var(--good);"></textarea></div>
-    ${isBase ? `<div class="field"><label>네거티브 프롬프트 (이 베이스와 함께 저장)</label>
-      <textarea id="bldNeg" style="min-height:52px;" placeholder="worst quality, bad anatomy, ..."></textarea>
-      <div class="bar" style="margin-top:5px;">
-        <button id="bldPreQ">추천 퀄리티 넣기</button><button id="bldPreN">추천 네거티브 넣기</button></div></div>` : ''}
-    <div class="field"><label>이름</label><input type="text" id="bldName" placeholder="${isBase ? '예: 시네마틱 야간' : '예: 레이나'}"></div>`);
-
-  const compose = () => {
+  const composeSelected = output => {
     const parts = [];
-    b.querySelectorAll('select[data-pick]').forEach(s => { if(s.value) parts.push(s.value); });
-    ($('bldExtra').value || '').split(',').map(x => x.trim()).filter(Boolean).forEach(x => parts.push(x));
+    b.querySelectorAll(`select[data-pick][data-output="${output}"]`).forEach(s => {
+      if(s.value) parts.push(s.value);
+    });
+    if(output === 'positive'){
+      ($('bldExtra').value || '').split(',').map(x => x.trim()).filter(Boolean).forEach(x => parts.push(x));
+    }
     return parts.join(', ');
   };
+  const compose = () => composeSelected('positive');
+  const composeNegative = () => [composeSelected('negative'), ($('bldNeg').value || '').trim()]
+    .filter(Boolean).join(', ');
   window._comp = compose;
+  window._compNeg = composeNegative;
   const refresh = () => {
     $('bldPreview').value = compose();
-    let tot = 0;
-    b.querySelectorAll('.sec').forEach((sec, i) => {
+    if($('bldNegPick')) $('bldNegPick').value = composeSelected('negative');
+    let pos = 0, neg = 0;
+    const activeSteps = [];
+    stepsBox.querySelectorAll('.sec').forEach((sec, i) => {
       const n = Array.from(sec.querySelectorAll('select[data-pick]')).filter(s => s.value).length;
-      tot += n;
+      if(sec.dataset.output === 'negative') neg += n; else pos += n;
       const el = sec.querySelector(`[data-bcnt="${i}"]`);
       if(el) el.textContent = n ? `${n}개` : '';
+      if(n) activeSteps.push({i, name:sec.dataset.stepName, n});
     });
-    $('bldStat').textContent = `${tot}개 선택됨`;
+    $('bldStat').textContent = `${pos}개 선택` + (neg ? ` · 네거티브 ${neg}개` : '');
+    $('bldProgress').innerHTML = activeSteps.length
+      ? activeSteps.map(x => `<button data-jumpstep="${x.i}">${esc(x.name)} ${x.n}</button>`).join('')
+      : '<span class="empty">아직 고른 단계가 없습니다.</span>';
   };
   window._bldRefresh = refresh;
 
@@ -10539,6 +10679,16 @@ function openBuilder(kind){
   if(window._bldChange) b.removeEventListener('change', window._bldChange);
   if(window._bldInput) b.removeEventListener('input', window._bldInput);
   window._bldClick = e => {
+    const jp = e.target.closest('[data-jumpstep]');
+    if(jp){
+      const head = stepsBox.querySelector(`[data-bstep="${jp.dataset.jumpstep}"]`);
+      const sec = head && head.closest('.sec');
+      if(sec){
+        sec.querySelector('.sec-body').classList.remove('hidden');
+        sec.scrollIntoView({behavior:'smooth', block:'start'});
+      }
+      return;
+    }
     const h = e.target.closest('[data-bstep]');
     if(h){ b.querySelector(`[data-bbody="${h.dataset.bstep}"]`).classList.toggle('hidden'); return; }
     const lk = e.target.closest('[data-lock]');
@@ -10562,7 +10712,6 @@ function openBuilder(kind){
       const first = box.querySelector('select');
       const cl = first.cloneNode(true);
       cl.value = '';
-      cl.style.marginTop = '4px';
       box.appendChild(cl);
       return;
     }
@@ -10573,18 +10722,36 @@ function openBuilder(kind){
   b.addEventListener('change', window._bldChange);
   b.addEventListener('input', window._bldInput);
 
-  $('bldOpenAll').addEventListener('click', () => b.querySelectorAll('.sec-body').forEach(x => x.classList.remove('hidden')));
-  $('bldCloseAll').addEventListener('click', () => b.querySelectorAll('.sec-body').forEach(x => x.classList.add('hidden')));
+  if($('bldCore')) $('bldCore').addEventListener('click', () => {
+    const coreOnly = stepsBox.classList.toggle('builder-core-only');
+    $('bldCore').textContent = coreOnly ? '모든 세부 단계 보기' : '핵심 단계만 보기';
+    $('bldCore').setAttribute('aria-pressed', coreOnly ? 'true' : 'false');
+  });
+  $('bldOpenAll').addEventListener('click', () => stepsBox.querySelectorAll('.sec').forEach(sec => {
+    if(sec.offsetParent !== null) sec.querySelector('.sec-body').classList.remove('hidden');
+  }));
+  $('bldCloseAll').addEventListener('click', () => stepsBox.querySelectorAll('.sec-body').forEach(x => x.classList.add('hidden')));
   $('bldClear').addEventListener('click', () => {
-    b.querySelectorAll('[data-slot]').forEach(f => { if(f.dataset.locked !== '1') f.querySelectorAll('select').forEach(s => s.value = ''); });
+    stepsBox.querySelectorAll('[data-slot]').forEach(f => {
+      if(f.dataset.locked !== '1') f.querySelectorAll('select').forEach(s => s.value = '');
+    });
     refresh();
   });
   $('bldRnd').addEventListener('click', () => {
-    b.querySelectorAll('[data-slot]').forEach(f => {
-      if(f.dataset.locked === '1') return;
-      const s = f.querySelector('select');
-      if(s && s.options.length > 1 && Math.random() < 0.6) s.selectedIndex = 1 + Math.floor(Math.random() * (s.options.length - 1));
-      else if(s) s.value = '';
+    /* 76개 슬롯을 각각 60%로 채우던 랜덤은 캐릭터를 쉽게 만드는 대신
+       서로 충돌하는 태그를 과도하게 만들었다. 핵심 단계에서 한 특징을 중심으로
+       가볍게 초안을 만들고, 네거티브는 사용자가 명시적으로 고르게 둔다. */
+    stepsBox.querySelectorAll('.sec').forEach(sec => {
+      if(sec.dataset.output === 'negative' || (!isBase && !sec.classList.contains('essential'))) return;
+      sec.querySelectorAll('[data-slot]').forEach((f, fi) => {
+        if(f.dataset.locked === '1') return;
+        const s = f.querySelector('select');
+        if(!s || s.options.length <= 1) return;
+        const chance = !isBase && sec.dataset.stepName === '인물' && fi === 0
+          ? 1 : (fi === 0 ? .62 : (isBase ? .24 : .16));
+        if(Math.random() < chance) s.selectedIndex = 1 + Math.floor(Math.random() * (s.options.length - 1));
+        else s.value = '';
+      });
     });
     refresh();
   });
@@ -10600,6 +10767,7 @@ function openBuilder(kind){
   refresh();
   $('modalFlash').textContent = '';
   $('modalBg').style.display = 'flex';
+  setTimeout(() => $('bldName').focus(), 0);
 }
 $('bCombo').addEventListener('click', () => openCombos(null));
 $('bStyle').addEventListener('click', () => openBuilder('style'));
@@ -10768,8 +10936,16 @@ async function optSave(option, op, name, value){
 }
 
 /* ── 모달 저장/닫기 ── */
-$('modalClose').addEventListener('click', () => $('modalBg').style.display = 'none');
-$('modalBg').addEventListener('click', e => { if(e.target.id === 'modalBg') $('modalBg').style.display = 'none'; });
+$('modalClose').addEventListener('click', () => {
+  $('modalBg').style.display = 'none';
+  $('modalBody').closest('.modal').classList.remove('builder-modal');
+});
+$('modalBg').addEventListener('click', e => {
+  if(e.target.id === 'modalBg'){
+    $('modalBg').style.display = 'none';
+    $('modalBody').closest('.modal').classList.remove('builder-modal');
+  }
+});
 $('modalSave').addEventListener('click', async () => {
   const m = window._mm;
   if(m === 'lib' || m === 'opts' || m === 'recipe' || m === 'combo'){ $('modalBg').style.display = 'none'; return; }
@@ -10789,12 +10965,13 @@ $('modalSave').addEventListener('click', async () => {
     const name = ($('bldName') || {value:''}).value.trim();
     if(!name){ alert('이름을 입력해주세요.'); return; }
     const composed = window._comp ? window._comp() : '';
+    const negative = window._compNeg ? window._compNeg() : (($('bldNeg') || {value:''}).value || '');
     if(!composed){ alert('선택된 태그가 없습니다.'); return; }
     const groups = {};
     $('modalBody').querySelectorAll('.sec').forEach(sec => {
       const step = sec.querySelector('.nm').textContent;
       sec.querySelectorAll('[data-slot]').forEach(f => {
-        const lb = f.querySelector('label span');
+        const lb = f.querySelector('.slot-name');
         const vals = Array.from(f.querySelectorAll('select')).map(s => s.value).filter(Boolean);
         if(vals.length && lb) groups[`${step}·${lb.textContent}`] = vals.join(', ');
       });
@@ -10804,13 +10981,34 @@ $('modalSave').addEventListener('click', async () => {
     if(m === 'style'){
       const r = await (await fetch('/api/style_save', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, prompt: composed, groups,
-          negative: ($('bldNeg') || {value:''}).value})})).json();
+          negative,
+          settings:{cfg_scale:Number($('pScale').value), cfg_rescale:Number($('pRescale').value),
+            steps:Number($('pSteps').value), sampler:$('pSampler').value, scheduler:$('pSched').value,
+            variety:$('pVariety').value === 'on', model:$('pModel').value,
+            width:STATE.width, height:STATE.height, uc_preset:Number($('pUc').value),
+            quality_toggle:$('pQuality').value === 'on'}})})).json();
       if(r.ok){ STYLES = r.styles; renderPresets(); renderLibrary(); $('modalFlash').textContent = `그림체/${name}.json 저장됨 ✓`; }
       else $('modalFlash').textContent = r.error;
     } else {
       const r = await (await fetch('/api/norm_save', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({type:'char', name, groups:{'조합': composed}, builder_groups: groups})})).json();
-      if(r.ok){ STATE.characters = r.characters; renderLibrary(); renderSlots(); $('modalFlash').textContent = `캐릭터 '${name}' 저장됨 ✓`; }
+        body: JSON.stringify({type:'char', name, negative,
+          groups:{'조합': composed}, builder_groups: groups})})).json();
+      if(r.ok){
+        STATE.characters = r.characters;
+        let used = false;
+        if(($('bldUseNow') || {}).checked){
+          const c = r.characters[r.characters.length - 1] || {};
+          (STATE.char_slots = STATE.char_slots || []).push({
+            name:c.name || name, prompt:c.female || composed, outfit:'',
+            negative:c.negative || negative, enabled:true
+          });
+          autoCoordsOnSecond();
+          used = true;
+          save();
+        }
+        renderLibrary(); renderSlots(); tokens();
+        $('modalFlash').textContent = `캐릭터 '${name}' 저장됨 ✓` + (used ? ' · 캐릭터 칸에 추가됨' : '');
+      }
       else $('modalFlash').textContent = r.error;
     }
     return;

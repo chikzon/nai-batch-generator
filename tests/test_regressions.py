@@ -97,6 +97,61 @@ class RegressionTests(unittest.TestCase):
             ".hl .w-num{color:var(--accent);opacity:.95;}", page)
         self.assertNotIn(".hl b{font-weight:400;border-radius:3px;padding:0 1px;}", page)
 
+    def test_builder_routes_character_variants_and_negative_separately(self):
+        """캐릭터 외형을 바꾸는 후보는 베이스에, 네거티브 후보는 양성에 섞지 않는다."""
+        builder = APP.load_builder()
+        char_names = [step.get("이름") for step in builder["캐릭터단계"]]
+        base_names = [step.get("이름") for step in builder["베이스단계"]]
+        self.assertIn("예술적 변형 (원작과 다르게)", char_names)
+        self.assertNotIn("예술적 변형 (원작과 다르게)", base_names)
+        negative_steps = [
+            step for step in builder["베이스단계"]
+            if step.get("이름") == "네거티브"
+        ]
+        self.assertEqual(len(negative_steps), 1)
+        self.assertEqual(negative_steps[0].get("출력"), "negative")
+
+        page = APP.PAGE_TEMPLATE
+        self.assertIn('data-output="${output}"', page)
+        self.assertIn("composeSelected('positive')", page)
+        self.assertIn("composeSelected('negative')", page)
+        self.assertIn("negative:c.negative || negative", page)
+        self.assertIn('id="bldUseNow" checked', page)
+
+    def test_builder_saves_style_settings_and_character_negative(self):
+        """빌더 저장도 빠른 프리셋 저장과 같은 묶음 규칙을 지킨다."""
+        page = APP.PAGE_TEMPLATE
+        builder_save = page[page.index("if(m === 'style' || m === 'char')"):]
+        self.assertIn("settings:{cfg_scale:Number($('pScale').value)", builder_save)
+        self.assertIn("quality_toggle:$('pQuality').value === 'on'", builder_save)
+        self.assertIn("JSON.stringify({type:'char', name, negative,", builder_save)
+        self.assertIn("groups:{'조합': composed}", builder_save)
+        self.assertIn("const lb = f.querySelector('.slot-name')", builder_save)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = []
+            with (
+                patch.object(APP, "CHAR_DIR", root / "캐릭터"),
+                patch.object(APP, "SETTINGS_FILE", root / "설정.json"),
+            ):
+                result = APP.ConfigServer(cfg).handle_norm_save(json.dumps({
+                    "type": "char",
+                    "name": "검증 캐릭터",
+                    "negative": "character-specific negative",
+                    "groups": {"조합": "1girl, alternate costume"},
+                    "builder_groups": {
+                        "인물·성별·인원": "1girl",
+                        "예술적 변형·의상 변경": "alternate costume",
+                    },
+                }, ensure_ascii=False))
+            self.assertTrue(result["ok"])
+            made = result["characters"][-1]
+            self.assertEqual(made["female"], "1girl, alternate costume")
+            self.assertEqual(made["negative"], "character-specific negative")
+            self.assertEqual(
+                made["groups"]["예술적 변형·의상 변경"], "alternate costume")
+
     def test_style_and_setting_files_recover_from_last_backup(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
