@@ -380,6 +380,33 @@ class RegressionTests(unittest.TestCase):
         for sel in ('id="regenMode"', 'id="regenStrength"', 'id="regenPicked"', 'id="regenAll"'):
             self.assertTrue(sel in page, f"복구 조작부가 사라졌다: {sel}")
 
+    def test_destructive_buttons_are_not_adjacent_to_creating_ones(self):
+        """되돌릴 수 없는 단추를 만드는 단추 **바로 옆**에 두지 않는다.
+
+        `선별 외 삭제`·`꺼진 칸 정리`·`세팅 삭제` 는 각각 파일·칸·씬 수백 개를
+        지운다. `+ 새 세팅` 이나 `⧉ 복제` 옆에 붙어 있으면 손이 미끄러진다.
+        단추를 없애거나 빨간색을 빼지 않는다 — **자리만** 떼어 놓는다."""
+        page = APP.render_page()
+        for bid in ('id="slotDelOff"', 'id="sbDel"', 'id="expDelUnpicked"'):
+            self.assertTrue(bid in page, f"파괴적 단추가 사라졌다: {bid}")
+        # 빨간 경고색은 유지해야 한다
+        for bid in ("slotDelOff", "sbDel", "expDelUnpicked"):
+            at = page.index(f'id="{bid}"')
+            near = page[max(0, at - 160):at + 160]
+            self.assertTrue("danger" in near, f"`{bid}` 가 경고색을 잃었다")
+        # 자리를 벌리는 장치가 있어야 한다.
+        # ⚠ `<span style="flex:1">` 스페이서는 쓰지 않는다 — `.bar` 가 `flex-wrap:wrap` 이라
+        #   좁은 오버레이에서 단추를 다음 줄 **왼쪽 끝**으로 밀어낸다(실측 x=12).
+        #   `margin-left:auto` 는 어느 줄에 놓이든 그 줄 오른쪽 끝으로 간다.
+        for bid in ("slotDelOff", "sbDel"):
+            at = page.index(f'id="{bid}"')
+            near = page[max(0, at - 200):at + 200]
+            self.assertTrue("margin-left:auto" in near,
+                            f"`{bid}` 가 만드는 단추 옆에 붙었다 (margin-left:auto 가 없다)")
+        at = page.index('id="expDelUnpicked"')
+        self.assertTrue('id="expStat"' in page[max(0, at - 320):at],
+                        "`선별 외 삭제` 앞의 상태글(auto 여백)이 없어졌다")
+
     def test_ui_labels_are_korean_words_not_invented_abbreviations(self):
         """화면 라벨은 **읽어서 뜻이 통해야** 한다.
 

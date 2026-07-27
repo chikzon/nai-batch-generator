@@ -5847,7 +5847,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button id="slotAllOff" title="모든 칸 끄기 — 칸은 남습니다">전부 끄기</button>
           <button id="slotBulkAdd" title="켠 칸의 외형 뒤에 같은 태그를 한꺼번에 붙입니다">＋태그 주입</button>
           <button id="slotDupAll" title="켠 칸을 복제합니다">⧉ 복제</button>
-          <button class="danger" id="slotDelOff" title="꺼 둔 칸을 모두 지웁니다">꺼진 칸 정리</button>
+          <!-- 되돌릴 수 없는 단추는 만드는 단추 옆에 붙이지 않는다 (자료 탭과 같은 규칙).
+               없애지도, 빨간색을 빼지도 않는다 — 자리만 떼어 잘못 눌리는 것을 막는다.
+               ⚠ `<span style="flex:1">` 스페이서를 쓰면 안 된다. `.bar` 는 `flex-wrap:wrap`
+                 이라 좁은 오버레이에서 스페이서가 남은 자리를 다 먹고 **단추를 다음 줄
+                 왼쪽 끝으로 밀어낸다**(실측: x=12 로 감). `margin-left:auto` 는 어느 줄에
+                 놓이든 그 줄의 오른쪽 끝으로 간다. -->
+          <button class="danger" id="slotDelOff" style="margin-left:auto;"
+            title="꺼 둔 칸을 모두 지웁니다">꺼진 칸 정리</button>
         </div>
       </div>
     </div>
@@ -6141,7 +6148,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <select id="sbPick" style="flex:1;"><option value="">고칠 세팅 고르기...</option></select>
           <button id="sbNew">+ 새 세팅</button>
           <button id="sbRenum" title="이 세팅의 씬 번호를 겹치지 않는 구간으로 다시 매깁니다">번호 다시 매기기</button>
-          <button id="sbDel" class="danger">세팅 삭제</button>
+          <!-- 세팅 삭제는 씬 수백 개가 함께 사라진다. `+ 새 세팅` 바로 옆은 위험하다.
+               스페이서 대신 `margin-left:auto` — 위 캐릭터 칸 주석 참조. -->
+          <button id="sbDel" class="danger" style="margin-left:auto;">세팅 삭제</button>
         </div>
         <div id="sbBody" class="hidden" style="margin-top:8px;">
           <div class="grid3">
