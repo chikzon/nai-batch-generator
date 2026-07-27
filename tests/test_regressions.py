@@ -1079,6 +1079,16 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("settingsNav.classList.toggle('hidden', !studio)", page)
         self.assertIn("#studioSettingsNav .studio-subnav-actions", css)
 
+    def test_character_duplicate_uses_latest_client_state_and_unique_identity(self):
+        """캐릭터 변형은 기존 전체 프롬프트를 깊은 복사하고 id·이름만 새로 만든다."""
+        page = APP.render_page()
+        self.assertIn('data-xdup="${c.id}"', page)
+        self.assertIn("const cloned = JSON.parse(JSON.stringify(chars[at]));", page)
+        self.assertIn("cloned.id = genId();", page)
+        self.assertIn("chars.splice(at + 1, 0, cloned);", page)
+        self.assertIn("while(names.has(name.toLocaleLowerCase()))", page)
+        self.assertIn("renderLibrary(); renderSlots(); save();", page)
+
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
 

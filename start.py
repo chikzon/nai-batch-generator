@@ -10654,6 +10654,7 @@ function renderCharCards(){
   (STATE.characters||[]).forEach(c => {
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-xc="${c.id}" data-xf="name" value="${escA(c.name)}" placeholder="이름">
+      <button data-xdup="${c.id}" title="이 캐릭터를 복사해 의상·변형만 바꿉니다">복제</button>
       <button class="danger" data-xdel="${c.id}">삭제</button></div>
       <textarea data-xc="${c.id}" data-xf="female" placeholder="girl, ...">${esc(c.female)}</textarea>
       <input type="text" data-xc="${c.id}" data-xf="clothed" placeholder="착의 (선택)" value="${escA(c.clothed)}" style="margin-top:4px;">
@@ -10663,6 +10664,25 @@ function renderCharCards(){
   h.querySelectorAll('[data-xc]').forEach(el => el.addEventListener('input', () => {
     const c = (STATE.characters||[]).find(x => x.id === el.dataset.xc);
     if(c){ c[el.dataset.xf] = el.value; save(); }
+  }));
+  h.querySelectorAll('[data-xdup]').forEach(b => b.addEventListener('click', () => {
+    const chars = STATE.characters || [];
+    const at = chars.findIndex(x => x.id === b.dataset.xdup);
+    if(at < 0) return;
+    // 최신 화면 값을 그대로 깊은 복사한다. groups·폴더·전용 네거티브도 보존하되
+    // 파일 동기화에서 원본을 덮지 않도록 id와 이름만 새로 만든다.
+    const cloned = JSON.parse(JSON.stringify(chars[at]));
+    const names = new Set(chars.map(x => String(x.name || '').trim().toLocaleLowerCase()));
+    const root = `${String(chars[at].name || '캐릭터').trim() || '캐릭터'} 복사본`;
+    let name = root, serial = 2;
+    while(names.has(name.toLocaleLowerCase())) name = `${root} ${serial++}`;
+    cloned.id = genId();
+    cloned.name = name;
+    chars.splice(at + 1, 0, cloned);
+    renderLibrary(); renderSlots(); save();
+    const input = document.querySelector(`[data-xc="${cloned.id}"][data-xf="name"]`);
+    if(input){ input.focus(); input.select(); }
+    flash(`'${name}' 복제됨 — 이름·의상·예술적 변형을 바꿔 저장하세요.`);
   }));
   h.querySelectorAll('[data-xdel]').forEach(b => b.addEventListener('click', () => {
     STATE.characters = (STATE.characters||[]).filter(x => x.id !== b.dataset.xdel);
