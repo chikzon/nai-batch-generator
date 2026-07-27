@@ -8075,6 +8075,11 @@ const ONOFF = [['pQuality','quality_toggle'],['pSmea','smea'],['pSmeaDyn','smea_
   ['pDynThr','dynamic_thresholding'],['pBrownian','prefer_brownian'],
   ['pEulerBug','deliberate_euler_ancestral_bug'],['pCoords','use_coords']];
 const NUMS = [['pUncond','uncond_scale',0],['pCtrl','controlnet_strength',1]];
+const STYLE_PARAM_IDS = new Set([
+  'basePrompt','negPrompt','pModel','pScale','pRescale','pSteps','pSampler','pSched',
+  'pVariety','pQuality','pUc','pRes','pWidth','pHeight','pSmea','pSmeaDyn',
+  'pDynThr','pUncond','pCtrl','pBrownian','pEulerBug'
+]);
 
 /* ── 시드 ──────────────────────────────────────────────────────────
    NAI 시드 = 0 이면 회차 시드를 쓰고(회차마다 하나 뽑아 상태.json에 저장),
@@ -8180,7 +8185,8 @@ function readParams(){
 }
 ['pModel','pFormat','pOutDir','pOutDate','pClean','pMaxSide','pSaveQ','pUc','pRes','pWidth','pHeight',...ONOFF.map(x=>x[0]),...NUMS.map(x=>x[0])]
   .forEach(id => { const el = $(id); if(!el) return;
-    el.addEventListener('change', readParams); el.addEventListener('input', readParams); });
+    const changed = () => { readParams(); if(STYLE_PARAM_IDS.has(id)) clearActiveStyle(); };
+    el.addEventListener('change', changed); el.addEventListener('input', changed); });
 
 /* ── 저장 ── */
 let saveT = null, saveBusy = false, saveQueued = false;
@@ -8262,7 +8268,7 @@ window.addEventListener('pagehide', () => {
     STATE.sampler = $('pSampler').value || 'k_euler_ancestral';
     STATE.scheduler = $('pSched').value || 'karras';
     STATE.variety = $('pVariety').value === 'on';
-    if(id === 'basePrompt') STATE.style_name = '';
+    if(STYLE_PARAM_IDS.has(id)) clearActiveStyle();
     tokens(); save();
   };
   el.addEventListener('input', h); el.addEventListener('change', h);
@@ -8371,45 +8377,102 @@ window.addEventListener('keydown', e => {
 });
 
 /* ── 베이스 프리셋 (그림체 파일) ── */
+function paintActiveStyle(){
+  const s = $('presetSel'); if(!s) return;
+  const active = (STATE && STATE.style_name) || '';
+  const idx = STYLES.findIndex(x => x.name === active);
+  s.options[0].textContent = active && idx < 0
+    ? `현재 그림체: ${active}` : '베이스 프리셋 불러오기...';
+  s.value = idx >= 0 ? String(idx) : '';
+  s.title = active ? `현재 그림체 묶음: ${active}` : '현재 값은 직접 편집한 상태입니다.';
+}
+function clearActiveStyle(){
+  if(!STATE || !STATE.style_name) return;
+  STATE.style_name = '';
+  paintActiveStyle();
+}
+function styleSettingsFromUI(){
+  return {
+    model: $('pModel').value,
+    cfg_scale: Number($('pScale').value),
+    cfg_rescale: Number($('pRescale').value),
+    steps: Number($('pSteps').value),
+    sampler: $('pSampler').value,
+    scheduler: $('pSched').value,
+    variety: $('pVariety').value === 'on',
+    width: Number($('pWidth').value) || STATE.width,
+    height: Number($('pHeight').value) || STATE.height,
+    uc_preset: Number($('pUc').value),
+    quality_toggle: $('pQuality').value === 'on',
+    smea: $('pSmea').value === 'on',
+    smea_dyn: $('pSmeaDyn').value === 'on',
+    dynamic_thresholding: $('pDynThr').value === 'on',
+    uncond_scale: Number($('pUncond').value),
+    controlnet_strength: Number($('pCtrl').value),
+    prefer_brownian: $('pBrownian').value === 'on',
+    deliberate_euler_ancestral_bug: $('pEulerBug').value === 'on',
+    legacy_v3_extend: !!STATE.legacy_v3_extend
+  };
+}
+function applyStyleSettings(raw){
+  const p = raw || {};
+  const first = (...keys) => {
+    const key = keys.find(k => Object.prototype.hasOwnProperty.call(p, k));
+    return key == null ? undefined : p[key];
+  };
+  const set = (key, value, cast) => {
+    if(value === undefined || value === null || value === '') return;
+    STATE[key] = cast ? cast(value) : value;
+  };
+  set('model', first('model'), String);
+  set('cfg_scale', first('cfg_scale', 'scale'), Number);
+  set('cfg_rescale', first('cfg_rescale'), Number);
+  set('steps', first('steps'), Number);
+  set('sampler', first('sampler'), String);
+  set('scheduler', first('scheduler', 'noise_schedule'), String);
+  set('variety', first('variety', 'variety_plus'), Boolean);
+  set('width', first('width'), Number);
+  set('height', first('height'), Number);
+  set('uc_preset', first('uc_preset', 'ucPreset'), Number);
+  set('quality_toggle', first('quality_toggle'), Boolean);
+  set('smea', first('smea', 'sm'), Boolean);
+  set('smea_dyn', first('smea_dyn', 'sm_dyn'), Boolean);
+  set('dynamic_thresholding', first('dynamic_thresholding'), Boolean);
+  set('uncond_scale', first('uncond_scale'), Number);
+  set('controlnet_strength', first('controlnet_strength'), Number);
+  set('prefer_brownian', first('prefer_brownian'), Boolean);
+  set('deliberate_euler_ancestral_bug', first('deliberate_euler_ancestral_bug'), Boolean);
+  set('legacy_v3_extend', first('legacy_v3_extend'), Boolean);
+  paintParams();
+}
 function renderPresets(){
   const s = $('presetSel');
   s.innerHTML = '<option value="">베이스 프리셋 불러오기...</option>';
   STYLES.forEach((x,i) => { const o = document.createElement('option'); o.value = i; o.textContent = x.name; s.appendChild(o); });
+  paintActiveStyle();
 }
 $('presetSel').addEventListener('change', () => {
   const i = $('presetSel').value;
   if(i === '') return;
   const st = STYLES[i];
   STATE.base_prompt = st.prompt; $('basePrompt').value = st.prompt;
-  if(st.negative){ STATE.negative_prompt = st.negative; $('negPrompt').value = st.negative; }
-  const p = st.settings || {};
-  if(p.cfg_scale != null){ STATE.cfg_scale = p.cfg_scale; $('pScale').value = p.cfg_scale; }
-  if(p.cfg_rescale != null){ STATE.cfg_rescale = p.cfg_rescale; $('pRescale').value = p.cfg_rescale; }
-  if(p.steps != null){ STATE.steps = p.steps; $('pSteps').value = p.steps; }
-  if(p.sampler){ STATE.sampler = p.sampler; $('pSampler').value = p.sampler; }
-  if(p.scheduler){ STATE.scheduler = p.scheduler; $('pSched').value = p.scheduler; }
-  if(p.variety != null){ STATE.variety = !!p.variety; $('pVariety').value = p.variety ? 'on' : 'off'; }
-  if(p.model){ STATE.model = p.model; if($('pModel')) $('pModel').value = p.model; }
-  if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
-  if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
-  if(p.width){ STATE.width = p.width; } if(p.height){ STATE.height = p.height; }
-  paintParams();
+  STATE.negative_prompt = st.negative || ''; $('negPrompt').value = STATE.negative_prompt;
+  applyStyleSettings(st.settings);
   STATE.style_name = st.name;
-  tokens(); save();
-  $('presetSel').value = '';
+  paintActiveStyle(); tokens(); save();
 });
 $('presetSave').addEventListener('click', async () => {
   const name = prompt('베이스 프리셋 이름 (프롬프트+네거티브+파라미터가 함께 저장):');
   if(!name) return;
   const r = await fetch('/api/style_save', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({name, prompt: $('basePrompt').value, negative: $('negPrompt').value,
-      settings: {cfg_scale: Number($('pScale').value), cfg_rescale: Number($('pRescale').value),
-        steps: Number($('pSteps').value), sampler: $('pSampler').value, scheduler: $('pSched').value,
-        variety: $('pVariety').value === 'on',
-        model: $('pModel').value, width: STATE.width, height: STATE.height,
-        uc_preset: Number($('pUc').value), quality_toggle: $('pQuality').value === 'on'}})});
+      settings: styleSettingsFromUI()})});
   const res = await r.json();
-  if(res.ok){ STYLES = res.styles; renderPresets(); renderLibrary(); alert(`그림체/${name}.json 저장됨`); }
+  if(res.ok){
+    STYLES = res.styles; STATE.style_name = name;
+    renderPresets(); renderLibrary(); save();
+    alert(`그림체/${name}.json 저장됨`);
+  }
   else alert(res.error || '저장 실패');
 });
 
@@ -10168,6 +10231,7 @@ function joinSplit3(){
   STATE.base_detail = $('baseDetail').value;
   $('basePrompt').value = v.join(', ');
   STATE.base_prompt = $('basePrompt').value;
+  clearActiveStyle();
 }
 function applySplit3(){
   const on = split3On();
@@ -10684,6 +10748,9 @@ function openFindReplace(){
       if($('frWord').checked) out = out.split(',').map(x => x.trim()).filter(Boolean).join(', ');
       h.set(out); n += h.n;
     });
+    if(hits.some(h => ['프롬프트','네거티브','고정','가변','디테일'].includes(h.name))){
+      clearActiveStyle();
+    }
     if(window.renderSlots) renderSlots();
     tokens(); save();
     $('frStat').textContent = `${n}군데 바꿨습니다 ✓`;
@@ -10790,28 +10857,22 @@ function flash(msg, extraBtn){
    경고로 막는 대신 **애초에 부분 적용이 불가능한 모양**으로 둔다. */
 function applyStyle(c){
   const p = c.params || {};
-  if(c.base){ STATE.base_prompt = c.base; $('basePrompt').value = c.base; }
+  if(Object.prototype.hasOwnProperty.call(c, 'base')){
+    STATE.base_prompt = c.base || ''; $('basePrompt').value = STATE.base_prompt;
+  }
   /* negative_full 이 있으면 프리셋을 떼어낸 결과라 빈 문자열도 뜻이 있다 (그대로 비운다) */
-  if(c.negative || c.negative_full != null){
+  const hasNegative = Object.prototype.hasOwnProperty.call(c, 'negative')
+    || c.negative_full != null;
+  if(hasNegative){
     const nv = c.negative || '';
     STATE.negative_prompt = nv; $('negPrompt').value = nv;
   }
-  const set = (k, el, v) => { if(v != null && v !== ''){ STATE[k] = v; if($(el)) $(el).value = v; } };
-  set('cfg_scale','pScale', p.scale);
-  set('cfg_rescale','pRescale', p.cfg_rescale);
-  set('steps','pSteps', p.steps);
-  set('sampler','pSampler', p.sampler);
-  set('scheduler','pSched', p.noise_schedule);
-  if(p.variety_plus != null){ STATE.variety = !!p.variety_plus; if($('pVariety')) $('pVariety').value = p.variety_plus ? 'on' : 'off'; }
-  // UC 프리셋·퀄리티 태그도 그림체의 일부다 (숫자만 보내면 NAI 가 무시하므로 문구로 합쳐진다)
-  if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
-  if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
-  if(p.width && $('pWidth')){ STATE.width = p.width; $('pWidth').value = p.width; }
-  if(p.height && $('pHeight')){ STATE.height = p.height; $('pHeight').value = p.height; }
-  tokens(); save();
+  applyStyleSettings(p);
+  STATE.style_name = c.title || c.name || c.id || '가져온 그림체';
+  paintActiveStyle(); tokens(); save();
   const bits = [];
-  if(c.base) bits.push('베이스');
-  if(c.negative) bits.push('네거티브');
+  if(Object.prototype.hasOwnProperty.call(c, 'base')) bits.push('베이스');
+  if(hasNegative) bits.push('네거티브');
   if(Object.keys(p).length) bits.push('설정값');
   refreshWelcome();
   let msg = bits.join(' + ') + ' 적용됨 ✓';
@@ -11149,7 +11210,7 @@ async function booruSearch(next){
     const tags = b.dataset.btags.split(/\s+/).filter(Boolean).map(t => t.replace(/_/g, ' ')).join(', ');
     const cur = $('basePrompt').value.trim().replace(/,$/, '');
     STATE.base_prompt = cur ? cur + ', ' + tags : tags;
-    $('basePrompt').value = STATE.base_prompt; tokens(); save();
+    $('basePrompt').value = STATE.base_prompt; clearActiveStyle(); tokens(); save();
     $('booruStat').textContent = '태그를 베이스에 붙였습니다 ✓';
   }));
   g.querySelectorAll('[data-bref]').forEach(b => b.addEventListener('click', async () => {
@@ -11249,13 +11310,13 @@ function openRecipe(it){
     </div>`;
   const body = it.positive || it.tags.join(', ');
   $('recToBase').addEventListener('click', () => {
-    STATE.base_prompt = body; $('basePrompt').value = body; STATE.style_name = '';
+    STATE.base_prompt = body; $('basePrompt').value = body; clearActiveStyle();
     tokens(); save(); $('modalFlash').textContent = '베이스로 적용됨 ✓';
   });
   $('recAppend').addEventListener('click', () => {
     const cur = $('basePrompt').value.trim().replace(/,$/, '');
     const v = cur ? cur + ', ' + body : body;
-    STATE.base_prompt = v; $('basePrompt').value = v;
+    STATE.base_prompt = v; $('basePrompt').value = v; clearActiveStyle();
     tokens(); save(); $('modalFlash').textContent = '이어붙였습니다 ✓';
   });
   $('recToChar').addEventListener('click', () => {
@@ -11264,12 +11325,12 @@ function openRecipe(it){
   });
   if($('recToNeg')) $('recToNeg').addEventListener('click', () => {
     STATE.negative_prompt = it.negative; $('negPrompt').value = it.negative;
-    tokens(); save(); $('modalFlash').textContent = '네거티브로 적용됨 ✓';
+    clearActiveStyle(); tokens(); save(); $('modalFlash').textContent = '네거티브로 적용됨 ✓';
   });
   b.querySelectorAll('[data-rt]').forEach(c => c.addEventListener('click', () => {
     const cur = $('basePrompt').value.trim().replace(/,$/, '');
     const v = cur ? cur + ', ' + c.dataset.rt : c.dataset.rt;
-    STATE.base_prompt = v; $('basePrompt').value = v; tokens(); save();
+    STATE.base_prompt = v; $('basePrompt').value = v; clearActiveStyle(); tokens(); save();
     c.classList.add('on');
   }));
   $('modalFlash').textContent = '';
@@ -11785,12 +11846,7 @@ $('modalSave').addEventListener('click', async () => {
     if(m === 'style'){
       const r = await (await fetch('/api/style_save', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, prompt: composed, groups,
-          negative,
-          settings:{cfg_scale:Number($('pScale').value), cfg_rescale:Number($('pRescale').value),
-            steps:Number($('pSteps').value), sampler:$('pSampler').value, scheduler:$('pSched').value,
-            variety:$('pVariety').value === 'on', model:$('pModel').value,
-            width:STATE.width, height:STATE.height, uc_preset:Number($('pUc').value),
-            quality_toggle:$('pQuality').value === 'on'}})})).json();
+          negative, settings:styleSettingsFromUI()})})).json();
       if(r.ok){ STYLES = r.styles; renderPresets(); renderLibrary(); $('modalFlash').textContent = `그림체/${name}.json 저장됨 ✓`; }
       else $('modalFlash').textContent = r.error;
     } else {

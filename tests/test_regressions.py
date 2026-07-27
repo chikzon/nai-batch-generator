@@ -145,8 +145,14 @@ class RegressionTests(unittest.TestCase):
         """빌더 저장도 빠른 프리셋 저장과 같은 묶음 규칙을 지킨다."""
         page = APP.PAGE_TEMPLATE
         builder_save = page[page.index("if(m === 'style' || m === 'char')"):]
-        self.assertIn("settings:{cfg_scale:Number($('pScale').value)", builder_save)
-        self.assertIn("quality_toggle:$('pQuality').value === 'on'", builder_save)
+        self.assertIn("negative, settings:styleSettingsFromUI()", builder_save)
+        self.assertIn("function styleSettingsFromUI()", page)
+        for field in (
+            "quality_toggle", "smea", "smea_dyn", "dynamic_thresholding",
+            "uncond_scale", "controlnet_strength", "prefer_brownian",
+            "deliberate_euler_ancestral_bug",
+        ):
+            self.assertIn(f"{field}:", page)
         self.assertIn("JSON.stringify({type:'char', name, negative,", builder_save)
         self.assertIn("groups:{'조합': composed}", builder_save)
         self.assertIn("const lb = f.querySelector('.slot-name')", builder_save)
@@ -174,6 +180,27 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(made["negative"], "character-specific negative")
             self.assertEqual(
                 made["groups"]["예술적 변형·의상 변경"], "alternate costume")
+
+    def test_style_file_round_trip_preserves_extended_generation_settings(self):
+        settings = {
+            "model": "nai-diffusion-4-5-full",
+            "cfg_scale": 6.2, "cfg_rescale": 0.31, "steps": 31,
+            "sampler": "k_dpmpp_2m", "scheduler": "karras",
+            "variety": True, "width": 1024, "height": 1024,
+            "uc_preset": 1, "quality_toggle": False,
+            "smea": True, "smea_dyn": True, "dynamic_thresholding": True,
+            "uncond_scale": 0.42, "controlnet_strength": 1.4,
+            "prefer_brownian": False, "deliberate_euler_ancestral_bug": True,
+            "legacy_v3_extend": True,
+        }
+        with tempfile.TemporaryDirectory() as td, patch.object(
+                APP, "STYLE_DIR", Path(td) / "그림체"):
+            APP.save_style_file(
+                "묶음", prompt="whole positive", negative="", settings=settings)
+            loaded = APP.list_styles({"그림체_그룹": []})[0]
+        self.assertEqual(loaded["prompt"], "whole positive")
+        self.assertEqual(loaded["negative"], "")
+        self.assertEqual(loaded["settings"], settings)
 
     def test_style_and_setting_files_recover_from_last_backup(self):
         with tempfile.TemporaryDirectory() as td:
