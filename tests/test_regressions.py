@@ -1456,6 +1456,7 @@ class RegressionTests(unittest.TestCase):
                 "외형": "new appearance", "착의": "new clothes",
                 "네거티브": "new negative", "출처": "user file",
                 "그룹": {"예술적 변형": "watercolor"},
+                "미래필드": {"keep": "unknown character metadata"},
             }, ensure_ascii=False), encoding="utf-8")
 
             with (
@@ -1479,6 +1480,10 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(char["enabled"], "화면의 켜기/끄기 상태는 보존해야 한다")
             self.assertEqual(saved_file["외형"], "new appearance")
             self.assertEqual(saved_file["착의"], "new clothes")
+            self.assertEqual(
+                saved_file["미래필드"],
+                {"keep": "unknown character metadata"},
+            )
             self.assertEqual(
                 saved_settings["characters"][0]["female"], "new appearance")
 
@@ -1508,6 +1513,141 @@ class RegressionTests(unittest.TestCase):
 
             self.assertEqual(cfg["characters"][0]["name"], "UI 최신값")
             self.assertEqual(cfg["characters"][0]["female"], "new appearance")
+
+    def test_unchanged_character_sync_does_not_rewrite_or_make_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            char_dir = Path(td) / "캐릭터"
+            char_dir.mkdir()
+            target = char_dir / "Stable.json"
+            document = {
+                "id": "stable-id",
+                "이름": "Stable",
+                "외형": "1girl, stable identity",
+                "착의": "blue dress",
+                "네거티브": "bad anatomy",
+                "미래필드": {"must": "survive"},
+            }
+            target.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            before = target.read_bytes()
+            before_mtime = target.stat().st_mtime_ns
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [{
+                "id": "stable-id",
+                "name": "Stable",
+                "female": "1girl, stable identity",
+                "clothed": "blue dress",
+                "negative": "bad anatomy",
+                "enabled": True,
+            }]
+
+            with patch.object(APP, "CHAR_DIR", char_dir):
+                APP.sync_chars_to_files(cfg)
+
+            self.assertEqual(target.read_bytes(), before)
+            self.assertEqual(target.stat().st_mtime_ns, before_mtime)
+            self.assertFalse(list(char_dir.rglob("*.bak")))
+
+    def test_same_character_names_never_overwrite_each_other(self):
+        with tempfile.TemporaryDirectory() as td:
+            char_dir = Path(td) / "캐릭터"
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [
+                {
+                    "id": "same-name-a", "name": "Same",
+                    "female": "first identity", "enabled": True,
+                },
+                {
+                    "id": "same-name-b", "name": "Same",
+                    "female": "second identity", "enabled": True,
+                },
+            ]
+
+            with patch.object(APP, "CHAR_DIR", char_dir):
+                APP.sync_chars_to_files(cfg)
+                APP.sync_chars_to_files(cfg)
+
+            files = sorted(char_dir.glob("Same*.json"))
+            self.assertEqual([p.name for p in files], ["Same (2).json", "Same.json"])
+            documents = [
+                json.loads(p.read_text(encoding="utf-8")) for p in files
+            ]
+            self.assertEqual(
+                {doc["id"] for doc in documents},
+                {"same-name-a", "same-name-b"},
+            )
+            self.assertEqual(
+                {doc["외형"] for doc in documents},
+                {"first identity", "second identity"},
+            )
+
+    def test_thousand_character_files_import_sync_restart_and_compare_without_loss(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            char_dir = root / "캐릭터"
+            char_dir.mkdir()
+            settings.write_text("{}", encoding="utf-8")
+            time.sleep(0.01)
+            expected_last = ""
+            for i in range(1000):
+                prompt = (
+                    f"1girl, bulk character {i:04d}, long hair, "
+                    f"identity token {i:04d}, 1.2::detail::{chr(0xAC00 + i % 100)}"
+                )
+                if i == 999:
+                    expected_last = prompt
+                folder = char_dir / f"묶음-{i % 10:02d}"
+                folder.mkdir(exist_ok=True)
+                (folder / f"캐릭터-{i:04d}.json").write_text(json.dumps({
+                    "id": f"bulk-{i:04d}",
+                    "이름": f"캐릭터 {i:04d}",
+                    "외형": prompt,
+                    "착의": f"outfit {i % 40}",
+                    "네거티브": f"negative {i % 13}",
+                }, ensure_ascii=False), encoding="utf-8")
+
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            with patch.object(APP, "SETTINGS_FILE", settings), \
+                    patch.object(APP, "CHAR_DIR", char_dir):
+                APP.import_char_files(cfg)
+                APP.sync_chars_to_files(cfg)
+                APP.save_config(cfg)
+                saved = json.loads(settings.read_text(encoding="utf-8"))
+                restarted = dict(APP.DEFAULT_CONFIG)
+                restarted.update(saved)
+                APP.import_char_files(restarted)
+                compared = APP.comparison_characters(restarted)
+
+            self.assertEqual(len(cfg["characters"]), 1000)
+            self.assertEqual(len(restarted["characters"]), 1000)
+            self.assertEqual(len(compared), 1000)
+            self.assertEqual(restarted["characters"][-1]["female"], expected_last)
+            self.assertEqual(
+                APP._comparison_character_prompt(compared[-1]),
+                expected_last + ", outfit 39",
+            )
+            self.assertEqual(len(restarted["character_folders"]), 10)
+
+    def test_large_character_library_renders_bounded_searchable_pages(self):
+        page = APP.render_page()
+        for element_id in (
+            "libFilter", "libType", "libCount", "libMore",
+            "charFilter", "charCount", "charMore",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("filtered.slice(0, LIB_LIMIT)", page)
+        self.assertIn("filtered.slice(0, CHAR_EDIT_LIMIT)", page)
+        self.assertIn("LIB_LIMIT += 100", page)
+        self.assertIn("CHAR_EDIT_LIMIT += 24", page)
+        self.assertIn("libraryNeedle", page)
+        self.assertIn(
+            "var LIB_FILTER_TIMER = null, CHAR_FILTER_TIMER = null;",
+            page,
+        )
+        self.assertIn("clearTimeout(CHAR_FILTER_TIMER);", page)
 
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.

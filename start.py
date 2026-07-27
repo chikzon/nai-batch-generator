@@ -4874,6 +4874,33 @@ def _folder_by_name(cfg, name, parent_id=None):
     return f
 
 
+def _read_char_documents(paths):
+    """많은 독립 JSON을 원자 저장 잠금 밖에서 병렬로 읽는다.
+
+    파일 교체는 os.replace라 잠금 없는 독자는 완성된 이전판 또는 새 판만 본다.
+    깨진 파일만 기존 복구 경로로 다시 읽어 `.bak`을 살린다. Windows에서 파일
+    1,000개를 직렬 open하면 보안 검사 지연만 수십 초가 걸려 자료 수에 비례해
+    시작이 멈추므로, 충분히 많을 때만 제한된 읽기 풀을 쓴다.
+    """
+    paths = list(paths)
+
+    def one(path):
+        try:
+            return path, json.loads(path.read_text(encoding="utf-8-sig")), None
+        except Exception as first:
+            try:
+                return path, load_json_recover(path), None
+            except Exception:
+                return path, None, first
+
+    if len(paths) < 32:
+        return [one(path) for path in paths]
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, paths))
+
+
 def import_char_files(cfg):
     """캐릭터/ 폴더의 규격 JSON을 등록하고, 더 새 외부 편집은 설정에 반영한다.
 
@@ -4889,10 +4916,10 @@ def import_char_files(cfg):
         settings_mtime = SETTINGS_FILE.stat().st_mtime_ns
     except OSError:
         settings_mtime = -1
-    for p in sorted(CHAR_DIR.rglob("*.json")):
-        try:
-            data = load_json_recover(p)
-        except Exception:
+    registered, refreshed = [], []
+    paths = sorted(CHAR_DIR.rglob("*.json"))
+    for p, data, error in _read_char_documents(paths):
+        if error is not None:
             log.warning(f"캐릭터 파일 손상(건너뜀): {p.name}")
             continue
         if not isinstance(data, dict):
@@ -4931,7 +4958,7 @@ def import_char_files(cfg):
                 current["groups"] = data["그룹"]
             else:
                 current.pop("groups", None)
-            log.info(f"외부에서 더 새로 편집한 캐릭터 반영: {p.relative_to(CHAR_DIR)}")
+            refreshed.append(str(p.relative_to(CHAR_DIR)))
             continue
         new_id = cid or "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         new_char = {
@@ -4944,13 +4971,38 @@ def import_char_files(cfg):
             new_char["groups"] = data["그룹"]
         cfg.setdefault("characters", []).append(new_char)
         known[new_id] = new_char
-        log.info(f"캐릭터 파일 등록: {p.relative_to(CHAR_DIR)}")
+        registered.append(str(p.relative_to(CHAR_DIR)))
+    if registered:
+        sample = ", ".join(registered[:3])
+        log.info(
+            f"캐릭터 파일 등록: {len(registered):,}개"
+            + (f" (예: {sample})" if sample else "")
+        )
+    if refreshed:
+        sample = ", ".join(refreshed[:3])
+        log.info(
+            f"외부에서 더 새로 편집한 캐릭터 반영: {len(refreshed):,}개"
+            + (f" (예: {sample})" if sample else "")
+        )
 
 
 def sync_chars_to_files(cfg):
     """설정의 캐릭터를 캐릭터/ 폴더 규격 JSON으로 내보낸다 (UI 폴더 = 실제 디렉터리)."""
     CHAR_DIR.mkdir(exist_ok=True)
     folders = {f["id"]: f for f in cfg.get("character_folders", [])}
+    # 시작할 때 수천 파일을 내용이 같은데도 모두 다시 fsync하면 실행이 수십 초
+    # 느려지고 .bak도 쓸데없이 수천 개 생긴다. id별 현재 파일과 원문을 한 번 읽어,
+    # 그대로인 파일은 건드리지 않고 이름·폴더·내용이 바뀐 것만 쓴다.
+    existing_by_id, existing_by_path = {}, {}
+    for old_path, old_data, error in _read_char_documents(
+            CHAR_DIR.rglob("*.json")):
+        if error is not None:
+            continue
+        if not isinstance(old_data, dict) or not old_data.get("id"):
+            continue
+        existing_by_id.setdefault(str(old_data["id"]), []).append(
+            (old_path, old_data))
+        existing_by_path[old_path.resolve()] = old_data
     keep = set()
     for c in cfg.get("characters", []):
         parts = []
@@ -4962,26 +5014,56 @@ def sync_chars_to_files(cfg):
             parts.append(_safe_name(sf["name"]))
         d = CHAR_DIR.joinpath(*parts) if parts else CHAR_DIR
         d.mkdir(parents=True, exist_ok=True)
-        p = d / f"{_safe_name(c.get('name') or c['id'])}.json"
-        data = {"id": c["id"], "이름": c.get("name", ""), "외형": c.get("female", ""),
-                "착의": c.get("clothed", ""), "네거티브": c.get("negative", "")}
+        desired = d / f"{_safe_name(c.get('name') or c['id'])}.json"
+        candidates = existing_by_id.get(str(c["id"]), [])
+        # 외부 파일을 처음 읽은 직후에는 원래 파일명과 알려지지 않은 필드를
+        # 그대로 지킨다. UI에서 이름·폴더를 바꾼 경우에만 새 위치로 옮긴다.
+        stable = next((
+            old_path for old_path, old_data in candidates
+            if old_path.parent.resolve() == d.resolve()
+            and str(old_data.get("이름") or old_path.stem)
+                == str(c.get("name") or "")
+        ), None)
+        p = stable or desired
+        if stable is None:
+            serial = 2
+            while p.exists():
+                occupant = existing_by_path.get(p.resolve())
+                if isinstance(occupant, dict) and str(occupant.get("id")) == str(c["id"]):
+                    break
+                p = d / f"{_safe_name(c.get('name') or c['id'])} ({serial}).json"
+                serial += 1
+        prior = existing_by_path.get(p.resolve())
+        if prior is None and candidates:
+            # 이름·폴더 이동에서도 외부 도구가 적은 알 수 없는 필드를 버리지 않는다.
+            prior = candidates[0][1]
+        data = dict(prior) if isinstance(prior, dict) else {}
+        data.update({
+            "id": c["id"], "이름": c.get("name", ""), "외형": c.get("female", ""),
+            "착의": c.get("clothed", ""), "네거티브": c.get("negative", ""),
+        })
         if c.get("groups"):
             data["그룹"] = c["groups"]
+        else:
+            data.pop("그룹", None)
         if c.get("source"):
             data["출처"] = c["source"]
+        else:
+            data.pop("출처", None)
         try:
-            atomic_write_json(p, data)
+            if not (p.is_file() and existing_by_path.get(p.resolve()) == data):
+                atomic_write_json(p, data)
             keep.add(p.resolve())
         except OSError as e:
             log.warning(f"캐릭터 파일 저장 실패({p.name}): {e}")
     # 설정에 있는 캐릭터의 옛 파일(이동/이름변경/삭제 잔재) 정리
     ids = {c["id"] for c in cfg.get("characters", [])}
-    for p in CHAR_DIR.rglob("*.json"):
+    for p, data in (
+        (old_path, old_data)
+        for rows in existing_by_id.values()
+        for old_path, old_data in rows
+    ):
         if p.resolve() in keep:
-            continue
-        try:
-            data = load_json_recover(p)
-        except Exception:
             continue
         if isinstance(data, dict) and data.get("id") and data["id"] in ids:
             # 같은 캐릭터의 새 위치 파일이 먼저 확정된 뒤 옛 위치는 복구 가능한
@@ -7828,11 +7910,18 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="card">
         <h2><span class="n">DB</span>캐릭터 · 그림체 라이브러리</h2>
         <p class="hint">캐릭터/ · 그림체/ 폴더의 파일 전부. 남이 만든 파일을 넣으면 여기 뜨고, 눌러서 내 것으로 가져올 수 있습니다.</p>
-        <div class="bar">
+        <div class="filterbar">
+          <input type="search" id="libFilter" placeholder="캐릭터·그림체 이름과 프롬프트 검색">
+          <select id="libType" style="width:auto;">
+            <option value="">전체 자료</option><option value="캐릭터">캐릭터</option>
+            <option value="그림체">그림체</option>
+          </select>
           <button id="libAddChar">+ 캐릭터 추가</button>
           <button id="libAddFolder">+ 폴더 추가</button>
+          <span class="n" id="libCount" style="margin-left:auto;"></span>
         </div>
         <div id="libGrid" class="items" style="grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:7px;"></div>
+        <div class="bar"><button type="button" id="libMore" style="flex:1;display:none;">더 보기 ▾</button></div>
       </div>
       <div class="card">
         <h2><span class="n">레시피</span>남들의 조합 <span class="n" id="recStat" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);"></span></h2>
@@ -7849,7 +7938,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <h2><span class="n">편집</span>캐릭터 상세
           <button type="button" id="charUndo" class="hidden" style="margin-left:auto;">↶ 최근 삭제 되돌리기</button></h2>
         <p class="hint" id="charEditMsg">복제로 의상·예술적 변형을 나누고, 삭제한 항목은 이 화면을 닫기 전 되돌릴 수 있습니다.</p>
+        <div class="filterbar">
+          <input type="search" id="charFilter" placeholder="편집할 캐릭터 이름·프롬프트 검색">
+          <span class="n" id="charCount" style="margin-left:auto;"></span>
+        </div>
         <div id="charList"></div>
+        <div class="bar"><button type="button" id="charMore" style="flex:1;display:none;">편집할 캐릭터 더 보기 ▾</button></div>
         <div id="folderList"></div>
       </div>
       </div>
@@ -11486,21 +11580,74 @@ $('setThumbs').addEventListener('change', () => {
 });
 
 /* ── 라이브러리 ── */
+var LIB_LIMIT = 100, CHAR_EDIT_LIMIT = 24;
+var LIB_FILTER_TIMER = null, CHAR_FILTER_TIMER = null;
+function libraryNeedle(value){
+  return String(value || '').normalize('NFKC').toLocaleLowerCase();
+}
 function renderLibrary(){
   const g = $('libGrid'); if(!g) return;
   g.innerHTML = '';
+  LIB_LIMIT = Number(LIB_LIMIT) || 100;
   const items = [];
   (STATE.characters||[]).forEach(c => items.push({t:'캐릭터', n:c.name||'(무명)', b:c.female||'', groups:c.groups, ref:c}));
   STYLES.forEach(s => items.push({t:'그림체', n:s.name, b:s.prompt, ref:s}));
-  items.forEach(it => {
+  const query = libraryNeedle(($('libFilter')||{}).value);
+  const kind = (($('libType')||{}).value) || '';
+  const filtered = items.filter(it => {
+    if(kind && it.t !== kind) return false;
+    if(!query) return true;
+    return libraryNeedle([
+      it.n, it.b, it.ref && it.ref.clothed,
+      it.ref && it.ref.negative, it.ref && it.ref.source,
+    ].join(' ')).includes(query);
+  });
+  const shown = filtered.slice(0, LIB_LIMIT);
+  shown.forEach(it => {
     const el = document.createElement('div'); el.className = 'row'; el.style.cursor = 'pointer'; el.style.margin = '0';
     el.innerHTML = `<div class="tag">${it.t}</div><b style="font-size:var(--fs-xs);">${esc(it.n)}</b>
-      <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;max-height:44px;overflow:hidden;">${esc(it.b.slice(0,100))}</div>`;
+      <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;max-height:44px;overflow:hidden;">${esc(String(it.b||'').slice(0,100))}</div>`;
     el.addEventListener('click', () => openLib(it));
     g.appendChild(el);
   });
+  if(!shown.length){
+    g.innerHTML = '<div class="row hint">조건에 맞는 캐릭터·그림체가 없습니다.</div>';
+  }
+  if($('libCount')) $('libCount').textContent =
+    `${shown.length.toLocaleString()} / ${filtered.length.toLocaleString()}개`;
+  if($('libMore')){
+    $('libMore').style.display = shown.length < filtered.length ? '' : 'none';
+    $('libMore').textContent =
+      `더 보기 · 남은 ${(filtered.length - shown.length).toLocaleString()}개 ▾`;
+  }
   renderCharCards();
 }
+if($('libFilter')) $('libFilter').addEventListener('input', () => {
+  clearTimeout(LIB_FILTER_TIMER);
+  LIB_FILTER_TIMER = setTimeout(() => {
+    LIB_LIMIT = 100;
+    renderLibrary();
+  }, 100);
+});
+if($('libType')) $('libType').addEventListener('change', () => {
+  LIB_LIMIT = 100;
+  renderLibrary();
+});
+if($('libMore')) $('libMore').addEventListener('click', () => {
+  LIB_LIMIT += 100;
+  renderLibrary();
+});
+if($('charFilter')) $('charFilter').addEventListener('input', () => {
+  clearTimeout(CHAR_FILTER_TIMER);
+  CHAR_FILTER_TIMER = setTimeout(() => {
+    CHAR_EDIT_LIMIT = 24;
+    renderCharCards();
+  }, 100);
+});
+if($('charMore')) $('charMore').addEventListener('click', () => {
+  CHAR_EDIT_LIMIT += 24;
+  renderCharCards();
+});
 const DELETED_CHARS = [];
 function updateCharUndo(){
   const button = $('charUndo'), message = $('charEditMsg');
@@ -11516,7 +11663,13 @@ function updateCharUndo(){
 function renderCharCards(){
   const h = $('charList'); if(!h) return;
   h.innerHTML = '';
-  (STATE.characters||[]).forEach(c => {
+  CHAR_EDIT_LIMIT = Number(CHAR_EDIT_LIMIT) || 24;
+  const query = libraryNeedle(($('charFilter')||{}).value);
+  const filtered = (STATE.characters||[]).filter(c => !query || libraryNeedle([
+    c.name, c.female, c.clothed, c.negative, c.source,
+  ].join(' ')).includes(query));
+  const shown = filtered.slice(0, CHAR_EDIT_LIMIT);
+  shown.forEach(c => {
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-xc="${c.id}" data-xf="name" value="${escA(c.name)}" placeholder="이름">
       <button data-xdup="${c.id}" title="이 캐릭터를 복사해 의상·변형만 바꿉니다">복제</button>
@@ -11526,6 +11679,16 @@ function renderCharCards(){
       <input type="text" data-xc="${c.id}" data-xf="negative" placeholder="전용 네거티브" value="${escA(c.negative)}" style="margin-top:4px;">`;
     h.appendChild(el);
   });
+  if(!shown.length){
+    h.innerHTML = '<div class="row hint">조건에 맞는 캐릭터가 없습니다.</div>';
+  }
+  if($('charCount')) $('charCount').textContent =
+    `${shown.length.toLocaleString()} / ${filtered.length.toLocaleString()}명`;
+  if($('charMore')){
+    $('charMore').style.display = shown.length < filtered.length ? '' : 'none';
+    $('charMore').textContent =
+      `편집할 캐릭터 더 보기 · 남은 ${(filtered.length - shown.length).toLocaleString()}명 ▾`;
+  }
   h.querySelectorAll('[data-xc]').forEach(el => el.addEventListener('input', () => {
     const c = (STATE.characters||[]).find(x => x.id === el.dataset.xc);
     if(c){ c[el.dataset.xf] = el.value; save(); }
@@ -11580,6 +11743,9 @@ $('charUndo').addEventListener('click', () => {
 });
 $('libAddChar').addEventListener('click', () => {
   (STATE.characters = STATE.characters||[]).push({id:genId(), name:'새 캐릭터', female:'', clothed:'', negative:'', enabled:true});
+  if($('libFilter')) $('libFilter').value = '';
+  if($('charFilter')) $('charFilter').value = '새 캐릭터';
+  LIB_LIMIT = 100; CHAR_EDIT_LIMIT = 24;
   renderLibrary(); save();
 });
 $('libAddFolder').addEventListener('click', () => {
