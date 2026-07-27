@@ -359,6 +359,50 @@ class RegressionTests(unittest.TestCase):
                 "highres",
             )
 
+    def test_nai_renamed_tags_are_the_autocomplete_suggestions(self):
+        data = {
+            "rows": [
+                ("v", 151368, "", "general", ["peace_sign", "v_sign"]),
+                ("|_|", 21652, "", "general", ["||_||"]),
+                ("tachi-e", 20834, "", "general", []),
+            ]
+        }
+        with (
+            patch.object(APP, "_ac_cache_load", return_value=None),
+            patch.object(APP, "_ac_cache_save"),
+        ):
+            index = APP._ac_index_inner(data)
+        with patch.object(APP, "_ac_index", return_value=index):
+            self.assertEqual(
+                APP.autocomplete_tags({}, "peace", 12)[0]["tag"],
+                "peace sign",
+            )
+            self.assertEqual(
+                APP.autocomplete_tags({}, "bar ey", 12)[0]["tag"],
+                "bar eyes",
+            )
+            self.assertEqual(
+                APP.autocomplete_tags({}, "tachi", 12)[0]["tag"],
+                "character image",
+            )
+
+    def test_nai_renamed_tag_verification_never_needs_danbooru(self):
+        old_tags = r"v, double v, |_|, \||/, :|, ;|, <|> <|>, eyepatch bikini, tachi-e"
+        expected = {
+            "peace sign", "double peace", "bar eyes", r"open \m/",
+            "neutral face", "neco-arc eyes", "square bikini", "character image",
+        }
+        with (
+            patch.dict(APP._TAGV_CACHE, {}, clear=True),
+            patch.object(APP, "_tags_json", side_effect=AssertionError("network called")),
+            patch.object(APP, "_tags_json_at", side_effect=AssertionError("network called")),
+        ):
+            result = APP.verify_tags(old_tags)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["summary"]["nai_renamed"], 9)
+        self.assertTrue(all(x["status"] == "nai_renamed" for x in result["items"]))
+        self.assertEqual({x["alias_to"] for x in result["items"]}, expected)
+
     def test_disabled_coordinates_are_neutralized_in_actual_payload(self):
         png = io.BytesIO()
         Image.new("RGB", (2, 2), "white").save(png, "PNG")
@@ -551,6 +595,62 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result["style"]["base"], "1girl")
         self.assertTrue(result["style"]["params"]["quality_toggle"])
         self.assertEqual(result["style"]["negative"], "bad anatomy")
+
+    def test_legacy_middle_quality_suffix_is_removed_once(self):
+        suffix = APP.quality_suffix_text("nai-diffusion-4-5-full")
+        prompt = f"1girl, {suffix}, outdoors"
+        cleaned, enabled = APP.split_quality_suffix(
+            prompt, "nai-diffusion-4-5-full")
+        self.assertTrue(enabled)
+        self.assertEqual(cleaned, "1girl, outdoors")
+
+        doubled = f"1girl, {suffix}, outdoors, {suffix}"
+        cleaned, enabled = APP.split_quality_suffix(
+            doubled, "nai-diffusion-4-5-full")
+        self.assertTrue(enabled)
+        self.assertEqual(cleaned, f"1girl, {suffix}, outdoors")
+
+    def test_explicit_quality_toggle_state_wins_over_phrase_guessing(self):
+        model = "nai-diffusion-4-5-full"
+        suffix = APP.quality_suffix_text(model)
+        prompt = f"1girl, {suffix}, outdoors"
+        self.assertEqual(
+            APP.restore_quality_prompt(prompt, model, {"quality_toggle": False}),
+            (prompt, False),
+        )
+        self.assertEqual(
+            APP.restore_quality_prompt(prompt, model, {"quality_toggle": True}),
+            ("1girl, outdoors", True),
+        )
+
+    def test_metadata_import_preserves_explicit_quality_toggle_state(self):
+        suffix = APP.quality_suffix_text("nai-diffusion-4-5-full")
+        prompt = f"1girl, {suffix}, outdoors"
+        for explicit, expected_base in (
+            (False, prompt),
+            (True, "1girl, outdoors"),
+        ):
+            metadata = PngInfo()
+            metadata.add_text("Comment", json.dumps({
+                "prompt": prompt,
+                "uc": "bad anatomy",
+                "source": "NovelAI Diffusion V4.5",
+                "qualityToggle": explicit,
+            }))
+            source = io.BytesIO()
+            Image.new("RGB", (2, 2), "white").save(
+                source, "PNG", pnginfo=metadata)
+            with tempfile.TemporaryDirectory() as td, patch.object(
+                    APP, "IMG_CACHE", Path(td)):
+                result = APP.ConfigServer(
+                    copy.deepcopy(APP.DEFAULT_CONFIG)
+                ).handle_inspect(source.getvalue(), "fixture.png", "")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["style"]["base"], expected_base)
+            self.assertIs(
+                result["style"]["params"]["quality_toggle"], explicit)
+            self.assertNotIn(
+                "quality_toggle_guessed", result["style"]["params"])
 
     def test_atomic_json_recovers_last_backup(self):
         with tempfile.TemporaryDirectory() as td:

@@ -1454,12 +1454,47 @@ def search_booru(site="danbooru", tags="", page=1, limit=40):
 # 없는 태그는 그림에 아무 영향이 없으면서 토큰만 잡아먹으므로 찾아낼 값어치가 있다.
 _TAGV_CACHE = {}
 
+# NovelAI 공식 개명표. 단부루에서는 왼쪽이 여전히 정식 태그이므로 CSV 자체는 고치지 않는다.
+# https://docs.novelai.net/en/image/tags/#renamed-tags
+NAI_RENAMED_TAGS = {
+    "v": "peace sign",
+    "double_v": "double peace",
+    "|_|": "bar eyes",
+    r"\||/": r"open \m/",
+    ":|": "neutral face",
+    ";|": "neutral face",
+    "<|>_<|>": "neco-arc eyes",
+    "eyepatch_bikini": "square bikini",
+    "tachi-e": "character image",
+}
+
+
+def _nai_tag_key(raw):
+    """NAI 개명표 대조용 키. `<|> <|>`를 우리 `<조각>` 문법으로 오인하지 않는다."""
+    t = str(raw or "").strip().lower()
+    for _ in range(4):
+        m = re.fullmatch(r"[+-]?\d+(?:\.\d+)?\s*::(.*?)::", t)
+        if not m:
+            break
+        t = m.group(1).strip()
+    t = t.translate(str.maketrans("", "", "{}[]")).strip()
+    t = re.sub(r"^artists?:", "", t)
+    return re.sub(r"_+", "_", re.sub(r"\s+", "_", t)).strip("_")
+
+
+def nai_renamed_tag(raw):
+    """단부루 이름이 NAI에서 개명됐으면 NAI 권장 이름을 돌려준다."""
+    return NAI_RENAMED_TAGS.get(_nai_tag_key(raw))
+
 
 def _tagv_norm(raw):
     """`1.3::artist:foo::` · `{a}` · `<조각>` 같은 표기를 단부루 태그 이름으로."""
     t = (raw or "").strip()
     if not t or t.startswith("#"):
         return ""
+    renamed_key = _nai_tag_key(t)
+    if renamed_key in NAI_RENAMED_TAGS:
+        return renamed_key
     if t.startswith("<") and t.endswith(">"):      # 우리 조각 문법은 검사 대상이 아니다
         return ""
     for _ in range(4):                              # 1.3::a:: 를 벗겨 낸다 (겹칠 수 있다)
@@ -1504,7 +1539,11 @@ def verify_tags(text, low=100):
 
     없는 태그(GHOST)에는 비슷한 이름 후보를 함께 준다 — 오타를 고치기 쉽게."""
     seen, order = {}, []
-    parts = (text or "").replace(chr(10), ",").replace(";", ",").split(",")
+    # 세미콜론도 예전에는 구분자로 받았지만 `;|` 자체가 NAI 공식 개명 태그다.
+    # 그 한 태그는 임시 표식으로 보존한 뒤 나머지 세미콜론만 구분자로 바꾼다.
+    semi_tag = "\x00NAI_SEMICOLON_BAR\x00"
+    prepared = (text or "").replace(";|", semi_tag)
+    parts = prepared.replace(chr(10), ",").replace(";", ",").replace(semi_tag, ";|").split(",")
     for chunk in parts:
         n = _tagv_norm(chunk)
         if not n or n in seen:
@@ -1513,7 +1552,7 @@ def verify_tags(text, low=100):
         order.append(n)
     out, err = [], None
     # 이름 여러 개를 한 번에 물어본다 (요청 수를 줄인다)
-    todo = [n for n in order if n not in _TAGV_CACHE]
+    todo = [n for n in order if n not in NAI_RENAMED_TAGS and n not in _TAGV_CACHE]
     for i in range(0, len(todo), 40):
         batch = todo[i:i + 40]
         try:
@@ -1532,7 +1571,7 @@ def verify_tags(text, low=100):
     #   ⚠ 별칭된 태그도 tags.json 에 **행이 남아 있고 is_deprecated 는 false** 다
     #     (crouching 0장 false → squatting 으로 옮겨 감). 행이 없는 것만 찾으면 놓친다.
     #   그래서 '0 장인 모든 것' 을 별칭 조회에 넣는다.
-    missing = [n for n in order
+    missing = [n for n in order if n not in NAI_RENAMED_TAGS
                if _TAGV_CACHE.get(n, (1, False)) is None or _TAGV_CACHE.get(n, (1, False))[0] == 0]
     aliases = {}
     for i in range(0, len(missing), 30):
@@ -1553,6 +1592,11 @@ def verify_tags(text, low=100):
             break
 
     for n in order:
+        if n in NAI_RENAMED_TAGS:
+            out.append({"raw": seen[n], "tag": n, "count": None,
+                        "status": "nai_renamed",
+                        "alias_to": NAI_RENAMED_TAGS[n]})
+            continue
         if n not in _TAGV_CACHE:               # 요청 자체가 실패한 것
             out.append({"raw": seen[n], "tag": n, "count": None, "status": "unknown"})
             continue
@@ -1589,7 +1633,8 @@ def verify_tags(text, low=100):
         out.append(item)
     return {"ok": True, "items": out, "error": err,
             "summary": {k: sum(1 for x in out if x["status"] == k)
-                        for k in ("ok", "low", "old", "alias", "ghost", "unknown")}}
+                        for k in ("ok", "low", "old", "alias", "nai_renamed",
+                                  "ghost", "unknown")}}
 
 
 def _b64_png(img_bytes_or_image):
@@ -2157,7 +2202,7 @@ def _ac_index(spec):
 
 
 AC_CACHE_FILE = BASE_DIR / "수집" / "태그색인.pickle"
-AC_CACHE_VER = 2      # 구조가 바뀌면 올린다 (2 = 별칭 색인 포함)
+AC_CACHE_VER = 3      # 3 = 별칭 색인 + NAI 개명 태그 교정
 
 
 def _tag_fingerprint():
@@ -2216,8 +2261,12 @@ def _ac_index_inner(d):
         t, c, _slot, _k = row[0], row[1], row[2], row[3]
         aliases = row[4] if len(row) > 4 else []
         tl = t.lower()
-        flat.append((t, c, tl))
-        keys = {tl[:2]}
+        suggested = nai_renamed_tag(t) or t
+        sl = suggested.lower()
+        flat.append((suggested, c, sl))
+        if sl != tl:
+            flat.append((suggested, c, tl))
+        keys = {tl[:2], sl[:2]}
         tb = re.sub(r"^artists?:", "", tl)
         if tb is not tl:
             keys.add(tb[:2])
@@ -2226,13 +2275,13 @@ def _ac_index_inner(d):
         for a2 in aliases[:6]:
             al = a2.lower()
             if al and al != tl:
-                flat.append((t, c, al))
+                flat.append((suggested, c, al))
                 if len(al) >= 2:
                     keys.add(al[:2])
-                    buckets.setdefault(al[:2], []).append((t, c, al))
+                    buckets.setdefault(al[:2], []).append((suggested, c, al))
         for k in keys:
             if len(k) == 2:
-                buckets.setdefault(k, []).append((t, c, tl))
+                buckets.setdefault(k, []).append((suggested, c, sl if k == sl[:2] else tl))
     for k in buckets:
         buckets[k].sort(key=lambda x: -x[1])
     flat.sort(key=lambda x: -x[1])
@@ -3602,7 +3651,25 @@ def split_quality_suffix(prompt, model=None):
             return "", True
         if raw.endswith(", " + text):
             return raw[:-(len(text) + 2)].rstrip().rstrip(","), True
+        if raw.startswith(text + ", "):
+            return raw[len(text) + 2:].lstrip().lstrip(","), True
+        marker = ", " + text + ", "
+        if marker in raw:
+            left, right = raw.split(marker, 1)
+            joined = ", ".join(x for x in (left.rstrip(" ,"), right.lstrip(" ,")) if x)
+            return joined, True
     return raw, False
+
+
+def restore_quality_prompt(prompt, model, params):
+    """명시된 메타데이터 상태를 우선하고, 없는 구형 파일만 문구로 추정한다."""
+    if "quality_toggle" in params:
+        enabled = bool(params["quality_toggle"])
+        if not enabled:
+            return str(prompt or "").strip().rstrip(","), False
+        base, _ = split_quality_suffix(prompt, model)
+        return base, True
+    return split_quality_suffix(prompt, model)
 
 
 # ⚠ NAI 는 요청의 `ucPreset` 숫자를 **그림에 반영하지 않는다.** 실측(2026-07):
@@ -9937,10 +10004,12 @@ async function runTagVerify(){
     const lows   = (r.items||[]).filter(x => x.status === 'low');
     const olds   = (r.items||[]).filter(x => x.status === 'old');
     const als    = (r.items||[]).filter(x => x.status === 'alias');
+    const nais   = (r.items||[]).filter(x => x.status === 'nai_renamed');
     let html = '<b>있음 '+(s.ok||0)+'</b>'
       + ' · <span style="color:#c9a227">드묾 '+(s.low||0)+'</span>'
       + (s.old ? ' · <span style="color:#4a7cc4">폐지됨 '+s.old+'</span>' : '')
       + (s.alias ? ' · <span style="color:#4a7cc4">이름바뀜 '+s.alias+'</span>' : '')
+      + (s.nai_renamed ? ' · <span style="color:#7950a8">NAI 개명 '+s.nai_renamed+'</span>' : '')
       + ' · <span style="color:#e0574e">없음 '+(s.ghost||0)+'</span>'
       + (s.unknown ? ' · <span style="color:var(--muted)">확인못함 '+s.unknown+'</span>' : '')
       + ' <span style="color:var(--muted)">(단부루 기준 · 100장 미만이면 드묾)</span>';
@@ -9980,6 +10049,13 @@ async function runTagVerify(){
       html += '<div style="margin-top:4px;color:#4a7cc4">↷ 이름 바뀜: ' + als.map(x =>
         esc(x.raw)+' → <span class="tvsug" data-old="'+esc(x.raw)+'" data-new="'+esc(x.alias_to)
         + '" style="cursor:pointer;text-decoration:underline dotted;" title="눌러서 새 이름으로">'
+        + esc(x.alias_to)+'</span>').join(', ') + '</div>';
+    }
+    /* NovelAI가 단부루 원래 이름과 다르게 쓰는 공식 개명 태그 */
+    if(nais.length){
+      html += '<div style="margin-top:4px;color:#7950a8">◆ NovelAI 권장 이름: ' + nais.map(x =>
+        esc(x.raw)+' → <span class="tvsug" data-old="'+esc(x.raw)+'" data-new="'+esc(x.alias_to)
+        + '" style="cursor:pointer;text-decoration:underline dotted;" title="눌러서 NovelAI 이름으로">'
         + esc(x.alias_to)+'</span>').join(', ') + '</div>';
     }
     if(r.error) html += '<div style="color:var(--muted);margin-top:4px;">일부 확인 실패: '+esc(r.error)+'</div>';
@@ -10720,7 +10796,7 @@ class ConfigServer:
             # 안 떼면 프롬프트 칸에 구워진 채 남아, 토글을 꺼도 접미사가 계속 전송된다
             # (외부 감사 nais_blue B-2 와 같은 계열 — 우리는 이중 추가는 가드가 막았지만
             #  '끄기가 안 듣는' 쪽이 남아 있었다. ai-review/외부감사/ 참고)
-            base_txt, qt = split_quality_suffix(m["base"], source_model)
+            base_txt, qt = restore_quality_prompt(m["base"], source_model, params)
             if "quality_toggle" not in params:
                 params["quality_toggle"] = qt
                 params["quality_toggle_guessed"] = True
