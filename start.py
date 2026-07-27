@@ -7648,7 +7648,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="grid3" style="margin-top:8px;">
           <div class="field"><label>비교 해상도</label>
             <select id="cmpRes">__RES__<option value="custom">직접 입력</option></select>
-            <div class="bar hidden" id="cmpCustom" style="margin-top:5px;">
+            <div class="hidden" id="cmpCustom" style="margin-top:5px;display:grid;
+              grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:5px;">
               <input type="number" id="cmpW" min="64" max="2048" step="64" value="832" aria-label="비교 너비">
               <span>×</span>
               <input type="number" id="cmpH" min="64" max="2048" step="64" value="1216" aria-label="비교 높이">
@@ -7677,6 +7678,20 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
 
+        <details class="row" id="cmpHistory" style="margin-top:8px;">
+          <summary style="cursor:pointer;font-weight:700;">지난 비교 실험 · 중단 작업</summary>
+          <div class="bar" style="margin-top:8px;flex-wrap:wrap;">
+            <select id="cmpRuns" style="flex:1;min-width:260px;">
+              <option value="">실험 기록을 불러오는 중...</option>
+            </select>
+            <button type="button" id="cmpRunRefresh">새로고침</button>
+            <button type="button" id="cmpRunLoad">계획 불러오기</button>
+            <button type="button" id="cmpRunOpen">결과 선별</button>
+          </div>
+          <div class="hint" id="cmpRunMsg" style="margin-top:6px;">
+            중단된 실험은 당시 계획을 불러온 뒤 현재 장수와 비용을 다시 확인해야 이어집니다.
+          </div>
+        </details>
         <div class="row" id="cmpSummary" style="margin-top:8px;line-height:1.6;">
           자료 수와 생성 장수를 계산하는 중입니다.
         </div>
@@ -8316,7 +8331,7 @@ function paint(){
 /* ── 자료 비교 생성 ───────────────────────────────────────────────────
    그림체 전체 / 캐릭터 전체 / 직교 조합을 같은 크기·시드로 한 장씩 본다.
    실제 장수는 서버가 자료 파일을 다시 세어 확정하며, 확인한 수와 달라지면 시작을 거부한다. */
-let CMP_PLAN = null, CMP_TIMER = null;
+let CMP_PLAN = null, CMP_TIMER = null, CMP_RUNS = [];
 function comparisonRead(){
   const mode = (document.querySelector('input[name="cmpMode"]:checked') || {}).value || 'styles';
   let w = Number($('cmpW').value) || Number(STATE.width) || 832;
@@ -8342,8 +8357,8 @@ function comparisonStore(opts){
   STATE.ui.comparison = Object.assign({}, opts);
   save();
 }
-function comparisonRestore(){
-  const saved = ((STATE.ui || {}).comparison) || {};
+function comparisonApply(saved){
+  saved = saved || {};
   const mode = ['styles','characters','both'].includes(saved.mode) ? saved.mode : 'styles';
   const radio = document.querySelector(`input[name="cmpMode"][value="${mode}"]`);
   if(radio) radio.checked = true;
@@ -8361,12 +8376,61 @@ function comparisonRestore(){
   $('cmpRefs').checked = saved.include_refs === true;
   comparisonPaintControls();
 }
+function comparisonRestore(){
+  comparisonApply(((STATE.ui || {}).comparison) || {});
+}
 function comparisonPaintControls(){
   const custom = $('cmpRes').value === 'custom';
   $('cmpCustom').classList.toggle('hidden', !custom);
   $('cmpRes').disabled = !$('cmpFix').checked;
   $('cmpW').disabled = !$('cmpFix').checked;
   $('cmpH').disabled = !$('cmpFix').checked;
+}
+function comparisonRunSelected(){
+  const folder = ($('cmpRuns') || {}).value || '';
+  return CMP_RUNS.find(x => x.folder === folder) || null;
+}
+async function comparisonRunsLoad(){
+  const select = $('cmpRuns'); if(!select) return;
+  select.innerHTML = '<option value="">실험 기록을 불러오는 중...</option>';
+  try{
+    const r = await (await fetch('/api/compare_runs')).json();
+    if(!r.ok) throw new Error(r.error || '실험 기록을 읽지 못했습니다.');
+    CMP_RUNS = r.runs || [];
+    if(!CMP_RUNS.length){
+      select.innerHTML = '<option value="">아직 비교 실험이 없습니다.</option>';
+      $('cmpRunMsg').textContent = '비교 생성이 시작되면 각 결과 폴더의 기록이 여기에 남습니다.';
+      return;
+    }
+    const statusName = {
+      complete:'완료', stopped:'중지', daily_limit:'일일 상한',
+      partial:'일부 실패', fatal:'오류', running:'진행 기록'
+    };
+    select.innerHTML = CMP_RUNS.map((run, i) => {
+      const state = statusName[run.status] || run.status || '상태 미상';
+      const date = run.updated_at ? ` · ${run.updated_at}` : '';
+      return `<option value="${escA(run.folder)}"${i===0?' selected':''}>`
+        + `${esc(run.mode_label || run.name)} · ${state} · `
+        + `${Number(run.completed||0).toLocaleString()}/${Number(run.total||0).toLocaleString()}장`
+        + `${esc(date)}</option>`;
+    }).join('');
+    $('cmpRunMsg').textContent =
+      '중단된 실험은 계획을 불러온 뒤 현재 자료 수·비용을 다시 확인하면 이어집니다.';
+  }catch(e){
+    CMP_RUNS = [];
+    select.innerHTML = '<option value="">실험 기록을 읽지 못했습니다.</option>';
+    $('cmpRunMsg').textContent = String(e);
+  }
+}
+async function openComparisonFolder(folder, message='비교 결과를 선별하세요.'){
+  if(!folder) return;
+  STATE.ui = STATE.ui || {};
+  STATE.ui.library_work = 'browse';
+  setMode('library');
+  arrangeStudioWorkspace();
+  await expLoad(folder);
+  $('expStat').textContent = message;
+  $('expGrid').scrollIntoView({behavior:'smooth', block:'start'});
 }
 async function comparisonPreview(){
   const opts = comparisonRead();
@@ -8436,21 +8500,38 @@ function bindComparison(){
   $('cmpConfirm').addEventListener('change', () => {
     $('cmpStart').disabled = !(CMP_PLAN && CMP_PLAN.ok && CMP_PLAN.count && $('cmpConfirm').checked);
   });
+  $('cmpRunRefresh').addEventListener('click', comparisonRunsLoad);
+  $('cmpRunOpen').addEventListener('click', async () => {
+    const run = comparisonRunSelected();
+    if(!run){ $('cmpRunMsg').textContent = '열 비교 실험을 선택해주세요.'; return; }
+    await openComparisonFolder(
+      run.folder,
+      `${run.mode_label || run.name} · ${Number(run.completed||0).toLocaleString()}/${Number(run.total||0).toLocaleString()}장`,
+    );
+  });
+  $('cmpRunLoad').addEventListener('click', async () => {
+    const run = comparisonRunSelected();
+    if(!run){ $('cmpRunMsg').textContent = '불러올 비교 실험을 선택해주세요.'; return; }
+    const r = await (await fetch('/api/compare_activate', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({folder:run.folder})})).json();
+    if(!r.ok){ $('cmpRunMsg').textContent = r.error || '계획을 불러오지 못했습니다.'; return; }
+    comparisonApply(r.options || {});
+    $('cmpRunMsg').textContent = r.resumable
+      ? `중단 지점 ${Number(r.completed||0).toLocaleString()}/${Number(r.total||0).toLocaleString()}장을 활성화했습니다. 아래 장수와 비용을 다시 확인해주세요.`
+      : '완료된 실험의 조건을 새 계획으로 불러왔습니다. 기존 결과는 덮어쓰지 않습니다.';
+    comparisonSchedule();
+  });
   $('cmpOpenResults').addEventListener('click', async () => {
     const r = await (await fetch('/api/compare_progress')).json();
     if(!r.ok){
       $('cmpSummary').textContent = r.error || '아직 선별할 비교 결과가 없습니다.';
       return;
     }
-    STATE.ui = STATE.ui || {};
-    STATE.ui.library_work = 'browse';
-    setMode('library');
-    arrangeStudioWorkspace();
-    await expLoad(r.folder);
     const done = Number(r.completed || 0).toLocaleString();
     const total = Number(r.total || 0).toLocaleString();
-    $('expStat').textContent = `최근 비교 결과 ${done}/${total}장 · 선별을 시작하세요.`;
-    $('expGrid').scrollIntoView({behavior:'smooth', block:'start'});
+    await openComparisonFolder(
+      r.folder, `최근 비교 결과 ${done}/${total}장 · 선별을 시작하세요.`);
   });
   $('cmpStart').addEventListener('click', async () => {
     if(!(CMP_PLAN && CMP_PLAN.ok && $('cmpConfirm').checked)) return;
@@ -8468,6 +8549,7 @@ function bindComparison(){
     }
     setMode('preview');
   });
+  comparisonRunsLoad();
   comparisonPreview();
 }
 
@@ -14769,6 +14851,11 @@ class ConfigServer:
                         self._json(local_image_integrity())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_runs"):
+                    try:
+                        self._json(comparison_runs(server.cfg))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_progress"):
                     try:
                         self._json(comparison_progress_summary(server.cfg))
@@ -14975,6 +15062,13 @@ class ConfigServer:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/save"):
                     self._json(server.handle_save(body))
+                elif self.path.startswith("/api/compare_activate"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        self._json(activate_comparison_run(
+                            server.cfg, data.get("folder")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_preview"):
                     self._json(server.handle_compare_preview(body))
                 elif self.path.startswith("/api/compare_run"):
@@ -15675,6 +15769,93 @@ def comparison_progress_summary(cfg):
         "completed": completed_n,
         "total": int(plan.get("count") or completed_n),
         "mode_label": str(progress.get("mode_label") or ""),
+    }
+
+
+def comparison_runs(cfg, limit=50):
+    """결과 폴더의 manifest를 읽어 최근 비교 실험과 재개 가능 여부를 돌려준다."""
+    root = out_root(cfg).resolve()
+    runs_root = (root / "비교생성").resolve()
+    if not runs_root.is_dir():
+        return {"ok": True, "runs": []}
+    found = []
+    for folder in runs_root.iterdir():
+        if not folder.is_dir() or not _path_is_inside(folder, runs_root):
+            continue
+        manifest_path = folder / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            progress = load_json_recover(manifest_path)
+        except Exception as e:
+            log.warning("비교 실험 기록을 읽지 못했습니다(%s): %s", folder.name, e)
+            continue
+        if not isinstance(progress, dict):
+            continue
+        plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
+        options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
+        completed = progress.get("completed")
+        completed_n = len(completed) if isinstance(completed, dict) else 0
+        total = int(plan.get("count") or completed_n)
+        status = str(progress.get("status") or "")
+        try:
+            mtime = manifest_path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        found.append({
+            "folder": folder.relative_to(root).as_posix(),
+            "name": folder.name,
+            "status": status,
+            "mode_label": str(progress.get("mode_label") or ""),
+            "completed": completed_n,
+            "total": total,
+            "updated_at": str(progress.get("updated_at")
+                              or progress.get("created_at") or ""),
+            "resumable": bool(
+                status != "complete"
+                and progress.get("signature")
+                and isinstance(completed, dict)
+            ),
+            "options": options,
+            "_mtime": mtime,
+        })
+    found.sort(key=lambda x: (x["_mtime"], x["name"]), reverse=True)
+    for item in found:
+        item.pop("_mtime", None)
+    return {"ok": True, "runs": found[:max(1, min(int(limit or 50), 200))]}
+
+
+def activate_comparison_run(cfg, folder):
+    """선택한 미완료 manifest를 현재 재개 대상으로 안전하게 활성화한다."""
+    root = out_root(cfg).resolve()
+    runs_root = (root / "비교생성").resolve()
+    rel = str(folder or "").strip().replace("\\", "/").strip("/")
+    candidate = (root / rel).resolve()
+    if (not rel or not _path_is_inside(candidate, runs_root)
+            or not candidate.is_dir()):
+        raise ValueError("선택한 비교 실험 폴더를 찾지 못했습니다.")
+    manifest_path = candidate / "manifest.json"
+    progress = load_json_recover(manifest_path)
+    if not isinstance(progress, dict):
+        raise ValueError("비교 실험 기록 형식이 올바르지 않습니다.")
+    plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
+    options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
+    completed = progress.get("completed")
+    resumable = bool(
+        progress.get("status") != "complete"
+        and progress.get("signature")
+        and isinstance(completed, dict)
+    )
+    if resumable:
+        atomic_write_json(COMPARE_PROGRESS_FILE, progress, indent=1)
+    return {
+        "ok": True,
+        "folder": candidate.relative_to(root).as_posix(),
+        "status": str(progress.get("status") or ""),
+        "completed": len(completed) if isinstance(completed, dict) else 0,
+        "total": int(plan.get("count") or 0),
+        "resumable": resumable,
+        "options": options,
     }
 
 

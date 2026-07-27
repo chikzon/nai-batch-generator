@@ -636,7 +636,12 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("confirmed_count:CMP_PLAN.count", page)
         self.assertIn("중지하거나 일일 상한에 닿아도 같은 계획으로 다시 누르면 이어집니다.", page)
         self.assertIn('id="cmpOpenResults"', page)
-        self.assertIn("await expLoad(r.folder);", page)
+        self.assertIn('id="cmpRuns"', page)
+        self.assertIn('id="cmpRunLoad"', page)
+        self.assertIn('id="cmpRunOpen"', page)
+        self.assertIn("fetch('/api/compare_runs')", page)
+        self.assertIn("fetch('/api/compare_activate'", page)
+        self.assertIn("await openComparisonFolder(", page)
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
@@ -666,6 +671,76 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(summary["completed"], 1)
         self.assertEqual(summary["total"], 12)
         self.assertFalse(escaped["ok"])
+
+    def test_comparison_history_lists_and_activates_each_incomplete_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "output"
+            runs = out / "비교생성"
+            stopped_dir = runs / "stopped-run"
+            complete_dir = runs / "complete-run"
+            stopped_dir.mkdir(parents=True)
+            complete_dir.mkdir(parents=True)
+            base_plan = {
+                "count": 4,
+                "options": {
+                    "mode": "both", "fixed_size": True,
+                    "width": 512, "height": 512,
+                    "same_seed": True, "seed": 7, "seed_count": 2,
+                    "limit": 0, "include_refs": False,
+                },
+            }
+            stopped = {
+                "signature": "stopped-signature",
+                "folder": "비교생성/stopped-run",
+                "status": "stopped",
+                "mode_label": "그림체 × 캐릭터",
+                "updated_at": "2026-07-28 00:10:00",
+                "plan": base_plan,
+                "completed": {"a": {"file": "비교생성/stopped-run/a.webp"}},
+            }
+            complete = {
+                "signature": "complete-signature",
+                "folder": "비교생성/complete-run",
+                "status": "complete",
+                "mode_label": "그림체 전체",
+                "updated_at": "2026-07-28 00:11:00",
+                "plan": {"count": 1, "options": {
+                    **base_plan["options"], "mode": "styles", "seed_count": 1,
+                }},
+                "completed": {"b": {"file": "비교생성/complete-run/b.webp"}},
+            }
+            (stopped_dir / "manifest.json").write_text(
+                json.dumps(stopped, ensure_ascii=False), encoding="utf-8")
+            time.sleep(0.01)
+            (complete_dir / "manifest.json").write_text(
+                json.dumps(complete, ensure_ascii=False), encoding="utf-8")
+            progress_file = root / "비교생성-진행.json"
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = str(out)
+
+            with patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file):
+                listed = APP.comparison_runs(cfg)
+                activated = APP.activate_comparison_run(
+                    cfg, "비교생성/stopped-run")
+                saved = json.loads(progress_file.read_text(encoding="utf-8"))
+                before_complete = progress_file.read_bytes()
+                completed_result = APP.activate_comparison_run(
+                    cfg, "비교생성/complete-run")
+                after_complete = progress_file.read_bytes()
+                with self.assertRaises(ValueError):
+                    APP.activate_comparison_run(cfg, "../outside")
+
+        self.assertEqual(len(listed["runs"]), 2)
+        by_name = {run["name"]: run for run in listed["runs"]}
+        self.assertTrue(by_name["stopped-run"]["resumable"])
+        self.assertFalse(by_name["complete-run"]["resumable"])
+        self.assertTrue(activated["resumable"])
+        self.assertEqual(activated["completed"], 1)
+        self.assertEqual(activated["options"]["seed_count"], 2)
+        self.assertEqual(saved["signature"], "stopped-signature")
+        self.assertFalse(completed_result["resumable"])
+        self.assertEqual(before_complete, after_complete)
 
     def test_whole_backup_excludes_secrets_and_restores_then_rolls_back(self):
         with tempfile.TemporaryDirectory() as td:
