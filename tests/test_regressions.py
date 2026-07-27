@@ -246,6 +246,164 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("asset_config.json", names)
         self.assertFalse(any(x.startswith("수집/") for x in names))
 
+    def test_comparison_plan_counts_each_mode_and_preserves_style_bundle(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["char_slots"] = [{"name": "현재", "prompt": "current character"}]
+        cfg["characters"] = [
+            {"id": "a", "name": "A", "female": "character a", "negative": "neg a"},
+            {"id": "b", "name": "B", "female": "character b", "negative": "neg b"},
+        ]
+        styles = [
+            {"id": "s1", "title": "S1", "base": "style one",
+             "negative": "style neg one",
+             "params": {"scale": 7.0, "steps": 31, "width": 1024, "height": 1024}},
+            {"id": "s2", "title": "S2", "base": "style two",
+             "negative": "style neg two",
+             "params": {"scale": 4.0, "steps": 20, "width": 832, "height": 1216}},
+        ]
+        with (
+            patch.object(APP, "load_combos", return_value=styles),
+            patch.object(APP, "list_styles", return_value=[]),
+        ):
+            style_plan = APP.comparison_plan(
+                cfg, {"mode": "styles", "width": 640, "height": 960})
+            char_plan = APP.comparison_plan(
+                cfg, {"mode": "characters", "width": 640, "height": 960})
+            both_plan = APP.comparison_plan(
+                cfg, {"mode": "both", "width": 640, "height": 960, "limit": 3})
+            source_styles, source_chars = APP.comparison_sources(cfg)
+
+        self.assertEqual(style_plan["count"], 2)
+        self.assertEqual(style_plan["current_slots"], 1)
+        self.assertEqual(char_plan["count"], 2)
+        self.assertEqual(both_plan["total"], 4)
+        self.assertEqual(both_plan["count"], 3)
+        self.assertTrue(both_plan["limited"])
+
+        first_job = next(APP.iter_comparison_jobs(
+            cfg, both_plan, source_styles, source_chars))
+        used, base, negative, people, _ = APP.comparison_job_values(
+            cfg, both_plan, first_job)
+        self.assertEqual(base, "style one")
+        self.assertEqual(negative, "style neg one")
+        self.assertEqual(used["cfg_scale"], 7.0)
+        self.assertEqual(used["steps"], 31)
+        self.assertEqual((used["width"], used["height"]), (640, 960))
+        self.assertEqual(people[0]["prompt"], "character a")
+        self.assertEqual(people[0]["negative"], "neg a")
+
+        no_lock = APP.comparison_style_config(
+            cfg, source_styles[0],
+            APP.normalize_comparison_options(
+                {"mode": "styles", "fixed_size": False}, cfg))
+        self.assertEqual((no_lock["width"], no_lock["height"]), (1024, 1024))
+
+    def test_comparison_requires_the_exact_recounted_job_confirmation(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["token"] = "pst-fixture"
+        cfg["characters"] = [{"id": "a", "name": "A", "female": "character a"}]
+        server = APP.ConfigServer(cfg)
+        with (
+            patch.object(APP, "load_combos", return_value=[]),
+            patch.object(APP, "list_styles", return_value=[]),
+        ):
+            rejected = server.handle_compare_run(json.dumps({
+                "mode": "characters", "confirmed": True, "confirmed_count": 2,
+            }).encode("utf-8"))
+        self.assertFalse(rejected["ok"])
+        self.assertIn("1장", rejected["error"])
+        self.assertFalse(server.live.running)
+
+    def test_comparison_worker_saves_then_resumes_without_paid_network(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(
+                token="pst-fixture",
+                out_dir=str(root / "output"),
+                characters=[
+                    {"id": "a", "name": "A", "female": "character a",
+                     "negative": "neg a"},
+                    {"id": "b", "name": "B", "female": "character b",
+                     "negative": "neg b"},
+                ],
+                pace={"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            )
+            styles = [{
+                "id": "s1", "_compare_id": "s1", "_compare_name": "Style",
+                "base": "style base", "negative": "style negative",
+                "params": {"scale": 6.5, "steps": 24, "width": 1024, "height": 1024},
+            }]
+            chars = APP.comparison_characters(cfg)
+            plan = APP.comparison_plan(
+                cfg, {"mode": "both", "fixed_size": True,
+                      "width": 512, "height": 512, "same_seed": True},
+                opus=True)
+            # comparison_plan reads global sources; replace its counts with the fixture's exact plan.
+            plan.update(ok=True, errors=[], styles=1, characters=2,
+                        total=2, count=2, limited=False,
+                        mode_label=APP.COMPARE_MODE_LABELS["both"])
+            state = {"seeds": {}, "progress": {}, "daily": {}, "total_generated": 0}
+            server = APP.ConfigServer(cfg)
+            calls = []
+
+            def fake_generate(_token, base, _female, _male, negative, width, height, **kw):
+                calls.append({
+                    "base": base, "negative": negative,
+                    "width": width, "height": height,
+                    "chars": kw["chars"], "seed": kw["seed"],
+                    "scale": kw["scale"],
+                })
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kw["seed"]
+                if len(calls) == 1:
+                    server.live.stop_req = True
+                return image
+
+            progress_file = root / "비교생성-진행.json"
+            with (
+                patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=fake_generate),
+            ):
+                APP._run_comparison(server, cfg, plan, styles, chars)
+                first = json.loads(progress_file.read_text(encoding="utf-8"))
+                self.assertEqual(first["status"], "stopped")
+                self.assertEqual(len(first["completed"]), 1)
+
+                server.live.stop_req = False
+                APP._run_comparison(server, cfg, plan, styles, chars)
+                final = json.loads(progress_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(final["status"], "complete")
+            self.assertEqual(len(final["completed"]), 2)
+            self.assertEqual(calls[0]["seed"], calls[1]["seed"])
+            self.assertEqual(
+                {(x["width"], x["height"]) for x in calls}, {(512, 512)})
+            self.assertEqual(
+                [x["chars"][0]["prompt"] for x in calls],
+                ["character a", "character b"])
+            self.assertTrue(all(x["base"] == "style base" for x in calls))
+            self.assertTrue(all(x["negative"] == "style negative" for x in calls))
+            self.assertTrue(all(x["scale"] == 6.5 for x in calls))
+            self.assertEqual(len(list((root / "output").rglob("*.webp"))), 2)
+            self.assertEqual(len(list((root / "output").rglob("manifest.json"))), 1)
+
+    def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
+        page = APP.render_page()
+        for value in ("styles", "characters", "both"):
+            self.assertIn(f'name="cmpMode" value="{value}"', page)
+        self.assertIn('id="cmpFix" checked', page)
+        self.assertIn("#cmpCustom.hidden{display:none;}", page)
+        self.assertIn('id="cmpSameSeed" checked', page)
+        self.assertIn('id="cmpConfirm"', page)
+        self.assertIn("confirmed_count:CMP_PLAN.count", page)
+        self.assertIn("중지하거나 일일 상한에 닿아도 같은 계획으로 다시 누르면 이어집니다.", page)
+
     def test_build_main_writes_the_data_pack_beside_the_program(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -680,7 +838,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_every_generation_path_builds_call_local_reference_params(self):
         source = (ROOT / "start.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count("runtime_generation_params("), 6)
+        self.assertEqual(source.count("runtime_generation_params("), 7)
         self.assertNotIn('raw.get("source_model")', source)
         self.assertNotIn("ensure_refs(", source)
 
@@ -1378,8 +1536,8 @@ class RegressionTests(unittest.TestCase):
 
     def test_every_nai_generation_path_marks_completion(self):
         source = (ROOT / "start.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count("call_nai_api("), 6)  # definition + five callers
-        self.assertEqual(source.count("pace_complete()"), 6)  # definition + five callers
+        self.assertEqual(source.count("call_nai_api("), 7)  # definition + six callers
+        self.assertEqual(source.count("pace_complete()"), 7)  # definition + six callers
         self.assertNotIn(
             'time.sleep(random.uniform(pc["delay_min"], pc["delay_max"]))',
             source,

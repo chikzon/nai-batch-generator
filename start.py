@@ -74,6 +74,7 @@ LEGACY_SETTINGS_FILE = BASE_DIR / "설정.txt"          # 원본 대조본은 �
 SETTINGS_FILE = PROFILE_DIR / "설정.json"
 CONFIG_FILE = BASE_DIR / "asset_config.json"
 STATE_FILE = PROFILE_DIR / "nsfw_seed_state.json"
+COMPARE_PROGRESS_FILE = PROFILE_DIR / "비교생성-진행.json"
 OUTPUT_BASE = PROFILE_DIR / "output"
 LOG_FILE = PROFILE_DIR / "생성.log"
 
@@ -3544,6 +3545,361 @@ def save_style_file(name, prompt="", groups=None, settings=None, negative=""):
         STYLE_DIR / f"{_safe_name(name)}.json", data)
 
 
+# ══ 자료 비교 생성 ════════════════════════════════════════════════════
+# 그림체·캐릭터 자료가 많아지면 한 항목씩 손으로 적용해 보는 것 자체가 일이 된다.
+# 같은 시드·같은 크기로 한 장씩 뽑아 차이만 보되, 그림체의 베이스·네거티브·생성
+# 설정은 한 덩어리로 유지한다. 크기 고정은 비교를 위한 명시적 단일 예외다.
+COMPARE_MODE_LABELS = {
+    "styles": "그림체 전체",
+    "characters": "캐릭터 전체",
+    "both": "그림체 × 캐릭터",
+}
+COMPARE_MAX_JOBS = 2_000_000
+
+
+def _comparison_id(prefix, *parts):
+    raw = json.dumps(parts, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"), default=str).encode("utf-8")
+    return f"{prefix}-{hashlib.sha256(raw).hexdigest()[:20]}"
+
+
+def comparison_styles(spec=None):
+    """수집 그림체와 사용자가 저장한 그림체 프리셋을 같은 실행 목록으로 합친다."""
+    out, seen = [], set()
+    for i, raw in enumerate(load_combos()):
+        if not isinstance(raw, dict):
+            continue
+        base = (raw.get("base") or raw.get("combo") or "").strip()
+        if not base:
+            continue
+        item = dict(raw)
+        ident = str(item.get("id") or _comparison_id(
+            "style", item.get("title"), base, item.get("negative"),
+            item.get("params"), i))
+        # 외부 자료의 id가 겹쳐도 둘 중 하나를 조용히 버리지 않는다.
+        if ident in seen:
+            ident = _comparison_id("style", ident, base, item.get("params"), i)
+        seen.add(ident)
+        item["_compare_id"] = ident
+        item["_compare_name"] = (item.get("title") or item.get("combo")
+                                 or f"그림체 {i + 1}").strip()
+        item["_compare_kind"] = "수집"
+        out.append(item)
+
+    for i, saved in enumerate(list_styles(spec or load_spec())):
+        if not isinstance(saved, dict) or not (saved.get("prompt") or "").strip():
+            continue
+        settings = dict(saved.get("settings") or {})
+        params = {
+            "scale": settings.get("cfg_scale"),
+            "cfg_rescale": settings.get("cfg_rescale"),
+            "steps": settings.get("steps"),
+            "sampler": settings.get("sampler"),
+            "noise_schedule": settings.get("scheduler"),
+            "variety_plus": settings.get("variety"),
+            "model": settings.get("model"),
+            "width": settings.get("width"),
+            "height": settings.get("height"),
+            "uc_preset": settings.get("uc_preset"),
+            "quality_toggle": settings.get("quality_toggle"),
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+        ident = _comparison_id(
+            "preset", saved.get("name"), saved.get("prompt"),
+            saved.get("negative"), params, i)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append({
+            "id": ident,
+            "_compare_id": ident,
+            "_compare_name": saved.get("name") or f"내 프리셋 {i + 1}",
+            "_compare_kind": "내 프리셋",
+            "base": saved.get("prompt", ""),
+            "negative": saved.get("negative", ""),
+            "params": params,
+        })
+    return out
+
+
+def comparison_characters(cfg):
+    """라이브러리의 캐릭터 전체. 켜짐 여부는 현재 화면용 상태라 전수 비교에서는 무시한다."""
+    out = []
+    for i, raw in enumerate((cfg or {}).get("characters") or []):
+        if not isinstance(raw, dict):
+            continue
+        prompt = strip_comment_lines(raw.get("female") or "").strip()
+        if not prompt:
+            continue
+        item = dict(raw)
+        item["_compare_id"] = str(item.get("id") or _comparison_id(
+            "char", item.get("name"), prompt, item.get("negative"), i))
+        item["_compare_name"] = (item.get("name") or f"캐릭터 {i + 1}").strip()
+        out.append(item)
+    return out
+
+
+def _compare_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def normalize_comparison_options(raw, cfg):
+    raw = raw if isinstance(raw, dict) else {}
+    mode = str(raw.get("mode") or "styles")
+    if mode not in COMPARE_MODE_LABELS:
+        mode = "styles"
+    try:
+        limit = max(0, min(int(raw.get("limit") or 0), COMPARE_MAX_JOBS))
+    except (TypeError, ValueError, OverflowError):
+        limit = 0
+    try:
+        seed = max(0, min(int(raw.get("seed") or 0), 2**32 - 1))
+    except (TypeError, ValueError, OverflowError):
+        seed = 0
+    try:
+        width = normalize_resolution(raw.get("width", cfg.get("width", 832)))
+        height = normalize_resolution(raw.get("height", cfg.get("height", 1216)))
+    except (TypeError, ValueError, OverflowError):
+        width = normalize_resolution(cfg.get("width", 832))
+        height = normalize_resolution(cfg.get("height", 1216))
+    return {
+        "mode": mode,
+        "fixed_size": _compare_bool(raw.get("fixed_size"), True),
+        "width": width,
+        "height": height,
+        "same_seed": _compare_bool(raw.get("same_seed"), True),
+        "seed": seed,
+        "limit": limit,
+        # 레퍼런스는 비교 변수를 흐리고 추가 과금도 생기므로 사용자가 켠 경우만 쓴다.
+        "include_refs": _compare_bool(raw.get("include_refs"), False),
+    }
+
+
+def comparison_style_config(cfg, style, options):
+    """그림체 한 건의 설정 묶음을 실행용 cfg 사본에 적용한다."""
+    used = dict(cfg or {})
+    p = (style or {}).get("params") or {}
+    mapping = {
+        "scale": "cfg_scale",
+        "cfg_rescale": "cfg_rescale",
+        "steps": "steps",
+        "sampler": "sampler",
+        "noise_schedule": "scheduler",
+        "variety_plus": "variety",
+        "uc_preset": "uc_preset",
+        "quality_toggle": "quality_toggle",
+        "sm": "smea",
+        "sm_dyn": "smea_dyn",
+        "dynamic_thresholding": "dynamic_thresholding",
+        "uncond_scale": "uncond_scale",
+        "controlnet_strength": "controlnet_strength",
+        "prefer_brownian": "prefer_brownian",
+        "deliberate_euler_ancestral_bug": "deliberate_euler_ancestral_bug",
+    }
+    for source, target in mapping.items():
+        if p.get(source) is not None:
+            used[target] = p[source]
+    if p.get("model"):
+        used["model"] = model_id_from_metadata(
+            p.get("model"), used.get("model") or "nai-diffusion-4-5-full")
+    if p.get("width"):
+        used["width"] = normalize_resolution(p["width"])
+    if p.get("height"):
+        used["height"] = normalize_resolution(p["height"])
+    if options.get("fixed_size"):
+        used["width"], used["height"] = options["width"], options["height"]
+    return used
+
+
+def comparison_sources(cfg, spec=None):
+    return comparison_styles(spec), comparison_characters(cfg)
+
+
+def comparison_plan(cfg, raw, spec=None, opus=None):
+    """실행 전에 장수와 과금 범위를 계산한다. API 호출은 하지 않는다."""
+    options = normalize_comparison_options(raw, cfg)
+    styles, chars = comparison_sources(cfg, spec)
+    mode = options["mode"]
+    current_slots = [
+        s for s in (cfg.get("char_slots") or [])
+        if slot_prompt(s).strip() and s.get("enabled") is not False
+    ]
+    total = (len(styles) if mode == "styles"
+             else len(chars) if mode == "characters"
+             else len(styles) * len(chars))
+    count = min(total, options["limit"]) if options["limit"] else total
+    errors = []
+    if mode in ("styles", "both") and not styles:
+        errors.append("비교할 그림체가 없습니다. 자료팩이나 그림체 자료를 먼저 넣어주세요.")
+    if mode in ("characters", "both") and not chars:
+        errors.append("비교할 캐릭터가 없습니다. 캐릭터 라이브러리에 먼저 저장해주세요.")
+    if count > COMPARE_MAX_JOBS:
+        errors.append(f"한 계획은 최대 {COMPARE_MAX_JOBS:,}장까지 만들 수 있습니다.")
+
+    refs = (sum(1 for r in cfg.get("char_refs", []) if r.get("enabled"))
+            if options["include_refs"] else 0)
+    paid_total = opus_total = eligible = 0
+    remain = count
+
+    def add_cost(job_cfg, multiplier):
+        nonlocal paid_total, opus_total, eligible, remain
+        n = max(0, min(int(multiplier), remain))
+        if not n:
+            return
+        paid = anlas_estimate(job_cfg, 1, opus=False, char_refs=refs)
+        free = anlas_estimate(job_cfg, 1, opus=True, char_refs=refs)
+        paid_total += paid["per_image"] * n
+        opus_total += free["per_image"] * n
+        if free["free_eligible"]:
+            eligible += n
+        remain -= n
+
+    if mode == "characters":
+        used = comparison_style_config(cfg, None, options)
+        add_cost(used, count)
+    elif mode == "styles":
+        for style in styles:
+            if remain <= 0:
+                break
+            add_cost(comparison_style_config(cfg, style, options), 1)
+    else:
+        for style in styles:
+            if remain <= 0:
+                break
+            add_cost(comparison_style_config(cfg, style, options), len(chars))
+
+    expected = None
+    if opus is True:
+        expected = opus_total
+    elif opus is False:
+        expected = paid_total
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "options": options,
+        "mode_label": COMPARE_MODE_LABELS[mode],
+        "styles": len(styles),
+        "characters": len(chars),
+        "current_slots": len(current_slots),
+        "total": total,
+        "count": count,
+        "limited": count < total,
+        "free_eligible": eligible,
+        "paid_anlas_max": paid_total,
+        "opus_anlas": opus_total,
+        "expected_anlas": expected,
+        "subscription_known": opus is not None,
+        "sample_styles": [x["_compare_name"] for x in styles[:3]],
+        "sample_characters": [x["_compare_name"] for x in chars[:3]],
+    }
+
+
+def comparison_signature(cfg, plan, styles, chars):
+    options = plan["options"]
+    relevant_cfg = {
+        k: cfg.get(k) for k in (
+            "base_prompt", "negative_prompt", "cfg_scale", "cfg_rescale", "steps",
+            "sampler", "scheduler", "variety", "model", "uc_preset",
+            "quality_toggle", "smea", "smea_dyn", "dynamic_thresholding",
+            "uncond_scale", "controlnet_strength", "prefer_brownian",
+            "deliberate_euler_ancestral_bug", "use_coords", "char_slots",
+            "char_centers", "vibes", "char_refs", "out_dir", "out_by_date",
+        )
+    }
+    raw = {
+        "options": options,
+        "config": relevant_cfg,
+        "styles": [
+            (x["_compare_id"], x.get("base"), x.get("combo"),
+             x.get("negative"), x.get("params")) for x in styles
+        ] if options["mode"] in ("styles", "both") else [],
+        "characters": [
+            (x["_compare_id"], x.get("female"), x.get("negative"))
+            for x in chars
+        ] if options["mode"] in ("characters", "both") else [],
+    }
+    return hashlib.sha256(json.dumps(
+        raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str).encode("utf-8")).hexdigest()
+
+
+def iter_comparison_jobs(cfg, plan, styles, chars):
+    """큰 직교곱도 목록 전체를 메모리에 만들지 않고 한 건씩 낸다."""
+    options, made = plan["options"], 0
+    limit = plan["count"]
+
+    def emit(style, char, style_name, char_name, key):
+        nonlocal made
+        if made >= limit:
+            return None
+        made += 1
+        return {
+            "index": made,
+            "key": _comparison_id("job", options["mode"], key),
+            "style": style,
+            "character": char,
+            "style_name": style_name,
+            "char_name": char_name,
+        }
+
+    if options["mode"] == "styles":
+        slots = [
+            s for s in (cfg.get("char_slots") or [])
+            if slot_prompt(s).strip() and s.get("enabled") is not False
+        ]
+        char_name = (f"현재 캐릭터 {len(slots)}명" if slots else "캐릭터 없음")
+        slot_key = [(slot_prompt(s), s.get("negative", "")) for s in slots]
+        for style in styles:
+            job = emit(style, None, style["_compare_name"], char_name,
+                       (style["_compare_id"], slot_key))
+            if job is None:
+                break
+            yield job
+    elif options["mode"] == "characters":
+        for char in chars:
+            job = emit(None, char, "현재 그림체", char["_compare_name"],
+                       ("current", char["_compare_id"]))
+            if job is None:
+                break
+            yield job
+    else:
+        for style in styles:
+            for char in chars:
+                job = emit(style, char, style["_compare_name"], char["_compare_name"],
+                           (style["_compare_id"], char["_compare_id"]))
+                if job is None:
+                    return
+                yield job
+
+
+def comparison_job_values(cfg, plan, job):
+    options = plan["options"]
+    style = job.get("style")
+    used = comparison_style_config(cfg, style, options)
+    base = ((style or {}).get("base") or (style or {}).get("combo")
+            or cfg.get("base_prompt") or "1girl").strip()
+    negative = ((style or {}).get("negative")
+                if style is not None else cfg.get("negative_prompt", ""))
+    negative = negative or ""
+    char = job.get("character")
+    if char is not None:
+        # 캐릭터 자료의 기본 전체 프롬프트를 한 캐릭터 칸으로 보낸다.
+        people = [{"prompt": strip_comment_lines(char.get("female") or "").strip(),
+                   "negative": char.get("negative", "") or ""}]
+        centers = [{"x": 0.5, "y": 0.5}]
+    else:
+        slots = [
+            s for s in (cfg.get("char_slots") or [])
+            if slot_prompt(s).strip() and s.get("enabled") is not False
+        ]
+        people, centers = active_people(slots, cfg.get("char_centers"))
+    return used, base, negative, people, centers
+
+
 class RateLimitError(Exception):
     def __init__(self, message, retry_after=60):
         super().__init__(message)
@@ -5786,6 +6142,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;}
   .field{margin-bottom:10px;}
   .bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px;}
+  /* .bar 가 전역 .hidden 보다 뒤에 선언되어 display:flex 로 되살아나는 것을 막는다.
+     비교 해상도의 직접 입력칸은 "직접 입력"을 고른 때에만 보여야 한다. */
+  #cmpCustom.hidden{display:none;}
   .bar .n{margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--good);}
   .chip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border:1px solid var(--line);
     border-radius:var(--radius-pill);font-size:var(--fs-xs);cursor:pointer;margin:0 5px 5px 0;background:var(--paper2);color:var(--muted);}
@@ -6358,6 +6717,61 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vSettings" style="display:none;">
+      <div class="card" id="compareCard">
+        <h2><span class="n">비교 생성</span>내 자료를 같은 조건으로 한 장씩 보기
+          <span class="count" id="cmpCounts" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
+        <p class="hint">그림체·캐릭터를 손으로 하나씩 바꾸지 않고 같은 조건으로 돌려
+        <b>output/비교생성/</b>에 모읍니다. 그림체는 <b>베이스+네거티브+생성 설정값</b>을
+        통째로 유지하며, 아래에서 켠 경우에만 비교를 위해 해상도를 하나로 고정합니다.
+        <b>그림체×캐릭터</b>는 두 자료 수를 곱하므로 실행 전 장수를 반드시 확인합니다.</p>
+
+        <div class="grid3" role="radiogroup" aria-label="비교할 자료">
+          <label class="row" style="cursor:pointer;margin:0;">
+            <input type="radio" name="cmpMode" value="styles" checked style="width:auto;flex:none;">
+            <span><b>그림체 전체</b><br><span class="hint">현재 캐릭터는 고정</span></span></label>
+          <label class="row" style="cursor:pointer;margin:0;">
+            <input type="radio" name="cmpMode" value="characters" style="width:auto;flex:none;">
+            <span><b>캐릭터 전체</b><br><span class="hint">현재 그림체는 고정</span></span></label>
+          <label class="row" style="cursor:pointer;margin:0;">
+            <input type="radio" name="cmpMode" value="both" style="width:auto;flex:none;">
+            <span><b>둘 다 조합</b><br><span class="hint">그림체 × 캐릭터</span></span></label>
+        </div>
+
+        <div class="grid3" style="margin-top:8px;">
+          <div class="field"><label>비교 해상도</label>
+            <select id="cmpRes">__RES__<option value="custom">직접 입력</option></select>
+            <div class="bar hidden" id="cmpCustom" style="margin-top:5px;">
+              <input type="number" id="cmpW" min="64" max="2048" step="64" value="832" aria-label="비교 너비">
+              <span>×</span>
+              <input type="number" id="cmpH" min="64" max="2048" step="64" value="1216" aria-label="비교 높이">
+            </div>
+            <label class="hint" style="display:flex;align-items:center;gap:5px;margin-top:6px;">
+              <input type="checkbox" id="cmpFix" checked style="width:auto;flex:none;"> 모든 결과를 이 크기로 고정</label>
+          </div>
+          <div class="field"><label>비교 시드</label>
+            <input type="number" id="cmpSeed" min="0" max="4294967295" step="1" value="0"
+              placeholder="0 = 시작할 때 한 번 정함">
+            <label class="hint" style="display:flex;align-items:center;gap:5px;margin-top:6px;">
+              <input type="checkbox" id="cmpSameSeed" checked style="width:auto;flex:none;"> 모든 결과에 같은 시드</label>
+          </div>
+          <div class="field"><label>시험 상한 <span class="hint">(0 = 전부)</span></label>
+            <input type="number" id="cmpLimit" min="0" max="2000000" step="1" value="0">
+            <label class="hint" style="display:flex;align-items:center;gap:5px;margin-top:6px;">
+              <input type="checkbox" id="cmpRefs" style="width:auto;flex:none;"> 현재 바이브·캐릭터 레퍼런스도 포함</label>
+          </div>
+        </div>
+
+        <div class="row" id="cmpSummary" style="margin-top:8px;line-height:1.6;">
+          자료 수와 생성 장수를 계산하는 중입니다.
+        </div>
+        <div class="bar" style="margin-top:8px;align-items:center;">
+          <label style="display:flex;align-items:center;gap:6px;flex:1;">
+            <input type="checkbox" id="cmpConfirm" style="width:auto;flex:none;">
+            <span id="cmpConfirmText">장수와 API 호출 횟수를 확인했습니다.</span></label>
+          <button class="go" id="cmpStart" disabled>▶ 비교 생성 시작</button>
+        </div>
+      </div>
+
       <div class="card">
         <h2><span class="n">세팅</span>씬 세트 <span class="count" id="setCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">세팅 = 씬 모음 + 부속 옵션 + 상대역이 담긴 <b>세팅/ 폴더의 파일</b>. 파일을 넣고 빼면 목록이 바뀝니다.
@@ -6899,6 +7313,7 @@ function paint(){
   $('pVariety').value = STATE.variety ? 'on' : 'off';
   paintParams();
   renderPresets(); renderSlots(); renderSettings(); renderLibrary(); renderScenePresets();
+  bindComparison();
   renderFrags(); renderScenes(); applySplit3(); paintPace(); acScan(document);
   sbPickList(); paintClash();
   if($('expGrid')) expLoad('');
@@ -6920,6 +7335,140 @@ function paint(){
   if($('notifySound')) $('notifySound').checked = !!(STATE.ui||{}).notify_sound;
   if($('notifySystem')) $('notifySystem').checked = !!(STATE.ui||{}).notify_system;
   tokens();
+}
+
+/* ── 자료 비교 생성 ───────────────────────────────────────────────────
+   그림체 전체 / 캐릭터 전체 / 직교 조합을 같은 크기·시드로 한 장씩 본다.
+   실제 장수는 서버가 자료 파일을 다시 세어 확정하며, 확인한 수와 달라지면 시작을 거부한다. */
+let CMP_PLAN = null, CMP_TIMER = null;
+function comparisonRead(){
+  const mode = (document.querySelector('input[name="cmpMode"]:checked') || {}).value || 'styles';
+  let w = Number($('cmpW').value) || Number(STATE.width) || 832;
+  let h = Number($('cmpH').value) || Number(STATE.height) || 1216;
+  if($('cmpRes').value !== 'custom'){
+    const parts = $('cmpRes').value.split('x').map(Number);
+    if(parts.length === 2 && parts.every(Number.isFinite)){ w = parts[0]; h = parts[1]; }
+  }
+  return {
+    mode,
+    fixed_size: $('cmpFix').checked,
+    width: w, height: h,
+    same_seed: $('cmpSameSeed').checked,
+    seed: Math.max(0, Math.trunc(Number($('cmpSeed').value) || 0)),
+    limit: Math.max(0, Math.trunc(Number($('cmpLimit').value) || 0)),
+    include_refs: $('cmpRefs').checked
+  };
+}
+function comparisonStore(opts){
+  STATE.ui = STATE.ui || {};
+  STATE.ui.comparison = Object.assign({}, opts);
+  save();
+}
+function comparisonRestore(){
+  const saved = ((STATE.ui || {}).comparison) || {};
+  const mode = ['styles','characters','both'].includes(saved.mode) ? saved.mode : 'styles';
+  const radio = document.querySelector(`input[name="cmpMode"][value="${mode}"]`);
+  if(radio) radio.checked = true;
+  const w = Number(saved.width || STATE.width || 832);
+  const h = Number(saved.height || STATE.height || 1216);
+  const res = `${w}x${h}`;
+  $('cmpRes').value = [...$('cmpRes').options].some(o => o.value === res) ? res : 'custom';
+  $('cmpW').value = w; $('cmpH').value = h;
+  $('cmpFix').checked = saved.fixed_size !== false;
+  $('cmpSameSeed').checked = saved.same_seed !== false;
+  $('cmpSeed').value = Number(saved.seed) || 0;
+  $('cmpLimit').value = Number(saved.limit) || 0;
+  $('cmpRefs').checked = saved.include_refs === true;
+  comparisonPaintControls();
+}
+function comparisonPaintControls(){
+  const custom = $('cmpRes').value === 'custom';
+  $('cmpCustom').classList.toggle('hidden', !custom);
+  $('cmpRes').disabled = !$('cmpFix').checked;
+  $('cmpW').disabled = !$('cmpFix').checked;
+  $('cmpH').disabled = !$('cmpFix').checked;
+}
+async function comparisonPreview(){
+  const opts = comparisonRead();
+  comparisonStore(opts);
+  CMP_PLAN = null;
+  $('cmpConfirm').checked = false;
+  $('cmpStart').disabled = true;
+  $('cmpSummary').textContent = '자료 수와 생성 장수를 계산하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/compare_preview', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(opts)})).json();
+    CMP_PLAN = r;
+    $('cmpCounts').textContent = `그림체 ${Number(r.styles||0).toLocaleString()} · 캐릭터 ${Number(r.characters||0).toLocaleString()}`;
+    if(!r.ok){
+      $('cmpSummary').innerHTML = `<span style="color:var(--danger)">${esc((r.errors||[r.error||'계산 실패']).join(' '))}</span>`;
+      return;
+    }
+    let formula = '';
+    if(opts.mode === 'styles'){
+      formula = `그림체 ${r.styles.toLocaleString()}개 × 현재 캐릭터 묶음 1개`
+        + ` (${r.current_slots.toLocaleString()}명 함께)`;
+    }else if(opts.mode === 'characters'){
+      formula = `현재 그림체 1개 × 캐릭터 ${r.characters.toLocaleString()}개`;
+    }else{
+      formula = `그림체 ${r.styles.toLocaleString()}개 × 캐릭터 ${r.characters.toLocaleString()}개`;
+    }
+    const cap = r.limited ? ` · 전체 ${r.total.toLocaleString()}장 중 앞 ${r.count.toLocaleString()}장` : '';
+    let cost = '';
+    if(r.subscription_known){
+      cost = ` · 현재 구독 기준 예상 ${Number(r.expected_anlas||0).toLocaleString()} Anlas`;
+    }else{
+      cost = ` · 예상 범위 ${Number(r.opus_anlas||0).toLocaleString()}~${Number(r.paid_anlas_max||0).toLocaleString()} Anlas`
+        + ' (구독 확인 전)';
+    }
+    const free = r.free_eligible === r.count
+      ? ' · 전부 Opus 무료 크기·스텝 범위'
+      : ` · 무료 조건 범위 ${Number(r.free_eligible||0).toLocaleString()}/${r.count.toLocaleString()}장`;
+    const ref = opts.include_refs ? ' · 레퍼런스 포함(추가 과금 가능)' : ' · 레퍼런스 제외';
+    $('cmpSummary').innerHTML = `<b>${esc(formula)} = ${r.count.toLocaleString()}장</b>${esc(cap + cost + free + ref)}
+      <div class="hint" style="margin-top:4px;">중지하거나 일일 상한에 닿아도 같은 계획으로 다시 누르면 이어집니다.
+      그림체 원본 시드는 쓰지 않고 비교 시드 규칙을 적용합니다.</div>`;
+    $('cmpConfirmText').textContent = `${r.count.toLocaleString()}번의 순차 API 호출과 저장을 확인했습니다.`;
+    $('cmpStart').disabled = !$('cmpConfirm').checked;
+  }catch(e){
+    $('cmpSummary').textContent = '계산 실패: ' + e;
+  }
+}
+function comparisonSchedule(){
+  comparisonPaintControls();
+  clearTimeout(CMP_TIMER);
+  CMP_TIMER = setTimeout(comparisonPreview, 180);
+}
+function bindComparison(){
+  if(!$('compareCard') || $('compareCard')._bound) return;
+  $('compareCard')._bound = true;
+  comparisonRestore();
+  document.querySelectorAll('input[name="cmpMode"]').forEach(x => x.addEventListener('change', comparisonSchedule));
+  ['cmpRes','cmpFix','cmpSameSeed','cmpSeed','cmpLimit','cmpRefs','cmpW','cmpH'].forEach(id => {
+    const el = $(id); if(!el) return;
+    el.addEventListener('change', comparisonSchedule);
+    if(['cmpSeed','cmpLimit','cmpW','cmpH'].includes(id)) el.addEventListener('input', comparisonSchedule);
+  });
+  $('cmpConfirm').addEventListener('change', () => {
+    $('cmpStart').disabled = !(CMP_PLAN && CMP_PLAN.ok && CMP_PLAN.count && $('cmpConfirm').checked);
+  });
+  $('cmpStart').addEventListener('click', async () => {
+    if(!(CMP_PLAN && CMP_PLAN.ok && $('cmpConfirm').checked)) return;
+    const opts = comparisonRead();
+    $('cmpStart').disabled = true;
+    const r = await (await fetch('/api/compare_run', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(Object.assign(opts, {
+        confirmed:true, confirmed_count:CMP_PLAN.count
+      }))})).json();
+    if(!r.ok){
+      alert(r.error || '비교 생성을 시작하지 못했습니다.');
+      comparisonSchedule();
+      return;
+    }
+    setMode('preview');
+  });
+  comparisonPreview();
 }
 
 /* 실제 NAI 토큰 수 — 서버의 T5 토크나이저에 물어본다 (입력이 멈추면 한 번) */
@@ -12074,6 +12623,63 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def handle_compare_preview(self, body):
+        """자료 비교 생성의 실제 장수·비용 범위를 계산한다. 생성이나 저장은 하지 않는다."""
+        try:
+            data = json.loads(body or b"{}")
+            opus = None
+            if self.anlas_balance_cache is not None:
+                opus = bool(self.anlas_balance_cache.get("opus"))
+            return comparison_plan(self.cfg, data, self.spec, opus=opus)
+        except Exception as e:
+            return {"ok": False, "errors": [str(e)], "error": str(e)}
+
+    def handle_compare_run(self, body):
+        """그림체 전체·캐릭터 전체·직교 조합을 같은 조건으로 한 장씩 생성한다."""
+        if self.live.running:
+            return {"ok": False, "error": "이미 생성 중입니다."}
+        if not self.cfg.get("token", "").startswith("pst-"):
+            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
+        try:
+            data = json.loads(body or b"{}")
+        except Exception as e:
+            return {"ok": False, "error": f"잘못된 요청입니다: {e}"}
+        opus = None
+        if self.anlas_balance_cache is not None:
+            opus = bool(self.anlas_balance_cache.get("opus"))
+        plan = comparison_plan(self.cfg, data, self.spec, opus=opus)
+        if not plan["ok"] or not plan["count"]:
+            return {"ok": False, "error": " ".join(plan.get("errors") or [])
+                    or "생성할 항목이 없습니다."}
+        try:
+            confirmed_count = int(data.get("confirmed_count"))
+        except (TypeError, ValueError):
+            confirmed_count = -1
+        if not data.get("confirmed") or confirmed_count != plan["count"]:
+            return {"ok": False, "error":
+                    f"실행 직전 장수 확인이 필요합니다. 현재 계획은 {plan['count']:,}장입니다.",
+                    "plan": plan}
+        tok = self.live.try_claim()
+        if tok is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
+
+        # 실행 중 화면 편집이 앞 장과 뒤 장의 비교 조건을 바꾸지 않도록 시작 시점 사본을 쓴다.
+        run_cfg = json.loads(json.dumps(self.cfg, ensure_ascii=False, default=str))
+        styles, chars = comparison_sources(run_cfg, self.spec)
+
+        def run():
+            try:
+                _run_comparison(self, run_cfg, plan, styles, chars)
+            except Exception as e:
+                log.error(f"자료 비교 생성 실패: {e}")
+                log.error(traceback.format_exc())
+                self.live.update(status_text=f"자료 비교 생성 실패: {e}")
+            finally:
+                self.live.release(tok)
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, "plan": plan}
+
     def handle_inspect(self, body, filename="", save_flag=""):
         """이미지에서 NAI 메타데이터를 뽑아 그림체 레코드로. (novelai.net/inspect 대체)
         X-Save: 1 이면 그림체 라이브러리에도 넣는다."""
@@ -12713,6 +13319,10 @@ class ConfigServer:
                 body = self.rfile.read(length) if length else b""
                 if self.path.startswith("/api/save"):
                     self._json(server.handle_save(body))
+                elif self.path.startswith("/api/compare_preview"):
+                    self._json(server.handle_compare_preview(body))
+                elif self.path.startswith("/api/compare_run"):
+                    self._json(server.handle_compare_run(body))
                 elif self.path.startswith("/api/start"):
                     self._json(server.handle_start())
                 elif self.path.startswith("/api/style_save"):
@@ -13376,6 +13986,231 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
             order.setdefault(item[1], len(order))
         pending.sort(key=lambda it: (order[it[1]], it[2], it[3]))
     return pending
+
+
+def _comparison_progress_load():
+    if not COMPARE_PROGRESS_FILE.exists():
+        return {}
+    try:
+        data = load_json_recover(COMPARE_PROGRESS_FILE)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"비교 생성 진행 기록을 읽지 못했습니다: {e}")
+        return {}
+
+
+def _comparison_progress_save(progress, folder):
+    """재개용 기록과 사람이 읽을 결과 폴더 manifest를 함께 원자 저장한다."""
+    atomic_write_json(COMPARE_PROGRESS_FILE, progress, indent=1)
+    atomic_write_json(folder / "manifest.json", progress, indent=1)
+
+
+def _comparison_progress_start(cfg, plan, styles, chars):
+    root = out_root(cfg).resolve()
+    signature = comparison_signature(cfg, plan, styles, chars)
+    old = _comparison_progress_load()
+    resumable = (old.get("signature") == signature
+                 and old.get("status") not in ("complete",)
+                 and isinstance(old.get("completed"), dict))
+    folder = None
+    if resumable:
+        rel = str(old.get("folder") or "")
+        candidate = (root / rel).resolve()
+        if (_path_is_inside(candidate, root) and candidate.is_dir()):
+            folder = candidate
+    if folder is None:
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+        folder = out_sub(cfg, "비교생성") / run_id
+        folder.mkdir(parents=True, exist_ok=True)
+        progress = {
+            "version": 1,
+            "signature": signature,
+            "status": "running",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "folder": folder.relative_to(root).as_posix(),
+            "mode": plan["options"]["mode"],
+            "mode_label": plan["mode_label"],
+            "plan": {k: v for k, v in plan.items()
+                     if k not in ("sample_styles", "sample_characters")},
+            "base_seed": int(plan["options"].get("seed") or 0)
+                         or random.randint(1, 2**32 - 1),
+            "completed": {},
+            "errors": {},
+        }
+    else:
+        progress = old
+        progress["status"] = "running"
+        progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        log.info("중단된 자료 비교 생성을 이어서 합니다: %s", folder)
+
+    # 기록만 있고 파일이 사라진 항목은 완료로 보지 않는다.
+    completed = progress.setdefault("completed", {})
+    for key, rec in list(completed.items()):
+        rel = rec.get("file") if isinstance(rec, dict) else rec
+        path = output_file_for_preview(cfg, rel)
+        if path is None or not path.is_file() or path.stat().st_size <= 0:
+            completed.pop(key, None)
+    _comparison_progress_save(progress, folder)
+    return progress, folder
+
+
+def _run_comparison(server, cfg, plan, styles, chars):
+    """자료 비교 큐. 한 번에 한 요청만 보내고 중지·일일 상한·재개를 모두 지킨다."""
+    progress, folder = _comparison_progress_start(cfg, plan, styles, chars)
+    completed = progress["completed"]
+    errors = progress.setdefault("errors", {})
+    options = plan["options"]
+    token = cfg["token"]
+    base_seed = int(progress["base_seed"])
+    state = load_state()
+    jobs = iter_comparison_jobs(cfg, plan, styles, chars)
+    done_n = len(completed)
+    server.live.update(
+        index=done_n, total=plan["count"], char_name=plan["mode_label"],
+        filename="", status_text=(f"자료 비교 생성 준비 중 — {done_n:,}/{plan['count']:,}"),
+        daily=daily_count(state), daily_cap=pace(cfg)["daily_cap"])
+
+    final_status = "complete"
+    fatal = False
+    for job in jobs:
+        key = job["key"]
+        if key in completed:
+            continue
+        if server.live.stop_req:
+            final_status = "stopped"
+            break
+        if daily_count(state) >= pace(cfg)["daily_cap"]:
+            final_status = "daily_limit"
+            server.live.update(status_text="일일 상한 도달 — 내일 같은 계획을 누르면 이어집니다.")
+            break
+
+        used, base, negative, people, centers = comparison_job_values(cfg, plan, job)
+        seed = (base_seed if options["same_seed"]
+                else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff)
+        seed = seed or 1
+        style_label = job["style_name"]
+        char_label = job["char_name"]
+        stem = (f"{job['index']:06d}_"
+                f"{_safe_name(style_label)[:38]}__{_safe_name(char_label)[:32]}")
+        target = available_output_path(folder / f"{stem}.webp", out_format(cfg))
+        done_n = len(completed)
+        server.live.update(
+            index=done_n + 1, total=plan["count"], filename=target.name,
+            char_name=f"{style_label} × {char_label}",
+            status_text=f"자료 비교 생성 중 — {done_n + 1:,}/{plan['count']:,}",
+            seed=seed)
+        log.info("[비교 %d/%d] %s × %s · %dx%d · 시드 %d",
+                 done_n + 1, plan["count"], style_label, char_label,
+                 used["width"], used["height"], seed)
+
+        ok = False
+        last_error = ""
+        for attempt in range(3):
+            if server.live.stop_req:
+                final_status = "stopped"
+                break
+            allowed, why = pace_gate(cfg, server.live, "자료 비교")
+            if not allowed:
+                last_error = why
+                if "일일 상한" in why:
+                    final_status = "daily_limit"
+                break
+            try:
+                params = runtime_generation_params(
+                    used, token, include_refs=options["include_refs"])
+                try:
+                    img = call_nai_api(
+                        token, base, "", "", negative,
+                        int(used.get("width", 832)), int(used.get("height", 1216)),
+                        chars=people,
+                        scale=used.get("cfg_scale", 5.5),
+                        cfg_rescale=used.get("cfg_rescale", 0.56),
+                        steps=int(used.get("steps", 28)),
+                        sampler=used.get("sampler", "k_euler_ancestral"),
+                        scheduler=used.get("scheduler", "karras"),
+                        variety=used.get("variety", False),
+                        uc_preset=int(used.get("uc_preset", 4)),
+                        seed=seed, params=with_centers(params, centers))
+                finally:
+                    pace_complete()
+                saved = save_with_meta(
+                    img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
+                    max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                server.live.set_image(img)
+                rel = saved.resolve().relative_to(out_root(cfg).resolve()).as_posix()
+                completed[key] = {
+                    "index": job["index"], "file": rel,
+                    "style": style_label, "character": char_label,
+                    "seed": seed, "width": int(used["width"]),
+                    "height": int(used["height"]),
+                }
+                errors.pop(key, None)
+                bump_daily(state)
+                save_state(state)
+                progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                _comparison_progress_save(progress, folder)
+                server.live.update(daily=daily_count(state))
+                ok = True
+                break
+            except RateLimitError as e:
+                last_error = str(e)
+                server.live.update(status_text=f"429 — {e.retry_after:g}초 뒤 재시도")
+                if server.live.wait_cancelable(e.retry_after):
+                    final_status = "stopped"
+                    break
+            except (AccountBannedError, AuthError) as e:
+                last_error = str(e)
+                server.live.update(status_text=f"즉시 중단: {e}")
+                final_status, fatal = "fatal", True
+                break
+            except APIError as e:
+                last_error = str(e)
+                if not e.retryable:
+                    break
+                wait = min(5 * (2 ** attempt), 30)
+                server.live.update(status_text=f"서버 오류 — {wait}초 뒤 재시도")
+                if attempt < 2 and server.live.wait_cancelable(wait):
+                    final_status = "stopped"
+                    break
+            except Exception as e:
+                last_error = str(e)
+                log.error("자료 비교 %s 실패(%d/3): %s", target.name, attempt + 1, e)
+                if attempt < 2 and server.live.wait_cancelable(30):
+                    final_status = "stopped"
+                    break
+
+        if not ok:
+            errors[key] = {
+                "index": job["index"], "style": style_label,
+                "character": char_label, "error": last_error or "중지됨",
+            }
+            progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            _comparison_progress_save(progress, folder)
+            if fatal or final_status in ("stopped", "daily_limit"):
+                break
+
+    if final_status == "complete" and len(completed) < plan["count"]:
+        final_status = "partial" if errors else "stopped"
+    progress["status"] = final_status
+    progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    progress["completed_count"] = len(completed)
+    _comparison_progress_save(progress, folder)
+
+    rel_folder = folder.resolve().relative_to(out_root(cfg).resolve()).as_posix()
+    if final_status == "complete":
+        text = f"자료 비교 완료 — {len(completed):,}장 · {rel_folder}"
+    elif final_status == "partial":
+        text = (f"자료 비교 부분 완료 — 성공 {len(completed):,}장 · "
+                f"실패 {len(errors):,}장 (같은 계획으로 실패분 재시도)")
+    elif final_status == "stopped":
+        text = f"자료 비교 중지 — {len(completed):,}/{plan['count']:,}장 (같은 계획으로 이어짐)"
+    elif final_status == "daily_limit":
+        text = f"일일 상한 도달 — {len(completed):,}/{plan['count']:,}장 (내일 이어짐)"
+    else:
+        text = f"자료 비교 중단 — {len(completed):,}/{plan['count']:,}장"
+    server.live.update(index=len(completed), total=plan["count"], status_text=text)
+    log.info(text)
 
 
 def main():
