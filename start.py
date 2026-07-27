@@ -1817,11 +1817,76 @@ def fetch_cached_image(url):
         ct = r.headers.get("content-type", "")
         if r.status_code == 200 and ct.startswith("image/"):
             p.write_bytes(r.content)
+            note_image_origin(url, r.content)
             return r.content, ct
         log.warning(f"이미지 응답 이상 [{r.status_code} {ct}]: {url[:80]}")
     except Exception as e:
         log.warning(f"이미지 가져오기 실패: {e}")
     return None, None
+
+
+# ── 그림 출처 장부 ──────────────────────────────────────────────────────────
+# 자료의 `images` 는 두 모양이다 — 원격 주소(`https://…`) 또는 내용 해시(`local:<sha256>`).
+# 둘 사이를 오갈 수 있어야 "가볍게 나눠 주고, 중요한 것만 동봉" 이 된다.
+#
+# ⚠ 그런데 `local:` 로 바꾸는 순간 **원래 주소가 사라지면 되돌릴 수 없다.**
+#   그래서 주소↔해시 짝을 여기에 남긴다.
+#
+# ⚠ 원격 캐시 파일명은 **주소 해시(SHA-1)** 라, 주소가 다른데 같은 그림이면
+#   두 번 받아 두 벌로 남는다. 내려받을 때 **내용 SHA-256** 을 함께 적어 두면
+#   나중에 그걸로 묶어 지울 수 있다.
+_ORIGIN_LOCK = threading.Lock()
+
+
+def _img_origin_path():
+    return IMG_CACHE / "출처장부.json"
+
+
+def load_image_origins():
+    p = _img_origin_path()
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def note_image_origin(url, data, pack=""):
+    """받아온 그림의 **원본 주소 · 내용 해시 · 저장 이름**을 적어 둔다.
+    나중에 원격↔로컬을 되돌리거나, 주소가 달라도 같은 그림을 묶는 근거가 된다."""
+    if not url or not data:
+        return None
+    sha = hashlib.sha256(data).hexdigest()
+    try:
+        with _ORIGIN_LOCK:
+            book = load_image_origins()
+            row = book.get(sha) or {"sha256": sha, "urls": [], "pack": pack}
+            if url not in row["urls"]:
+                row["urls"].append(url)
+            if pack and not row.get("pack"):
+                row["pack"] = pack
+            row["size"] = len(data)
+            book[sha] = row
+            p = _img_origin_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"출처 기록 실패: {e}")
+    return sha
+
+
+def image_origin_stats():
+    """장부 요약 — 같은 그림을 가리키는 주소가 여럿인 것이 몇 건인가."""
+    book = load_image_origins()
+    dup = {k: v for k, v in book.items() if len(v.get("urls") or []) > 1}
+    return {"ok": True,
+            "그림": len(book),
+            "주소여럿": len(dup),
+            "낭비주소": sum(len(v["urls"]) - 1 for v in dup.values()),
+            "예시": [{"sha256": k[:16], "urls": v["urls"][:4]}
+                     for k, v in list(dup.items())[:20]]}
 
 
 _WARM_POOL = None
@@ -9440,43 +9505,41 @@ function openCombos(target){
   $('modalBg').style.display = 'flex';
 }
 
-/* ── 그림에서 가져올 항목 고르기 (SDStudio 의 ExternalImageView.applyImport) ──
-   예전에는 그림을 넣으면 프롬프트·네거티브·설정값이 통째로 덮어써졌다.
-   지금 쓰던 네거티브만 지키고 싶다거나 시드만 가져오고 싶을 때를 위해 고르게 한다. */
+/* ── 그림에서 읽은 그림체 보여 주기 ────────────────────────────────
+   ★ 그림체는 `베이스 + 네거티브 + NAI 생성 설정 전체` 가 **분리 불가능한 한 덩어리**다.
+     화면에서 읽기 좋게 나눠 보여줄 수는 있어도 **적용은 언제나 통째로** 한다.
+   예전에는 항목마다 체크박스를 두어 골라 넣게 했는데(`applyStyle(c, pick)`),
+   그렇게 섞으면 베이스는 이 그림 것인데 설정값은 남의 것인 잡종이 되어
+   **원래 그림이 재현되지 않는다.** 그래서 고르는 길을 없앴다. */
 function openApplyPicker(c){
   const p = c.params || {};
   const rows = [
-    ['base', '프롬프트(베이스)', c.base ? c.base.slice(0, 90) : '', !!c.base],
-    ['negative', '네거티브', (c.negative || (c.negative_full != null ? '(비움)' : '')).slice(0, 90),
+    ['프롬프트(베이스)', c.base ? c.base.slice(0, 90) : '', !!c.base],
+    ['네거티브', (c.negative || (c.negative_full != null ? '(비움)' : '')).slice(0, 90),
       !!(c.negative || c.negative_full != null)],
-    ['params', '설정값 (CFG·리스케일·스텝·샘플러·스케줄)',
+    ['설정값 (CFG·리스케일·스텝·샘플러·스케줄)',
       [p.scale != null ? `CFG ${p.scale}` : '', p.cfg_rescale != null ? `리스케일 ${p.cfg_rescale}` : '',
        p.steps ? `${p.steps}스텝` : '', p.sampler || '', p.noise_schedule || ''].filter(Boolean).join(' · '),
       p.scale != null || p.steps != null || !!p.sampler],
-    ['size', '해상도', (p.width && p.height) ? `${p.width}×${p.height}` : '', !!(p.width && p.height)],
-    ['uc', 'UC 프리셋 · 퀄리티 태그',
+    ['해상도', (p.width && p.height) ? `${p.width}×${p.height}` : '', !!(p.width && p.height)],
+    ['UC 프리셋 · 퀄리티 태그',
       [p.uc_preset != null ? `UC ${p.uc_preset}` : '', p.quality_toggle != null ? (p.quality_toggle ? '퀄리티 켬' : '퀄리티 끔') : ''].filter(Boolean).join(' · '),
       p.uc_preset != null || p.quality_toggle != null],
-    ['seed', '시드 고정', p.seed ? String(p.seed) : '', !!p.seed],
-  ].filter(r => r[3]);
-  $('modalTitle').textContent = '🖼 그림에서 가져올 항목 고르기';
+    ['시드', p.seed ? String(p.seed) : '', !!p.seed],
+  ].filter(r => r[2]);
+  $('modalTitle').textContent = '🖼 그림에서 읽은 그림체';
   $('modalBody').innerHTML = `
-    <p class="hint">체크한 것만 지금 설정에 넣습니다. 나머지는 지금 값 그대로 둡니다.</p>
-    ${rows.map(([k, label, val]) => `<label class="row" style="display:flex;gap:8px;align-items:flex-start;">
-      <input type="checkbox" data-imp="${k}" checked style="margin-top:3px;">
-      <span style="flex:1;min-width:0;"><b>${esc(label)}</b>
-      ${val ? `<div class="hint" style="font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(val)}</div>` : ''}</span></label>`).join('')}
-    <div class="bar"><button class="primary" id="impGo">고른 것만 가져오기</button>
-      <button id="impAll">전부 가져오기</button></div>`;
+    <p class="hint">그림체는 <b>베이스·네거티브·생성 설정이 한 덩어리</b>입니다.
+    쪼개서 넣으면 원래 그림이 재현되지 않으므로 <b>통째로만</b> 넣습니다.</p>
+    ${rows.map(([label, val]) => `<div class="row">
+      <b>${esc(label)}</b>
+      ${val ? `<div class="hint" style="font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(val)}</div>` : ''}</div>`).join('')}
+    <div class="bar"><button class="primary" id="impAll">그림체 통째로 적용</button></div>`;
   $('modalBg').style.display = 'flex';
-  const run = (only) => {
-    const pick = {};
-    document.querySelectorAll('#modalBody [data-imp]').forEach(x => pick[x.dataset.imp] = x.checked);
-    applyStyle(c, only ? pick : null);
+  $('impAll').addEventListener('click', () => {
+    applyStyle(c);
     $('modalBg').style.display = 'none';
-  };
-  $('impGo').addEventListener('click', () => run(true));
-  $('impAll').addEventListener('click', () => run(false));
+  });
 }
 
 /* ── ⇄ 찾아 바꾸기 (SDStudio 의 FindReplaceDialog) ─────────────────────
@@ -9624,8 +9687,8 @@ function styleCard(c){
         <div style="font-family:var(--mono);font-size:var(--fs-xs);line-height:1.5;max-height:66px;overflow:auto;">${esc(c.combo || '(작가 태그 없음)')}</div>
         ${bits.length ? `<div class="hint" style="margin-top:5px;">⚙ ${esc(bits.join(' · '))}</div>` : ''}
         <div class="bar" style="margin:6px 0 0;flex-wrap:wrap;">
-          <button data-cuse="${escA(c.combo)}">작가 조합만</button>
-          ${c.base ? `<button data-cbase="${escA(c.base)}">베이스 전체</button>` : ''}
+          ${window._comboTarget ? `<button data-cuse="${escA(c.combo)}"
+            title="빌더의 작가 조합 칸에 이 값을 넣습니다">이 조합 쓰기</button>` : ''}
           <button class="primary" data-cfull="${escA(JSON.stringify(c))}">그림체 통째로 적용</button>
           <button data-csave="${escA(JSON.stringify(c))}">내 프리셋으로 저장</button>
           <button data-crate="${escA(JSON.stringify(c.artists||[]))}"
@@ -9646,40 +9709,31 @@ function flash(msg, extraBtn){
   if(extraBtn) el.appendChild(extraBtn);
 }
 
-/* 그림체 통째로 적용 — 베이스 + 네거티브 + 파라미터 */
-function applyStyle(c, pick){
-  /* pick 을 주면 **체크한 항목만** 넣는다 (그림에서 항목별 가져오기).
-     pick 이 없으면 예전처럼 통째로 — 그림체 카드의 '통째로 적용' 이 이 경로다. */
-  const want = k => !pick || pick[k];
+/* ★ 그림체 적용 — 언제나 통째로.
+   그림체의 최소 단위는 `베이스 + 네거티브 + NAI 생성 설정 전체` 한 덩어리다.
+   쪼개서 넣으면 베이스는 이 그림 것인데 설정값은 남의 것인 잡종이 되어
+   **원래 그림이 재현되지 않는다.** 그래서 '무엇을 넣을지 고르는' 인자를 없앴다 —
+   경고로 막는 대신 **애초에 부분 적용이 불가능한 모양**으로 둔다. */
+function applyStyle(c){
   const p = c.params || {};
-  if(want('base') && c.base){ STATE.base_prompt = c.base; $('basePrompt').value = c.base; }
+  if(c.base){ STATE.base_prompt = c.base; $('basePrompt').value = c.base; }
   /* negative_full 이 있으면 프리셋을 떼어낸 결과라 빈 문자열도 뜻이 있다 (그대로 비운다) */
-  if(want('negative') && (c.negative || c.negative_full != null)){
+  if(c.negative || c.negative_full != null){
     const nv = c.negative || '';
     STATE.negative_prompt = nv; $('negPrompt').value = nv;
   }
   const set = (k, el, v) => { if(v != null && v !== ''){ STATE[k] = v; if($(el)) $(el).value = v; } };
-  if(want('params')){
-    set('cfg_scale','pScale', p.scale);
-    set('cfg_rescale','pRescale', p.cfg_rescale);
-    set('steps','pSteps', p.steps);
-    set('sampler','pSampler', p.sampler);
-    set('scheduler','pSched', p.noise_schedule);
-    if(p.variety_plus != null){ STATE.variety = !!p.variety_plus; if($('pVariety')) $('pVariety').value = p.variety_plus ? 'on' : 'off'; }
-  }
-  // 그림체 = 베이스 + 네거티브 + 설정값 전부. UC 프리셋·퀄리티 태그도 그림체의 일부다.
-  if(want('uc')){
-    if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
-    if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
-  }
-  if(want('size')){
-    if(p.width && $('pWidth')){ STATE.width = p.width; $('pWidth').value = p.width; }
-    if(p.height && $('pHeight')){ STATE.height = p.height; $('pHeight').value = p.height; }
-  }
-  if(pick && pick.seed && p.seed){          // 시드는 고르면 바로 고정한다
-    STATE.nai_seed = Number(p.seed) || 0;
-    if($('pNaiSeed')) $('pNaiSeed').value = STATE.nai_seed;
-  }
+  set('cfg_scale','pScale', p.scale);
+  set('cfg_rescale','pRescale', p.cfg_rescale);
+  set('steps','pSteps', p.steps);
+  set('sampler','pSampler', p.sampler);
+  set('scheduler','pSched', p.noise_schedule);
+  if(p.variety_plus != null){ STATE.variety = !!p.variety_plus; if($('pVariety')) $('pVariety').value = p.variety_plus ? 'on' : 'off'; }
+  // UC 프리셋·퀄리티 태그도 그림체의 일부다 (숫자만 보내면 NAI 가 무시하므로 문구로 합쳐진다)
+  if(p.uc_preset != null){ STATE.uc_preset = Number(p.uc_preset); if($('pUc')) $('pUc').value = String(p.uc_preset); }
+  if(p.quality_toggle != null){ STATE.quality_toggle = !!p.quality_toggle; if($('pQuality')) $('pQuality').value = p.quality_toggle ? 'on' : 'off'; }
+  if(p.width && $('pWidth')){ STATE.width = p.width; $('pWidth').value = p.width; }
+  if(p.height && $('pHeight')){ STATE.height = p.height; $('pHeight').value = p.height; }
   tokens(); save();
   const bits = [];
   if(c.base) bits.push('베이스');
@@ -9822,26 +9876,23 @@ async function loadCombos(append){
   const host = $('comboList');
   if(!append) host.innerHTML = '';
   r.items.forEach(c => host.appendChild(styleCard(c)));
-  host.querySelectorAll('[data-cuse],[data-cbase]').forEach(btn => {
+  /* '이 조합 쓰기' 는 **빌더에서 열었을 때만** 나온다.
+     빌더의 작가 조합 칸에 값을 고르는 일이지 '그림체를 적용' 하는 것이 아니다.
+     그림체를 왼쪽 화면에 넣는 길은 '통째로 적용' **하나뿐**이다 — 베이스만·설정만
+     넣는 길을 두면 원래 그림이 재현되지 않는 잡종이 만들어진다. */
+  host.querySelectorAll('[data-cuse]').forEach(btn => {
     btn.addEventListener('click', () => {
-      const val = btn.dataset.cuse || btn.dataset.cbase;
+      const val = btn.dataset.cuse;
       const tg = window._comboTarget;
-      if(tg && document.body.contains(tg)){
-        if(![...tg.options].some(o => o.value === val)){
-          const o = document.createElement('option');
-          o.value = val; o.textContent = val.slice(0, 60) + '…';
-          tg.insertBefore(o, tg.options[1] || null);
-        }
-        tg.value = val;
-        if(window._bldRefresh) window._bldRefresh();
-        $('modalFlash').textContent = '빌더 항목에 적용됨 ✓';
-      } else {
-        const cur = $('basePrompt').value.trim().replace(/,$/, '');
-        const v = btn.dataset.cbase ? val : (cur ? cur + ', ' + val : val);
-        STATE.base_prompt = v; $('basePrompt').value = v;
-        tokens(); save();
-        $('modalFlash').textContent = '베이스 프롬프트에 적용됨 ✓';
+      if(!(tg && document.body.contains(tg))) return;
+      if(![...tg.options].some(o => o.value === val)){
+        const o = document.createElement('option');
+        o.value = val; o.textContent = val.slice(0, 60) + '…';
+        tg.insertBefore(o, tg.options[1] || null);
       }
+      tg.value = val;
+      if(window._bldRefresh) window._bldRefresh();
+      $('modalFlash').textContent = '빌더 항목에 적용됨 ✓';
     });
   });
   host.querySelectorAll('[data-cfull]').forEach(b =>
@@ -11925,6 +11976,13 @@ class ConfigServer:
                 elif self.path.startswith("/api/pack_log"):
                     try:
                         self._json({"ok": True, "log": pack_log_brief()})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/img_origins"):
+                    # 원격 캐시는 **주소 해시**로 파일을 만든다. 주소가 달라도 같은 그림이면
+                    # 두 벌이 남는데, 내려받을 때 적어 둔 **내용 해시**로 그걸 찾아낸다.
+                    try:
+                        self._json(image_origin_stats())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/combos"):
