@@ -405,7 +405,8 @@ class RegressionTests(unittest.TestCase):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["char_slots"] = [{"name": "현재", "prompt": "current character"}]
         cfg["characters"] = [
-            {"id": "a", "name": "A", "female": "character a", "negative": "neg a"},
+            {"id": "a", "name": "A", "female": "character a",
+             "clothed": "red dress", "negative": "neg a"},
             {"id": "b", "name": "B", "female": "character b", "negative": "neg b"},
         ]
         styles = [
@@ -444,8 +445,16 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(used["cfg_scale"], 7.0)
         self.assertEqual(used["steps"], 31)
         self.assertEqual((used["width"], used["height"]), (640, 960))
-        self.assertEqual(people[0]["prompt"], "character a")
+        self.assertEqual(people[0]["prompt"], "character a, red dress")
         self.assertEqual(people[0]["negative"], "neg a")
+        original_signature = APP.comparison_signature(
+            cfg, both_plan, source_styles, source_chars)
+        changed_chars = copy.deepcopy(source_chars)
+        changed_chars[0]["clothed"] = "blue dress"
+        self.assertNotEqual(
+            original_signature,
+            APP.comparison_signature(cfg, both_plan, source_styles, changed_chars),
+            "착의가 달라진 비교 계획을 이전 진행 기록으로 오인하면 안 된다")
 
         no_lock = APP.comparison_style_config(
             cfg, source_styles[0],
@@ -478,6 +487,7 @@ class RegressionTests(unittest.TestCase):
                 out_dir=str(root / "output"),
                 characters=[
                     {"id": "a", "name": "A", "female": "character a",
+                     "clothed": "red dress",
                      "negative": "neg a"},
                     {"id": "b", "name": "B", "female": "character b",
                      "negative": "neg b"},
@@ -541,7 +551,7 @@ class RegressionTests(unittest.TestCase):
                 {(x["width"], x["height"]) for x in calls}, {(512, 512)})
             self.assertEqual(
                 [x["chars"][0]["prompt"] for x in calls],
-                ["character a", "character b"])
+                ["character a, red dress", "character b"])
             self.assertTrue(all(x["base"] == "style base" for x in calls))
             self.assertTrue(all(x["negative"] == "style negative" for x in calls))
             self.assertTrue(all(x["scale"] == 6.5 for x in calls))

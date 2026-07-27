@@ -3760,13 +3760,21 @@ def comparison_styles(spec=None):
     return out
 
 
+def _comparison_character_prompt(item):
+    """저장 캐릭터도 일반 캐릭터 칸과 같은 `외형 + 착의` 한 덩어리로 보낸다."""
+    return slot_prompt({
+        "prompt": (item or {}).get("female", ""),
+        "outfit": (item or {}).get("clothed", ""),
+    })
+
+
 def comparison_characters(cfg):
     """라이브러리의 캐릭터 전체. 켜짐 여부는 현재 화면용 상태라 전수 비교에서는 무시한다."""
     out = []
     for i, raw in enumerate((cfg or {}).get("characters") or []):
         if not isinstance(raw, dict):
             continue
-        prompt = strip_comment_lines(raw.get("female") or "").strip()
+        prompt = _comparison_character_prompt(raw)
         if not prompt:
             continue
         item = dict(raw)
@@ -3956,7 +3964,7 @@ def comparison_signature(cfg, plan, styles, chars):
              x.get("negative"), x.get("params")) for x in styles
         ] if options["mode"] in ("styles", "both") else [],
         "characters": [
-            (x["_compare_id"], x.get("female"), x.get("negative"))
+            (x["_compare_id"], x.get("female"), x.get("clothed"), x.get("negative"))
             for x in chars
         ] if options["mode"] in ("characters", "both") else [],
     }
@@ -4025,8 +4033,8 @@ def comparison_job_values(cfg, plan, job):
     negative = negative or ""
     char = job.get("character")
     if char is not None:
-        # 캐릭터 자료의 기본 전체 프롬프트를 한 캐릭터 칸으로 보낸다.
-        people = [{"prompt": strip_comment_lines(char.get("female") or "").strip(),
+        # 캐릭터 자료의 외형+착의를 일반 캐릭터 칸과 같은 한 덩어리로 보낸다.
+        people = [{"prompt": _comparison_character_prompt(char),
                    "negative": char.get("negative", "") or ""}]
         centers = [{"x": 0.5, "y": 0.5}]
     else:
