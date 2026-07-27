@@ -2676,6 +2676,159 @@ def import_settings_bytes(data, filename=""):
     return {"ok": bool(added), "added": added, "skipped": skipped}
 
 
+# ── 자료팩 가져오기 ────────────────────────────────────────────────────────
+# 배포본에는 수집물(그림체·레시피·작가통계·예시 그림)을 넣지 않는다 — 용량이 크고
+# 남이 공개한 자료라 재배포 조건을 확인하지 않았다. 대신 `배포준비.py --자료팩` 으로
+# 따로 묶고, 받는 쪽은 여기로 넣는다.
+#
+# ⚠ **덮어쓰지 않고 없는 것만 더한다.** 받는 사람이 이미 자기 자료를 갖고 있을 수 있고
+#   (사용자는 그림체 1,600건을 따로 정리 중이다), 남의 팩이 그걸 지우면 안 된다.
+#   같은 열쇠가 이미 있으면 건너뛰고 몇 건인지 알려 준다.
+#
+# 자리는 기존 상수를 그대로 쓴다 (STYLE_FILE·RECIPE_FILE·COMBO_FILE·IMG_CACHE·TAG_DIR).
+# 새 경로 상수를 만들면 두 곳이 어긋날 수 있다.
+def _datapack_lists():
+    """{파일이름: (저장위치, 합칠 열쇠)}"""
+    return {
+        "그림체.json": (STYLE_FILE, "id"),
+        "레시피.json": (RECIPE_FILE, "id"),
+        "작가조합.json": (COMBO_FILE, "id"),        # 그림체.json 의 구세대 판
+        "작가통계.json": (BASE_DIR / "수집" / "작가통계.json", "tag"),
+    }
+
+
+# 이미지캐시는 SHA-256 내용주소 파일명이라 **이름이 같으면 내용도 같다.**
+# 그래서 있는 파일은 건드리지 않고 없는 것만 복사하면 그게 곧 올바른 병합이다.
+def _datapack_dirs():
+    """{팩 안 경로: (저장위치, 받아들일 확장자)}"""
+    return {"수집/이미지캐시": (IMG_CACHE, (".webp", ".png", ".jpg", ".jpeg")),
+            "태그": (TAG_DIR, (".csv",))}
+
+
+def _pack_rel(name):
+    """ZIP 안 경로를 우리 폴더 기준 상대경로로. 위험하면 None."""
+    parts = [x for x in str(name).replace("\\", "/").split("/") if x not in ("", ".")]
+    if any(p == ".." for p in parts) or (parts and ":" in parts[0]):
+        return None                      # 경로 탈출·드라이브 지정 차단
+    # 팩이 한 겹 더 감싸여 있어도(자료팩/수집/…) 알아보게 앞을 훑는다
+    for i, p in enumerate(parts):
+        if p in ("수집", "태그"):
+            return "/".join(parts[i:])
+    return "/".join(parts)
+
+
+def _merge_list_json(path, incoming, key):
+    """key 기준으로 없는 것만 더한다 → (더함, 이미있음)"""
+    old = []
+    if path.exists():
+        try:
+            got = json.loads(path.read_text(encoding="utf-8"))
+            old = got if isinstance(got, list) else []
+        except Exception:
+            old = []                     # 깨진 파일은 새로 쓴다 (사본은 아래에서 남긴다)
+    have = {str(x.get(key)) for x in old if isinstance(x, dict) and x.get(key) is not None}
+    added = 0
+    for x in incoming:
+        if not isinstance(x, dict):
+            continue
+        k = x.get(key)
+        if k is None or str(k) in have:
+            continue
+        have.add(str(k))
+        old.append(x)
+        added += 1
+    if added:
+        if path.exists():                # 되돌릴 수 있게 한 판 남긴다
+            try:
+                shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+            except Exception:
+                pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    return added, len(incoming) - added
+
+
+def forget_collection_caches():
+    """자료가 늘었으니 한 번 읽고 물고 있던 것들을 놓게 한다.
+    `load_combos()`·`load_recipes()` 는 `loaded` 깃발을 보고 다시 읽고,
+    자동완성 색인은 `_TAG_CACHE` 를 비우면 다음 호출에 다시 만든다."""
+    _COMBOS["loaded"] = False
+    _RECIPES["loaded"] = False
+    try:
+        _TAG_CACHE.clear()
+    except Exception:
+        pass
+
+
+def import_datapack_bytes(data, filename=""):
+    """자료팩 ZIP 이든 낱개 JSON 이든 받아 수집/·태그/ 에 **합친다**(덮어쓰지 않음)."""
+    import io
+    import zipfile
+    lists, dirs = _datapack_lists(), _datapack_dirs()
+    report, files = [], 0
+
+    def take_list(stem, raw):
+        nonlocal files
+        spot = lists.get(stem)
+        if not spot:
+            return False
+        dest, key = spot
+        try:
+            d = json.loads(raw.decode("utf-8"))
+        except Exception:
+            report.append(f"{stem}: JSON 이 아니라 건너뜀")
+            return True
+        if not isinstance(d, list):
+            report.append(f"{stem}: 목록이 아니라 건너뜀")
+            return True
+        add, dup = _merge_list_json(dest, d, key)
+        report.append(f"{stem}: 새로 {add}건" + (f" · 이미 있음 {dup}건" if dup else ""))
+        files += add
+        return True
+
+    if data[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            copied, skipped = {}, {}
+            for n in z.namelist():
+                if n.endswith("/"):
+                    continue
+                rel = _pack_rel(n)
+                if rel is None:
+                    continue
+                stem = Path(rel).name
+                if stem in lists:
+                    take_list(stem, z.read(n))
+                    continue
+                for d, (root, exts) in dirs.items():
+                    if rel.startswith(d + "/") and stem.lower().endswith(exts):
+                        dest = root / stem      # 한 겹으로 편다 (내용주소라 이름이 곧 열쇠)
+                        if dest.exists():       # 같은 이름 = 같은 파일
+                            skipped[d] = skipped.get(d, 0) + 1
+                        else:
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            with z.open(n) as src, open(dest, "wb") as out:
+                                shutil.copyfileobj(src, out)
+                            copied[d] = copied.get(d, 0) + 1
+                        break
+            for d in dirs:
+                c, s = copied.get(d, 0), skipped.get(d, 0)
+                if c or s:
+                    files += c
+                    report.append(f"{d}: 새로 {c}개" + (f" · 이미 있음 {s}개" if s else ""))
+    else:
+        stem = Path(filename).name
+        if not take_list(stem, data):
+            return {"ok": False,
+                    "error": f"'{stem}' 은(는) 자료팩이 아닙니다. "
+                             f"자료팩.zip 이나 {' · '.join(lists)} 를 넣어 주세요."}
+
+    if not report:
+        return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
+    # 알아본 자료가 있으면 성공이다. 같은 팩을 다시 넣어 **전부 중복이어도 실패가 아니다**
+    # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
+    return {"ok": True, "added": files, "report": report}
+
+
 def setting_path(name):
     for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
         try:
@@ -5667,6 +5820,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="expDirs" class="bar" style="flex-wrap:wrap;margin-top:8px;"></div>
         <div id="expGrid" style="display:grid;gap:6px;margin-top:8px;
           grid-template-columns:repeat(auto-fill,minmax(var(--ecard,130px),1fr));"></div>
+      </div>
+
+      <div class="card">
+        <h2><span class="n">자료팩</span>자료 넣기
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">그림체·레시피·태그를 한 번에</span></h2>
+        <p class="hint">앱에는 <b>수집 자료가 들어 있지 않습니다</b> — 용량이 크고 남이 공개한
+        자료라 함께 배포하지 않습니다. <b>자료팩(zip)</b> 이나 <b>그림체.json · 레시피.json ·
+        작가통계.json</b> 을 여기에 넣으면 알아서 제자리에 정리됩니다.<br>
+        <b>덮어쓰지 않고 없는 것만 더합니다</b> — 이미 갖고 있는 자료는 그대로 둡니다.
+        같은 팩을 두 번 넣어도 안전합니다.</p>
+        <div id="packDrop" class="drop" style="padding:18px;text-align:center;
+          border:2px dashed var(--line);border-radius:var(--radius);cursor:pointer;">
+          여기에 <b>자료팩.zip</b> 을 끌어다 놓거나 눌러서 고르세요
+        </div>
+        <input type="file" id="packFile" accept=".zip,.json" multiple style="display:none;">
+        <div id="packMsg" class="hint" style="margin-top:8px;"></div>
       </div>
 
       <div class="card">
@@ -8694,6 +8863,43 @@ $('setExport').addEventListener('click', () => {
   window.location.href = '/api/setting_export' + (q ? '?' + q : '');
   setTimeout(() => { $('setMsg').textContent = '내보냄 ✓'; }, 800);
 });
+/* ── 자료팩 넣기 ───────────────────────────────────────────────────
+   배포본에 수집물을 넣지 않으므로 여기로 받는다. 서버가 합쳐 주고(덮어쓰지 않음)
+   무엇이 몇 건 들어왔는지 그대로 보여 준다. */
+async function sendPack(files){
+  if(!files.length) return;
+  const lines = [];
+  for(const f of files){
+    $('packMsg').textContent = f.name + ' 넣는 중... (큰 팩은 시간이 걸립니다)';
+    let r;
+    try{
+      r = await (await fetch('/api/pack_import', {method:'POST',
+        headers:{'X-Filename': encodeURIComponent(f.name)}, body: f})).json();
+    }catch(e){ r = {ok:false, error:String(e)}; }
+    if(r.error) lines.push(f.name + ': ' + r.error);
+    else (r.report || []).forEach(x => lines.push(x));
+  }
+  $('packMsg').innerHTML = lines.join('<br>') || '들어온 것 없음';
+  await reloadConfig();
+}
+if($('packDrop')){
+  $('packDrop').addEventListener('click', () => $('packFile').click());
+  $('packFile').addEventListener('change', async () => {
+    const fs = [...$('packFile').files]; $('packFile').value = '';
+    await sendPack(fs);
+  });
+  $('packDrop').addEventListener('dragover', e => {
+    e.preventDefault(); $('packDrop').style.borderColor = 'var(--accent)';
+  });
+  $('packDrop').addEventListener('dragleave', () => {
+    $('packDrop').style.borderColor = '';
+  });
+  $('packDrop').addEventListener('drop', async e => {
+    e.preventDefault(); $('packDrop').style.borderColor = '';
+    await sendPack([...(e.dataTransfer.files || [])]);
+  });
+}
+
 $('setImport').addEventListener('click', () => $('setImportFile').click());
 $('setImportFile').addEventListener('change', async () => {
   const files = [...$('setImportFile').files];
@@ -11780,6 +11986,19 @@ class ConfigServer:
                             body, unquote(self.headers.get("X-Filename", "")))
                         # 세팅은 list_settings() 가 매번 파일을 다시 읽으므로
                         # 따로 되불러올 것이 없다. 화면만 새로 그리면 된다.
+                        self._json(r)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/pack_import"):
+                    # 자료팩(수집물)은 배포본에 넣지 않는다. 따로 받아 여기서 합친다.
+                    from urllib.parse import unquote
+                    try:
+                        r = import_datapack_bytes(
+                            body, unquote(self.headers.get("X-Filename", "")))
+                        if r.get("ok"):
+                            # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
+                            # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
+                            forget_collection_caches()
                         self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
