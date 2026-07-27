@@ -11684,7 +11684,10 @@ class ConfigServer:
                                    for w, n in artists),
                 "artists": [n for _, n in artists],
                 "weights": {n: (w if w is not None else 1.0) for w, n in artists},
-                "base": base_txt, "rest": ", ".join(rest)[:1200],
+                # ⚠ 프롬프트는 **자르지 않는다.** `rest` 는 `base` 에서 작가 태그를 뺀
+                #   파생값이라 예전엔 1,200자에서 잘랐는데, 사용자 원본 자료를 말없이
+                #   줄이는 셈이라 없앴다. 원본은 `base` 에 온전히 있고 크기 문제도 없다.
+                "base": base_txt, "rest": ", ".join(rest),
                 # 네거티브는 프리셋을 뗀 '사용자가 쓴 부분' 만 담는다
                 "negative": user_neg if ucp is not None else m["negative"],
                 "negative_full": m["negative"],

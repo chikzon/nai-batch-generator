@@ -380,6 +380,63 @@ class RegressionTests(unittest.TestCase):
         for sel in ('id="regenMode"', 'id="regenStrength"', 'id="regenPicked"', 'id="regenAll"'):
             self.assertTrue(sel in page, f"복구 조작부가 사라졌다: {sel}")
 
+    def test_long_prompts_survive_a_save_load_round_trip_byte_for_byte(self):
+        """프롬프트는 **사용자 원본 자료**다. 저장했다 불러오면 바이트까지 같아야 한다.
+
+        줄바꿈·가중치(`1.2::`)·괄호(`(nier:automata)`)·파이프(`||a|b||`)·중괄호 조각·
+        유니코드가 섞인 긴 원문으로 확인한다. 글자 수로 자르는 길이 하나라도 생기면
+        여기서 걸린다."""
+        long_tail = ", ".join(f"artist:tester{i}" for i in range(400))   # 6천 자가 넘는다
+        base = (
+            "1girl, solo,\n"
+            "1.2::artist:ratatatat74 ::, 0.4::artist:ctrlz77 ::,\n"
+            "2b (nier:automata), 1920s (style), {a|b|c}, ||red||,\n"
+            "-1::film grain ::, [[weak]], <조각이름>, <*차례조각>,\n"
+            "한글 태그, emoji 🎨, quote \" and ' and \\ backslash,\n"
+            + long_tail
+        )
+        negative = ("lowres, bad anatomy,\n||x|y||, (parens), 1.5::strong::,\n"
+                    + ", ".join(f"neg{i}" for i in range(300)))
+        char1 = "girl, long black hair,\n1.3::detailed eyes::, (nier:automata)\n" + long_tail
+        self.assertGreater(len(base), 6000, "시험 원문이 충분히 길어야 의미가 있다")
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "설정.json"
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["base_prompt"] = base
+            cfg["negative_prompt"] = negative
+            cfg["char_slots"] = [{"prompt": char1, "outfit": "red dress\n1.1::lace::",
+                                  "negative": negative, "enabled": True}]
+            with patch.object(APP, "SETTINGS_FILE", path):
+                APP.save_config(cfg)
+                back = APP.load_json_recover(path)
+            self.assertEqual(back["base_prompt"], base, "베이스 프롬프트가 왕복에서 달라졌다")
+            self.assertEqual(back["negative_prompt"], negative, "네거티브가 왕복에서 달라졌다")
+            self.assertEqual(back["char_slots"][0]["prompt"], char1, "캐릭터 프롬프트가 달라졌다")
+            # 바이트 단위로도 같아야 한다 (인코딩·개행 변환이 끼어들지 않는지)
+            self.assertEqual(back["base_prompt"].encode("utf-8"), base.encode("utf-8"))
+            self.assertEqual(back["char_slots"][0]["outfit"].encode("utf-8"),
+                             "red dress\n1.1::lace::".encode("utf-8"))
+
+            # 그림체 자료도 같은 규칙 — 저장했다 읽으면 그대로여야 한다
+            style = Path(td) / "그림체.json"
+            with patch.object(APP, "STYLE_FILE", style):
+                APP._write_styles_raw([{"id": "long-1", "base": base,
+                                        "negative": negative, "rest": base,
+                                        "characters": [{"prompt": char1}]}])
+                rows = APP._load_styles_raw()
+            self.assertEqual(rows[0]["base"], base, "그림체 base 가 왕복에서 잘렸다")
+            self.assertEqual(rows[0]["negative"], negative)
+            self.assertEqual(rows[0]["rest"], base, "`rest` 가 다시 잘리기 시작했다")
+            self.assertEqual(rows[0]["characters"][0]["prompt"], char1)
+
+    def test_prompt_fields_have_no_length_caps(self):
+        """화면 입력칸에 `maxlength` 를 달지 않는다 — 달면 긴 원문을 **붙여넣는 순간**
+        잘린다. 미리보기 말줄임(카드·요약)은 괜찮지만 입력·편집칸은 안 된다."""
+        page = APP.render_page()
+        self.assertFalse("maxlength" in page.lower(),
+                         "입력칸에 maxlength 가 생겼다 — 긴 프롬프트가 붙여넣기에서 잘린다")
+
     def test_destructive_buttons_are_not_adjacent_to_creating_ones(self):
         """되돌릴 수 없는 단추를 만드는 단추 **바로 옆**에 두지 않는다.
 
