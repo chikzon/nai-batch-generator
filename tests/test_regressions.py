@@ -389,6 +389,116 @@ class RegressionTests(unittest.TestCase):
                 server.httpd.shutdown()
                 server.httpd.server_close()
 
+    def test_two_servers_merge_different_config_keys_and_conflict_on_same_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            char_dir = root / "캐릭터"
+            initial = copy.deepcopy(APP.DEFAULT_CONFIG)
+            settings.write_text(
+                json.dumps(initial, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            server_a = APP.ConfigServer(copy.deepcopy(initial))
+            server_b = APP.ConfigServer(copy.deepcopy(initial))
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "CHAR_DIR", char_dir),
+            ):
+                saved_a = server_a.handle_save(json.dumps({
+                    "_revision": 0,
+                    "_base": {"base_prompt": ""},
+                    "base_prompt": "A FULL",
+                }, ensure_ascii=False))
+                saved_b = server_b.handle_save(json.dumps({
+                    "_revision": 0,
+                    "_base": {"negative_prompt": ""},
+                    "negative_prompt": "B FULL",
+                }, ensure_ascii=False))
+                merged = json.loads(settings.read_text(encoding="utf-8"))
+                self.assertTrue(saved_a["ok"])
+                self.assertTrue(saved_b["ok"])
+                self.assertEqual(merged["base_prompt"], "A FULL")
+                self.assertEqual(merged["negative_prompt"], "B FULL")
+
+                server_c = APP.ConfigServer(copy.deepcopy(merged))
+                server_d = APP.ConfigServer(copy.deepcopy(merged))
+                saved_c = server_c.handle_save(json.dumps({
+                    "_revision": 0,
+                    "_base": {"base_prompt": "A FULL"},
+                    "base_prompt": "C FULL",
+                }, ensure_ascii=False))
+                conflict_d = server_d.handle_save(json.dumps({
+                    "_revision": 0,
+                    "_base": {"base_prompt": "A FULL"},
+                    "base_prompt": "D FULL",
+                }, ensure_ascii=False))
+                final = json.loads(settings.read_text(encoding="utf-8"))
+                self.assertTrue(saved_c["ok"])
+                self.assertTrue(conflict_d["conflict"])
+                self.assertEqual(
+                    conflict_d["conflict_keys"], ["base_prompt"])
+                self.assertEqual(final["base_prompt"], "C FULL")
+                self.assertEqual(final["negative_prompt"], "B FULL")
+
+        page = APP.render_page()
+        self.assertIn("function stateSavePatch()", page)
+        self.assertIn("body: JSON.stringify(patch)", page)
+
+    def test_two_servers_merge_reference_lists_without_losing_the_other_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            vibe_dir = root / "수집" / "바이브"
+            initial = copy.deepcopy(APP.DEFAULT_CONFIG)
+            settings.write_text(
+                json.dumps(initial, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            server_a = APP.ConfigServer(copy.deepcopy(initial))
+            server_b = APP.ConfigServer(copy.deepcopy(initial))
+            vibe = [{"id": "v-a", "name": "A", "enabled": True}]
+            char_ref = [{"id": "r-b", "name": "B", "enabled": True}]
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "VIBE_DIR", vibe_dir),
+            ):
+                saved_a = server_a.handle_ref_save(json.dumps({
+                    "_revision": 0, "_base": {"vibes": []}, "vibes": vibe,
+                }, ensure_ascii=False))
+                saved_b = server_b.handle_ref_save(json.dumps({
+                    "_revision": 0, "_base": {"char_refs": []},
+                    "char_refs": char_ref,
+                }, ensure_ascii=False))
+                merged = json.loads(settings.read_text(encoding="utf-8"))
+                self.assertTrue(saved_a["ok"])
+                self.assertTrue(saved_b["ok"])
+                self.assertEqual(merged["vibes"], vibe)
+                self.assertEqual(merged["char_refs"], char_ref)
+
+                server_c = APP.ConfigServer(copy.deepcopy(merged))
+                server_d = APP.ConfigServer(copy.deepcopy(merged))
+                changed_c = [{**vibe[0], "strength": 0.4}]
+                changed_d = [{**vibe[0], "strength": 0.9}]
+                saved_c = server_c.handle_ref_save(json.dumps({
+                    "_revision": 0, "_base": {"vibes": vibe},
+                    "vibes": changed_c,
+                }, ensure_ascii=False))
+                conflict_d = server_d.handle_ref_save(json.dumps({
+                    "_revision": 0, "_base": {"vibes": vibe},
+                    "vibes": changed_d,
+                }, ensure_ascii=False))
+                final = json.loads(settings.read_text(encoding="utf-8"))
+                self.assertTrue(saved_c["ok"])
+                self.assertTrue(conflict_d["conflict"])
+                self.assertEqual(conflict_d["conflict_keys"], ["vibes"])
+                self.assertEqual(final["vibes"], changed_c)
+                self.assertEqual(final["char_refs"], char_ref)
+
+        page = APP.render_page()
+        self.assertIn("const changed = ['vibes','char_refs'].filter", page)
+        self.assertIn("payload[key] = STATE[key] || []", page)
+
     def test_generated_image_is_published_only_after_complete_encoding(self):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "result.png"

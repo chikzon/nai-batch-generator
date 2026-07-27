@@ -1388,7 +1388,22 @@ def prepare_vibes(cfg, token):
         ies.append(ie)
     if changed:
         with shared_data_transaction(VIBE_DIR.parent.parent):
-            save_config(cfg)      # 캐시 상태를 남겨 다음엔 공짜로 쓴다
+            # 인코딩은 최대 180초가 걸린다. 그 사이 다른 실행본이 저장한 설정을
+            # 시작 시점의 cfg 전체로 덮지 않고, 같은 id의 캐시 상태만 최신판에 합친다.
+            latest = dict(DEFAULT_CONFIG)
+            if SETTINGS_FILE.is_file():
+                loaded = load_json_recover(SETTINGS_FILE)
+                if isinstance(loaded, dict):
+                    latest.update(loaded)
+            encoded_ie = {
+                item.get("id"): item.get("encoded_ie")
+                for item in cfg.get("vibes", [])
+                if item.get("id") and item.get("encoded_ie") is not None
+            }
+            for item in latest.get("vibes", []):
+                if item.get("id") in encoded_ie:
+                    item["encoded_ie"] = encoded_ie[item.get("id")]
+            save_config(latest)      # 캐시 상태를 남겨 다음엔 공짜로 쓴다
     return encoded, strengths, ies, newly
 
 
@@ -8828,7 +8843,7 @@ function showFatalError(reason){
 window.addEventListener('error', event => showFatalError(event.error || event.message));
 window.addEventListener('unhandledrejection', event => showFatalError(event.reason));
 
-let STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
+let STATE = null, SAVED_STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
 let FRAGS = {};
 const RES_PRESETS = __RESJSON__;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
 
@@ -8840,6 +8855,7 @@ function $(id){ return document.getElementById(id); }
 async function init(){
   const d = await (await fetch('/api/config')).json();
   STATE = d.config;
+  SAVED_STATE = JSON.parse(JSON.stringify(STATE));
   SETTINGS = d.settings || [];
   STYLES = d.styles || [];
   SPEC = d.spec || {};
@@ -9541,10 +9557,25 @@ function renderRefs(){
   }));
 }
 async function saveRefs(){
+  const changed = ['vibes','char_refs'].filter(key =>
+    JSON.stringify((STATE||{})[key] || []) !==
+    JSON.stringify((SAVED_STATE||{})[key] || []));
+  if(!changed.length) return;
+  const payload = {_revision:STATE._revision, _base:{}};
+  changed.forEach(key => {
+    payload[key] = STATE[key] || [];
+    payload._base[key] = (SAVED_STATE||{})[key] || [];
+  });
   const r = await (await fetch('/api/ref_save', {method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({vibes: STATE.vibes || [], char_refs: STATE.char_refs || []})})).json();
-  if(r.ok){ STATE.vibes = r.vibes; STATE.char_refs = r.char_refs; renderRefs(); anlasRefresh(false); }
+    body: JSON.stringify(payload)})).json();
+  if(r.conflict){ flash(r.error || '참조 목록 저장 충돌'); return; }
+  if(r.ok){
+    STATE.vibes = r.vibes; STATE.char_refs = r.char_refs;
+    if(r.revision != null) STATE._revision = r.revision;
+    rememberSavedKeys(changed);
+    renderRefs(); anlasRefresh(false);
+  }
 }
 async function addRefs(files, kind){
   const imgs = files.filter(f => /\.(png|webp)$/i.test(f.name));
@@ -9559,6 +9590,8 @@ async function addRefs(files, kind){
       if(r.ok){
         if(r.vibes) STATE.vibes = r.vibes;
         if(r.char_refs) STATE.char_refs = r.char_refs;
+        if(r.revision != null) STATE._revision = r.revision;
+        rememberSavedKeys(r.vibes ? ['vibes'] : ['char_refs']);
         $('refMsg').textContent = r.warn || `${f.name} 등록 ✓`;
       } else $('refMsg').textContent = r.error;
     }catch(e){ $('refMsg').textContent = String(e); }
@@ -9935,6 +9968,24 @@ function readParams(){
 
 /* ── 저장 ── */
 let saveT = null, saveBusy = false, saveQueued = false;
+function stateSavePatch(){
+  const patch = {_revision: STATE._revision, _base:{}};
+  for(const [key, value] of Object.entries(STATE || {})){
+    if(key.startsWith('_')) continue;
+    const before = SAVED_STATE ? SAVED_STATE[key] : undefined;
+    if(JSON.stringify(value) === JSON.stringify(before)) continue;
+    patch[key] = value;
+    patch._base[key] = before;
+  }
+  return patch;
+}
+function rememberSavedKeys(keys){
+  SAVED_STATE = SAVED_STATE || {};
+  (keys || []).forEach(key => {
+    if(key in STATE) SAVED_STATE[key] = JSON.parse(JSON.stringify(STATE[key]));
+  });
+  SAVED_STATE._revision = STATE._revision;
+}
 function save(){
   clearTimeout(saveT);
   saveState('busy', '저장 대기…');
@@ -9955,8 +10006,11 @@ async function doSave(){
   saveBusy = true;
   saveState('busy', '저장 중…');
   try{
+    const patch = stateSavePatch();
+    const changed = Object.keys(patch).filter(key => !key.startsWith('_'));
+    if(!changed.length){ saveState('', '저장됨 ✓'); return; }
     const r = await (await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(STATE)})).json();
+      body: JSON.stringify(patch)})).json();
     if(r && r.conflict){
       const msg = r.error || '다른 화면에서 설정이 변경됐습니다. 새로고침해주세요.';
       saveState('fail', '저장 충돌 ⚠', msg); flash(msg); return;
@@ -9980,6 +10034,7 @@ async function doSave(){
     if(note) note.textContent = wh.length
       ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${wh.map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`).join(' · ')}` : '';
     if(r && r.rejected && r.rejected.length) flash(`저장하지 않은 잘못된 값: ${r.rejected.join(', ')}`);
+    rememberSavedKeys((r && r.accepted) || changed);
     saveState('', '저장됨 ✓');
   }catch(e){
     console.warn('설정 저장 실패', e);
@@ -9996,8 +10051,10 @@ async function doSave(){
 window.addEventListener('pagehide', () => {
   if(!saveT || saveBusy || !navigator.sendBeacon) return;
   clearTimeout(saveT); saveT = null;
+  const patch = stateSavePatch();
+  if(!Object.keys(patch).some(key => !key.startsWith('_'))) return;
   navigator.sendBeacon('/api/save',
-    new Blob([JSON.stringify(STATE)], {type:'application/json'}));
+    new Blob([JSON.stringify(patch)], {type:'application/json'}));
 });
 ['basePrompt','negPrompt','token','pScale','pRescale','pSteps','pSeed','pNaiSeed','pSampler','pSched','pVariety'].forEach(id => {
   const el = $(id);
@@ -14677,6 +14734,36 @@ class ConfigServer:
         self.anlas_balance_cache = None
         self.anlas_balance_token_key = None
 
+    def latest_config_from_disk(self):
+        """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
+        runtime = {
+            key: value for key, value in self.cfg.items()
+            if str(key).startswith("_")
+        }
+        latest = {
+            key: value for key, value in self.cfg.items()
+            if not str(key).startswith("_")
+        }
+        if SETTINGS_FILE.is_file():
+            try:
+                loaded = load_json_recover(SETTINGS_FILE)
+                if isinstance(loaded, dict):
+                    latest = loaded
+            except Exception:
+                pass
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(latest)
+        merged.update(runtime)
+        migrate_legacy_selections(merged)
+        migrate_char_slots(merged)
+        return merged
+
+    def use_latest_config(self):
+        merged = self.latest_config_from_disk()
+        self.cfg.clear()
+        self.cfg.update(merged)
+        return merged
+
     def snapshot_config(self):
         settings_out = []
         try:
@@ -15192,11 +15279,13 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    @serialized_data_write(lambda: BASE_DIR)
     def handle_compare_promote(self, body):
         """비교 결과의 서버 원문을 기존 그림체/캐릭터 자료 형식으로 명시적으로 저장."""
         try:
             data = json.loads(body or b"{}")
             with self.config_lock:
+                self.use_latest_config()
                 result = promote_comparison_recipe_assets(
                     self.cfg,
                     data.get("path"),
@@ -15364,6 +15453,7 @@ class ConfigServer:
             if kind == "vibe":
                 with shared_data_transaction(VIBE_DIR.parent.parent):
                     with self.config_lock:
+                        self.use_latest_config()
                         p, _ = vibe_paths(rid)
                         converted = im.convert("RGB")
                         _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
@@ -15372,6 +15462,7 @@ class ConfigServer:
                                 "encoded_ie": None}
                         self.cfg.setdefault("vibes", []).append(item)
                         save_config(self.cfg)
+                        self.config_revision += 1
                 token = (self.cfg.get("token") or "").strip()
                 if token:
                     # 최대 180초인 유료 인코딩 통신 중에는 다른 자료 저장을 막지 않는다.
@@ -15381,11 +15472,14 @@ class ConfigServer:
                         item["encoded"] = True
                     except Exception as e:
                         return {"ok": True, "item": item, "vibes": self.cfg["vibes"],
-                                "warn": f"등록은 됐지만 인코딩 실패: {e}"}
-                return {"ok": True, "item": item, "vibes": self.cfg["vibes"]}
+                                "warn": f"등록은 됐지만 인코딩 실패: {e}",
+                                "revision": self.config_revision}
+                return {"ok": True, "item": item, "vibes": self.cfg["vibes"],
+                        "revision": self.config_revision}
             else:
                 with shared_data_transaction(VIBE_DIR.parent.parent):
                     with self.config_lock:
+                        self.use_latest_config()
                         p = VIBE_DIR / f"{rid}.ref.png"
                         converted = im.convert("RGB")
                         _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
@@ -15394,7 +15488,9 @@ class ConfigServer:
                                 "fidelity": 0.6}
                         self.cfg.setdefault("char_refs", []).append(item)
                         save_config(self.cfg)
-                return {"ok": True, "item": item, "char_refs": self.cfg["char_refs"]}
+                        self.config_revision += 1
+                return {"ok": True, "item": item, "char_refs": self.cfg["char_refs"],
+                        "revision": self.config_revision}
         except Exception as e:
             log.warning(f"레퍼런스 추가 실패: {traceback.format_exc()}")
             return {"ok": False, "error": str(e)}
@@ -15404,27 +15500,62 @@ class ConfigServer:
         """목록 갱신(강도·정보추출·켜기/끄기·삭제)."""
         try:
             d = json.loads(body or b"{}")
-            for key in ("vibes", "char_refs"):
-                if key not in d:
-                    continue
-                old = {x.get("id"): x for x in self.cfg.get(key, [])}
-                new = d[key]
-                # 사라진 항목의 파일 정리
-                for gone in set(old) - {x.get("id") for x in new}:
-                    for p in (VIBE_DIR / f"{gone}.png", VIBE_DIR / f"{gone}.vibe",
-                              VIBE_DIR / f"{gone}.ref.png"):
-                        if p.exists():
-                            recoverable_remove(p)
-                # 정보추출이 바뀌면 캐시를 버려 다음 생성에서 다시 인코딩
-                for x in new:
-                    o = old.get(x.get("id"))
-                    if o and abs(float(x.get("info_extracted", 0.7))
-                                 - float(o.get("info_extracted", 0.7))) > 1e-9:
-                        x["encoded_ie"] = None
-                self.cfg[key] = new
-            save_config(self.cfg)
-            return {"ok": True, "vibes": self.cfg.get("vibes", []),
-                    "char_refs": self.cfg.get("char_refs", [])}
+            revision = d.pop("_revision", None)
+            base_values = d.pop("_base", {})
+            if not isinstance(base_values, dict):
+                base_values = {}
+            with self.config_lock:
+                if revision is not None:
+                    try:
+                        stale = int(revision) != self.config_revision
+                    except (TypeError, ValueError):
+                        stale = True
+                    if stale:
+                        return {"ok": False, "conflict": True,
+                                "revision": self.config_revision,
+                                "error": "다른 화면에서 참조 설정이 먼저 변경됐습니다. "
+                                         "새로고침 후 다시 시도하세요."}
+                merged = self.latest_config_from_disk()
+                conflicts = [
+                    key for key in ("vibes", "char_refs")
+                    if key in d and key in base_values
+                    and merged.get(key) != base_values.get(key)
+                    and d.get(key) != merged.get(key)
+                ]
+                if conflicts:
+                    self.cfg.clear()
+                    self.cfg.update(merged)
+                    self.config_revision += 1
+                    return {"ok": False, "conflict": True,
+                            "conflict_keys": conflicts,
+                            "revision": self.config_revision,
+                            "error": "다른 실행본이 같은 참조 목록을 먼저 변경했습니다. "
+                                     "새로고침 후 다시 시도하세요."}
+                self.cfg.clear()
+                self.cfg.update(merged)
+                for key in ("vibes", "char_refs"):
+                    if key not in d:
+                        continue
+                    old = {x.get("id"): x for x in self.cfg.get(key, [])}
+                    new = d[key]
+                    # 사라진 항목의 파일 정리
+                    for gone in set(old) - {x.get("id") for x in new}:
+                        for p in (VIBE_DIR / f"{gone}.png", VIBE_DIR / f"{gone}.vibe",
+                                  VIBE_DIR / f"{gone}.ref.png"):
+                            if p.exists():
+                                recoverable_remove(p)
+                    # 정보추출이 바뀌면 캐시를 버려 다음 생성에서 다시 인코딩
+                    for x in new:
+                        o = old.get(x.get("id"))
+                        if o and abs(float(x.get("info_extracted", 0.7))
+                                     - float(o.get("info_extracted", 0.7))) > 1e-9:
+                            x["encoded_ie"] = None
+                    self.cfg[key] = new
+                save_config(self.cfg)
+                self.config_revision += 1
+                return {"ok": True, "vibes": self.cfg.get("vibes", []),
+                        "char_refs": self.cfg.get("char_refs", []),
+                        "revision": self.config_revision}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -15500,17 +15631,22 @@ class ConfigServer:
                                    if isinstance(v, str) and v.strip())
             if not female:
                 return {"ok": False, "error": "내용이 비어 있습니다."}
-            new_char = {
-                "id": "".join(random.choices(string.ascii_lowercase + string.digits, k=8)),
-                "name": name, "female": female, "clothed": "", "negative": data.get("negative", ""),
-                "groups": data.get("builder_groups") or groups, "enabled": True,
-                "folder_id": data.get("folder_id") or None,
-                "subfolder_id": data.get("subfolder_id") or None,
-            }
-            self.cfg.setdefault("characters", []).append(new_char)
-            sync_chars_to_files(self.cfg)
-            save_config(self.cfg)
-            return {"ok": True, "characters": self.cfg["characters"]}
+            with self.config_lock:
+                self.use_latest_config()
+                new_char = {
+                    "id": "".join(random.choices(string.ascii_lowercase + string.digits, k=8)),
+                    "name": name, "female": female, "clothed": "",
+                    "negative": data.get("negative", ""),
+                    "groups": data.get("builder_groups") or groups, "enabled": True,
+                    "folder_id": data.get("folder_id") or None,
+                    "subfolder_id": data.get("subfolder_id") or None,
+                }
+                self.cfg.setdefault("characters", []).append(new_char)
+                sync_chars_to_files(self.cfg)
+                save_config(self.cfg)
+                self.config_revision += 1
+                return {"ok": True, "characters": self.cfg["characters"],
+                        "revision": self.config_revision}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -15521,6 +15657,9 @@ class ConfigServer:
         except json.JSONDecodeError:
             return {"ok": False, "error": "잘못된 데이터"}
         revision = data.pop("_revision", None)
+        base_values = data.pop("_base", {})
+        if not isinstance(base_values, dict):
+            base_values = {}
         with self.config_lock:
             if revision is not None:
                 try:
@@ -15530,10 +15669,34 @@ class ConfigServer:
                 if stale:
                     return {"ok": False, "conflict": True, "revision": self.config_revision,
                             "error": "다른 화면에서 설정이 먼저 변경됐습니다. 새로고침 후 다시 시도하세요."}
-            old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
+            # 다른 프로세스는 각자 config_revision을 가지므로 파일 잠금만으로는 부족하다.
+            # 잠금을 얻은 뒤 디스크 최신판을 다시 읽고, 이번 요청이 실제로 바꾼
+            # top-level 키만 그 위에 적용한다. 같은 키가 시작값과 달라졌다면 조용히
+            # 덮지 않고 충돌로 돌려준다.
+            merged = self.latest_config_from_disk()
             allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
             allowed |= {"booru_keys"}
             allowed -= {"male_prompt"}
+            conflicts = [
+                key for key, incoming in data.items()
+                if key in allowed and key in base_values
+                and merged.get(key) != base_values.get(key)
+                and incoming != merged.get(key)
+            ]
+            if conflicts:
+                self.cfg.clear()
+                self.cfg.update(merged)
+                self.config_revision += 1
+                return {
+                    "ok": False, "conflict": True,
+                    "conflict_keys": sorted(conflicts),
+                    "revision": self.config_revision,
+                    "error": "다른 실행본이 같은 설정을 먼저 변경했습니다. "
+                             "새로고침 후 값을 확인하고 다시 시도하세요.",
+                }
+            self.cfg.clear()
+            self.cfg.update(merged)
+            old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
             accepted, rejected, fixed_vals = [], [], {}
             for key, val in data.items():
                 if key not in allowed:
