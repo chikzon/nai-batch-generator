@@ -4415,6 +4415,10 @@ def normalize_comparison_options(raw, cfg):
     except (TypeError, ValueError, OverflowError):
         seed = 0
     try:
+        seed_count = max(1, min(int(raw.get("seed_count") or 1), 4))
+    except (TypeError, ValueError, OverflowError):
+        seed_count = 1
+    try:
         width = normalize_resolution(raw.get("width", cfg.get("width", 832)))
         height = normalize_resolution(raw.get("height", cfg.get("height", 1216)))
     except (TypeError, ValueError, OverflowError):
@@ -4427,6 +4431,7 @@ def normalize_comparison_options(raw, cfg):
         "height": height,
         "same_seed": _compare_bool(raw.get("same_seed"), True),
         "seed": seed,
+        "seed_count": seed_count,
         "limit": limit,
         # 레퍼런스는 비교 변수를 흐리고 추가 과금도 생기므로 사용자가 켠 경우만 쓴다.
         "include_refs": _compare_bool(raw.get("include_refs"), False),
@@ -4482,9 +4487,10 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         s for s in (cfg.get("char_slots") or [])
         if slot_prompt(s).strip() and s.get("enabled") is not False
     ]
-    total = (len(styles) if mode == "styles"
-             else len(chars) if mode == "characters"
-             else len(styles) * len(chars))
+    combinations = (len(styles) if mode == "styles"
+                    else len(chars) if mode == "characters"
+                    else len(styles) * len(chars))
+    total = combinations * options["seed_count"]
     count = min(total, options["limit"]) if options["limit"] else total
     errors = []
     if mode in ("styles", "both") and not styles:
@@ -4519,12 +4525,18 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         for style in styles:
             if remain <= 0:
                 break
-            add_cost(comparison_style_config(cfg, style, options), 1)
+            add_cost(
+                comparison_style_config(cfg, style, options),
+                options["seed_count"],
+            )
     else:
         for style in styles:
             if remain <= 0:
                 break
-            add_cost(comparison_style_config(cfg, style, options), len(chars))
+            add_cost(
+                comparison_style_config(cfg, style, options),
+                len(chars) * options["seed_count"],
+            )
 
     expected = None
     if opus is True:
@@ -4539,6 +4551,8 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         "styles": len(styles),
         "characters": len(chars),
         "current_slots": len(current_slots),
+        "combinations": combinations,
+        "seed_count": options["seed_count"],
         "total": total,
         "count": count,
         "limited": count < total,
@@ -4586,18 +4600,20 @@ def iter_comparison_jobs(cfg, plan, styles, chars):
     options, made = plan["options"], 0
     limit = plan["count"]
 
-    def emit(style, char, style_name, char_name, key):
+    def emit(style, char, style_name, char_name, key, seed_index):
         nonlocal made
         if made >= limit:
             return None
         made += 1
         return {
             "index": made,
-            "key": _comparison_id("job", options["mode"], key),
+            "key": _comparison_id(
+                "job", options["mode"], key, int(seed_index)),
             "style": style,
             "character": char,
             "style_name": style_name,
             "char_name": char_name,
+            "seed_index": int(seed_index),
         }
 
     if options["mode"] == "styles":
@@ -4608,26 +4624,33 @@ def iter_comparison_jobs(cfg, plan, styles, chars):
         char_name = (f"현재 캐릭터 {len(slots)}명" if slots else "캐릭터 없음")
         slot_key = [(slot_prompt(s), s.get("negative", "")) for s in slots]
         for style in styles:
-            job = emit(style, None, style["_compare_name"], char_name,
-                       (style["_compare_id"], slot_key))
-            if job is None:
-                break
-            yield job
-    elif options["mode"] == "characters":
-        for char in chars:
-            job = emit(None, char, "현재 그림체", char["_compare_name"],
-                       ("current", char["_compare_id"]))
-            if job is None:
-                break
-            yield job
-    else:
-        for style in styles:
-            for char in chars:
-                job = emit(style, char, style["_compare_name"], char["_compare_name"],
-                           (style["_compare_id"], char["_compare_id"]))
+            for seed_index in range(options["seed_count"]):
+                job = emit(style, None, style["_compare_name"], char_name,
+                           (style["_compare_id"], slot_key), seed_index)
                 if job is None:
                     return
                 yield job
+    elif options["mode"] == "characters":
+        for char in chars:
+            for seed_index in range(options["seed_count"]):
+                job = emit(None, char, "현재 그림체", char["_compare_name"],
+                           ("current", char["_compare_id"]), seed_index)
+                if job is None:
+                    return
+                yield job
+    else:
+        for style in styles:
+            for char in chars:
+                for seed_index in range(options["seed_count"]):
+                    job = emit(
+                        style, char, style["_compare_name"],
+                        char["_compare_name"],
+                        (style["_compare_id"], char["_compare_id"]),
+                        seed_index,
+                    )
+                    if job is None:
+                        return
+                    yield job
 
 
 def comparison_job_values(cfg, plan, job):
@@ -7636,8 +7659,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div class="field"><label>비교 시드</label>
             <input type="number" id="cmpSeed" min="0" max="4294967295" step="1" value="0"
               placeholder="0 = 시작할 때 한 번 정함">
+            <label class="hint" style="display:flex;align-items:center;gap:7px;margin-top:6px;">
+              자료마다 확인할 시드
+              <select id="cmpSeedCount" style="width:auto;">
+                <option value="1">1개</option><option value="2">2개</option>
+                <option value="3">3개</option><option value="4">4개</option>
+              </select>
+            </label>
             <label class="hint" style="display:flex;align-items:center;gap:5px;margin-top:6px;">
-              <input type="checkbox" id="cmpSameSeed" checked style="width:auto;flex:none;"> 모든 결과에 같은 시드</label>
+              <input type="checkbox" id="cmpSameSeed" checked style="width:auto;flex:none;">
+              같은 시드 차례끼리 공정하게 비교</label>
           </div>
           <div class="field"><label>시험 상한 <span class="hint">(0 = 전부)</span></label>
             <input type="number" id="cmpLimit" min="0" max="2000000" step="1" value="0">
@@ -8300,6 +8331,8 @@ function comparisonRead(){
     width: w, height: h,
     same_seed: $('cmpSameSeed').checked,
     seed: Math.max(0, Math.trunc(Number($('cmpSeed').value) || 0)),
+    seed_count: Math.max(1, Math.min(4,
+      Math.trunc(Number($('cmpSeedCount').value) || 1))),
     limit: Math.max(0, Math.trunc(Number($('cmpLimit').value) || 0)),
     include_refs: $('cmpRefs').checked
   };
@@ -8322,6 +8355,8 @@ function comparisonRestore(){
   $('cmpFix').checked = saved.fixed_size !== false;
   $('cmpSameSeed').checked = saved.same_seed !== false;
   $('cmpSeed').value = Number(saved.seed) || 0;
+  $('cmpSeedCount').value = String(Math.max(1, Math.min(4,
+    Math.trunc(Number(saved.seed_count) || 1))));
   $('cmpLimit').value = Number(saved.limit) || 0;
   $('cmpRefs').checked = saved.include_refs === true;
   comparisonPaintControls();
@@ -8358,6 +8393,9 @@ async function comparisonPreview(){
     }else{
       formula = `그림체 ${r.styles.toLocaleString()}개 × 캐릭터 ${r.characters.toLocaleString()}개`;
     }
+    if(Number(r.seed_count || 1) > 1){
+      formula += ` × 시드 ${Number(r.seed_count).toLocaleString()}개`;
+    }
     const cap = r.limited ? ` · 전체 ${r.total.toLocaleString()}장 중 앞 ${r.count.toLocaleString()}장` : '';
     let cost = '';
     if(r.subscription_known){
@@ -8389,7 +8427,8 @@ function bindComparison(){
   $('compareCard')._bound = true;
   comparisonRestore();
   document.querySelectorAll('input[name="cmpMode"]').forEach(x => x.addEventListener('change', comparisonSchedule));
-  ['cmpRes','cmpFix','cmpSameSeed','cmpSeed','cmpLimit','cmpRefs','cmpW','cmpH'].forEach(id => {
+  ['cmpRes','cmpFix','cmpSameSeed','cmpSeed','cmpSeedCount',
+   'cmpLimit','cmpRefs','cmpW','cmpH'].forEach(id => {
     const el = $(id); if(!el) return;
     el.addEventListener('change', comparisonSchedule);
     if(['cmpSeed','cmpLimit','cmpW','cmpH'].includes(id)) el.addEventListener('input', comparisonSchedule);
@@ -15726,13 +15765,22 @@ def _run_comparison(server, cfg, plan, styles, chars):
             break
 
         used, base, negative, people, centers = comparison_job_values(cfg, plan, job)
-        seed = (base_seed if options["same_seed"]
-                else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff)
+        seed_index = int(job.get("seed_index") or 0)
+        seed = (
+            (base_seed + seed_index * 100003) & 0xffffffff
+            if options["same_seed"]
+            else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff
+        )
         seed = seed or 1
         style_label = job["style_name"]
         char_label = job["char_name"]
+        seed_suffix = (
+            f"_S{seed_index + 1}"
+            if int(options.get("seed_count") or 1) > 1 else ""
+        )
         stem = (f"{job['index']:06d}_"
-                f"{_safe_name(style_label)[:38]}__{_safe_name(char_label)[:32]}")
+                f"{_safe_name(style_label)[:38]}__{_safe_name(char_label)[:32]}"
+                f"{seed_suffix}")
         target = available_output_path(folder / f"{stem}.webp", out_format(cfg))
         done_n = len(completed)
         server.live.update(
@@ -15782,6 +15830,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 completed[key] = {
                     "index": job["index"], "file": rel,
                     "style": style_label, "character": char_label,
+                    "seed_index": seed_index,
                     "seed": seed, "width": int(used["width"]),
                     "height": int(used["height"]),
                 }

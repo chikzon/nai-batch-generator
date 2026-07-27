@@ -469,6 +469,12 @@ class RegressionTests(unittest.TestCase):
                 cfg, {"mode": "characters", "width": 640, "height": 960})
             both_plan = APP.comparison_plan(
                 cfg, {"mode": "both", "width": 640, "height": 960, "limit": 3})
+            multi_seed_plan = APP.comparison_plan(
+                cfg, {
+                    "mode": "both", "width": 640, "height": 960,
+                    "seed_count": 3,
+                },
+            )
             source_styles, source_chars = APP.comparison_sources(cfg)
 
         self.assertEqual(style_plan["count"], 2)
@@ -477,6 +483,17 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(both_plan["total"], 4)
         self.assertEqual(both_plan["count"], 3)
         self.assertTrue(both_plan["limited"])
+        self.assertEqual(multi_seed_plan["combinations"], 4)
+        self.assertEqual(multi_seed_plan["seed_count"], 3)
+        self.assertEqual(multi_seed_plan["total"], 12)
+        multi_seed_jobs = list(APP.iter_comparison_jobs(
+            cfg, multi_seed_plan, source_styles, source_chars))
+        self.assertEqual(len(multi_seed_jobs), 12)
+        self.assertEqual(
+            [job["seed_index"] for job in multi_seed_jobs[:3]],
+            [0, 1, 2],
+        )
+        self.assertEqual(len({job["key"] for job in multi_seed_jobs}), 12)
 
         first_job = next(APP.iter_comparison_jobs(
             cfg, both_plan, source_styles, source_chars))
@@ -544,11 +561,13 @@ class RegressionTests(unittest.TestCase):
             chars = APP.comparison_characters(cfg)
             plan = APP.comparison_plan(
                 cfg, {"mode": "both", "fixed_size": True,
-                      "width": 512, "height": 512, "same_seed": True},
+                      "width": 512, "height": 512, "same_seed": True,
+                      "seed_count": 2},
                 opus=True)
             # comparison_plan reads global sources; replace its counts with the fixture's exact plan.
             plan.update(ok=True, errors=[], styles=1, characters=2,
-                        total=2, count=2, limited=False,
+                        combinations=2, seed_count=2,
+                        total=4, count=4, limited=False,
                         mode_label=APP.COMPARE_MODE_LABELS["both"])
             state = {"seeds": {}, "progress": {}, "daily": {}, "total_generated": 0}
             server = APP.ConfigServer(cfg)
@@ -585,19 +604,22 @@ class RegressionTests(unittest.TestCase):
                 APP._run_comparison(server, cfg, plan, styles, chars)
                 final = json.loads(progress_file.read_text(encoding="utf-8"))
 
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 4)
             self.assertEqual(final["status"], "complete")
-            self.assertEqual(len(final["completed"]), 2)
-            self.assertEqual(calls[0]["seed"], calls[1]["seed"])
+            self.assertEqual(len(final["completed"]), 4)
+            self.assertEqual(calls[0]["seed"], calls[2]["seed"])
+            self.assertEqual(calls[1]["seed"], calls[3]["seed"])
+            self.assertNotEqual(calls[0]["seed"], calls[1]["seed"])
             self.assertEqual(
                 {(x["width"], x["height"]) for x in calls}, {(512, 512)})
             self.assertEqual(
                 [x["chars"][0]["prompt"] for x in calls],
-                ["character a, red dress", "character b"])
+                ["character a, red dress", "character a, red dress",
+                 "character b", "character b"])
             self.assertTrue(all(x["base"] == "style base" for x in calls))
             self.assertTrue(all(x["negative"] == "style negative" for x in calls))
             self.assertTrue(all(x["scale"] == 6.5 for x in calls))
-            self.assertEqual(len(list((root / "output").rglob("*.webp"))), 2)
+            self.assertEqual(len(list((root / "output").rglob("*.webp"))), 4)
             self.assertEqual(len(list((root / "output").rglob("manifest.json"))), 1)
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
@@ -607,6 +629,9 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="cmpFix" checked', page)
         self.assertIn("#cmpCustom.hidden{display:none;}", page)
         self.assertIn('id="cmpSameSeed" checked', page)
+        self.assertIn('id="cmpSeedCount"', page)
+        self.assertIn("seed_count: Math.max(1, Math.min(4,", page)
+        self.assertIn("× 시드 ${Number(r.seed_count).toLocaleString()}개", page)
         self.assertIn('id="cmpConfirm"', page)
         self.assertIn("confirmed_count:CMP_PLAN.count", page)
         self.assertIn("중지하거나 일일 상한에 닿아도 같은 계획으로 다시 누르면 이어집니다.", page)
