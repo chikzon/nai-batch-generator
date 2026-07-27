@@ -15343,6 +15343,8 @@ class ConfigServer:
                     self.live.set_image(img)
                     bump_daily(state); save_state(state)
                     done += 1
+                    self.live.update(
+                        completed=done, index=i, daily=daily_count(state))
                 if self.live.stop_req:
                     phase = "stopped"
                     text = f"그림체 복구 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
@@ -15466,6 +15468,8 @@ class ConfigServer:
                     bump_daily(state)
                     save_state(state)
                     done += 1
+                    self.live.update(
+                        completed=done, index=i, daily=daily_count(state))
                 if self.live.stop_req:
                     phase = "stopped"
                     text = f"씬 모드 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
