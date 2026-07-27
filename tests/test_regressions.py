@@ -125,6 +125,21 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("composeSelected('negative')", page)
         self.assertIn("negative:c.negative || negative", page)
         self.assertIn('id="bldUseNow" checked', page)
+        self.assertIn("const hydrateSection = sec =>", page)
+        self.assertIn("select._bldCandidates =", page)
+        self.assertIn("if(body.classList.contains('hidden')) hydrateSection", page)
+
+    def test_completed_settings_migration_drops_retired_partner_keys(self):
+        """이전이 끝난 male_prompt가 화면 저장 때마다 잘못된 키 경고를 만들면 안 된다."""
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update({
+            "_settings_migrated": True,
+            "male_prompt": "",
+            "male_outfit": "",
+        })
+        APP.migrate_legacy_selections(cfg)
+        self.assertNotIn("male_prompt", cfg)
+        self.assertNotIn("male_outfit", cfg)
 
     def test_builder_saves_style_settings_and_character_negative(self):
         """빌더 저장도 빠른 프리셋 저장과 같은 묶음 규칙을 지킨다."""

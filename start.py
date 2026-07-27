@@ -404,6 +404,10 @@ def migrate_char_slots(cfg):
 def migrate_legacy_selections(cfg):
     """구 cfg 키(selected_*/테마/남자·파트너 역)를 세팅 구조로 1회 이전"""
     if cfg.get("_settings_migrated"):
+        # DEFAULT_CONFIG에 이전용 키가 남아 있어 병합할 때마다 빈 male_prompt가
+        # 되살아났다. 화면은 이 폐기 키를 저장하려다 모든 모달에 경고를 띄웠다.
+        cfg.pop("male_prompt", None)
+        cfg.pop("male_outfit", None)
         return
     ss = cfg.setdefault("setting_state", {})
     if cfg.get("selected_positions") is not None:
@@ -436,9 +440,11 @@ def migrate_legacy_selections(cfg):
             atomic_write_json(p, pack)
         except Exception as e:
             log.warning(f"상대역 이전 실패({name}): {e}")
-    if cfg.get("male_prompt"):
-        put_role("남녀 체위", {"외형": cfg.get("male_prompt", ""),
-                              "의상": cfg.pop("male_outfit", "")})
+    legacy_male = cfg.pop("male_prompt", "")
+    legacy_male_outfit = cfg.pop("male_outfit", "")
+    if legacy_male:
+        put_role("남녀 체위", {"외형": legacy_male,
+                              "의상": legacy_male_outfit})
     if cfg.get("partner_prompt"):
         put_role("백합", {"외형": cfg.pop("partner_prompt", ""),
                          "착의": cfg.pop("partner_clothed", ""),
@@ -11373,6 +11379,24 @@ function openBuilder(kind){
       지금도 오른쪽의 직접 태그 입력으로 저장할 수 있습니다.</p></div>`;
   }
 
+  /* 접힌 18단계의 후보 3천여 개를 모달을 여는 순간 전부 option으로 만들지 않는다.
+     단계 헤더와 후보 수는 즉시 보이고, 실제 선택지는 그 단계를 처음 펼칠 때 채운다. */
+  const hydrateSection = sec => {
+    if(!sec) return;
+    sec.querySelectorAll('select[data-pick]').forEach(select => {
+      if(select.dataset.hydrated === '1') return;
+      const fragment = document.createDocumentFragment();
+      (select._bldCandidates || []).forEach(tag => {
+        const option = document.createElement('option');
+        option.value = tag;
+        option.textContent = tag + (ko[tag] ? ' — ' + ko[tag] : '');
+        fragment.appendChild(option);
+      });
+      select.appendChild(fragment);
+      select.dataset.hydrated = '1';
+    });
+  };
+
   steps.forEach((st, si) => {
     const output = st['출력'] === 'negative' ? 'negative' : 'positive';
     const essential = !isBase && charCore.has(st['이름']);
@@ -11381,8 +11405,6 @@ function openBuilder(kind){
     sec.dataset.output = output;
     sec.dataset.stepName = st['이름'];
     const rows = (st['슬롯'] || []).map((sl, li) => {
-      const opts = (sl['후보'] || []).map(tg =>
-        `<option value="${escA(tg)}">${esc(tg)}${ko[tg] ? ' — ' + esc(ko[tg]) : ''}</option>`).join('');
       const id = `${si}-${li}`;
       return `<div class="bld-slot" data-slot="${id}">
         <div class="bld-slot-head">
@@ -11398,7 +11420,7 @@ function openBuilder(kind){
         </div>
         <div data-tagres="${escA(kind + '|' + st['이름'] + '·' + sl['라벨'])}" class="tagres"></div>
         <div data-sels="${id}" class="bld-selects"><select data-pick="${id}" data-output="${output}">
-          <option value="">(선택 안 함)</option>${opts}</select></div>
+          <option value="">(선택 안 함)</option></select></div>
       </div>`;
     }).join('');
     sec.innerHTML = `<div class="sec-head" data-bstep="${si}">
@@ -11407,7 +11429,11 @@ function openBuilder(kind){
         <span class="builder-stage-route ${output}">${output === 'negative' ? '네거티브로' : (isBase ? '베이스로' : '캐릭터로')}</span>
         <span class="cnt" data-bcnt="${si}"></span></div>
       <div class="sec-body ${si < (isBase ? 2 : 1) ? '' : 'hidden'}" data-bbody="${si}">${rows}</div>`;
+    sec.querySelectorAll('select[data-pick]').forEach((select, li) => {
+      select._bldCandidates = [...(((st['슬롯'] || [])[li] || {})['후보'] || [])];
+    });
     stepsBox.appendChild(sec);
+    if(!sec.querySelector('.sec-body').classList.contains('hidden')) hydrateSection(sec);
   });
 
   const composeSelected = output => {
@@ -11459,7 +11485,12 @@ function openBuilder(kind){
       return;
     }
     const h = e.target.closest('[data-bstep]');
-    if(h){ b.querySelector(`[data-bbody="${h.dataset.bstep}"]`).classList.toggle('hidden'); return; }
+    if(h){
+      const body = b.querySelector(`[data-bbody="${h.dataset.bstep}"]`);
+      if(body.classList.contains('hidden')) hydrateSection(h.closest('.sec'));
+      body.classList.toggle('hidden');
+      return;
+    }
     const lk = e.target.closest('[data-lock]');
     if(lk){
       const f = b.querySelector(`[data-slot="${CSS.escape(lk.dataset.lock)}"]`);
@@ -11497,7 +11528,10 @@ function openBuilder(kind){
     $('bldCore').setAttribute('aria-pressed', coreOnly ? 'true' : 'false');
   });
   $('bldOpenAll').addEventListener('click', () => stepsBox.querySelectorAll('.sec').forEach(sec => {
-    if(sec.offsetParent !== null) sec.querySelector('.sec-body').classList.remove('hidden');
+    if(sec.offsetParent !== null){
+      hydrateSection(sec);
+      sec.querySelector('.sec-body').classList.remove('hidden');
+    }
   }));
   $('bldCloseAll').addEventListener('click', () => stepsBox.querySelectorAll('.sec-body').forEach(x => x.classList.add('hidden')));
   $('bldClear').addEventListener('click', () => {
@@ -11512,6 +11546,7 @@ function openBuilder(kind){
        가볍게 초안을 만들고, 네거티브는 사용자가 명시적으로 고르게 둔다. */
     stepsBox.querySelectorAll('.sec').forEach(sec => {
       if(sec.dataset.output === 'negative' || (!isBase && !sec.classList.contains('essential'))) return;
+      hydrateSection(sec);
       sec.querySelectorAll('[data-slot]').forEach((f, fi) => {
         if(f.dataset.locked === '1') return;
         const s = f.querySelector('select');
