@@ -67,6 +67,7 @@ def _profile_from_argv():
 
 PROFILE = _profile_from_argv()
 PROFILE_DIR = (BASE_DIR / "프로필" / PROFILE) if PROFILE else BASE_DIR
+UI_DIR = BASE_DIR / "ui"
 if PROFILE:
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6322,7 +6323,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .bld-slot-actions{width:100%;margin-left:0;}
     .bld-search{flex:1;min-width:120px;width:auto;}
   }
-</style></head>
+  </style>
+  <!-- 새 화면 구성은 거대한 PAGE_TEMPLATE에 다시 덧붙이지 않는다.
+       설정에서 `작업실(실험)`을 골랐을 때만 적용되고 파일이 없어도 기존 UI는 동작한다. -->
+  <link rel="stylesheet" href="/ui/studio.css">
+  </head>
 <body data-mode="preview">
 
 <div class="titlebar">
@@ -6331,11 +6336,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   <!-- 계획서의 5탭 순서 그대로: 기본 생성 · 자료 · 빌더 · 세팅 · 기타.
        숫자키 1~5 로도 옮긴다. -->
   <div class="modes" id="modes">
-    <button data-mode="preview" class="on" title="Alt+1">🖼 생성</button>
-    <button data-mode="library" title="Alt+2">📚 자료</button>
-    <button data-mode="builder" title="Alt+3">🧰 빌더</button>
-    <button data-mode="settings" title="Alt+4">🎬 세팅</button>
-    <button data-mode="system" title="Alt+5">⚙ 기타</button>
+    <button data-mode="preview" class="on" title="Alt+1"><span class="navico" aria-hidden="true">◉</span><span>생성</span></button>
+    <button data-mode="library" title="Alt+2"><span class="navico" aria-hidden="true">▦</span><span>자료</span></button>
+    <button data-mode="builder" title="Alt+3"><span class="navico" aria-hidden="true">◇</span><span>빌더</span></button>
+    <button data-mode="settings" title="Alt+4"><span class="navico" aria-hidden="true">≋</span><span>세팅</span></button>
+    <button data-mode="system" title="Alt+5"><span class="navico" aria-hidden="true">⚙</span><span>기타</span></button>
   </div>
   <div class="spacer"></div>
   <div class="stat" id="topStat">-</div>
@@ -7063,7 +7068,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="card">
         <h2><span class="n">02</span>화면 · 디자인</h2>
-        <p class="hint">색 테마·강조색·글씨 크기·모서리를 바꿀 수 있습니다. 즉시 반영되고 저장됩니다.</p>
+        <p class="hint">화면 구성과 색 테마·강조색·글씨 크기·모서리를 바꿀 수 있습니다. 즉시 반영되고 저장됩니다.</p>
+        <div class="field"><label>화면 구성</label><div id="layoutChips"></div>
+          <p class="hint" style="margin-top:5px;">작업실은 기능은 그대로 두고 탭마다 필요한 작업면만 크게 쓰는 실험 화면입니다. 언제든 기존으로 돌아올 수 있습니다.</p>
+        </div>
         <div class="field"><label>테마</label><div id="themeChips"></div></div>
         <div class="grid3">
           <div class="field"><label>강조색</label><div id="accentChips"></div></div>
@@ -11699,6 +11707,7 @@ const THEMES = [
   ['mono','모노크롬','#141414','#1c1c1c','#d8d8d8'],
   ['wine','와인','#170f14','#20161c','#e05780'],
 ];
+const LAYOUTS = [['','기존'],['studio','작업실 (실험)']];
 const ACCENTS = [['','기본'],['blue','파랑'],['violet','보라'],['pink','분홍'],['green','초록'],['amber','앰버'],['cyan','시안'],['red','빨강']];
 const FSIZES = [['s','작게'],['','보통'],['l','크게'],['xl','아주 크게']];
 const RADII = [['','기본'],['soft','살짝 둥글게'],['round','둥글게']];
@@ -11709,6 +11718,7 @@ function applyUI(){
      그냥 두면 칩 강조가 어긋나므로 빈 값으로 접어 준다. */
   if(u.theme === 'slate') u.theme = '';
   if(u.radius === 'sharp') u.radius = '';
+  u.layout ? r.setAttribute('data-layout', u.layout) : r.removeAttribute('data-layout');
   u.theme ? r.setAttribute('data-theme', u.theme) : r.removeAttribute('data-theme');
   u.accent ? r.setAttribute('data-accent', u.accent) : r.removeAttribute('data-accent');
   u.fs ? r.setAttribute('data-fs', u.fs) : r.removeAttribute('data-fs');
@@ -11737,6 +11747,7 @@ function renderUIChips(){
       h.appendChild(c);
     });
   };
+  mk('layoutChips', LAYOUTS, 'layout');
   mk('themeChips', THEMES, 'theme');
   mk('accentChips', ACCENTS, 'accent');
   mk('fsChips', FSIZES, 'fs');
@@ -13056,7 +13067,20 @@ class ConfigServer:
                     return False
 
             def do_GET(self):
-                if self.path.startswith("/api/config"):
+                if self.path == "/ui/studio.css":
+                    # 프로그램 UI 자산만 고정 경로로 제공한다. 사용자 경로를 받지 않아
+                    # 정적 파일 제공 때문에 경로 탈출 표면이 늘어나지 않는다.
+                    f = UI_DIR / "studio.css"
+                    if not f.is_file():
+                        self.send_response(404); self.end_headers(); return
+                    data = f.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/css; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                elif self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
                 elif self.path.startswith("/refimg"):
                     from urllib.parse import urlparse, parse_qs

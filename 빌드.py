@@ -47,7 +47,9 @@ ASSETS = [
     "README.md", "LICENSE", "CREDITS.md", "THIRD_PARTY_NOTICES.md",
     "requirements.txt",
 ]
-ASSET_DIRS: list[str] = []
+# HTML 안에 다시 CSS를 쌓지 않고 화면 구성 자산을 프로그램과 함께 둔다.
+# 개인 자료가 아니라 실행에 필요한 코드 자산이므로 exe 옆에 반드시 복사한다.
+ASSET_DIRS: list[str] = ["ui"]
 
 # 사용자가 원할 때 자료 탭으로 넣는 **별도 기본 자료팩**.
 # `asset_config.json`은 세팅 3종의 구형 중복본이라 넣지 않는다. 둘을 함께 넣으면

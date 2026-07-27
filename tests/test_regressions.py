@@ -227,7 +227,9 @@ class RegressionTests(unittest.TestCase):
         for content_dir in ("태그", "캐릭터", "세팅", "tests",
                             "수집", "output", "프로필"):
             self.assertNotIn(content_dir, BUILD.ASSET_DIRS)
-        self.assertEqual(BUILD.ASSET_DIRS, [])
+        # UI 코드는 개인 자료가 아니라 프로그램 자산이다. 새 화면 CSS를 start.py에
+        # 다시 쌓지 않고 exe 옆에 함께 둔다.
+        self.assertEqual(BUILD.ASSET_DIRS, ["ui"])
         self.assertEqual(
             set(BUILD.DATA_PACK_ASSETS),
             {"후보사전.json", "규격.json", "옵션.json"},
@@ -850,6 +852,18 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("window.addEventListener('unhandledrejection'", page)
         self.assertIn("fatalErrorBar", page)
         self.assertIn("새로고침", page)
+
+    def test_studio_layout_is_opt_in_and_external_program_asset(self):
+        """전면 UI 실험은 기존 화면을 덮지 않고 설정 한 번으로 되돌릴 수 있어야 한다."""
+        page = APP.render_page()
+        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        self.assertIn('href="/ui/studio.css"', page)
+        self.assertIn('id="layoutChips"', page)
+        self.assertIn("const LAYOUTS = [['','기존'],['studio','작업실 (실험)']]", page)
+        self.assertIn("setAttribute('data-layout', u.layout)", page)
+        self.assertIn(':root[data-layout="studio"] .titlebar', css)
+        self.assertIn('body:not([data-mode="preview"]) .left', css)
+        self.assertNotIn("수집", BUILD.ASSET_DIRS)
 
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.

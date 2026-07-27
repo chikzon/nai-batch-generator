@@ -1,0 +1,270 @@
+/*
+ * 작업실(실험) 화면 구성
+ *
+ * 색은 기존 테마 변수를 그대로 사용한다. 이 파일은 배치만 담당하므로
+ * 작업실+종이, 작업실+미드나잇처럼 자유롭게 조합할 수 있다.
+ * 파일이 빠지거나 읽히지 않아도 기존 PAGE_TEMPLATE 화면은 그대로 동작한다.
+ */
+
+:root[data-layout="studio"] {
+  --studio-rail: 188px;
+  --studio-gap: 18px;
+  --studio-shadow: 0 14px 36px rgba(15, 23, 42, .09);
+}
+
+:root[data-layout="studio"] body {
+  background:
+    linear-gradient(145deg, var(--accent-dim), transparent 34%),
+    var(--bg);
+}
+
+:root[data-layout="studio"] .navico {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border: 1px solid currentColor;
+  border-radius: calc(var(--radius) + 2px);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: 1;
+}
+
+:root[data-layout="studio"] .card {
+  border-radius: calc(var(--radius) + 2px);
+  box-shadow: var(--studio-shadow);
+}
+
+:root[data-layout="studio"] .card > h2 {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+:root[data-layout="studio"] .card h2 .n {
+  border-radius: 3px;
+  letter-spacing: .03em;
+}
+
+:root[data-layout="studio"] .builder-entry,
+:root[data-layout="studio"] .builder-intro,
+:root[data-layout="studio"] .builder-summary {
+  box-shadow: none;
+}
+
+@media (min-width: 1201px) {
+  :root[data-layout="studio"] body {
+    overflow: hidden;
+  }
+
+  :root[data-layout="studio"] .titlebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: var(--studio-rail);
+    height: 100vh;
+    box-sizing: border-box;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+    padding: 22px 14px 16px;
+    border: 0;
+    border-right: 1px solid var(--line);
+    background: var(--paper);
+    box-shadow: 8px 0 28px rgba(15, 23, 42, .08);
+  }
+
+  :root[data-layout="studio"] .titlebar .app {
+    padding: 2px 8px 18px;
+    border-bottom: 1px solid var(--line);
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  :root[data-layout="studio"] .titlebar .app > span:first-child {
+    display: block;
+    margin-top: 2px;
+    font-size: calc(var(--fs-lg) + 2px);
+  }
+
+  :root[data-layout="studio"] .titlebar .app .save-state {
+    display: block;
+    width: max-content;
+    margin: 10px 0 0;
+    padding: 3px 7px;
+    vertical-align: 0;
+  }
+
+  :root[data-layout="studio"] .modes {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
+    gap: 5px;
+  }
+
+  :root[data-layout="studio"] .modes button {
+    width: 100%;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 11px;
+    padding: 0 12px;
+    border: 1px solid transparent;
+    border-left: 3px solid transparent;
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--muted);
+    text-align: left;
+    font-size: var(--fs-sm);
+  }
+
+  :root[data-layout="studio"] .modes button:hover {
+    background: var(--paper2);
+    color: var(--text);
+  }
+
+  :root[data-layout="studio"] .modes button.on {
+    border-color: var(--line);
+    border-left-color: var(--accent);
+    background: var(--accent-dim);
+    color: var(--accent);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+
+  :root[data-layout="studio"] .modes button.on .navico {
+    color: var(--paper);
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+
+  :root[data-layout="studio"] .titlebar .spacer {
+    display: block;
+    flex: 1;
+  }
+
+  :root[data-layout="studio"] .titlebar .stat {
+    order: 8;
+    max-width: none;
+    padding: 11px 8px;
+    border-top: 1px solid var(--line);
+    white-space: normal;
+    line-height: 1.55;
+  }
+
+  :root[data-layout="studio"] .titlebar .paneltog {
+    order: 9;
+    width: 100%;
+    height: 32px;
+  }
+
+  :root[data-layout="studio"] #app {
+    width: calc(100vw - var(--studio-rail));
+    height: 100vh;
+    margin-left: var(--studio-rail);
+    --colL: var(--lw, 420px);
+    --colR: 320px;
+    grid-template-columns: var(--colL) minmax(560px, 1fr) var(--colR);
+  }
+
+  :root[data-layout="studio"] .left {
+    border-right: 1px solid var(--line);
+    box-shadow: none;
+  }
+
+  :root[data-layout="studio"] .center {
+    padding: 28px 30px 60px;
+    background:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 28px 28px;
+    background-position: -1px -1px;
+  }
+
+  :root[data-layout="studio"] .center > .view {
+    max-width: 1240px;
+  }
+
+  :root[data-layout="studio"] .right {
+    padding: 18px;
+    border-left: 1px solid var(--line);
+    box-shadow: none;
+  }
+
+  /*
+   * 자료·빌더·세팅·기타는 그 자체가 주 작업이다. 생성 프롬프트와 최근 결과가
+   * 화면의 절반을 계속 차지하지 않도록 작업면 전체를 돌려준다.
+   */
+  :root[data-layout="studio"] body:not([data-mode="preview"]) #app {
+    --colL: 0px;
+    --colR: 0px;
+    grid-template-columns: 0 minmax(0, 1fr) 0 !important;
+  }
+
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .left,
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .right {
+    display: none !important;
+  }
+
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .center {
+    grid-column: 2;
+  }
+
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .center > .view {
+    max-width: 1460px;
+  }
+
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .titlebar .paneltog {
+    display: none;
+  }
+
+  :root[data-layout="studio"] .preset-bar {
+    padding: 16px 16px 12px;
+  }
+
+  :root[data-layout="studio"] .psec-head {
+    padding: 13px 16px 9px;
+  }
+
+  :root[data-layout="studio"] .psec-body {
+    padding: 0 16px 13px;
+  }
+
+  :root[data-layout="studio"] .tools {
+    padding: 12px 16px;
+  }
+
+  :root[data-layout="studio"] .genrow {
+    padding-inline: 16px;
+  }
+}
+
+@media (max-width: 1200px) {
+  :root[data-layout="studio"] .titlebar {
+    border-bottom-width: 2px;
+  }
+
+  :root[data-layout="studio"] .modes button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  :root[data-layout="studio"] .center {
+    background: var(--bg);
+  }
+}
+
+@media (max-width: 700px) {
+  :root[data-layout="studio"] .navico {
+    display: none;
+  }
+
+  :root[data-layout="studio"] .card {
+    box-shadow: none;
+  }
+}
