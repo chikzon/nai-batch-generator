@@ -494,7 +494,8 @@ def load_options():
         except Exception as e:
             log.warning(f"옵션.json 손상 — 기본 옵션 사용: {e}")
         return json.loads(json.dumps(DEFAULT_OPTIONS))
-    atomic_write_json(OPTIONS_FILE, DEFAULT_OPTIONS, keep_backup=False)
+    # 본체와 자료를 분리한 빈 배포에서는 파일을 자동으로 만들지 않는다.
+    # 기본값은 코드에서 쓸 수 있고, 사용자가 편집하거나 자료팩을 넣을 때만 생긴다.
     return json.loads(json.dumps(DEFAULT_OPTIONS))
 
 
@@ -2957,6 +2958,19 @@ def _datapack_dirs():
             "태그": (TAG_DIR, (".csv",))}
 
 
+def _datapack_whole_files():
+    """목록 병합이 아니라 파일 전체가 한 단위인 기본 자료.
+
+    상수 중 SPEC_FILE은 이 함수보다 아래에서 선언되지만, 함수가 실제 호출되는 시점에는
+    모듈 초기화가 끝나 있으므로 안전하다.
+    """
+    return {
+        "후보사전.json": BUILDER_FILE,
+        "규격.json": SPEC_FILE,
+        "옵션.json": OPTIONS_FILE,
+    }
+
+
 def _pack_rel(name):
     """ZIP 안 경로를 우리 폴더 기준 상대경로로. 위험하면 None."""
     parts = [x for x in str(name).replace("\\", "/").split("/") if x not in ("", ".")]
@@ -2964,7 +2978,7 @@ def _pack_rel(name):
         return None                      # 경로 탈출·드라이브 지정 차단
     # 팩이 한 겹 더 감싸여 있어도(자료팩/수집/…) 알아보게 앞을 훑는다
     for i, p in enumerate(parts):
-        if p in ("수집", "태그"):
+        if p in ("수집", "태그", "세팅"):
             return "/".join(parts[i:])
     return "/".join(parts)
 
@@ -3119,17 +3133,62 @@ def save_pack_log(rows):
 
 
 def import_datapack_bytes(data, filename="", overwrite=False):
-    """자료팩 ZIP 이든 낱개 JSON 이든 받아 수집/·태그/ 에 **합친다**(기본은 덮어쓰지 않음).
+    """자료팩 ZIP 이든 낱개 JSON 이든 받아 자료 종류별 제자리에 넣는다.
 
     무엇이 들어왔는지 `수집/가져온기록.json` 에 남겨 **통째로 되돌릴 수 있게** 한다.
     자료를 넣고 나서 정리하려면 '무엇이 이번에 들어왔나' 를 알아야 하기 때문이다."""
     import io
     import zipfile
-    lists, dirs = _datapack_lists(), _datapack_dirs()
+    lists, dirs, whole = _datapack_lists(), _datapack_dirs(), _datapack_whole_files()
     report, files = [], 0
+    batch_id = f"{int(time.time())}-{os.urandom(4).hex()}"
     batch = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
              "file": Path(filename).name or "자료팩",
-             "lists": {}, "files": {}}
+             "id": batch_id, "lists": {}, "files": {}, "installed": []}
+
+    def take_whole(label, raw, dest):
+        """후보사전·규격·옵션·세팅 파일 하나를 검증한 뒤 원자적으로 설치한다.
+
+        덮어쓸 때는 가져온 판 전용 백업을 따로 남긴다. 되돌릴 때 현재 파일이
+        그 뒤 수정되지 않았을 때만 복구하므로, 자료팩 뒤의 사용자 편집을 덮지 않는다.
+        """
+        nonlocal files
+        try:
+            parsed = json.loads(raw.decode("utf-8-sig"))
+        except Exception:
+            report.append(f"{label}: JSON으로 읽지 못해 건너뜀")
+            return True
+        if not isinstance(parsed, dict):
+            report.append(f"{label}: JSON 객체가 아니라 건너뜀")
+            return True
+        canonical = json.dumps(parsed, ensure_ascii=False, indent=1).encode("utf-8")
+        rel = dest.relative_to(BASE_DIR).as_posix()
+        digest = hashlib.sha256(canonical).hexdigest()
+        if dest.exists():
+            try:
+                same = load_json_recover(dest) == parsed
+            except Exception:
+                same = False
+            if same:
+                report.append(f"{label}: 이미 같은 자료가 있음")
+                return True
+            if not overwrite:
+                report.append(f"{label}: 기존 자료가 달라 그대로 둠")
+                return True
+            backup = BASE_DIR / "수집" / "가져온백업" / batch_id / rel
+            _atomic_write_bytes(backup, dest.read_bytes(), keep_backup=False)
+            _atomic_write_bytes(dest, canonical)
+            batch["installed"].append({
+                "path": rel, "backup": backup.relative_to(BASE_DIR).as_posix(),
+                "sha256": digest,
+            })
+            report.append(f"{label}: 기존 자료를 백업하고 새 것으로 바꿈")
+        else:
+            _atomic_write_bytes(dest, canonical, keep_backup=False)
+            batch["installed"].append({"path": rel, "sha256": digest})
+            report.append(f"{label}: 새로 넣음")
+        files += 1
+        return True
 
     def take_list(stem, raw):
         nonlocal files
@@ -3161,6 +3220,12 @@ def import_datapack_bytes(data, filename="", overwrite=False):
                 if stem in lists:
                     take_list(stem, z.read(n))
                     continue
+                if stem in whole and not rel.startswith("세팅/"):
+                    take_whole(stem, z.read(n), whole[stem])
+                    continue
+                if rel.startswith("세팅/") and stem.lower().endswith(".json"):
+                    take_whole(f"세팅/{stem}", z.read(n), SETTINGS_DIR / stem)
+                    continue
                 for d, (root, exts) in dirs.items():
                     if rel.startswith(d + "/") and stem.lower().endswith(exts):
                         dest = root / stem      # 한 겹으로 편다 (내용주소라 이름이 곧 열쇠)
@@ -3180,16 +3245,18 @@ def import_datapack_bytes(data, filename="", overwrite=False):
                     report.append(f"{d}: 새로 {c}개" + (f" · 이미 있음 {s}개" if s else ""))
     else:
         stem = Path(filename).name
-        if not take_list(stem, data):
+        if stem in whole:
+            take_whole(stem, data, whole[stem])
+        elif not take_list(stem, data):
             return {"ok": False,
                     "error": f"'{stem}' 은(는) 자료팩이 아닙니다. "
-                             f"자료팩.zip 이나 {' · '.join(lists)} 를 넣어 주세요."}
+                             f"자료팩.zip 이나 {' · '.join(list(lists) + list(whole))} 를 넣어 주세요."}
 
     if not report:
         return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
     # 알아본 자료가 있으면 성공이다. 같은 팩을 다시 넣어 **전부 중복이어도 실패가 아니다**
     # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
-    if batch["lists"] or batch["files"]:
+    if batch["lists"] or batch["files"] or batch["installed"]:
         rows = load_pack_log()
         # ⚠ 판 id 는 **초 단위 시간만으로 지으면 안 된다.** 화면의 `sendPack` 은 여러 파일을
         #   반복문으로 잇달아 넣으므로 두 파일을 함께 끌어다 놓으면 **같은 초**에 들어가
@@ -3200,7 +3267,6 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         #   `random` 이 아니라 `os.urandom` 을 쓰는 것은 **프로필 두 개를 나란히 돌려도**
         #   (서로 다른 프로세스) 겹치지 않게 하기 위해서다.
         #   옛 기록의 숫자만 있는 id 도 그대로 읽히고 되돌려진다 (문자열로 견준다).
-        batch["id"] = f"{int(time.time())}-{os.urandom(4).hex()}"
         batch["새로"] = files
         batch["요약"] = " · ".join(report)
         rows.append(batch)
@@ -3260,6 +3326,31 @@ def undo_datapack(batch_id):
                 pass
         if gone:
             said.append(f"{d}: {gone}개 지움")
+    for item in reversed(hit.get("installed") or []):
+        try:
+            rel = Path(item.get("path", ""))
+            dest = (BASE_DIR / rel).resolve()
+            # 기록 파일을 사람이 고쳐도 앱 폴더 밖은 절대 만지지 않는다.
+            if BASE_DIR.resolve() not in dest.parents:
+                continue
+            if not dest.exists():
+                continue
+            current = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if current != item.get("sha256"):
+                said.append(f"{rel.as_posix()}: 가져온 뒤 수정되어 그대로 둠")
+                continue
+            backup_rel = item.get("backup")
+            if backup_rel:
+                backup = (BASE_DIR / backup_rel).resolve()
+                if backup.exists() and BASE_DIR.resolve() in backup.parents:
+                    _atomic_write_bytes(dest, backup.read_bytes())
+                    backup.unlink()
+                    said.append(f"{rel.as_posix()}: 이전 자료 복구")
+            else:
+                recoverable_remove(dest, label="자료팩되돌리기")
+                said.append(f"{rel.as_posix()}: 가져온 파일 뺌")
+        except Exception as e:
+            log.warning(f"자료팩 전체파일 되돌리기 실패: {e}")
     # ⚠ **되돌린 그 판만** 뺀다. 예전에는 id 가 같은 것을 모두 걸러냈는데,
     #   이미 겹쳐 있는 옛 기록(위 참조)에서는 손대지도 않은 판의 기록까지 사라져
     #   그 자료를 **영영 되돌릴 수 없게** 됐다. 객체로 견주면 옛 기록도 한 번에 한 판씩
@@ -3403,7 +3494,8 @@ def load_spec():
         except Exception as e:
             log.warning(f"규격.json 손상 — 기본 규격 사용: {e}")
             return dict(DEFAULT_SPEC)
-    atomic_write_json(SPEC_FILE, DEFAULT_SPEC, keep_backup=False)
+    # 규격도 빈 본체에서 자동 생성하지 않는다. 내장 기본값으로 기능은 유지하고,
+    # 별도 기본 자료팩을 넣거나 사용자가 저장할 때만 외부 파일이 생긴다.
     return dict(DEFAULT_SPEC)
 
 
@@ -6464,10 +6556,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="card">
         <h2><span class="n">자료팩</span>자료 넣기
-          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">그림체·레시피·태그를 한 번에</span></h2>
-        <p class="hint">앱에는 <b>수집 자료가 들어 있지 않습니다</b> — 용량이 크고 남이 공개한
-        자료라 함께 배포하지 않습니다. <b>자료팩(zip)</b> 이나 <b>그림체.json · 레시피.json ·
-        작가통계.json</b> 을 여기에 넣으면 알아서 제자리에 정리됩니다.<br>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">후보·태그·세팅·수집물을 한 번에</span></h2>
+        <p class="hint">앱 본체에는 <b>후보사전·태그·세팅·수집 자료가 들어 있지 않습니다.</b>
+        <b>기본자료팩.zip</b>, 개인 자료팩 또는 <b>그림체.json · 레시피.json · 작가통계.json</b>을
+        여기에 넣으면 후보사전·규격·옵션·태그·세팅·수집물별 제자리로 정리됩니다.<br>
         <b>덮어쓰지 않고 없는 것만 더합니다</b> — 이미 갖고 있는 자료는 그대로 둡니다.
         같은 팩을 두 번 넣어도 안전합니다.</p>
         <div id="packDrop" class="drop" style="padding:18px;text-align:center;
@@ -7941,6 +8033,14 @@ function renderSettings(){
   });
   host.innerHTML = '';
   $('setCount').textContent = `${SETTINGS.length}개`;
+  if(!SETTINGS.length){
+    host.innerHTML = `<div class="row" style="padding:18px;text-align:center;">
+      <b>아직 넣은 세팅이 없습니다.</b>
+      <p class="hint" style="margin:7px 0 10px;">본체와 자료는 분리되어 있습니다.
+      기본자료팩을 자료 탭에 넣거나, 위의 새 세팅으로 직접 만드세요.</p>
+      <button id="setGoData">기본자료팩 넣으러 가기</button></div>`;
+    $('setGoData').addEventListener('click', () => setMode('library'));
+  }
   SETTINGS.forEach(st => {
     const s = stState(st.name);
     const tot = st.groups.reduce((a,g)=>a+g.ids.length,0);
@@ -10603,6 +10703,12 @@ function openBuilder(kind){
       </aside>
     </div>`;
   const stepsBox = $('bldSteps');
+  if(!nSteps){
+    stepsBox.innerHTML = `<div class="row" style="padding:20px;text-align:center;">
+      <b>빌더 후보 자료가 아직 없습니다.</b>
+      <p class="hint" style="margin:7px 0 0;">기본자료팩을 자료 탭에 넣으면 후보 단계가 채워집니다.
+      지금도 오른쪽의 직접 태그 입력으로 저장할 수 있습니다.</p></div>`;
+  }
 
   steps.forEach((st, si) => {
     const output = st['출력'] === 'negative' ? 'negative' : 'positive';
@@ -13013,6 +13119,11 @@ class ConfigServer:
                             # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
                             # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
                             forget_collection_caches()
+                            # 기본 자료팩에는 규격·옵션도 있다. 서버를 껐다 켜지 않아도
+                            # 가져오기 직후 빌더와 새 세팅에 반영되게 메모리 사본도 갱신한다.
+                            self.spec = load_spec()
+                            OPTIONS.clear()
+                            OPTIONS.update(load_options())
                         self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
@@ -13020,7 +13131,12 @@ class ConfigServer:
                     # 넣고 나서 아니다 싶으면 통째로 물린다 (그때 들어온 것만).
                     try:
                         d = json.loads(body or b"{}")
-                        self._json(undo_datapack(d.get("id")))
+                        r = undo_datapack(d.get("id"))
+                        if r.get("ok"):
+                            self.spec = load_spec()
+                            OPTIONS.clear()
+                            OPTIONS.update(load_options())
+                        self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/style_del"):

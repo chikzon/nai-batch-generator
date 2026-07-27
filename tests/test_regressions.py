@@ -217,13 +217,173 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn('data-crate="${escA(JSON.stringify(c.artists||[]))}"', page)
         self.assertIn("const fragment = document.createDocumentFragment()", page)
 
-    def test_distribution_includes_core_scenes_but_not_personal_collections(self):
-        self.assertIn("asset_config.json", BUILD.ASSETS)
-        self.assertIn("세팅", BUILD.ASSET_DIRS)
-        for private_dir in ("수집", "output", "프로필"):
-            self.assertNotIn(private_dir, BUILD.ASSET_DIRS)
-        for private_file in ("설정.json", "설정.json.bak", "생성.log"):
-            self.assertNotIn(private_file, BUILD.ASSETS)
+    def test_distribution_separates_program_from_all_content_data(self):
+        self.assertIn("t5_tokenizer.json", BUILD.ASSETS)
+        for content in (
+            "후보사전.json", "규격.json", "옵션.json",
+            "asset_config.json", "설정.txt",
+        ):
+            self.assertNotIn(content, BUILD.ASSETS)
+        for content_dir in ("태그", "캐릭터", "세팅", "tests",
+                            "수집", "output", "프로필"):
+            self.assertNotIn(content_dir, BUILD.ASSET_DIRS)
+        self.assertEqual(BUILD.ASSET_DIRS, [])
+        self.assertEqual(
+            set(BUILD.DATA_PACK_ASSETS),
+            {"후보사전.json", "규격.json", "옵션.json"},
+        )
+        self.assertEqual(set(BUILD.DATA_PACK_DIRS), {"태그", "세팅"})
+
+        with tempfile.TemporaryDirectory() as td:
+            pack = BUILD.build_data_pack(Path(td))
+            with zipfile.ZipFile(pack) as archive:
+                names = set(archive.namelist())
+        self.assertIn("후보사전.json", names)
+        self.assertIn("규격.json", names)
+        self.assertIn("옵션.json", names)
+        self.assertTrue(any(x.startswith("태그/") for x in names))
+        self.assertTrue(any(x.startswith("세팅/") for x in names))
+        self.assertNotIn("asset_config.json", names)
+        self.assertFalse(any(x.startswith("수집/") for x in names))
+
+    def test_build_main_writes_the_data_pack_beside_the_program(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app_dir = root / "dist" / BUILD.APP_NAME
+            app_dir.mkdir(parents=True)
+            exe = app_dir / f"{BUILD.APP_NAME}.exe"
+            exe.write_bytes(b"fixture")
+            seen = {}
+
+            def fake_data_pack(out_dir):
+                seen["out_dir"] = out_dir
+                target = out_dir / BUILD.DATA_PACK_NAME
+                target.write_bytes(b"fixture")
+                return target
+
+            with (
+                patch.object(BUILD, "HERE", root),
+                patch.object(BUILD, "make_icon", return_value=None),
+                patch.object(BUILD, "make_version_file",
+                             return_value=root / "build" / "version.txt"),
+                patch.object(BUILD, "build_exe", return_value=exe),
+                patch.object(BUILD, "copy_assets", return_value=([], [])),
+                patch.object(BUILD, "build_data_pack",
+                             side_effect=fake_data_pack),
+                patch.object(BUILD.sys, "argv", ["빌드.py"]),
+            ):
+                self.assertEqual(BUILD.main(), 0)
+
+        self.assertEqual(seen["out_dir"], root / "dist")
+
+    def test_empty_program_does_not_recreate_bundled_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "SETTINGS_DIR", root / "세팅"),
+                patch.object(APP, "SCHEMA_DIR", root / "씬규격"),
+                patch.object(APP, "CONFIG_FILE", root / "asset_config.json"),
+                patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
+                patch.object(APP, "SPEC_FILE", root / "규격.json"),
+            ):
+                self.assertEqual(APP.list_settings(), [])
+                self.assertFalse((root / "세팅").exists())
+                self.assertFalse((root / "씬규격").exists())
+                self.assertTrue(APP.load_options())
+                self.assertTrue(APP.load_spec())
+                self.assertFalse((root / "옵션.json").exists())
+                self.assertFalse((root / "규격.json").exists())
+        page = APP.PAGE_TEMPLATE
+        self.assertIn("아직 넣은 세팅이 없습니다.", page)
+        self.assertIn("빌더 후보 자료가 아직 없습니다.", page)
+        self.assertIn("앱 본체에는 <b>후보사전·태그·세팅·수집 자료가 들어 있지 않습니다.", page)
+
+    def test_basic_data_pack_installs_and_undoes_each_data_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "후보사전.json",
+                    json.dumps({"캐릭터단계": [], "베이스단계": []},
+                               ensure_ascii=False),
+                )
+                archive.writestr(
+                    "규격.json",
+                    json.dumps({"캐릭터_그룹": [], "그림체_그룹": []},
+                               ensure_ascii=False),
+                )
+                archive.writestr(
+                    "옵션.json",
+                    json.dumps({"장소테마": {"시험": "test"}}, ensure_ascii=False),
+                )
+                archive.writestr(
+                    "세팅/시험.json",
+                    json.dumps({"이름": "시험", "방식": "단독",
+                                "씬": {"1": {"name": "시험"}}},
+                               ensure_ascii=False),
+                )
+                archive.writestr("태그/시험.csv", "tag,0,1,\n")
+
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "BUILDER_FILE", root / "후보사전.json"),
+                patch.object(APP, "SPEC_FILE", root / "규격.json"),
+                patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
+                patch.object(APP, "SETTINGS_DIR", root / "세팅"),
+                patch.object(APP, "TAG_DIR", root / "태그"),
+                patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
+            ):
+                result = APP.import_datapack_bytes(
+                    payload.getvalue(), "기본자료팩.zip")
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["added"], 5)
+                for rel in (
+                    "후보사전.json", "규격.json", "옵션.json",
+                    "세팅/시험.json", "태그/시험.csv",
+                ):
+                    self.assertTrue((root / rel).exists(), rel)
+                undone = APP.undo_datapack(result["batch"])
+                self.assertTrue(undone["ok"])
+                for rel in (
+                    "후보사전.json", "규격.json", "옵션.json",
+                    "세팅/시험.json", "태그/시험.csv",
+                ):
+                    self.assertFalse((root / rel).exists(), rel)
+
+    def test_data_pack_overwrite_undo_restores_previous_whole_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old = {"캐릭터단계": [{"이름": "내 자료"}], "베이스단계": []}
+            new = {"캐릭터단계": [{"이름": "새 자료"}], "베이스단계": []}
+            (root / "후보사전.json").write_text(
+                json.dumps(old, ensure_ascii=False), encoding="utf-8")
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "BUILDER_FILE", root / "후보사전.json"),
+                patch.object(APP, "SPEC_FILE", root / "규격.json"),
+                patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
+                patch.object(APP, "SETTINGS_DIR", root / "세팅"),
+                patch.object(APP, "TAG_DIR", root / "태그"),
+                patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
+            ):
+                result = APP.import_datapack_bytes(
+                    json.dumps(new, ensure_ascii=False).encode(),
+                    "후보사전.json", overwrite=True)
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    json.loads((root / "후보사전.json").read_text(
+                        encoding="utf-8")),
+                    new,
+                )
+                undone = APP.undo_datapack(result["batch"])
+                self.assertTrue(undone["ok"])
+                self.assertEqual(
+                    json.loads((root / "후보사전.json").read_text(
+                        encoding="utf-8")),
+                    old,
+                )
 
     def test_active_people_keep_slot_coordinate_pairs(self):
         slots = [

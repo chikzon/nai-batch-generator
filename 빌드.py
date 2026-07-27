@@ -9,13 +9,14 @@ Electron·Tauri 를 얹으면 껍데기 하나 때문에 100~200MB 가 붙고 �
 PyInstaller 는 지금 구조를 **그대로 두고** 파이썬 런타임만 함께 넣는다.
 `실행.bat` 이 인터넷에서 파이썬을 내려받던 것을 **exe 안에 넣는 것**이 이 빌드의 목적이다.
 
-    python 빌드.py              # dist/NAI배치생성기/NAI배치생성기.exe
-    python 빌드.py --설치본      # 위 + 설치 프로그램(.exe) — Inno Setup 필요
+    python 빌드.py              # 본체 폴더 + 별도 기본자료팩.zip
+    python 빌드.py --설치본      # 위 + 본체만 든 설치 프로그램(.exe)
     python 빌드.py --정리        # build/dist/생성물 삭제
 
-⚠ 자산을 exe **옆**에 둔다 (`_internal` 안이 아니라).
+⚠ 프로그램 자산만 exe **옆**에 둔다 (`_internal` 안이 아니라).
    `start.py` 의 `BASE_DIR` 22곳이 전부 그 자리를 보므로 코드를 안 고쳐도 된다.
    사용자 데이터(`설정.json`·`output/`)도 같은 자리에 쌓여 **포터블**이 된다.
+   후보사전·태그·세팅 같은 내용물은 `기본자료팩.zip`으로 따로 만든다.
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 # ⚠ 윈도우 기본 콘솔은 cp949 라 `—`·`✔` 에서 UnicodeEncodeError 로 죽는다.
@@ -39,17 +41,20 @@ APP_NAME = "NAI배치생성기"
 APP_VERSION = "1.0.0"
 PUBLISHER = "ninesdead"
 
-# exe 옆에 놓을 것 — 없으면 조용히 건너뛴다(저장소 clone 은 일부가 없다)
+# exe 옆에 놓을 **프로그램 자산**. 후보·태그·세팅 등 내용물은 넣지 않는다.
 ASSETS = [
-    "t5_tokenizer.json", "후보사전.json", "규격.json", "옵션.json",
-    "asset_config.json", "설정.txt",
+    "t5_tokenizer.json",
     "README.md", "LICENSE", "CREDITS.md", "THIRD_PARTY_NOTICES.md",
     "requirements.txt",
 ]
-# `세팅/`은 사용자 수집 자료가 아니라 앱이 처음부터 제공하는 기본 씬 3종이다.
-# 이것이 빠지면 새 설치에서 세팅 탭과 일괄 생성 대상이 모두 비어 버린다.
-# 반대로 `수집/`·`output/`·`프로필/`은 개인 자료이므로 배포본에 넣지 않는다.
-ASSET_DIRS = ["태그", "캐릭터", "세팅", "tests"]
+ASSET_DIRS: list[str] = []
+
+# 사용자가 원할 때 자료 탭으로 넣는 **별도 기본 자료팩**.
+# `asset_config.json`은 세팅 3종의 구형 중복본이라 넣지 않는다. 둘을 함께 넣으면
+# 세팅을 뺐는데도 첫 실행 마이그레이션이 다시 만들어 내는 원인이 된다.
+DATA_PACK_ASSETS = ["후보사전.json", "규격.json", "옵션.json"]
+DATA_PACK_DIRS = ["태그", "세팅"]
+DATA_PACK_NAME = f"{APP_NAME}-기본자료팩.zip"
 
 
 def _run(cmd: list[str], **kw) -> int:
@@ -227,6 +232,35 @@ def copy_assets(app_dir: Path) -> tuple[list[str], list[str]]:
     return put, miss
 
 
+def build_data_pack(out_dir: Path) -> Path:
+    """기본 후보·태그·세팅을 본체와 섞지 않고 ZIP 하나로 만든다."""
+    target = out_dir / DATA_PACK_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=9) as z:
+        for name in DATA_PACK_ASSETS:
+            src = HERE / name
+            if src.is_file():
+                z.write(src, name)
+        for name in DATA_PACK_DIRS:
+            root = HERE / name
+            if not root.is_dir():
+                continue
+            for src in sorted(root.rglob("*")):
+                if src.is_file() and "__pycache__" not in src.parts:
+                    z.write(src, src.relative_to(HERE).as_posix())
+        z.writestr(
+            "기본자료팩-사용법.txt",
+            "NAI 배치 생성기 기본 자료팩\n\n"
+            "1. 프로그램을 실행합니다.\n"
+            "2. [자료] → [자료 넣기]에 이 ZIP을 그대로 끌어다 놓습니다.\n"
+            "3. 후보사전·규격·옵션·태그·세팅이 각각 제자리에 들어갑니다.\n\n"
+            "본체에는 이 자료가 포함되지 않습니다. 같은 팩을 다시 넣어도 기존 자료를 "
+            "덮어쓰지 않으며, 가져온 기록에서 이번에 추가한 자료만 되돌릴 수 있습니다.\n",
+        )
+    return target
+
+
 def find_iscc() -> Path | None:
     """Inno Setup 컴파일러. ⚠ winget 이 **관리자 없이** 깔면 `Program Files` 가 아니라
     `%LOCALAPPDATA%\\Programs` 로 들어간다 (실제로 여기 깔렸다). 셋 다 본다."""
@@ -315,6 +349,10 @@ def main() -> int:
     total = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file())
     print(f"\n✔ exe: {exe}")
     print(f"  폴더 크기: {total/1024/1024:.1f} MB · 항목 {sum(1 for _ in app_dir.rglob('*'))}개")
+
+    print("■ 기본 자료팩 (본체와 분리)")
+    data_pack = build_data_pack(HERE / "dist")
+    print(f"✔ 자료팩: {data_pack} ({data_pack.stat().st_size/1024/1024:.1f} MB)")
 
     if a.설치본:
         print("■ 설치 프로그램")
