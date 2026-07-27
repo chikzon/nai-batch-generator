@@ -4789,7 +4789,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     --good:#087a5b;--danger:#c4322b;--gold:#3158c9;
     /* 모서리 기본 = 각짐. --radius-pill 은 알약/칩용(각짐일 땐 같이 각진다) */
     --radius:6px;--radius-pill:999px;
-    --fs:15px;--fs-sm:13.5px;--fs-xs:12px;
+    /* 글자 크기 사다리 — 5단. `--fs-2xs`·`--fs-lg` 는 그동안 px 로 박혀 있던 자리를
+       설정에 따라 같이 움직이게 하려고 추가했다 (배지·툴팁이 11px, 제목이 17px 로
+       고정이라 '글씨 크게' 를 골라도 안 따라오던 자리가 41곳 있었다). */
+    --fs-2xs:11px;--fs-xs:12px;--fs-sm:13.5px;--fs:15px;--fs-lg:17px;
     --mono:'JetBrains Mono','Consolas',monospace;
     --sans:-apple-system,'Pretendard','Malgun Gothic',sans-serif;
   }
@@ -4839,9 +4842,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   :root[data-accent="cyan"]{--accent:#3ec9e0;--accent-dim:#3ec9e026;}
   :root[data-accent="red"]{--accent:#ff6b6b;--accent-dim:#ff6b6b26;}
   /* ── 글씨 크기 ── */
-  :root[data-fs="s"]{--fs:13.5px;--fs-sm:12px;--fs-xs:11px;}
-  :root[data-fs="l"]{--fs:16px;--fs-sm:14.5px;--fs-xs:13px;}
-  :root[data-fs="xl"]{--fs:17px;--fs-sm:15.5px;--fs-xs:14px;}
+  :root[data-fs="s"]{--fs-2xs:10px;--fs-xs:11px;--fs-sm:12px;--fs:13.5px;--fs-lg:15px;}
+  :root[data-fs="l"]{--fs-2xs:12px;--fs-xs:13px;--fs-sm:14.5px;--fs:16px;--fs-lg:18px;}
+  :root[data-fs="xl"]{--fs-2xs:13px;--fs-xs:14px;--fs-sm:15.5px;--fs:17px;--fs-lg:19px;}
   /* ── 모서리 ── ('' = 각짐이 기본) */
   :root[data-radius="soft"]{--radius:8px;--radius-pill:99px;}
   :root[data-radius="round"]{--radius:16px;--radius-pill:99px;}
@@ -4890,7 +4893,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
 /* 창 아무 데나 그림을 떨어뜨릴 때 뜨는 안내 */
 #dropOverlay{position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;
-  background:rgba(0,0,0,.55);backdrop-filter:blur(2px);font-size:17px;font-weight:600;color:#fff;
+  background:rgba(0,0,0,.55);backdrop-filter:blur(2px);font-size:var(--fs-lg);font-weight:600;color:#fff;
   border:3px dashed var(--accent);pointer-events:none;text-align:center;padding:20px;}
 #dropOverlay.on{display:flex;}
 
@@ -4927,7 +4930,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   /* ── 타이틀바 ── */
   .titlebar{height:56px;display:flex;align-items:center;gap:22px;padding:0 18px;
     border-bottom:1px solid var(--line);background:var(--paper);box-shadow:0 1px 4px #1018280b;position:relative;z-index:30;}
-  .titlebar .app{font-weight:800;font-size:16px;letter-spacing:-.01em;white-space:nowrap;}
+  .titlebar .app{font-weight:800;font-size:var(--fs-lg);letter-spacing:-.01em;white-space:nowrap;}
   .titlebar .app span{color:var(--accent);}
   .modes{display:flex;align-self:stretch;gap:2px;}
   .modes button{padding:0 16px;border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;font-size:var(--fs-sm);font-weight:600;}
@@ -4939,6 +4942,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── 3단 레이아웃 ── */
   #app{display:grid;grid-template-columns:var(--lw,360px) minmax(520px,1fr) 280px;height:calc(100vh - 56px);}
+  /* 넓은 화면에서 가운데가 논다 — 1600×1000 실측에서 좌 360 / 중 960 / 우 280 이었고,
+     그동안 프롬프트 칸은 보이는 높이 228px 에 내용 1,104px(80% 가 잘림)이었다.
+     좌·우를 넓혀 같은 글이 세로로 덜 접히게 한다. `--lw` 는 사용자가 손잡이를 끌면
+     localStorage 에 남으므로, **직접 정한 폭이 있으면 그쪽이 이긴다.** */
+  @media (min-width:1200px){
+    #app{grid-template-columns:var(--lw,400px) minmax(520px,1fr) 280px;}
+  }
+  @media (min-width:1500px){
+    #app{grid-template-columns:var(--lw,440px) minmax(560px,1fr) 300px;}
+  }
+  @media (min-width:1900px){
+    #app{grid-template-columns:var(--lw,500px) minmax(640px,1fr) 320px;}
+  }
   .left{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;position:relative;background:var(--paper);box-shadow:2px 0 10px #10182808;z-index:2;}
   /* 왼쪽 패널 폭 조절 손잡이 (Forge 참고) — 드래그로 240~560px */
   /* ⚠ right:-3px 로 패널 밖에 두면 문서 폭이 3px 늘어 좁은 창에서 가로 스크롤이 생긴다.
@@ -4962,6 +4978,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .psec-body{padding:0 14px 10px;flex:1;min-height:0;display:flex;}
   .psec-body.hidden{display:none;}
   .psec-body textarea{flex:1;min-height:90px;line-height:1.55;}
+  /* 3분할 — `:not(.hidden)` 으로 써야 `.hidden{display:none}` 이 이긴다.
+     `#split3{display:flex}` 로 두면 id 우선순위(1-0-0)가 클래스(0-1-0)를 눌러
+     예전처럼 영영 안 숨는다. */
+  #split3:not(.hidden){display:flex;}
   .tools{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:10px 14px;border-top:1px solid var(--line);}
   .tools.jumps{grid-template-columns:repeat(2,1fr);border-top:0;padding-top:0;}
   .tool.jump{background:transparent;color:var(--muted);}
@@ -4979,7 +4999,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     border:1px solid var(--line);flex:none;background:var(--paper2);}
   .tool{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;
     padding:10px 3px;font-size:var(--fs-xs);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .tool .ico{font-size:17px;line-height:1;}
+  .tool .ico{font-size:var(--fs-lg);line-height:1;}
   .tool.on{border-color:var(--accent);color:var(--accent);background:var(--accent-dim);}
   .tool .badge{position:absolute;right:1px;top:1px;min-width:16px;height:16px;border-radius:var(--radius-pill);
     background:var(--danger);color:#12131a;font-size:var(--fs-xs);font-weight:700;display:flex;align-items:center;
@@ -5088,17 +5108,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   @media(max-width:700px){
     .titlebar{height:auto;min-height:98px;padding:8px 10px;gap:7px;display:grid;
       grid-template-columns:1fr auto;grid-template-rows:32px 46px;position:sticky;top:0;}
-    .titlebar .app{font-size:14px;grid-column:1;grid-row:1;}
+    .titlebar .app{font-size:var(--fs);grid-column:1;grid-row:1;}
     .titlebar .stat{max-width:180px;text-align:right;grid-column:2;grid-row:1;}
     .titlebar .spacer{display:none;}
     .modes{grid-column:1/-1;grid-row:2;width:100%;overflow-x:auto;gap:2px;}
-    .modes button{flex:1 0 68px;padding:0 7px;font-size:12px;white-space:nowrap;}
+    .modes button{flex:1 0 68px;padding:0 7px;font-size:var(--fs-xs);white-space:nowrap;}
     #app{min-height:calc(100vh - 98px);}
     .center{padding:14px 10px;}
     .card{padding:15px 13px;margin-bottom:12px;}
     .grid2,.grid3{grid-template-columns:1fr;}
     .left{min-height:0;}
-    .psec-body textarea{min-height:82px;max-height:150px;}
+    /* ⚠ 예전엔 max-height:150px 였다. 390×844 실측에서 내용 999px 중 150px 만 보여
+       85% 가 잘렸다. 화면 높이에 비례하게 바꿔 좁은 기기에서도 한 번에 더 읽힌다. */
+    .psec-body textarea{min-height:170px;max-height:38vh;}
     .tools{gap:6px;padding-inline:10px;}
     .tool{padding:9px 2px;}
     .pv-img{width:100%;max-height:none;border-radius:var(--radius);}
@@ -5142,12 +5164,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <textarea id="basePrompt" placeholder="1girl, artist:..., masterpiece"></textarea>
         <!-- 3분할 — 켜면 아래 세 칸이 위 칸을 대신한다. 보낼 때는 위에서부터 이어 붙인다.
              그림체는 고정에 두고 가변만 굴리는 식으로 쓴다. -->
-        <div id="split3" class="hidden" style="display:flex;flex-direction:column;gap:5px;flex:1;min-height:0;">
+        <!-- ⚠ 여기 `style="display:flex"` 를 인라인으로 두면 `.hidden{display:none}` 이
+             **절대 못 이긴다**(인라인이 항상 위다). 그래서 `⋮⋮` 토글이 클래스를 붙였다 떼도
+             3분할이 늘 보였고, 프롬프트 칸이 좌우로 반 토막 나 있었다
+             (1600px 실측: 439px 중 206px 만 씀). display 는 CSS 로 옮겼다. -->
+        <div id="split3" class="hidden" style="flex-direction:column;gap:5px;flex:1;min-height:0;">
           <textarea id="baseFixed" data-s3 placeholder="고정 — 그림체·작가 조합처럼 늘 들어갈 것" style="flex:1;"></textarea>
           <textarea id="baseVar" data-s3 placeholder="가변 — 매번 바꿔 굴릴 것 (조각 &lt;이름&gt; 쓰기 좋음)" style="flex:1;"></textarea>
           <textarea id="baseDetail" data-s3 placeholder="디테일 — 세부 묘사·마감" style="flex:1;"></textarea>
         </div>
-        <div id="tagVerifyOut" class="hidden" style="font-size:11px;line-height:1.7;padding:6px 2px 0;"></div>
+        <div id="tagVerifyOut" class="hidden" style="font-size:var(--fs-2xs);line-height:1.7;padding:6px 2px 0;"></div>
       </div>
     </div>
 
@@ -5193,7 +5219,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <!-- 캐릭터 오버레이 -->
     <div class="ovl hidden" id="ovlChars">
       <div class="ovl-head"><span class="t">👥 캐릭터</span>
-        <span class="count" style="font-size:11px;color:var(--muted);">한 그림에 함께 들어갈 인물 · 보내는 건 켠 것만 (NAI 상한 6명)</span>
+        <span class="count" style="font-size:var(--fs-2xs);color:var(--muted);">한 그림에 함께 들어갈 인물 · 보내는 건 켠 것만 (NAI 상한 6명)</span>
         <button class="x" data-ovl-close>✕</button></div>
       <div class="ovl-body">
         <div class="bar" style="margin-bottom:6px;">
@@ -5205,7 +5231,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <!-- 인물이 둘 이상인데 좌표를 안 쓰면 NAI 가 몸을 겹쳐 그리는 일이 흔하다.
              한 번 눌러 좌우로 떨어뜨릴 수 있게 해 둔다. -->
         <div class="row hidden" id="chFuseWarn" style="margin:0 0 8px;padding:8px 10px;">
-          <div style="font-size:12px;"><b>인물이 둘 이상인데 위치를 안 정했습니다.</b>
+          <div style="font-size:var(--fs-xs);"><b>인물이 둘 이상인데 위치를 안 정했습니다.</b>
             이러면 NAI 가 <b>몸을 붙여</b> 그리는 일이 흔합니다.</div>
           <div class="bar" style="margin-top:6px;">
             <button class="primary" id="chSpread">좌우로 떨어뜨리기</button>
@@ -5233,7 +5259,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <!-- 레퍼런스 오버레이 (바이브 · 캐릭터 레퍼런스) -->
     <div class="ovl hidden" id="ovlRefs">
       <div class="ovl-head"><span class="t">🎨 레퍼런스</span>
-        <span class="count" style="font-size:11px;color:var(--muted);">그림으로 분위기·생김새를 참조</span>
+        <span class="count" style="font-size:var(--fs-2xs);color:var(--muted);">그림으로 분위기·생김새를 참조</span>
         <button class="x" data-ovl-close>✕</button></div>
       <div class="ovl-body">
         <p class="hint"><b>바이브</b>는 그림의 분위기를 옮깁니다. 처음 한 번만 인코딩(2 Anlas)하고
@@ -5367,7 +5393,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <p class="hint">직접 프롬프트를 짤 필요 없습니다. NAI로 만든 그림 파일을 넣으면
         <b>프롬프트·네거티브·설정값(CFG·리스케일·스텝·샘플러·시드)</b>을 통째로 읽어옵니다.</p>
         <div id="welcomeDrop" class="row" style="text-align:center;padding:26px 14px;border-style:dashed;cursor:pointer;">
-          <div style="font-size:15px;font-weight:600;">🖼️ 여기에 그림을 끌어다 놓으세요</div>
+          <div style="font-size:var(--fs);font-weight:600;">🖼️ 여기에 그림을 끌어다 놓으세요</div>
           <div class="hint" style="margin-top:6px;">눌러서 파일을 골라도 됩니다 · PNG / WebP · 여러 장 한꺼번에 가능</div>
           <input type="file" id="welcomeFile" accept="image/png,image/webp" multiple style="display:none;">
         </div>
@@ -5381,13 +5407,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="pv">
-        <div class="pv-img" id="pvImg"><span style="color:var(--muted);font-size:12.5px;text-align:center;">
+        <div class="pv-img" id="pvImg"><span style="color:var(--muted);font-size:var(--fs-xs);text-align:center;">
           왼쪽에서 프롬프트·캐릭터를 넣고<br>[생성]을 누르면 여기에 표시됩니다.</span></div>
         <div class="pv-meta">
           <div class="nm" id="pvName">대기 중</div>
           <div class="fn" id="pvFile">-</div>
           <div class="bar" style="margin:8px 0 0;"><span class="n" id="pvProg">0 / 0</span>
-            <span style="font-size:11px;color:var(--muted);" id="pvDaily"></span></div>
+            <span style="font-size:var(--fs-2xs);color:var(--muted);" id="pvDaily"></span></div>
           <div class="bar" id="pvSeedRow" style="margin:6px 0 0;display:none;">
             <span class="n" id="pvSeed" title="이 그림의 NAI 시드"></span>
             <button id="pvSeedCopy" title="시드 복사">복사</button>
@@ -5398,7 +5424,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <!-- img2img · 인페인트 — 왼쪽 프롬프트·파라미터를 그대로 쓰고 원본만 더한다 -->
       <div class="card">
         <h2><span class="n">고쳐 그리기</span>img2img · 인페인트
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">왼쪽 프롬프트·파라미터를 그대로 씁니다</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">왼쪽 프롬프트·파라미터를 그대로 씁니다</span></h2>
         <p class="hint">그림을 넣고 <b>변화 강도</b>만 주면 <b>img2img</b>(전체를 다시 그림),
         칠한 곳이 있으면 <b>인페인트</b>(칠한 곳만 다시 그림)로 나갑니다.
         결과는 <b>output/img2img/</b> · <b>output/인페인트/</b> 에 저장됩니다.</p>
@@ -5445,7 +5471,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2><span class="n">디렉터</span>NAI 가 그림을 다시 손봐줍니다 <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">배경 제거 · 라인아트 · 스케치 · 색칠 · 표정 · 정리 · 업스케일</span></h2>
+        <h2><span class="n">디렉터</span>NAI 가 그림을 다시 손봐줍니다 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">배경 제거 · 라인아트 · 스케치 · 색칠 · 표정 · 정리 · 업스케일</span></h2>
         <p class="hint">이미 있는 그림을 넣으면 NAI 가 손봐서 돌려줍니다. 결과는
         <b>output/디렉터/</b> 에 저장되고 미리보기에도 뜹니다.
         배경 제거는 투명 PNG 로, 나머지는 WebP 로 저장됩니다.</p>
@@ -5474,7 +5500,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
     <div class="view" id="vSettings" style="display:none;">
       <div class="card">
-        <h2><span class="n">세팅</span>씬 세트 <span class="count" id="setCount" style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted);"></span></h2>
+        <h2><span class="n">세팅</span>씬 세트 <span class="count" id="setCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">세팅 = 씬 모음 + 부속 옵션 + 상대역이 담긴 <b>세팅/ 폴더의 파일</b>. 파일을 넣고 빼면 목록이 바뀝니다.
         각 세팅의 <b>전용 캐스트</b>를 비우면 왼쪽 [캐릭터]의 인물로 생성됩니다.</p>
         <div class="bar" style="margin-bottom:8px;">
@@ -5495,7 +5521,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <!-- 씬 모드 — 세팅과 별도로 병존한다. 세팅을 대체하지 않는다. -->
       <div class="card">
         <h2><span class="n">씬</span>씬 모드 (가벼운 낱개 변주)
-          <span class="count" id="sceneCount" style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted);"></span></h2>
+          <span class="count" id="sceneCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">세팅이 <b>5장 묶음 + 문맥에 반응하는 옵션</b>이라면, 씬은 <b>이름·프롬프트·해상도만 있는 낱개</b>입니다.
         즉석에서 변주를 뽑을 때 씁니다. 씬 프롬프트는 왼쪽 그림체 뒤에 붙고, 조각 <b>&lt;이름&gt;</b> 도 그대로 먹습니다.
         <b>예약 매수를 1 이상</b>으로 걸어 둔 씬만 생성합니다. 결과는 <b>output/씬/</b> 에 쌓입니다.</p>
@@ -5510,7 +5536,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <!-- 세팅 빌더 — 세팅을 앱 안에서 만들고 고친다 -->
       <div class="card">
         <h2><span class="n">빌더</span>세팅 빌더
-          <span class="count" id="sbClash" style="margin-left:auto;font-size:11px;color:var(--danger);"></span></h2>
+          <span class="count" id="sbClash" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--danger);"></span></h2>
         <p class="hint">세팅은 <b>세트(묶음)</b>의 모음입니다. 세트는 <b>단계명마다 씬 하나</b>로 이루어지고,
         단계 수는 <b>자유</b>입니다 (3단계든 7단계든). 씬 이름을 <b>「세트이름 단계명」</b>으로 지으면
         자동으로 한 묶음이 됩니다.</p>
@@ -5604,7 +5630,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
       <div class="card">
         <h2><span class="n">생성물</span>탐색기 · 선별
-          <span class="count" id="expCount" style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted);"></span></h2>
+          <span class="count" id="expCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">뽑아 둔 그림을 훑어보고 <b>고르는</b> 곳입니다. 그림을 누르면 크게 보이고,
         <b>←→</b> 로 넘기고 <b>F</b> 로 선별, <b>C</b> 로 비교함에 담고, <b>Esc</b> 로 닫습니다.
         폴더는 <b>이름표</b>일 뿐이라 원본 파일은 제자리에 그대로 둡니다.</p>
@@ -5645,7 +5671,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="card">
         <h2><span class="n">검색</span>단부루에서 찾기
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">태그·그림체를 실제 그림에서 가져오기</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">태그·그림체를 실제 그림에서 가져오기</span></h2>
         <p class="hint">태그로 검색해서 마음에 드는 그림의 <b>태그를 그대로 가져오거나</b>,
         그 그림을 <b>바이브·캐릭터 레퍼런스로 등록</b>할 수 있습니다.
         NAI 로 만든 그림이면 <b>그림체까지</b> 뽑아옵니다.</p>
@@ -5741,7 +5767,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="card">
         <h2><span class="n">03</span>계정 여러 개 (프로필)
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">지금: __PROFNOW__</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">지금: __PROFNOW__</span></h2>
         <p class="hint">계정을 <b>따로 결제해서 두 대를 동시에</b> 돌릴 때 씁니다.
         프로필마다 <b>토큰·설정·진행상태·생성물</b>이 갈리고, 그림체·태그·후보사전·조각은 <b>함께</b> 씁니다.
         포트도 자동으로 갈립니다 (첫째 8787 · 둘째 8788 …).</p>
@@ -5754,7 +5780,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="card">
         <h2><span class="n">04</span>알림 · 단축키
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">565장은 몇 시간이 걸립니다</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">565장은 몇 시간이 걸립니다</span></h2>
         <div class="bar" style="flex-wrap:wrap;">
           <label class="hint" style="display:flex;align-items:center;gap:5px;margin:0;">
             <input type="checkbox" id="notifySound"> 다 끝나면 소리로 알리기</label>
@@ -5772,7 +5798,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <!-- 진단 — 무엇이 왜 실패했는지 앱 안에서 본다 (nais_blue 의 DiagnosticDrawer) -->
       <div class="card">
         <h2><span class="n">04b</span>진단 · 최근 기록
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">생성.log 를 앱 안에서</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">생성.log 를 앱 안에서</span></h2>
         <p class="hint">실패 원인을 파일을 찾아 열지 않고 시간·심각도·종류별로 봅니다.
         토큰·서명·사용자 홈 경로는 서버에서 지운 뒤 표시합니다. <b>오류만</b>을 켜면 경고·오류만 남습니다.</p>
         <div class="bar" style="flex-wrap:wrap;">
@@ -5784,12 +5810,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <span class="n" id="diagStat" style="margin-left:auto;"></span>
         </div>
         <pre id="diagOut" style="max-height:260px;overflow:auto;background:var(--bg);padding:8px;
-          font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-all;margin:6px 0 0;"></pre>
+          font-size:var(--fs-2xs);line-height:1.45;white-space:pre-wrap;word-break:break-all;margin:6px 0 0;"></pre>
       </div>
 
       <div class="card">
         <h2><span class="n">05</span>모자이크 칠하기
-          <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">내 컴퓨터에서 · Anlas 안 듦</span></h2>
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">내 컴퓨터에서 · Anlas 안 듦</span></h2>
         <p class="hint">가릴 곳을 붓으로 칠하면 그 부분만 모자이크로 바꿉니다. NAI 를 거치지 않아 <b>공짜</b>입니다.
         결과는 <b>output/모자이크/</b> 에 저장됩니다.</p>
         <div id="mosDrop" class="row" style="text-align:center;padding:16px 14px;border-style:dashed;cursor:pointer;">
@@ -5813,7 +5839,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2><span class="n">06</span>밴 예방 · 속도 <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">쉬는 자리는 장과 장 사이입니다</span></h2>
+        <h2><span class="n">06</span>밴 예방 · 속도 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">쉬는 자리는 장과 장 사이입니다</span></h2>
         <p class="hint">한꺼번에 몰아치면 NAI 가 요청을 막습니다. 장 사이에 쉬고, 일정 장수마다 길게 쉽니다.
         <b>생성 도중에는 절대 끊지 않습니다</b> — 항상 한 장을 끝낸 뒤에 쉽니다.</p>
         <div class="grid3">
@@ -5836,7 +5862,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2><span class="n">07</span>메타데이터 제거 <span class="count" style="margin-left:auto;font-size:11px;color:var(--muted);">남에게 줄 사본 만들기</span></h2>
+        <h2><span class="n">07</span>메타데이터 제거 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">남에게 줄 사본 만들기</span></h2>
         <p class="hint">NAI 그림에는 프롬프트가 <b>두 군데</b> 들어 있습니다 —
         파일 정보(EXIF·PNG 텍스트)와 <b>알파 채널에 숨은 스텔스</b>. 앞엣것만 지우면
         novelai.net/inspect 로 뒤엣것이 그대로 읽힙니다. 여기서는 <b>둘 다</b> 지웁니다.
@@ -7150,7 +7176,7 @@ function renderSettings(){
           <span>${esc(g.label)}${g.mood==='진함'?' 🔥':''}${g.ids.length>1?` (${g.ids.length})`:''}</span>
           <input type="number" class="rep" data-srep="${escA(st.name)}" data-id="${g.id}"
             value="${rep}" min="1" max="20" title="이 세트를 몇 벌 뽑을지 (기본 1벌)"
-            style="width:34px;padding:2px 3px;font-size:11px;text-align:center;">
+            style="width:34px;padding:2px 3px;font-size:var(--fs-2xs);text-align:center;">
           <span class="ed" data-sedit="${escA(st.name)}" data-ids="${g.ids.join(',')}">✎</span>
           <span class="ed" data-sdup="${escA(st.name)}" data-id="${g.id}"
             title="이 세트를 복제 (씬을 새 번호로 복사)">⧉</span>`;
@@ -7622,9 +7648,9 @@ function expChunk(){
         style="width:100%;aspect-ratio:1/1;object-fit:cover;display:block;
         border:2px solid ${EXP.picked.has(f.path)?'var(--good)':'var(--line)'};
         border-radius:var(--radius);${EXP.cmp.has(f.path)?'outline:2px dashed var(--accent);outline-offset:1px;':''}">
-      <div style="position:absolute;top:2px;right:3px;font-size:13px;text-shadow:0 0 3px #000;">
+      <div style="position:absolute;top:2px;right:3px;font-size:var(--fs-sm);text-shadow:0 0 3px #000;">
         ${EXP.fav.has(f.path)?'⭐':''}${EXP.picked.has(f.path)?'✔':''}</div>
-      ${(EXP.ranks||{})[f.path] ? `<div style="position:absolute;top:2px;left:3px;font-size:11px;
+      ${(EXP.ranks||{})[f.path] ? `<div style="position:absolute;top:2px;left:3px;font-size:var(--fs-2xs);
         background:#000a;color:#ffd76e;padding:1px 4px;border-radius:var(--radius-pill);">
         🏆${EXP.ranks[f.path]}</div>` : ''}
       <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>`;
@@ -7705,14 +7731,14 @@ function cupDraw(){
     document.body.appendChild(ov);
   }
   const left = Math.max(0, CUP.round.length - CUP.i) + CUP.next.length;
-  ov.innerHTML = `<div style="color:#eee;font-size:13px;">
+  ov.innerHTML = `<div style="color:#eee;font-size:var(--fs-sm);">
       🏆 이미지 월드컵 — ${CUP.total}장 중 ${left}장 남음 · ${CUP.matches + 1}번째 판
       <span style="opacity:.7;margin-left:10px;">←/→ 또는 클릭으로 승자 · Space 둘 다 · Esc 중단</span></div>
     <div style="display:flex;gap:12px;align-items:center;justify-content:center;max-height:78vh;">
       <img data-cup="L" src="/setout?p=${encodeURIComponent(a)}" style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
       <img data-cup="R" src="/setout?p=${encodeURIComponent(b)}" style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
     </div>
-    <div style="color:#aaa;font-size:11px;">${esc(a.split('/').pop())} vs ${esc(b.split('/').pop())}</div>`;
+    <div style="color:#aaa;font-size:var(--fs-2xs);">${esc(a.split('/').pop())} vs ${esc(b.split('/').pop())}</div>`;
   ov.querySelectorAll('[data-cup]').forEach(im => {
     im.addEventListener('mouseenter', () => im.style.borderColor = 'var(--accent)');
     im.addEventListener('mouseleave', () => im.style.borderColor = 'transparent');
@@ -7754,7 +7780,7 @@ function expOpen(i){
       style="max-width:96vw;max-height:82vh;object-fit:contain;border-radius:var(--radius);">
     <div class="bar" style="background:var(--paper);padding:7px 11px;border-radius:var(--radius);">
       <span class="n">${i+1} / ${vis.length}</span>
-      <b style="font-size:12px;">${esc(f.name)}</b>
+      <b style="font-size:var(--fs-xs);">${esc(f.name)}</b>
       <span class="tag">${EXP.picked.has(f.path)?'✔ 선별됨':'F = 선별'}</span>
       <span class="tag">${EXP.cmp.has(f.path)?'비교함에 있음':'C = 비교함'}</span>
       <span class="tag">${EXP.fav.has(f.path)?'⭐':'S = 즐겨찾기'}</span>
@@ -8721,8 +8747,8 @@ function renderLibrary(){
   STYLES.forEach(s => items.push({t:'그림체', n:s.name, b:s.prompt, ref:s}));
   items.forEach(it => {
     const el = document.createElement('div'); el.className = 'row'; el.style.cursor = 'pointer'; el.style.margin = '0';
-    el.innerHTML = `<div class="tag">${it.t}</div><b style="font-size:12.5px;">${esc(it.n)}</b>
-      <div style="font-size:10.5px;color:var(--muted);margin-top:4px;max-height:44px;overflow:hidden;">${esc(it.b.slice(0,100))}</div>`;
+    el.innerHTML = `<div class="tag">${it.t}</div><b style="font-size:var(--fs-xs);">${esc(it.n)}</b>
+      <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;max-height:44px;overflow:hidden;">${esc(it.b.slice(0,100))}</div>`;
     el.addEventListener('click', () => openLib(it));
     g.appendChild(el);
   });
@@ -8763,9 +8789,9 @@ function openLib(it){
   const b = $('modalBody'); b.innerHTML = '';
   if(it.groups && Object.keys(it.groups).length){
     Object.entries(it.groups).forEach(([k,v]) => b.insertAdjacentHTML('beforeend',
-      `<div class="row"><div class="tag">${esc(k)}</div><div style="font-size:12px;">${esc(String(v))}</div></div>`));
+      `<div class="row"><div class="tag">${esc(k)}</div><div style="font-size:var(--fs-xs);">${esc(String(v))}</div></div>`));
   } else {
-    b.insertAdjacentHTML('beforeend', `<div class="row"><div style="font-family:var(--mono);font-size:11.5px;white-space:pre-wrap;">${esc(it.b)}</div></div>`);
+    b.insertAdjacentHTML('beforeend', `<div class="row"><div style="font-family:var(--mono);font-size:var(--fs-2xs);white-space:pre-wrap;">${esc(it.b)}</div></div>`);
   }
   b.insertAdjacentHTML('beforeend', `<div class="bar"><button class="primary" id="libTake">${it.t==='캐릭터'?'왼쪽 캐릭터 칸에 추가':'현재 베이스로 적용'}</button></div>`);
   $('libTake').addEventListener('click', () => {
@@ -9390,7 +9416,7 @@ async function loadRecipes(append){
       style="width:100%;aspect-ratio:1/1;object-fit:cover;display:block;background:#0004;">` : '';
     el.innerHTML = `${img}<div style="padding:8px 10px;">
       <div class="tag" style="margin-bottom:4px;">${esc(AXIS_KO[it.axis]||it.axis)}${it.concept_ko ? ' · ' + esc(it.concept_ko) : ''}</div>
-      <b style="font-size:11.5px;line-height:1.35;display:block;">${esc((it.title||'(제목 없음)').slice(0,48))}</b></div>`;
+      <b style="font-size:var(--fs-2xs);line-height:1.35;display:block;">${esc((it.title||'(제목 없음)').slice(0,48))}</b></div>`;
     el.addEventListener('click', () => openRecipe(it));
     g.appendChild(el);
   });
@@ -9456,10 +9482,10 @@ function bindTagSearch(scope){
       const q = inp.value.trim();
       const r = await (await fetch(`/api/tags?kind=${kind}&slot=${encodeURIComponent(slot)}&q=${encodeURIComponent(q)}&limit=40`)).json();
       box.innerHTML = '';
-      if(!r.ok || !r.tags.length){ box.innerHTML = `<span style="font-size:11px;color:var(--muted);">${q?'결과 없음':''}</span>`; return; }
+      if(!r.ok || !r.tags.length){ box.innerHTML = `<span style="font-size:var(--fs-2xs);color:var(--muted);">${q?'결과 없음':''}</span>`; return; }
       r.tags.forEach(t => {
         const c = document.createElement('span'); c.className = 'chip';
-        c.innerHTML = `${esc(t.tag)} <span style="font-size:9.5px;color:var(--muted)">${t.count>=1000?Math.round(t.count/1000)+'k':t.count}</span>`;
+        c.innerHTML = `${esc(t.tag)} <span style="font-size:var(--fs-2xs);color:var(--muted)">${t.count>=1000?Math.round(t.count/1000)+'k':t.count}</span>`;
         c.addEventListener('click', () => {
           // 빌더 안이면 그 슬롯 칩 목록에 바로 추가하고 선택 상태로
           const field = inp.closest('[data-slot]');
@@ -9768,8 +9794,8 @@ function drawOpts(){
     const opts = st.options[ok]||{};
     let x = `<div class="row"><div class="tag">${esc(ok)}</div>`;
     Object.keys(opts).forEach(n => {
-      x += `<div class="bar" style="margin:3px 0;"><span style="min-width:78px;font-size:12px;font-weight:600;">${esc(n)}</span>
-        <span style="flex:1;font-size:10.5px;color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">${esc(optText(opts[n]).replace(/\n/g,' / ').slice(0,64))}</span>
+      x += `<div class="bar" style="margin:3px 0;"><span style="min-width:78px;font-size:var(--fs-xs);font-weight:600;">${esc(n)}</span>
+        <span style="flex:1;font-size:var(--fs-2xs);color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">${esc(optText(opts[n]).replace(/\n/g,' / ').slice(0,64))}</span>
         <button data-ol="${escA(ok)}" data-on="${escA(n)}">수정</button>
         <button class="danger" data-od="${escA(ok)}" data-on="${escA(n)}">삭제</button></div>`;
     });
