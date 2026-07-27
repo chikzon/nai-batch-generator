@@ -2594,6 +2594,8 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(len(first["files"]), 120)
             self.assertTrue(first["has_more"])
             self.assertEqual(first["ranks"], {})
+            self.assertEqual(first["ratings"], {})
+            self.assertEqual(first["tags"], {})
             self.assertEqual(second["offset"], 120)
             self.assertEqual(len(second["files"]), 120)
             self.assertTrue(
@@ -2605,6 +2607,49 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(filtered["total"], len(expected))
             self.assertEqual({item["path"] for item in filtered["files"]}, expected)
             self.assertFalse(filtered["has_more"])
+
+    def test_image_ratings_tags_and_candidate_groups_are_bounded_labels(self):
+        with tempfile.TemporaryDirectory() as td:
+            picks_file = Path(td) / "선별.json"
+            raw_tags = [f"tag-{i}" for i in range(15)] + ["tag-1", "x" * 80]
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                saved = APP.save_picks({
+                    "picked": ["a.webp", "a.webp"],
+                    "fav": [],
+                    "folders": {
+                        "  후보군 이름  ": ["a.webp", "a.webp", "b.webp"],
+                        "x" * 41: ["c.webp"],
+                        "x" * 42: ["d.webp"],
+                    },
+                    "ranks": {},
+                    "ratings": {"a.webp": 9, "b.webp": 0, "bad.webp": "bad"},
+                    "tags": {"a.webp": raw_tags, "empty.webp": ["", " "]},
+                })
+                loaded = APP.load_picks()
+
+            self.assertEqual(saved, loaded)
+            self.assertEqual(loaded["picked"], ["a.webp"])
+            self.assertEqual(
+                loaded["folders"]["후보군 이름"], ["a.webp", "b.webp"])
+            self.assertEqual(
+                loaded["folders"]["x" * 40], ["c.webp", "d.webp"])
+            self.assertEqual(loaded["ratings"], {"a.webp": 5})
+            self.assertEqual(len(loaded["tags"]["a.webp"]), 12)
+            self.assertTrue(all(
+                len(tag) <= 40 for tag in loaded["tags"]["a.webp"]))
+            self.assertNotIn("empty.webp", loaded["tags"])
+
+    def test_explorer_exposes_rating_tags_and_virtual_candidate_groups(self):
+        page = APP.render_page()
+        for element_id in (
+            "expGroupFilter", "expGroupName", "expGroupSave",
+            "expGroupDelete", "expRate", "expTagInput", "expTagSave",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("ratings:EXP.ratings || {}", page)
+        self.assertIn("tags:EXP.tags || {}", page)
+        self.assertIn("folders:EXP.folders || {}", page)
+        self.assertIn("원본 파일은 이동하지 않습니다.", page)
 
     def test_structured_diagnostics_redact_secrets_paths_and_export_safe_events(self):
         raw_lines = [

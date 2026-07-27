@@ -6271,15 +6271,67 @@ def load_picks():
                 d.setdefault("fav", [])
                 d.setdefault("folders", {})     # 폴더이름 → [경로…]
                 d.setdefault("ranks", {})       # 경로 → 월드컵 순위(1등이 1)
-                return d
+                d.setdefault("ratings", {})     # 경로 → 0~5점
+                d.setdefault("tags", {})        # 경로 → [짧은 판단 태그…]
+                return normalize_picks(d)
         except Exception as e:
             log.warning(f"선별.json 읽기 실패: {e}")
-    return {"picked": [], "fav": [], "folders": {}, "ranks": {}}
+    return {
+        "picked": [], "fav": [], "folders": {}, "ranks": {},
+        "ratings": {}, "tags": {},
+    }
+
+
+def normalize_picks(d):
+    """선별 이름표를 작은 JSON 값으로 제한해 손상·무한 증식을 막는다."""
+    d = dict(d or {})
+    for key in ("picked", "fav"):
+        d[key] = list(dict.fromkeys(
+            str(path).replace("\\", "/") for path in (d.get(key) or [])
+            if str(path).strip()
+        ))
+    clean_folders = {}
+    for name, paths in (d.get("folders") or {}).items():
+        clean_name = str(name).strip()[:40]
+        if not clean_name or not isinstance(paths, list):
+            continue
+        # 긴 이름 둘이 같은 40자 이름으로 정리되어도 먼저 저장한 후보를 잃지 않는다.
+        clean_folders[clean_name] = list(dict.fromkeys([
+            *clean_folders.get(clean_name, []),
+            *(
+                str(path).replace("\\", "/") for path in paths
+                if str(path).strip()
+            ),
+        ]))
+    d["folders"] = clean_folders
+    d["ranks"] = {
+        str(path).replace("\\", "/"): max(1, int(rank))
+        for path, rank in (d.get("ranks") or {}).items()
+        if str(path).strip() and str(rank).lstrip("-").isdigit()
+    }
+    d["ratings"] = {
+        str(path).replace("\\", "/"): max(1, min(5, int(score)))
+        for path, score in (d.get("ratings") or {}).items()
+        if str(path).strip() and str(score).isdigit() and int(score) > 0
+    }
+    clean_tags = {}
+    for path, tags in (d.get("tags") or {}).items():
+        if not str(path).strip() or not isinstance(tags, list):
+            continue
+        cleaned = list(dict.fromkeys(
+            str(tag).strip()[:40] for tag in (tags or [])
+            if str(tag).strip()
+        ))[:12]
+        if cleaned:
+            clean_tags[str(path).replace("\\", "/")] = cleaned
+    d["tags"] = clean_tags
+    return d
 
 
 def save_picks(d):
-    atomic_write_json(PICKS_FILE, d, indent=1)
-    return d
+    cleaned = normalize_picks(d)
+    atomic_write_json(PICKS_FILE, cleaned, indent=1)
+    return cleaned
 
 
 TRASH_DIR_NAME = ".NAI-휴지통"
@@ -6439,6 +6491,8 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
             "has_more": bool(limit and offset + len(files) < total),
             "picked": picks["picked"], "fav": picks["fav"],
             "folders": picks["folders"], "ranks": picks.get("ranks", {}),
+            "ratings": picks.get("ratings", {}),
+            "tags": picks.get("tags", {}),
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
 
 
@@ -7939,6 +7993,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button id="expApplyPicked" title="이 폴더에서 선별한 비교 결과 한 장의 원문 설정을 생성 화면에 적용합니다">↳ 선별 1장 생성에 적용</button>
           <span class="n" id="expStat"></span>
           <button id="expDelUnpicked" class="danger" title="이 폴더에서 선별 안 된 것을 실제로 지웁니다">선별 외 삭제</button>
+        </div>
+        <div class="bar" style="margin-top:6px;flex-wrap:wrap;">
+          <span class="tag">후보군</span>
+          <select id="expGroupFilter" style="width:auto;min-width:150px;">
+            <option value="">전체 보기</option>
+          </select>
+          <input type="text" id="expGroupName"
+            placeholder="후보군 이름" style="width:150px;">
+          <button id="expGroupSave">선별을 후보군에 추가</button>
+          <button id="expGroupDelete">후보군 이름표 삭제</button>
+          <span class="hint">원본 파일은 이동하지 않습니다.</span>
         </div>
         <div id="expDirs" class="bar" style="flex-wrap:wrap;margin-top:8px;"></div>
         <div id="expGrid" style="display:grid;gap:6px;margin-top:8px;
@@ -10491,7 +10556,8 @@ if($('i2iDrop')){
    원본 파일은 옮기지 않는다. 선별·즐겨찾기는 경로에 붙는 이름표(선별.json)다. */
 const EXP_CHUNK = 120;
 let EXP = {dir:'', files:[], dirs:[], total:0, loading:false,
-  loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1};
+  loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1,
+  folders:{}, ranks:{}, ratings:{}, tags:{}};
 function expListUrl(dir, offset=0){
   const q = new URLSearchParams({
     dir: dir ?? EXP.dir, limit: String(EXP_CHUNK), offset: String(offset)
@@ -10518,6 +10584,7 @@ async function expLoad(dir){
   EXP.dir = r.dir; EXP.files = r.files; EXP.dirs = r.dirs;
   EXP.total = Number.isFinite(r.total) ? r.total : r.files.length;
   EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav); EXP.ranks = r.ranks || {};
+  EXP.folders = r.folders || {}; EXP.ratings = r.ratings || {}; EXP.tags = r.tags || {};
   $('expPath').textContent = 'output/' + (r.dir ? r.dir + '/' : '');
   /* 최상위에서는 위로 갈 곳이 없다 — 눌려도 아무 일 없으면 고장으로 보인다 */
   const up = $('expUp');
@@ -10558,7 +10625,21 @@ function expVisible(){
   let f = EXP.files;
   if($('expOnlyPick').checked) f = f.filter(x => EXP.picked.has(x.path));
   if($('expOnlyFav').checked) f = f.filter(x => EXP.fav.has(x.path));
+  const group = ($('expGroupFilter') || {}).value || '';
+  if(group){
+    const members = new Set(EXP.folders[group] || []);
+    f = f.filter(x => members.has(x.path));
+  }
   return f;
+}
+function expPaintGroups(){
+  const select = $('expGroupFilter'); if(!select) return;
+  const before = select.value;
+  const names = Object.keys(EXP.folders || {}).sort((a,b) => a.localeCompare(b));
+  select.innerHTML = '<option value="">전체 보기</option>'
+    + names.map(name => `<option value="${escA(name)}">${esc(name)}`
+      + ` (${(EXP.folders[name] || []).length.toLocaleString()})</option>`).join('');
+  select.value = names.includes(before) ? before : '';
 }
 function expDraw(){
   const dh = $('expDirs'); dh.innerHTML = '';
@@ -10570,9 +10651,11 @@ function expDraw(){
   });
   const g = $('expGrid'); g.innerHTML = '';
   g.style.setProperty('--ecard', $('expSize').value + 'px');
+  expPaintGroups();
   const vis = expVisible();
   $('expCount').textContent = `${EXP.total}장`;
-  $('expStat').textContent = `${vis.length}/${EXP.total}장 불러옴 · 선별 ${EXP.picked.size} · 즐겨찾기 ${EXP.fav.size}`;
+  $('expStat').textContent = `${vis.length}/${EXP.total}장 불러옴 · 선별 ${EXP.picked.size}`
+    + ` · 즐겨찾기 ${EXP.fav.size} · 평가 ${Object.keys(EXP.ratings||{}).length}`;
   $('expCmpN').textContent = EXP.cmp.size;
   /* 수천 장을 한 번에 그리면 초기 로딩·메모리가 터진다 (Custom 의 페이지 분할 참고).
      120장씩 그리고, '더 보기'가 화면에 가까워지면 자동으로 다음 묶음. */
@@ -10585,6 +10668,8 @@ function expChunk(){
   const end = Math.min(vis.length, EXP.shown + EXP_CHUNK);
   for(let i = EXP.shown; i < end; i++){
     const f = vis[i];
+    const score = Number((EXP.ratings || {})[f.path] || 0);
+    const tags = (EXP.tags || {})[f.path] || [];
     const el = document.createElement('div');
     el.style.cssText = 'position:relative;cursor:pointer;';
     el.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt="" loading="lazy"
@@ -10593,10 +10678,11 @@ function expChunk(){
         border-radius:var(--radius);${EXP.cmp.has(f.path)?'outline:2px dashed var(--accent);outline-offset:1px;':''}">
       <div style="position:absolute;top:2px;right:3px;font-size:var(--fs-sm);text-shadow:0 0 3px #000;">
         ${EXP.fav.has(f.path)?'⭐':''}${EXP.picked.has(f.path)?'✔':''}</div>
-      ${(EXP.ranks||{})[f.path] ? `<div style="position:absolute;top:2px;left:3px;font-size:var(--fs-2xs);
+      ${((EXP.ranks||{})[f.path] || score) ? `<div style="position:absolute;top:2px;left:3px;font-size:var(--fs-2xs);
         background:#000a;color:#ffd76e;padding:1px 4px;border-radius:var(--radius-pill);">
-        🏆${EXP.ranks[f.path]}</div>` : ''}
-      <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>`;
+        ${(EXP.ranks||{})[f.path] ? `🏆${EXP.ranks[f.path]}` : ''}${score ? ` ${'★'.repeat(score)}` : ''}</div>` : ''}
+      <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>
+      ${tags.length ? `<div class="hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(tags.slice(0,3).join(' · '))}</div>` : ''}`;
     el.addEventListener('click', () => expOpen(i));
     g.appendChild(el);
   }
@@ -10703,7 +10789,11 @@ function cupPick(which){
 }
 async function picksSave(){
   await fetch('/api/picks_save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({picked:[...EXP.picked], fav:[...EXP.fav], ranks: EXP.ranks || {}})});
+    body: JSON.stringify({
+      picked:[...EXP.picked], fav:[...EXP.fav],
+      folders:EXP.folders || {}, ranks:EXP.ranks || {},
+      ratings:EXP.ratings || {}, tags:EXP.tags || {}
+    })});
 }
 let EXP_RECIPE_UNDO = null;
 const EXP_RECIPE_KEYS = [
@@ -10796,16 +10886,39 @@ function expOpen(i){
     ov.addEventListener('click', e => { if(e.target === ov) expClose(); });
     document.body.appendChild(ov);
   }
+  const score = Number((EXP.ratings || {})[f.path] || 0);
+  const tags = (EXP.tags || {})[f.path] || [];
   ov.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt=""
       style="max-width:96vw;max-height:82vh;object-fit:contain;border-radius:var(--radius);">
-    <div class="bar" style="background:var(--paper);padding:7px 11px;border-radius:var(--radius);">
+    <div class="bar" style="background:var(--paper);padding:7px 11px;border-radius:var(--radius);flex-wrap:wrap;">
       <span class="n">${i+1} / ${vis.length}</span>
       <b style="font-size:var(--fs-xs);">${esc(f.name)}</b>
       <span class="tag">${EXP.picked.has(f.path)?'✔ 선별됨':'F = 선별'}</span>
       <span class="tag">${EXP.cmp.has(f.path)?'비교함에 있음':'C = 비교함'}</span>
       <span class="tag">${EXP.fav.has(f.path)?'⭐':'S = 즐겨찾기'}</span>
+      <select id="expRate" aria-label="이 그림 별점" style="width:auto;">
+        <option value="0"${score===0?' selected':''}>별점 없음</option>
+        ${[1,2,3,4,5].map(n => `<option value="${n}"${score===n?' selected':''}>${'★'.repeat(n)}</option>`).join('')}
+      </select>
+      <input type="text" id="expTagInput" value="${escA(tags.join(', '))}"
+        placeholder="판단 태그 (쉼표로 구분)" style="width:220px;">
+      <button type="button" id="expTagSave">태그 저장</button>
       <span class="hint">←→ 넘기기 · Esc 닫기</span>
     </div>`;
+  $('expRate').addEventListener('change', async () => {
+    const value = Number($('expRate').value) || 0;
+    if(value) EXP.ratings[f.path] = value;
+    else delete EXP.ratings[f.path];
+    await picksSave(); expDraw(); expOpen(EXP.open);
+  });
+  $('expTagSave').addEventListener('click', async () => {
+    const values = [...new Set(
+      $('expTagInput').value.split(',').map(x => x.trim().slice(0,40)).filter(Boolean)
+    )].slice(0,12);
+    if(values.length) EXP.tags[f.path] = values;
+    else delete EXP.tags[f.path];
+    await picksSave(); expDraw(); expOpen(EXP.open);
+  });
 }
 function expClose(){ const o = $('expViewer'); if(o) o.remove(); EXP.open = -1; }
 window.addEventListener('keydown', async e => {
@@ -10843,6 +10956,26 @@ if($('expUp')){
   $('expReload').addEventListener('click', () => expLoad());
   ['expOnlyPick','expOnlyFav'].forEach(id => $(id).addEventListener('change', () => expLoad(EXP.dir)));
   $('expSize').addEventListener('change', expDraw);
+  $('expGroupFilter').addEventListener('change', expDraw);
+  $('expGroupSave').addEventListener('click', async () => {
+    const name = $('expGroupName').value.trim().slice(0,40);
+    if(!name){ $('expStat').textContent = '후보군 이름을 입력해주세요.'; return; }
+    const visible = await expEnsureAll();
+    const chosen = visible.map(file => file.path).filter(path => EXP.picked.has(path));
+    if(!chosen.length){ $('expStat').textContent = '이 폴더에서 후보군에 넣을 그림을 먼저 선별해주세요.'; return; }
+    EXP.folders[name] = [...new Set([...(EXP.folders[name] || []), ...chosen])];
+    await picksSave();
+    expPaintGroups(); $('expGroupFilter').value = name; expDraw();
+    $('expStat').textContent = `'${name}' 후보군에 선별 ${chosen.length}장을 이름표로 연결했습니다.`;
+  });
+  $('expGroupDelete').addEventListener('click', async () => {
+    const name = $('expGroupFilter').value;
+    if(!name){ $('expStat').textContent = '삭제할 후보군 이름표를 선택해주세요.'; return; }
+    if(!confirm(`후보군 '${name}' 이름표를 지울까요? 원본 그림과 선별 표시는 그대로 남습니다.`)) return;
+    delete EXP.folders[name];
+    await picksSave(); expPaintGroups(); expDraw();
+    $('expStat').textContent = `'${name}' 후보군 이름표만 지웠습니다.`;
+  });
   $('expCmpClear').addEventListener('click', () => { EXP.cmp.clear(); expDraw(); });
   if($('expCup')) $('expCup').addEventListener('click', cupStart);
   if($('expApplyPicked')) $('expApplyPicked').addEventListener(
@@ -15442,7 +15575,10 @@ class ConfigServer:
                         # load→merge→save 전체가 한 transaction이어야 다른 탭의 선별을 덮지 않는다.
                         with _JSON_IO_LOCK:
                             cur = load_picks()
-                            for k in ("picked", "fav", "folders", "ranks"):
+                            for k in (
+                                "picked", "fav", "folders", "ranks",
+                                "ratings", "tags",
+                            ):
                                 if k in d:
                                     cur[k] = d[k]
                             saved = save_picks(cur)
@@ -15467,6 +15603,12 @@ class ConfigServer:
                                     x for x in picks.get("fav", []) if x not in gone]
                                 picks["ranks"] = {
                                     k: v for k, v in picks.get("ranks", {}).items()
+                                    if k not in gone}
+                                picks["ratings"] = {
+                                    k: v for k, v in picks.get("ratings", {}).items()
+                                    if k not in gone}
+                                picks["tags"] = {
+                                    k: v for k, v in picks.get("tags", {}).items()
                                     if k not in gone}
                                 picks["folders"] = {
                                     name: [x for x in paths if x not in gone]
