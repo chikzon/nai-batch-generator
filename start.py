@@ -17,6 +17,7 @@
 import gzip
 import hashlib
 import base64
+import functools
 import io
 import json
 import logging
@@ -2636,8 +2637,23 @@ def load_builder():
 SETTINGS_DIR = BASE_DIR / "세팅"
 SCHEMA_DIR = BASE_DIR / "씬규격"   # 구버전 (마이그레이션 소스)
 KINDS = ("체위", "표정", "백합")
+_SETTING_TX_LOCK = threading.RLock()
 
 
+def serialized_setting_write(func):
+    """세팅 한 파일의 읽기→수정→쓰기를 한 덩어리로 직렬화한다.
+
+    atomic_write_json은 반쪽 파일을 막지만, 두 요청이 같은 옛 파일을 읽은 뒤 각각
+    정상 저장하면 마지막 저장이 앞 변경을 덮는 문제까지 막지는 못한다.
+    """
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with _SETTING_TX_LOCK:
+            return func(*args, **kwargs)
+    return wrapped
+
+
+@serialized_setting_write
 def ensure_settings_migration():
     """씬규격/(구) 또는 asset_config.json(구구) → 세팅/ 으로 1회 변환"""
     if SETTINGS_DIR.exists():
@@ -2750,6 +2766,7 @@ def setting_thumbs(name, cfg=None):
     return out
 
 
+@serialized_setting_write
 def duplicate_setting_group(name, gid):
     """세트 복제 — 그 세트의 씬들을 새 번호로 복사해 같은 세팅 파일에 넣는다."""
     p = setting_path(name)
@@ -2789,6 +2806,7 @@ def duplicate_setting_group(name, gid):
 BUILDER_MODES = ("단독", "남녀", "백합")
 
 
+@serialized_setting_write
 def new_setting(name, mode="단독", stages=None):
     """빈 세팅 파일을 만든다. stages 는 단계명 목록 (["시작","중간","끝"] 처럼)."""
     safe = _safe_name(name) or "새 세팅"
@@ -2813,6 +2831,7 @@ def new_setting(name, mode="단독", stages=None):
     return {"ok": True, "name": target.stem, "file": target.name}
 
 
+@serialized_setting_write
 def setting_add_set(name, label, category="", width=832, height=1216, stages=None):
     """세트 하나를 추가 — 단계명마다 씬을 하나씩 만든다."""
     p = setting_path(name)
@@ -2838,6 +2857,7 @@ def setting_add_set(name, label, category="", width=832, height=1216, stages=Non
     return {"ok": True, "start": start, "count": len(stages)}
 
 
+@serialized_setting_write
 def setting_meta_save(name, patch):
     """세팅의 머리 정보 (이름·방식·단계명·계열이름·옵션규격·옵션·상대역) 저장."""
     p = setting_path(name)
@@ -2867,6 +2887,7 @@ def setting_meta_save(name, patch):
     return {"ok": True, "name": d["이름"]}
 
 
+@serialized_setting_write
 def setting_renumber(name, start=None):
     """이 세팅의 씬 번호를 겹치지 않는 구간으로 다시 매긴다 (세트·단계 순서는 유지)."""
     p = setting_path(name)
@@ -2890,6 +2911,7 @@ def setting_renumber(name, start=None):
     return {"ok": True, "start": start, "count": len(new), "clashes": scene_num_clashes()}
 
 
+@serialized_setting_write
 def setting_delete(name):
     p = setting_path(name)
     if not p:
@@ -2912,6 +2934,7 @@ def export_settings_zip(names=None):
     return buf.getvalue()
 
 
+@serialized_setting_write
 def import_settings_bytes(data, filename=""):
     """ZIP 이든 낱개 JSON 이든 받아 세팅/ 에 넣는다. 같은 이름은 덮어쓰지 않고 ' (2)' 를 붙인다."""
     import io
@@ -12653,6 +12676,7 @@ class ConfigServer:
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "count": len(jobs)}
 
+    @serialized_setting_write
     def handle_role_save(self, body):
         """세팅의 상대역 저장 → 세팅 파일에 기록"""
         try:
@@ -12660,8 +12684,7 @@ class ConfigServer:
             path = setting_path(data.get("setting", ""))
             if not path:
                 return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-            with open(path, encoding="utf-8") as f:
-                pack = json.load(f)
+            pack = load_json_recover(path)
             role = pack.setdefault("상대역", {})
             for k in ("외형", "착의", "네거티브", "의상"):
                 if k in (data.get("role") or {}):
@@ -12684,6 +12707,7 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    @serialized_setting_write
     def handle_option_item(self, body):
         """세팅에 소속된 옵션의 항목 추가/삭제. {setting, option, op: set|del, name, value}"""
         try:
@@ -12694,8 +12718,7 @@ class ConfigServer:
             path = setting_path(data.get("setting", ""))
             if not path or not option or not name or op not in ("set", "del"):
                 return {"ok": False, "error": "잘못된 요청입니다."}
-            with open(path, encoding="utf-8") as f:
-                pack = json.load(f)
+            pack = load_json_recover(path)
             opts = pack.setdefault("옵션", {}).setdefault(option, {})
             if op == "del":
                 opts.pop(name, None)
@@ -13054,6 +13077,7 @@ class ConfigServer:
             return {"ok": True, "accepted": accepted, "rejected": rejected,
                     "fixed": fixed_vals, "revision": self.config_revision}
 
+    @serialized_setting_write
     def handle_scene_save(self, body):
         """씬 내부 프롬프트 수정 → asset_config.json 에 저장 (생성 중이면 다음 장부터 반영)"""
         try:
@@ -13067,8 +13091,7 @@ class ConfigServer:
             n = 0
             for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
                 try:
-                    with open(p, encoding="utf-8") as f:
-                        pack = json.load(f)
+                    pack = load_json_recover(p)
                 except Exception:
                     continue
                 scenes = pack.get("씬") or {}

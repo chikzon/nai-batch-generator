@@ -205,6 +205,47 @@ class RegressionTests(unittest.TestCase):
                 APP._COMBOS.clear()
                 APP._COMBOS.update(old_cache)
 
+    def test_concurrent_setting_edits_are_one_read_modify_write_transaction(self):
+        """서로 다른 정상 저장 두 개가 겹쳐도 마지막 요청이 앞 변경을 지우면 안 된다."""
+        with tempfile.TemporaryDirectory() as td:
+            settings_dir = Path(td) / "세팅"
+            with patch.object(APP, "SETTINGS_DIR", settings_dir):
+                self.assertTrue(APP.new_setting("동시저장", mode="단독")["ok"])
+                real_load = APP.load_json_recover
+                activity = {"now": 0, "max": 0}
+                activity_lock = threading.Lock()
+
+                def slow_load(path):
+                    with activity_lock:
+                        activity["now"] += 1
+                        activity["max"] = max(activity["max"], activity["now"])
+                    try:
+                        time.sleep(0.05)
+                        return real_load(path)
+                    finally:
+                        with activity_lock:
+                            activity["now"] -= 1
+
+                results = []
+                with patch.object(APP, "load_json_recover", side_effect=slow_load):
+                    workers = [
+                        threading.Thread(target=lambda: results.append(
+                            APP.setting_meta_save("동시저장", {"방식": "남녀"}))),
+                        threading.Thread(target=lambda: results.append(
+                            APP.setting_meta_save("동시저장", {"단계명": ["도입", "완료"]}))),
+                    ]
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join()
+
+                saved = APP.load_json_recover(settings_dir / "동시저장.json")
+                self.assertEqual(activity["max"], 1)
+                self.assertEqual(len(results), 2)
+                self.assertTrue(all(x["ok"] for x in results))
+                self.assertEqual(saved["방식"], "남녀")
+                self.assertEqual(saved["단계명"], ["도입", "완료"])
+
     def test_generated_image_is_published_only_after_complete_encoding(self):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "result.png"
