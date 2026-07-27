@@ -89,9 +89,13 @@ class RegressionTests(unittest.TestCase):
 
     def test_weight_highlight_does_not_draw_text_twice(self):
         page = APP.PAGE_TEMPLATE
-        self.assertIn(".hl .w-num{color:transparent;}", page)
+        self.assertIn(
+            ".hlwrap .hl *{color:transparent!important;"
+            "-webkit-text-fill-color:transparent!important;", page)
+        self.assertIn(".hl b{font-weight:400;border-radius:3px;padding:0;}", page)
         self.assertNotIn(
             ".hl .w-num{color:var(--accent);opacity:.95;}", page)
+        self.assertNotIn(".hl b{font-weight:400;border-radius:3px;padding:0 1px;}", page)
 
     def test_style_and_setting_files_recover_from_last_backup(self):
         with tempfile.TemporaryDirectory() as td:

@@ -5486,22 +5486,25 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
    글자 상자가 textarea 의 것과 정확히 겹친다. */
 .hlwrap .hl{position:absolute;top:1px;left:1px;z-index:1;overflow:hidden;pointer-events:none;
   white-space:pre-wrap;word-break:normal;overflow-wrap:break-word;color:transparent;
+  -webkit-text-fill-color:transparent;text-shadow:none;
   padding:7px 9px;border:0;border-radius:var(--radius);
   font-family:var(--mono);font-size:var(--fs-sm);line-height:1.55;
   box-sizing:border-box;tab-size:8;}
 .psec-body .hlwrap .hl{line-height:1.55;}
+/* 브라우저 기본 b 스타일이나 테마 규칙이 투명 글자를 되살리지 못하게, 하이라이트
+   거울층의 모든 자손은 글리프를 절대 그리지 않는다. 실제 글자는 textarea 한 층뿐이다. */
+.hlwrap .hl *{color:transparent!important;-webkit-text-fill-color:transparent!important;
+  text-shadow:none!important;text-decoration:none!important;}
 /* NAI 와 같은 색 규칙: 강조(1보다 큼)는 붉은색, 약화·음수는 파란색.
    숫자가 클수록 / 작을수록 진해진다. */
-.hl b{font-weight:400;border-radius:3px;padding:0 1px;}
+.hl b{font-weight:400;border-radius:3px;padding:0;}
 .hl .w-up3{background:rgba(190,70,70,.42);}     /* 2.0 이상 — 아주 강함 */
 .hl .w-up2{background:rgba(180,74,74,.30);}     /* 1.4~2.0 */
 .hl .w-up1{background:rgba(170,80,80,.20);}     /* 1.0~1.4 — 살짝 강함 */
 .hl .w-dn1{background:rgba(74,124,196,.22);}    /* 0.5~1.0 — 약함 */
 .hl .w-dn2{background:rgba(64,108,196,.32);}    /* 0.5 미만 — 많이 약함 */
 .hl .w-neg{background:rgba(48,96,204,.46);}     /* 음수 — 빼기 (가장 진한 파랑) */
-/* textarea 원문이 이미 위에서 그려진다. 숫자를 아래 레이어에서도 색칠하면 두 글자가
-   겹쳐 보여 번진다. 배경 강조만 남기고 하이라이트 레이어의 글자는 투명하게 둔다. */
-.hl .w-num{color:transparent;}
+/* textarea 원문이 이미 위에서 그려진다. 거울층은 배경 위치만 계산한다. */
 
 /* 창 아무 데나 그림을 떨어뜨릴 때 뜨는 안내 */
 #dropOverlay{position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;
