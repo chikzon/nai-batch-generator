@@ -7197,7 +7197,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2><span class="n">편집</span>캐릭터 상세</h2>
+        <h2><span class="n">편집</span>캐릭터 상세
+          <button type="button" id="charUndo" class="hidden" style="margin-left:auto;">↶ 최근 삭제 되돌리기</button></h2>
+        <p class="hint" id="charEditMsg">복제로 의상·예술적 변형을 나누고, 삭제한 항목은 이 화면을 닫기 전 되돌릴 수 있습니다.</p>
         <div id="charList"></div>
         <div id="folderList"></div>
       </div>
@@ -10648,6 +10650,18 @@ function renderLibrary(){
   });
   renderCharCards();
 }
+const DELETED_CHARS = [];
+function updateCharUndo(){
+  const button = $('charUndo'), message = $('charEditMsg');
+  if(!button || !message) return;
+  button.classList.toggle('hidden', !DELETED_CHARS.length);
+  if(DELETED_CHARS.length){
+    const last = DELETED_CHARS[DELETED_CHARS.length - 1].character;
+    message.textContent = `'${last.name || '캐릭터'}' 삭제됨 · 이 화면에서 되돌릴 수 있습니다.`;
+  }else{
+    message.textContent = '복제로 의상·예술적 변형을 나누고, 삭제한 항목은 이 화면을 닫기 전 되돌릴 수 있습니다.';
+  }
+}
 function renderCharCards(){
   const h = $('charList'); if(!h) return;
   h.innerHTML = '';
@@ -10685,10 +10699,34 @@ function renderCharCards(){
     flash(`'${name}' 복제됨 — 이름·의상·예술적 변형을 바꿔 저장하세요.`);
   }));
   h.querySelectorAll('[data-xdel]').forEach(b => b.addEventListener('click', () => {
-    STATE.characters = (STATE.characters||[]).filter(x => x.id !== b.dataset.xdel);
-    renderLibrary(); renderSlots(); save();
+    const chars = STATE.characters || [];
+    const at = chars.findIndex(x => x.id === b.dataset.xdel);
+    if(at < 0) return;
+    const character = chars[at];
+    if(!confirm(`'${character.name || '캐릭터'}'을 삭제할까요? 이 화면을 닫기 전에는 되돌릴 수 있습니다.`)) return;
+    DELETED_CHARS.push({character:JSON.parse(JSON.stringify(character)), index:at});
+    chars.splice(at, 1);
+    renderLibrary(); renderSlots(); updateCharUndo(); save();
   }));
 }
+$('charUndo').addEventListener('click', () => {
+  const deleted = DELETED_CHARS.pop();
+  if(!deleted) return;
+  const chars = STATE.characters || (STATE.characters = []);
+  const restored = deleted.character;
+  if(chars.some(x => x.id === restored.id)) restored.id = genId();
+  const names = new Set(chars.map(x => String(x.name || '').trim().toLocaleLowerCase()));
+  if(names.has(String(restored.name || '').trim().toLocaleLowerCase())){
+    const root = `${String(restored.name || '캐릭터').trim() || '캐릭터'} 복구본`;
+    let name = root, serial = 2;
+    while(names.has(name.toLocaleLowerCase())) name = `${root} ${serial++}`;
+    restored.name = name;
+  }
+  chars.splice(Math.min(deleted.index, chars.length), 0, restored);
+  renderLibrary(); renderSlots(); updateCharUndo(); save();
+  const input = document.querySelector(`[data-xc="${restored.id}"][data-xf="name"]`);
+  if(input) input.focus();
+});
 $('libAddChar').addEventListener('click', () => {
   (STATE.characters = STATE.characters||[]).push({id:genId(), name:'새 캐릭터', female:'', clothed:'', negative:'', enabled:true});
   renderLibrary(); save();

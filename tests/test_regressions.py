@@ -1089,6 +1089,16 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("while(names.has(name.toLocaleLowerCase()))", page)
         self.assertIn("renderLibrary(); renderSlots(); save();", page)
 
+    def test_character_delete_requires_confirmation_and_can_be_undone(self):
+        page = APP.render_page()
+        self.assertIn('id="charUndo" class="hidden"', page)
+        self.assertIn("const DELETED_CHARS = [];", page)
+        self.assertIn("if(!confirm(`'${character.name || '캐릭터'}'을 삭제할까요?", page)
+        self.assertIn("DELETED_CHARS.push({character:JSON.parse(JSON.stringify(character)), index:at});", page)
+        self.assertIn("const deleted = DELETED_CHARS.pop();", page)
+        self.assertIn("chars.splice(Math.min(deleted.index, chars.length), 0, restored);", page)
+        self.assertIn("if(chars.some(x => x.id === restored.id)) restored.id = genId();", page)
+
     def test_collapsible_panels_pin_their_grid_columns(self):
         """패널을 접어도 가운데가 밀리지 않게 **열을 못박아** 둔다.
 
