@@ -5740,6 +5740,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <button id="presetSave" title="현재 프롬프트+네거티브+파라미터를 파일로 저장">저장</button>
     </div>
 
+    <!-- ⚠ 이 1.2 : 1 배분을 건드리기 전에 아래를 읽을 것 (두 번 헛짚었다).
+         ① **칸이 커 보인다고 줄이지 말 것.** 빈 화면에서만 커 보인다. `수집/그림체.json`
+            732건 실측은 base 중앙값 593자 · negative 중앙값 1,080자(UC 프리셋 문구를
+            `split_uc_preset` 으로 뗀 뒤)다. 지금도 1280 에서는 **중앙값 프롬프트가 38%
+            잘린다.** 라운드10 이 잘림을 80%→34% 로 줄이려 키운 자리다.
+         ② **길이가 길다고 네거티브에 더 주지도 말 것.** 1 : 1.5 로 뒤집어 실측했더니
+            두 칸 잘림 **합계가 그대로였다** (1600 317→317px · 1280 521→522px).
+            세로는 총량이 정해져 있어 순수 재분배이고, 자주 고치는 프롬프트 칸만
+            14%→42% 로 나빠졌다. 네거티브는 그림체에서 통째로 받아 두고 거의 안 고친다.
+            그래서 **자주 고치는 쪽에 더 주는 지금 배분을 유지한다.**
+         진짜로 나아지려면 총 높이를 늘리거나(접기·오버레이) 칸을 자동으로 키워야 한다. -->
     <div class="psec" style="flex:1.2;">
       <div class="psec-head" data-fold="pPos"><span class="chev">▾</span><span class="t">프롬프트</span>
         <span class="count" id="posTok">0</span>
@@ -6229,16 +6240,34 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <option value="130" selected>보통</option><option value="200">크게</option></select>
           <button id="expReload">새로고침</button>
         </div>
+        <!-- ⚠ 한 줄에 `margin-left:auto` 를 **둘** 두지 말 것. `.bar .n{margin-left:auto}`
+             에 더해 `expCompare` 에도 auto 가 붙어 있어서, 상태글이 줄 한복판에 뜨고
+             단추가 좌우로 흩어져 무엇이 한 묶음인지 읽히지 않았다.
+             지금은 auto 가 `expStat` 하나뿐이라 [고르는 도구들] … 상태 [지우기] 로 읽힌다.
+             파괴적인 `선별 외 삭제` 는 상태글을 사이에 두고 **끝으로 떼어 놨다** — 없애지
+             않았고 빨간색도 그대로다(경고는 유지해야 한다). 옆에 붙어 잘못 눌리는 것만 막는다. -->
         <div class="bar" style="margin-top:6px;">
-          <span class="n" id="expStat"></span>
           <button id="expCup" title="보이는 그림들을 1:1 로 붙여 순위를 매깁니다 (SDStudio 의 이미지 월드컵)">🏆 월드컵</button>
-          <button id="expCompare" style="margin-left:auto;">🔍 비교함 보기 (<span id="expCmpN">0</span>)</button>
+          <button id="expCompare">🔍 비교함 보기 (<span id="expCmpN">0</span>)</button>
           <button id="expCmpClear">비교함 비우기</button>
+          <span class="n" id="expStat"></span>
           <button id="expDelUnpicked" class="danger" title="이 폴더에서 선별 안 된 것을 실제로 지웁니다">선별 외 삭제</button>
         </div>
-        <!-- 그림체 복구 — 그림에 박힌 메타를 읽어 그 설정 그대로 다시 돌린다 -->
-        <div class="filterbar" style="margin-top:6px;">
-          <span class="hint" style="white-space:nowrap;">🔁 그림체 복구</span>
+        <div id="expDirs" class="bar" style="flex-wrap:wrap;margin-top:8px;"></div>
+        <div id="expGrid" style="display:grid;gap:6px;margin-top:8px;
+          grid-template-columns:repeat(auto-fill,minmax(var(--ecard,130px),1fr));"></div>
+      </div>
+
+      <!-- 그림체 복구 — 뽑아 둔 그림의 메타를 읽어 그 설정 그대로 다시 돌린다.
+           탐색·선별과는 하는 일이 다르다(고르는 것이 아니라 **새로 뽑는다**. 결과도
+           `output/복구/` 라는 다른 자리에 쌓이고 Anlas 도 든다). 한 카드 안에 있을 때는
+           선별 도구 사이에 끼어 '이것도 고르는 기능인가' 로 읽혔다. 카드를 갈랐다. -->
+      <div class="card">
+        <h2><span class="n">복구</span>그림체 복구 — 그 설정 그대로 다시 뽑기
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">결과는 output/복구/ 에</span></h2>
+        <p class="hint">그림에 박힌 <b>프롬프트·시드·설정값</b>을 읽어 그대로 다시 돌립니다.
+        메타가 지워진 그림(카톡·디스코드 경유, 메타 제거본)은 건너뜁니다.</p>
+        <div class="filterbar">
           <select id="regenMode">
             <option value="generate">같은 설정으로 다시 뽑기 (시드까지 그대로)</option>
             <option value="img2img">원본을 바탕에 두고 다듬기 (img2img)</option>
@@ -6248,11 +6277,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button id="regenPicked">선별한 것 복구</button>
           <button id="regenAll">보이는 것 전부 복구</button>
         </div>
-        <p class="hint" style="margin:4px 0 0;">그림에 박힌 <b>프롬프트·시드·설정값</b>을 읽어 그대로 다시 돌립니다.
-        메타가 지워진 그림(카톡·디스코드 경유, 메타 제거본)은 건너뜁니다. 결과는 <b>output/복구/</b> 에 쌓입니다.</p>
-        <div id="expDirs" class="bar" style="flex-wrap:wrap;margin-top:8px;"></div>
-        <div id="expGrid" style="display:grid;gap:6px;margin-top:8px;
-          grid-template-columns:repeat(auto-fill,minmax(var(--ecard,130px),1fr));"></div>
       </div>
 
       <div class="card">

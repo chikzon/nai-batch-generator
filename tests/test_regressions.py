@@ -354,6 +354,32 @@ class RegressionTests(unittest.TestCase):
         for sel in ('id="togLeft"', 'id="togRight"', "localStorage.setItem(key"):
             self.assertTrue(sel in page, f"패널 접기 조작부가 없다: {sel}")
 
+    def test_explorer_bar_has_a_single_auto_margin_and_regen_is_its_own_card(self):
+        """한 줄에 `margin-left:auto` 를 **둘** 두면 무엇이 한 묶음인지 안 읽힌다.
+
+        `.bar .n{margin-left:auto}` 에 더해 `expCompare` 에도 auto 가 붙어 있어서
+        상태글이 줄 한복판에 뜨고 단추가 좌우로 흩어졌다. 지금은 auto 가 `expStat`
+        하나뿐이라 [고르는 도구들] … 상태 [선별 외 삭제] 로 읽힌다.
+
+        그림체 복구는 **고르는 일이 아니라 새로 뽑는 일**이라(결과가 `output/복구/` 에
+        쌓이고 Anlas 도 든다) 카드를 갈랐다."""
+        page = APP.render_page()
+        bar_at = page.index('id="expCup"')
+        bar_end = page.index("</div>", bar_at)
+        bar = page[bar_at:bar_end]
+        self.assertFalse("margin-left:auto" in bar,
+                         "탐색기 단추 줄에 auto 여백이 다시 생겼다 (상태글의 것 하나면 된다)")
+        # 파괴적 동작은 남기되 상태글 뒤로 떼어 놓는다 (없애지 않는다)
+        self.assertTrue(page.index('id="expStat"') < page.index('id="expDelUnpicked"'),
+                        "`선별 외 삭제` 가 다른 단추 옆으로 붙었다")
+        self.assertTrue('id="expDelUnpicked"' in page and 'class="danger"' in page,
+                        "`선별 외 삭제` 가 사라졌거나 경고색을 잃었다")
+        # 복구는 탐색기와 다른 카드에 있어야 한다
+        self.assertTrue(page.index('id="expGrid"') < page.index('id="regenMode"'),
+                        "그림체 복구가 다시 탐색기 카드 안으로 들어갔다")
+        for sel in ('id="regenMode"', 'id="regenStrength"', 'id="regenPicked"', 'id="regenAll"'):
+            self.assertTrue(sel in page, f"복구 조작부가 사라졌다: {sel}")
+
     def test_ui_labels_are_korean_words_not_invented_abbreviations(self):
         """화면 라벨은 **읽어서 뜻이 통해야** 한다.
 
