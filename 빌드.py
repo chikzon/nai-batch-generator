@@ -41,11 +41,15 @@ PUBLISHER = "ninesdead"
 
 # exe 옆에 놓을 것 — 없으면 조용히 건너뛴다(저장소 clone 은 일부가 없다)
 ASSETS = [
-    "t5_tokenizer.json", "후보사전.json", "규격.json", "옵션.json", "설정.txt",
+    "t5_tokenizer.json", "후보사전.json", "규격.json", "옵션.json",
+    "asset_config.json", "설정.txt",
     "README.md", "LICENSE", "CREDITS.md", "THIRD_PARTY_NOTICES.md",
     "requirements.txt",
 ]
-ASSET_DIRS = ["태그", "캐릭터", "tests"]
+# `세팅/`은 사용자 수집 자료가 아니라 앱이 처음부터 제공하는 기본 씬 3종이다.
+# 이것이 빠지면 새 설치에서 세팅 탭과 일괄 생성 대상이 모두 비어 버린다.
+# 반대로 `수집/`·`output/`·`프로필/`은 개인 자료이므로 배포본에 넣지 않는다.
+ASSET_DIRS = ["태그", "캐릭터", "세팅", "tests"]
 
 
 def _run(cmd: list[str], **kw) -> int:

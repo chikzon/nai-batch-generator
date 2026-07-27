@@ -29,9 +29,21 @@ SPEC = importlib.util.spec_from_file_location("nai_helper_under_test", ROOT / "s
 assert SPEC and SPEC.loader
 APP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(APP)
+BUILD_SPEC = importlib.util.spec_from_file_location("nai_build_under_test", ROOT / "빌드.py")
+assert BUILD_SPEC and BUILD_SPEC.loader
+BUILD = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(BUILD)
 
 
 class RegressionTests(unittest.TestCase):
+    def test_distribution_includes_core_scenes_but_not_personal_collections(self):
+        self.assertIn("asset_config.json", BUILD.ASSETS)
+        self.assertIn("세팅", BUILD.ASSET_DIRS)
+        for private_dir in ("수집", "output", "프로필"):
+            self.assertNotIn(private_dir, BUILD.ASSET_DIRS)
+        for private_file in ("설정.json", "설정.json.bak", "생성.log"):
+            self.assertNotIn(private_file, BUILD.ASSETS)
+
     def test_active_people_keep_slot_coordinate_pairs(self):
         slots = [
             {"prompt": "A", "negative": "na", "enabled": True},
