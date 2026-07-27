@@ -2020,6 +2020,7 @@ class RegressionTests(unittest.TestCase):
                 result = APP.trash_output_files(
                     cfg, ["단독/one.png", "../outside.png"])
                 self.assertEqual(result["deleted"], 1)
+                self.assertEqual(result["paths"], ["단독/one.png"])
                 self.assertFalse(source.exists())
                 self.assertEqual(outside.read_bytes(), b"outside")
                 listing = APP.list_output("", cfg)

@@ -6922,7 +6922,12 @@ def trash_output_files(cfg, targets, keep=()):
             "items": moved,
             "labels": labels,
         }, indent=2)
-    return {"deleted": len(moved), "batch_id": batch_id if moved else None}
+    return {
+        "deleted": len(moved),
+        "batch_id": batch_id if moved else None,
+        # 호출자가 실제로 옮기지 못한 경로의 이름표까지 지우지 않도록 근거를 돌려준다.
+        "paths": [item["original"] for item in moved],
+    }
 
 
 def restore_trash_batch(cfg, batch_id):
@@ -16745,7 +16750,9 @@ class ConfigServer:
                                    if str(x) not in keep]
                         result = trash_output_files(server.cfg, targets, keep)
                         if result["deleted"]:
-                            gone = set(targets)
+                            # 파일이 이미 없어졌거나 경로 검사를 통과하지 못한 요청은 이름표를
+                            # 유지한다. 실제 휴지통으로 옮긴 경로만 선별 기록에서 뺀다.
+                            gone = set(result.get("paths") or [])
                             with _JSON_IO_LOCK:
                                 picks = load_picks()
                                 picks["picked"] = [
