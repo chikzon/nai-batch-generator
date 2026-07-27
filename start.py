@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 import zipfile
 import zlib
@@ -538,13 +539,37 @@ def load_json_recover(path):
     with _JSON_IO_LOCK:
         try:
             return json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as first:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as first:
             bak = path.with_name(path.name + ".bak")
             try:
                 data = json.loads(bak.read_text(encoding="utf-8-sig"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 raise first
             log.error(f"손상된 {path.name} 대신 백업을 복구했습니다: {first}")
+            atomic_write_json(path, data, keep_backup=False)
+            return data
+
+
+def load_settings_recover(path):
+    """설정은 JSON 객체만 정상으로 인정하고, 정상 `.bak`이 있을 때만 자동 복구한다."""
+    path = Path(path)
+
+    def read_dict(candidate):
+        data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{candidate.name}의 최상위 값은 JSON 객체여야 합니다.")
+        return data
+
+    with _JSON_IO_LOCK:
+        try:
+            return read_dict(path)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as first:
+            backup = path.with_name(path.name + ".bak")
+            try:
+                data = read_dict(backup)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                raise first
+            log.error("손상된 %s 대신 객체형 백업을 복구했습니다: %s", path.name, first)
             atomic_write_json(path, data, keep_backup=False)
             return data
 
@@ -5377,8 +5402,8 @@ def load_or_init_config():
     STARTUP_RECOVERY_NOTICE = None
     if SETTINGS_FILE.exists():
         try:
-            cfg = load_json_recover(SETTINGS_FILE)
-        except json.JSONDecodeError as e:
+            cfg = load_settings_recover(SETTINGS_FILE)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
             # 주 파일과 `.bak`이 모두 JSON으로 읽히지 않는 경우만 구조 시작으로 전환한다.
             # 권한·디스크 오류는 손상으로 오인해 파일을 옮기지 않고 그대로 알린다.
             STARTUP_RECOVERY_NOTICE = quarantine_corrupt_settings(
@@ -6878,53 +6903,87 @@ def trash_output_files(cfg, targets, keep=()):
     root = out_root(cfg).resolve()
     trash_root = (root / TRASH_DIR_NAME).resolve()
     keep = set(keep or ())
-    batch_id = (datetime.now().strftime("%Y%m%d-%H%M%S")
-                + f"-{time.time_ns() % 1_000_000:06d}")
-    batch_dir = trash_root / batch_id
-    moved = []
-    picks = load_picks()
+    planned = []
+    seen = set()
     for rel in targets or ():
         rel = str(rel or "").replace("\\", "/").lstrip("/")
-        if not rel or rel in keep or rel.startswith(TRASH_DIR_NAME + "/"):
+        if (not rel or rel in seen or rel in keep
+                or rel.startswith(TRASH_DIR_NAME + "/")):
             continue
         source = (root / rel).resolve()
         if not _path_is_inside(source, root) or not source.is_file():
             continue
-        dest = (batch_dir / rel).resolve()
-        if not _path_is_inside(dest, batch_dir):
+        # batch id가 정해지기 전에도 목적지는 항상 같은 상대 경로다.
+        planned.append({"original": rel})
+        seen.add(rel)
+    if not planned:
+        return {"deleted": 0, "batch_id": None, "paths": []}
+
+    trash_root.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(8):
+        batch_id = (datetime.now().strftime("%Y%m%d-%H%M%S")
+                    + "-" + uuid.uuid4().hex[:12])
+        batch_dir = trash_root / batch_id
+        try:
+            batch_dir.mkdir(parents=False, exist_ok=False)
+            break
+        except FileExistsError:
             continue
+    else:
+        raise FileExistsError("고유한 휴지통 묶음 폴더를 만들지 못했습니다.")
+
+    for item in planned:
+        dest = (batch_dir / item["original"]).resolve()
+        if not _path_is_inside(dest, batch_dir):
+            raise ValueError("휴지통 밖을 가리키는 경로가 포함되어 있습니다.")
+        item["trashed"] = dest.relative_to(root).as_posix()
+
+    picks = load_picks()
+    labels = {}
+    for item in planned:
+        rel = item["original"]
+        record = {}
+        if rel in picks.get("picked", []):
+            record["picked"] = True
+        if rel in picks.get("fav", []):
+            record["fav"] = True
+        folders = [
+            name for name, paths in picks.get("folders", {}).items()
+            if rel in paths
+        ]
+        if folders:
+            record["folders"] = folders
+        for key in ("ranks", "ratings", "tags"):
+            if rel in picks.get(key, {}):
+                record[key] = picks[key][rel]
+        if record:
+            labels[rel] = record
+
+    manifest_path = batch_dir / "manifest.json"
+    manifest = {
+        "schema": "nais-output-trash/v2",
+        "batch_id": batch_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "moving",
+        "items": planned,
+        "labels": labels,
+    }
+    # 이동보다 장부를 먼저 쓴다. 이후 어느 지점에서 꺼져도 이미 옮긴 파일은
+    # 목록에 다시 나타나며, 장부 쓰기 자체가 실패하면 원본은 한 장도 움직이지 않는다.
+    atomic_write_json(manifest_path, manifest, indent=2)
+    moved = []
+    for item in planned:
+        source = (root / item["original"]).resolve()
+        dest = (root / item["trashed"]).resolve()
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(dest))
-        moved.append({"original": rel, "trashed": dest.relative_to(root).as_posix()})
-    if moved:
-        moved_paths = {item["original"] for item in moved}
-        labels = {}
-        for rel in moved_paths:
-            record = {}
-            if rel in picks.get("picked", []):
-                record["picked"] = True
-            if rel in picks.get("fav", []):
-                record["fav"] = True
-            folders = [
-                name for name, paths in picks.get("folders", {}).items()
-                if rel in paths
-            ]
-            if folders:
-                record["folders"] = folders
-            for key in ("ranks", "ratings", "tags"):
-                if rel in picks.get(key, {}):
-                    record[key] = picks[key][rel]
-            if record:
-                labels[rel] = record
-        atomic_write_json(batch_dir / "manifest.json", {
-            "batch_id": batch_id,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "items": moved,
-            "labels": labels,
-        }, indent=2)
+        moved.append(item)
+    manifest["status"] = "ready"
+    manifest["moved"] = len(moved)
+    atomic_write_json(manifest_path, manifest, indent=2)
     return {
         "deleted": len(moved),
-        "batch_id": batch_id if moved else None,
+        "batch_id": batch_id,
         # 호출자가 실제로 옮기지 못한 경로의 이름표까지 지우지 않도록 근거를 돌려준다.
         "paths": [item["original"] for item in moved],
     }
@@ -6941,25 +7000,79 @@ def restore_trash_batch(cfg, batch_id):
     if not manifest_path.is_file():
         raise FileNotFoundError("복원할 휴지통 묶음을 찾을 수 없습니다.")
     manifest = load_json_recover(manifest_path)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
+        raise ValueError("휴지통 장부 형식이 올바르지 않습니다.")
+    items = [item for item in manifest["items"] if isinstance(item, dict)]
+    plan = manifest.get("restore_plan")
+    if not isinstance(plan, dict):
+        plan = {}
+    plan_changed = False
+
+    def unused_target(original):
+        target = (root / original).resolve()
+        if (not _path_is_inside(target, root)
+                or _path_is_inside(target, trash_root)):
+            return None
+        if not target.exists():
+            return target
+        stem, suffix, serial = target.stem, target.suffix, 2
+        while target.exists():
+            target = target.with_name(f"{stem}_{serial}{suffix}")
+            serial += 1
+        return target
+
+    # 모든 복원 목적지를 이동 전에 기록한다. 파일 이동 뒤 이름표 저장이 실패해도
+    # 다음 실행은 이 계획으로 이미 복원된 파일을 찾아 이름표만 다시 붙일 수 있다.
+    for item in items:
+        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
+        source = (root / str(item.get("trashed") or "")).resolve()
+        if not original or not _path_is_inside(source, batch):
+            continue
+        planned_rel = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
+        planned = (root / planned_rel).resolve() if planned_rel else None
+        if planned is not None and (
+                not _path_is_inside(planned, root)
+                or _path_is_inside(planned, trash_root)):
+            planned = None
+        if planned is None and source.is_file():
+            planned = unused_target(original)
+            if planned is not None:
+                plan[original] = planned.relative_to(root).as_posix()
+                plan_changed = True
+    if plan_changed or manifest.get("restore_plan") != plan:
+        manifest["restore_plan"] = plan
+        manifest["restore_status"] = "moving"
+        atomic_write_json(manifest_path, manifest, indent=2)
+
     restored = []
     restored_map = {}
-    for item in manifest.get("items") or []:
+    for item in items:
+        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
+        planned_rel = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
+        if not original or not planned_rel:
+            continue
         source = (root / str(item.get("trashed") or "")).resolve()
-        target = (root / str(item.get("original") or "")).resolve()
+        target = (root / planned_rel).resolve()
         if (not _path_is_inside(source, batch)
                 or not _path_is_inside(target, root)
-                or not source.is_file()):
+                or _path_is_inside(target, trash_root)):
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            stem, suffix, serial = target.stem, target.suffix, 2
-            while target.exists():
-                target = target.with_name(f"{stem}_{serial}{suffix}")
-                serial += 1
-        shutil.move(str(source), str(target))
-        restored_rel = target.relative_to(root).as_posix()
-        restored.append(restored_rel)
-        restored_map[str(item.get("original") or "").replace("\\", "/")] = restored_rel
+        if source.is_file() and target.exists():
+            # 계획 기록 뒤 외부에서 같은 이름을 만들었으면 절대 덮어쓰지 않는다.
+            target = unused_target(original)
+            if target is None:
+                continue
+            planned_rel = target.relative_to(root).as_posix()
+            plan[original] = planned_rel
+            manifest["restore_plan"] = plan
+            atomic_write_json(manifest_path, manifest, indent=2)
+        if source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+        elif not target.is_file():
+            continue
+        restored.append(planned_rel)
+        restored_map[original] = planned_rel
     # 지울 때 함께 보관한 가상 이름표도 실제 복원 경로에 되붙인다.
     # 경로 충돌로 `(2)`가 붙었으면 옛 원래 경로가 아니라 새 파일에 붙여야 한다.
     labels = manifest.get("labels") or {}
@@ -6968,6 +7081,8 @@ def restore_trash_batch(cfg, batch_id):
             picks = load_picks()
             for original, restored_rel in restored_map.items():
                 record = labels.get(original) or {}
+                if not isinstance(record, dict):
+                    record = {}
                 # 이동 직후 프로세스가 꺼져 이름표 정리가 끝나지 못한 경우도 있다.
                 # 원래 경로의 낡은 이름표를 먼저 떼고 실제 복원된 경로로 옮긴다.
                 picks["picked"] = [x for x in picks["picked"] if x != original]
@@ -6990,6 +7105,7 @@ def restore_trash_batch(cfg, batch_id):
             save_picks(picks)
     manifest["restored_at"] = datetime.now().isoformat(timespec="seconds")
     manifest["restored"] = restored
+    manifest["restore_status"] = "complete"
     atomic_write_json(manifest_path, manifest, indent=2)
     return {"restored": len(restored), "paths": restored}
 
@@ -7007,10 +7123,13 @@ def list_trash_batches(cfg):
             continue
         try:
             manifest = load_json_recover(manifest_path)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
+            continue
+        items = [item for item in manifest["items"] if isinstance(item, dict)]
         available, size = 0, 0
-        for item in manifest.get("items") or []:
+        for item in items:
             path = (root / str(item.get("trashed") or "")).resolve()
             if _path_is_inside(path, batch) and path.is_file():
                 available += 1
@@ -7022,8 +7141,10 @@ def list_trash_batches(cfg):
             "batch_id": str(manifest.get("batch_id") or batch.name),
             "created_at": str(manifest.get("created_at") or ""),
             "available": available,
-            "total": len(manifest.get("items") or []),
+            "total": len(items),
             "bytes": size,
+            "status": str(manifest.get("restore_status")
+                          or manifest.get("status") or ""),
         })
     return {
         "ok": True,
@@ -14959,7 +15080,10 @@ class LiveState:
                    (self.finished_at or self.started_at or 0.0))
             elapsed = max(0.0, end - self.started_at) if self.started_at else 0.0
             run_done = max(0, int(self.completed) - int(self.eta_base_completed))
-            remaining = max(0, int(self.total) - int(self.completed))
+            # 실패·건너뜀도 이미 처리한 장이다. 성공 표본만 평균 속도에 쓰되
+            # 남은 장 수에서는 다시 세지 않는다.
+            remaining = max(
+                0, int(self.total) - int(self.completed) - int(self.failed))
             eta = None
             if self.running and run_done > 0 and remaining > 0:
                 eta = elapsed / run_done * remaining
@@ -18004,7 +18128,7 @@ def _run_generation(server):
         params = runtime_generation_params(cfg, token)
 
         char, cid, num, copy = pending[0]
-        total_now = completed + len(pending)
+        total_now = completed + len(skip_set) + len(pending)
 
         try:
             out_dir = out_sub(cfg, "nsfw_seed") / f"seed_{seed_key}" / cid

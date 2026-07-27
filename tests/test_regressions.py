@@ -11,6 +11,7 @@ import hashlib
 import io
 import importlib.util
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import unittest
 import urllib.error
 import urllib.request
 import zipfile
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +43,51 @@ BUILD_SPEC.loader.exec_module(BUILD)
 
 
 class RegressionTests(unittest.TestCase):
+    def test_rendered_page_has_valid_javascript_and_unique_dom_ids(self):
+        class PageAudit(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids = []
+                self.scripts = []
+                self._script = None
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "script":
+                    self._script = []
+                for key, value in attrs:
+                    if key == "id":
+                        self.ids.append(value)
+
+            def handle_data(self, data):
+                if self._script is not None:
+                    self._script.append(data)
+
+            def handle_endtag(self, tag):
+                if tag == "script" and self._script is not None:
+                    self.scripts.append("".join(self._script))
+                    self._script = None
+
+        parser = PageAudit()
+        parser.feed(APP.render_page())
+        duplicates = sorted({
+            element_id for element_id in parser.ids
+            if parser.ids.count(element_id) > 1
+        })
+        self.assertEqual(duplicates, [])
+        self.assertTrue(parser.scripts)
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js가 없어 렌더된 페이지의 JavaScript 구문 검사를 건너뜁니다.")
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "rendered-page.js"
+            script.write_text("\n".join(parser.scripts), encoding="utf-8")
+            result = subprocess.run(
+                [node, "--check", str(script)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_over_limit_prompts_are_preserved_in_actual_payload(self):
         base = ", ".join(f"base_tag_{i}" for i in range(900))
         char = ", ".join(f"character_tag_{i}" for i in range(500))
@@ -1035,6 +1082,19 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="pvEta"', APP.PAGE_TEMPLATE)
         self.assertIn("남은 시간 계산 중", APP.PAGE_TEMPLATE)
 
+    def test_live_state_eta_does_not_count_failed_work_as_remaining(self):
+        live = APP.LiveState()
+        with patch.object(APP.time, "time", return_value=100.0):
+            live.try_claim("실패 뒤 계속", "settings")
+        live.update(
+            total=3, index=2, completed=1, failed=1,
+            eta_base_completed=0,
+        )
+        with patch.object(APP.time, "time", return_value=130.0):
+            snap = live.snapshot()
+        self.assertEqual(snap["eta_samples"], 1)
+        self.assertEqual(snap["eta_seconds"], 30.0)
+
     def test_corrupt_settings_and_backup_are_quarantined_before_safe_start(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1071,6 +1131,64 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="startupRecovery"', APP.PAGE_TEMPLATE)
         self.assertIn("startup_recovery", APP.ConfigServer(
             copy.deepcopy(APP.DEFAULT_CONFIG)).snapshot_config())
+
+    def test_invalid_utf8_settings_and_backup_are_quarantined_byte_exact(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            backup = root / "설정.json.bak"
+            primary_bytes = b"\xff\xfe\xfa-primary"
+            backup_bytes = b"\x80\x81-backup"
+            settings.write_bytes(primary_bytes)
+            backup.write_bytes(backup_bytes)
+
+            def save_fixture(cfg):
+                APP.atomic_write_json(settings, cfg, keep_backup=False)
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "_migrate_legacy", side_effect=lambda cfg: cfg),
+                patch.object(APP, "ensure_settings_migration", return_value=None),
+                patch.object(APP, "migrate_legacy_selections", return_value=None),
+                patch.object(APP, "import_char_files", return_value=None),
+                patch.object(APP, "sync_chars_to_files", return_value=None),
+                patch.object(APP, "save_config", side_effect=save_fixture),
+                patch.object(APP, "STARTUP_RECOVERY_NOTICE", None),
+            ):
+                APP.load_or_init_config()
+                kept = Path(APP.STARTUP_RECOVERY_NOTICE["folder"])
+                self.assertEqual((kept / "설정.json").read_bytes(), primary_bytes)
+                self.assertEqual(
+                    (kept / "설정.json.bak").read_bytes(), backup_bytes)
+
+    def test_non_object_settings_backup_is_not_used_to_overwrite_primary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            backup = root / "설정.json.bak"
+            primary_bytes = b"{broken-primary"
+            backup_bytes = b"[]"
+            settings.write_bytes(primary_bytes)
+            backup.write_bytes(backup_bytes)
+
+            def save_fixture(cfg):
+                APP.atomic_write_json(settings, cfg, keep_backup=False)
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "_migrate_legacy", side_effect=lambda cfg: cfg),
+                patch.object(APP, "ensure_settings_migration", return_value=None),
+                patch.object(APP, "migrate_legacy_selections", return_value=None),
+                patch.object(APP, "import_char_files", return_value=None),
+                patch.object(APP, "sync_chars_to_files", return_value=None),
+                patch.object(APP, "save_config", side_effect=save_fixture),
+                patch.object(APP, "STARTUP_RECOVERY_NOTICE", None),
+            ):
+                APP.load_or_init_config()
+                kept = Path(APP.STARTUP_RECOVERY_NOTICE["folder"])
+                self.assertEqual((kept / "설정.json").read_bytes(), primary_bytes)
+                self.assertEqual(
+                    (kept / "설정.json.bak").read_bytes(), backup_bytes)
 
     def test_single_generation_failure_is_visible_without_paid_network(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
@@ -2083,6 +2201,156 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="trashCard"', APP.PAGE_TEMPLATE)
         self.assertIn("fetch('/api/trash'", APP.PAGE_TEMPLATE)
         self.assertIn("자동 만료와 영구 비우기는 하지 않습니다.", APP.PAGE_TEMPLATE)
+
+    def test_trash_writes_recovery_manifest_before_moving_any_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            source = root / "one.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"one")
+            real_atomic = APP.atomic_write_json
+
+            def fail_manifest(path, data, **kwargs):
+                if Path(path).name == "manifest.json":
+                    raise OSError("fixture: manifest unavailable")
+                return real_atomic(path, data, **kwargs)
+
+            with (
+                patch.object(APP, "PICKS_FILE", Path(td) / "선별.json"),
+                patch.object(APP, "atomic_write_json", side_effect=fail_manifest),
+            ):
+                with self.assertRaises(OSError):
+                    APP.trash_output_files({"out_dir": str(root)}, ["one.png"])
+            self.assertEqual(source.read_bytes(), b"one")
+
+    def test_trash_pre_manifest_recovers_file_if_final_manifest_write_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            source = root / "one.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"one")
+            real_atomic = APP.atomic_write_json
+            manifest_writes = 0
+
+            def fail_second_manifest(path, data, **kwargs):
+                nonlocal manifest_writes
+                if Path(path).name == "manifest.json":
+                    manifest_writes += 1
+                    if manifest_writes == 2:
+                        raise OSError("fixture: final manifest unavailable")
+                return real_atomic(path, data, **kwargs)
+
+            cfg = {"out_dir": str(root)}
+            with (
+                patch.object(APP, "PICKS_FILE", Path(td) / "선별.json"),
+                patch.object(
+                    APP, "atomic_write_json", side_effect=fail_second_manifest),
+            ):
+                with self.assertRaises(OSError):
+                    APP.trash_output_files(cfg, ["one.png"])
+            self.assertFalse(source.exists())
+            listing = APP.list_trash_batches(cfg)
+            self.assertEqual(listing["total_files"], 1)
+            batch_id = listing["batches"][0]["batch_id"]
+            restored = APP.restore_trash_batch(cfg, batch_id)
+            self.assertEqual(restored["restored"], 1)
+            self.assertEqual(source.read_bytes(), b"one")
+
+    def test_restore_retries_labels_after_picks_write_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            picks_file = Path(td) / "선별.json"
+            source = root / "one.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"one")
+            APP.atomic_write_json(picks_file, {
+                "picked": ["one.png"], "fav": ["one.png"],
+                "folders": {"후보": ["one.png"]},
+                "ranks": {"one.png": 2}, "ratings": {"one.png": 4},
+                "tags": {"one.png": ["빛"]},
+            })
+            cfg = {"out_dir": str(root)}
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                trashed = APP.trash_output_files(cfg, ["one.png"])
+                with patch.object(
+                        APP, "save_picks",
+                        side_effect=OSError("fixture: picks unavailable")):
+                    with self.assertRaises(OSError):
+                        APP.restore_trash_batch(cfg, trashed["batch_id"])
+                # 파일은 이미 돌아왔지만 장부의 restore_plan으로 이름표를 재시도한다.
+                retried = APP.restore_trash_batch(cfg, trashed["batch_id"])
+                self.assertEqual(retried["restored"], 1)
+                restored_rel = retried["paths"][0]
+                picks = APP.load_picks()
+                self.assertIn(restored_rel, picks["picked"])
+                self.assertIn(restored_rel, picks["fav"])
+                self.assertIn(restored_rel, picks["folders"]["후보"])
+                self.assertEqual(picks["ranks"][restored_rel], 2)
+                self.assertEqual(picks["ratings"][restored_rel], 4)
+                self.assertEqual(picks["tags"][restored_rel], ["빛"])
+
+    def test_trash_batch_ids_remain_unique_under_identical_clock_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            first = root / "one.png"
+            second = root / "two.png"
+            root.mkdir(parents=True)
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            cfg = {"out_dir": str(root)}
+            real_datetime = APP.datetime
+
+            class FixedDateTime:
+                @classmethod
+                def now(cls):
+                    return real_datetime(2026, 7, 28, 12, 0, 0)
+
+            class FixedUuid:
+                def __init__(self, value):
+                    self.hex = value
+
+            with (
+                patch.object(APP, "PICKS_FILE", Path(td) / "선별.json"),
+                patch.object(APP, "datetime", FixedDateTime),
+                patch.object(
+                    APP.uuid, "uuid4",
+                    side_effect=[
+                        FixedUuid("a" * 32),
+                        FixedUuid("a" * 32),
+                        FixedUuid("b" * 32),
+                    ],
+                ),
+            ):
+                one = APP.trash_output_files(cfg, ["one.png"])
+                two = APP.trash_output_files(cfg, ["two.png"])
+            self.assertNotEqual(one["batch_id"], two["batch_id"])
+            listing = APP.list_trash_batches(cfg)
+            self.assertEqual(len(listing["batches"]), 2)
+            self.assertEqual(listing["total_files"], 2)
+
+    def test_bad_trash_manifest_does_not_hide_other_batches(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            source = root / "one.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"one")
+            cfg = {"out_dir": str(root)}
+            with patch.object(APP, "PICKS_FILE", Path(td) / "선별.json"):
+                good = APP.trash_output_files(cfg, ["one.png"])
+            trash = root / APP.TRASH_DIR_NAME
+            bad_list = trash / "bad-list"
+            bad_items = trash / "bad-items"
+            bad_list.mkdir()
+            bad_items.mkdir()
+            (bad_list / "manifest.json").write_text("[]", encoding="utf-8")
+            (bad_items / "manifest.json").write_text(
+                '{"items":"not-a-list"}', encoding="utf-8")
+            listing = APP.list_trash_batches(cfg)
+            self.assertEqual(listing["total_files"], 1)
+            self.assertEqual(
+                [row["batch_id"] for row in listing["batches"]],
+                [good["batch_id"]],
+            )
 
     def test_style_restore_keeps_conflicting_deleted_data_in_trash(self):
         """같은 id가 다시 생겨도 새 자료를 덮거나 옛 자료를 휴지통에서 잃지 않는다."""
