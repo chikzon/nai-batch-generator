@@ -600,6 +600,120 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(summary["total"], 12)
         self.assertFalse(escaped["ok"])
 
+    def test_whole_backup_excludes_secrets_and_restores_then_rolls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            char_dir = root / "캐릭터"
+            settings_dir = root / "세팅"
+            cache = root / "수집" / "이미지캐시"
+            remote = cache / "원격"
+            for directory in (char_dir, settings_dir, cache, remote):
+                directory.mkdir(parents=True, exist_ok=True)
+            char_file = char_dir / "A.json"
+            char_file.write_text('{"id":"a","이름":"A","외형":"original"}',
+                                 encoding="utf-8")
+            (settings_dir / "내세팅.json").write_text('{"이름":"내세팅","씬":{}}',
+                                                     encoding="utf-8")
+            (cache / "local.webp").write_bytes(b"local-source")
+            (remote / "download.webp").write_bytes(b"remote-cache")
+            (root / "output").mkdir()
+            (root / "output" / "result.webp").write_bytes(b"generated")
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(token="pst-never-export", booru_keys={"x": {"key": "secret"}},
+                       out_dir=str(root / "output"), base_prompt="backup prompt")
+            settings_file = root / "설정.json"
+            settings_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+            empty = root / "empty"
+
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "PROFILE_DIR", root),
+                patch.object(APP, "SETTINGS_FILE", settings_file),
+                patch.object(APP, "BUILDER_FILE", root / "후보사전.json"),
+                patch.object(APP, "SPEC_FILE", root / "규격.json"),
+                patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
+                patch.object(APP, "TAG_DIR", empty / "태그"),
+                patch.object(APP, "SETTINGS_DIR", settings_dir),
+                patch.object(APP, "SCHEMA_DIR", empty / "씬규격"),
+                patch.object(APP, "SCENESET_DIR", empty / "씬프리셋"),
+                patch.object(APP, "STYLE_DIR", empty / "그림체"),
+                patch.object(APP, "CHAR_DIR", char_dir),
+                patch.object(APP, "FRAG_DIR", empty / "조각"),
+                patch.object(APP, "VIBE_DIR", empty / "바이브"),
+                patch.object(APP, "PICKS_FILE", root / "선별.json"),
+                patch.object(APP, "SCENES_FILE", root / "씬.json"),
+            ):
+                blob = APP.export_user_backup(cfg)
+                with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+                    names = set(archive.namelist())
+                    saved_cfg = json.loads(
+                        archive.read("data/profile/설정.json"))
+                self.assertNotIn("token", saved_cfg)
+                self.assertNotIn("booru_keys", saved_cfg)
+                self.assertNotIn("out_dir", saved_cfg)
+                self.assertIn("data/common/수집/이미지캐시/local.webp", names)
+                self.assertFalse(any("원격" in name for name in names))
+                self.assertFalse(any("output/" in name for name in names))
+
+                char_file.write_text('{"id":"a","이름":"A","외형":"changed"}',
+                                     encoding="utf-8")
+                current = dict(cfg)
+                current.update(token="pst-current", base_prompt="changed prompt")
+                settings_file.write_text(json.dumps(current, ensure_ascii=False),
+                                         encoding="utf-8")
+                preview = APP.preview_user_backup(blob)
+                restored = APP.restore_user_backup(blob, preview["sha256"])
+                restored_cfg = json.loads(settings_file.read_text(encoding="utf-8"))
+                self.assertTrue(restored["ok"])
+                self.assertEqual(
+                    json.loads(char_file.read_text(encoding="utf-8"))["외형"],
+                    "original")
+                self.assertEqual(restored_cfg["base_prompt"], "backup prompt")
+                self.assertEqual(restored_cfg["token"], "pst-current")
+                self.assertEqual(restored_cfg["out_dir"], str(root / "output"))
+
+                # 복원 뒤 사용자가 다시 편집한 파일은 되돌리기가 덮어쓰면 안 된다.
+                char_file.write_text(
+                    '{"id":"a","이름":"A","외형":"after-restore edit"}',
+                    encoding="utf-8",
+                )
+                rolled = APP.rollback_user_backup(restored["batch"])
+                rolled_cfg = json.loads(settings_file.read_text(encoding="utf-8"))
+                self.assertTrue(rolled["ok"])
+                self.assertEqual(rolled["skipped"], 1)
+                self.assertEqual(
+                    json.loads(char_file.read_text(encoding="utf-8"))["외형"],
+                    "after-restore edit")
+                self.assertEqual(rolled_cfg["base_prompt"], "changed prompt")
+                self.assertEqual(rolled_cfg["token"], "pst-current")
+
+    def test_whole_backup_rejects_manifest_path_escape(self):
+        payload = io.BytesIO()
+        raw = b"unsafe"
+        manifest = {
+            "schema": APP.BACKUP_SCHEMA,
+            "files": [{"path": "common/../outside.txt", "size": len(raw),
+                       "sha256": hashlib.sha256(raw).hexdigest()}],
+        }
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+            archive.writestr("data/common/../outside.txt", raw)
+        with self.assertRaisesRegex(ValueError, "위험하거나 중복"):
+            APP.preview_user_backup(payload.getvalue())
+
+    def test_whole_backup_ui_reloads_without_losing_rollback_handle(self):
+        page = APP.PAGE_TEMPLATE
+        for element_id in (
+            "backupCard", "backupExport", "backupChoose", "backupFile",
+            "backupRestore", "backupRollback", "backupMsg",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("X-Backup-SHA256", page)
+        self.assertIn("sessionStorage.setItem('naisBackupRollback'", page)
+        self.assertIn("sessionStorage.getItem('naisBackupRollback')", page)
+        self.assertIn("sessionStorage.removeItem('naisBackupRollback')", page)
+        self.assertGreaterEqual(page.count("setTimeout(() => location.reload(), 700)"), 2)
+
     def test_build_main_writes_the_data_pack_beside_the_program(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

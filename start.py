@@ -3500,6 +3500,267 @@ def undo_datapack(batch_id):
             "log": pack_log_brief()}
 
 
+# ══ 내 자료 전체 백업 ═════════════════════════════════════════════════
+BACKUP_SCHEMA = "nais-user-backup/v1"
+BACKUP_SECRET_KEYS = {"token", "booru_keys", "out_dir"}
+
+
+def _backup_clean_settings(raw):
+    data = dict(raw or {}) if isinstance(raw, dict) else {}
+    for key in BACKUP_SECRET_KEYS:
+        data.pop(key, None)
+    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def _backup_sources(cfg):
+    """토큰·생성물·재생성 가능한 캐시를 빼고 사용자 원본만 모은다."""
+    files = {}
+
+    def put(logical, path):
+        try:
+            if path.is_file() and not path.name.endswith((".bak", ".tmp")):
+                files[logical] = path.read_bytes()
+        except OSError as e:
+            log.warning("백업에서 건너뜀 %s: %s", path, e)
+
+    def tree(prefix, root, skip=()):
+        if not root.is_dir():
+            return
+        resolved = root.resolve()
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.name.endswith((".bak", ".tmp")):
+                continue
+            rel = path.relative_to(root)
+            if any(part in skip for part in rel.parts):
+                continue
+            try:
+                if resolved not in path.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            put(f"common/{prefix}/{rel.as_posix()}", path)
+
+    for name, path in (("후보사전.json", BUILDER_FILE), ("규격.json", SPEC_FILE),
+                       ("옵션.json", OPTIONS_FILE)):
+        put(f"common/{name}", path)
+    for prefix, root in (
+        ("태그", TAG_DIR), ("세팅", SETTINGS_DIR), ("씬규격", SCHEMA_DIR),
+        ("씬프리셋", SCENESET_DIR), ("그림체", STYLE_DIR),
+        ("캐릭터", CHAR_DIR), ("조각", FRAG_DIR), ("수집/바이브", VIBE_DIR),
+    ):
+        tree(prefix, root)
+    collect = BASE_DIR / "수집"
+    if collect.is_dir():
+        for path in sorted(collect.glob("*.json")):
+            put(f"common/수집/{path.name}", path)
+        # local: 그림은 원본 자료다. 다시 받을 수 있는 원격/ 하위만 캐시로 제외한다.
+        tree("수집/이미지캐시", collect / "이미지캐시", skip=("원격",))
+    files["profile/설정.json"] = _backup_clean_settings(cfg)
+    for name, path in (("선별.json", PICKS_FILE), ("씬.json", SCENES_FILE)):
+        put(f"profile/{name}", path)
+    return files
+
+
+def export_user_backup(cfg):
+    payloads = _backup_sources(cfg)
+    manifest = {
+        "schema": BACKUP_SCHEMA,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "profile": PROFILE or "기본",
+        "files": [{"path": p, "size": len(raw),
+                   "sha256": hashlib.sha256(raw).hexdigest()}
+                  for p, raw in sorted(payloads.items())],
+        "excluded": ["API 토큰", "생성 결과(output)", "로그·진행상태",
+                     "태그 검색 색인", "다운로드한 원격 이미지 캐시",
+                     "자료팩 되돌리기 임시백업"],
+    }
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        z.writestr("manifest.json",
+                   json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
+        for logical, raw in sorted(payloads.items()):
+            z.writestr("data/" + logical, raw)
+    return out.getvalue()
+
+
+def _backup_safe_logical(value):
+    value = str(value or "").replace("\\", "/").strip("/")
+    parts = value.split("/") if value else []
+    if (len(parts) < 2 or parts[0] not in ("common", "profile")
+            or any(p in ("", ".", "..") or ":" in p for p in parts)):
+        return None
+    return "/".join(parts)
+
+
+def _read_user_backup(blob):
+    if not blob.startswith(b"PK"):
+        raise ValueError("NAI 사용자 백업 ZIP이 아닙니다.")
+    archive_sha = hashlib.sha256(blob).hexdigest()
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        infos = [x for x in z.infolist() if not x.is_dir()]
+        if len(infos) > 50000 or sum(x.file_size for x in infos) > 1024 ** 3:
+            raise ValueError("백업의 파일 수나 압축 해제 크기가 비정상적입니다.")
+        try:
+            manifest = json.loads(z.read("manifest.json"))
+        except Exception as e:
+            raise ValueError(f"manifest.json을 읽지 못했습니다: {e}") from e
+        if manifest.get("schema") != BACKUP_SCHEMA:
+            raise ValueError("지원하지 않는 백업 형식입니다.")
+        payloads, seen = {}, set()
+        for entry in manifest.get("files") or []:
+            logical = _backup_safe_logical(entry.get("path"))
+            if not logical or logical in seen:
+                raise ValueError("백업 manifest에 위험하거나 중복된 경로가 있습니다.")
+            seen.add(logical)
+            try:
+                raw = z.read("data/" + logical)
+            except KeyError as e:
+                raise ValueError(f"백업 내용이 빠졌습니다: {logical}") from e
+            if (len(raw) != int(entry.get("size", -1))
+                    or hashlib.sha256(raw).hexdigest() != entry.get("sha256")):
+                raise ValueError(f"백업 내용 검사가 실패했습니다: {logical}")
+            payloads[logical] = raw
+    return manifest, payloads, archive_sha
+
+
+def _backup_destination(logical):
+    logical = _backup_safe_logical(logical)
+    if not logical:
+        raise ValueError("위험한 백업 경로입니다.")
+    scope, rel = logical.split("/", 1)
+    if scope == "profile":
+        if rel not in {"설정.json", "선별.json", "씬.json"}:
+            raise ValueError(f"허용하지 않는 프로필 자료입니다: {rel}")
+        root = PROFILE_DIR.resolve()
+    else:
+        allowed_files = {"후보사전.json", "규격.json", "옵션.json"}
+        allowed_dirs = {"태그", "세팅", "씬규격", "씬프리셋", "그림체",
+                        "캐릭터", "조각", "수집"}
+        if rel not in allowed_files and rel.split("/", 1)[0] not in allowed_dirs:
+            raise ValueError(f"허용하지 않는 공용 자료입니다: {rel}")
+        root = BASE_DIR.resolve()
+    target = (root / rel).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("백업 경로가 앱 자료 폴더를 벗어납니다.")
+    return target
+
+
+def _backup_merge_secrets(logical, raw, target):
+    if logical != "profile/설정.json":
+        return raw
+    incoming = json.loads(raw.decode("utf-8"))
+    current = {}
+    if target.is_file():
+        try:
+            current = load_json_recover(target)
+        except Exception:
+            pass
+    for key in BACKUP_SECRET_KEYS:
+        if key in current:
+            incoming[key] = current[key]
+    return json.dumps(incoming, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def preview_user_backup(blob):
+    manifest, payloads, archive_sha = _read_user_backup(blob)
+    counts = {"새 파일": 0, "바뀔 파일": 0, "같은 파일": 0}
+    total = 0
+    for logical, raw in payloads.items():
+        target = _backup_destination(logical)
+        wanted = _backup_merge_secrets(logical, raw, target)
+        total += len(wanted)
+        if not target.exists():
+            counts["새 파일"] += 1
+        elif target.read_bytes() == wanted:
+            counts["같은 파일"] += 1
+        else:
+            counts["바뀔 파일"] += 1
+    return {"ok": True, "sha256": archive_sha, "files": len(payloads),
+            "bytes": total, "counts": counts, "created_at": manifest.get("created_at"),
+            "profile": manifest.get("profile"), "excluded": manifest.get("excluded") or []}
+
+
+def restore_user_backup(blob, expected_sha=""):
+    manifest, payloads, archive_sha = _read_user_backup(blob)
+    if expected_sha and expected_sha != archive_sha:
+        return {"ok": False, "error": "미리보기한 백업과 복원할 백업이 다릅니다."}
+    batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    journal = PROFILE_DIR / "복원기록" / batch
+    operations = []
+    for logical, raw in sorted(payloads.items()):
+        target = _backup_destination(logical)
+        wanted = _backup_merge_secrets(logical, raw, target)
+        old = target.read_bytes() if target.is_file() else None
+        if old == wanted:
+            continue
+        op = {"path": logical, "new": old is None,
+              "applied_sha256": hashlib.sha256(wanted).hexdigest()}
+        if old is not None:
+            saved = (_backup_clean_settings(json.loads(old))
+                     if logical == "profile/설정.json" else old)
+            _atomic_write_bytes(journal / "before" / logical, saved, keep_backup=False)
+        operations.append((op, target, wanted))
+    record = {"schema": "nais-restore-journal/v1", "id": batch,
+              "backup_sha256": archive_sha, "status": "ready",
+              "operations": [x[0] for x in operations], "completed": []}
+    atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
+    try:
+        record["status"] = "applying"
+        atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
+        for op, target, wanted in operations:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(target, wanted)
+            record["completed"].append(op["path"])
+            atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
+    except Exception:
+        rollback_user_backup(batch)
+        raise
+    record.update(status="complete",
+                  completed_at=datetime.now().isoformat(timespec="seconds"))
+    atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
+    forget_collection_caches()
+    return {"ok": True, "batch": batch, "changed": len(operations),
+            "files": len(payloads)}
+
+
+def rollback_user_backup(batch_id):
+    if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{6}", str(batch_id or "")):
+        return {"ok": False, "error": "복원 기록 번호가 올바르지 않습니다."}
+    root = (PROFILE_DIR / "복원기록").resolve()
+    journal = (root / str(batch_id)).resolve()
+    if root not in journal.parents or not (journal / "journal.json").is_file():
+        return {"ok": False, "error": "복원 기록을 찾지 못했습니다."}
+    record = load_json_recover(journal / "journal.json")
+    if record.get("status") == "rolled_back":
+        return {"ok": False, "error": "이미 되돌린 복원입니다."}
+    done, restored, skipped = set(record.get("completed") or []), 0, 0
+    for op in reversed(record.get("operations") or []):
+        logical = op.get("path")
+        if logical not in done:
+            continue
+        target = _backup_destination(logical)
+        if (not target.is_file()
+                or hashlib.sha256(target.read_bytes()).hexdigest()
+                != op.get("applied_sha256")):
+            # 복원 뒤 사용자가 다시 고친 파일은 옛 상태로 덮어쓰지 않는다.
+            skipped += 1
+            continue
+        if op.get("new"):
+            recoverable_remove(target, label="복원취소")
+            restored += 1
+        else:
+            saved = journal / "before" / logical
+            if saved.is_file():
+                raw = _backup_merge_secrets(logical, saved.read_bytes(), target)
+                _atomic_write_bytes(target, raw)
+                restored += 1
+    record.update(status="rolled_back",
+                  rolled_back_at=datetime.now().isoformat(timespec="seconds"))
+    atomic_write_json(journal / "journal.json", record, indent=1)
+    forget_collection_caches()
+    return {"ok": True, "restored": restored, "skipped": skipped}
+
+
 def setting_path(name):
     for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
         try:
@@ -7312,6 +7573,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         요청이 겹쳐 제한에 걸릴 위험이 커집니다. 프로필은 계정이 <b>다를 때</b> 쓰는 기능입니다.</p>
       </div>
 
+      <div class="card" id="backupCard">
+        <h2><span class="n">안전</span>내 자료 전체 백업</h2>
+        <p class="hint">현재 프로필의 설정·선별과 공용 캐릭터·그림체·세팅·조각·자료 원문을
+        manifest와 SHA-256 내용 검사로 한 ZIP에 묶습니다.
+        <b>API 토큰·output 생성물·로그·원격 이미지 캐시는 넣지 않습니다.</b>
+        복원할 때도 기존에만 있는 파일은 지우지 않으며, 먼저 변경 수를 보여 준 뒤 실행합니다.</p>
+        <div class="bar" style="flex-wrap:wrap;">
+          <button type="button" id="backupExport" class="primary">⬇ 내 자료 백업 만들기</button>
+          <button type="button" id="backupChoose">⬆ 백업 파일 검사</button>
+          <input type="file" id="backupFile" accept=".zip" style="display:none;">
+          <button type="button" id="backupRestore" class="danger" disabled>검사한 백업 복원</button>
+          <button type="button" id="backupRollback" class="hidden">↶ 방금 복원 되돌리기</button>
+        </div>
+        <div id="backupMsg" class="hint" style="margin-top:8px;"></div>
+      </div>
+
       <div class="card">
         <h2><span class="n">04</span>알림 · 단축키
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">565장은 몇 시간이 걸립니다</span></h2>
@@ -7527,7 +7804,7 @@ function paint(){
   $('pVariety').value = STATE.variety ? 'on' : 'off';
   paintParams();
   renderPresets(); renderSlots(); renderSettings(); renderLibrary(); renderScenePresets();
-  bindComparison();
+  bindComparison(); bindUserBackup();
   renderFrags(); renderScenes(); applySplit3(); paintPace(); acScan(document);
   sbPickList(); paintClash();
   if($('expGrid')) expLoad('');
@@ -7699,6 +7976,81 @@ function bindComparison(){
     setMode('preview');
   });
   comparisonPreview();
+}
+
+/* ── 내 자료 전체 백업 ─────────────────────────────────────────────── */
+let BACKUP_FILE = null, BACKUP_SHA = '', BACKUP_BATCH = '';
+function bindUserBackup(){
+  if(!$('backupCard') || $('backupCard')._bound) return;
+  $('backupCard')._bound = true;
+  BACKUP_BATCH = sessionStorage.getItem('naisBackupRollback') || '';
+  if(BACKUP_BATCH){
+    $('backupRollback').classList.remove('hidden');
+    $('backupMsg').textContent = '방금 복원한 자료가 적용되었습니다. 문제가 있으면 복원 전 상태로 되돌릴 수 있습니다.';
+  }
+  $('backupExport').addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = '/api/backup_export';
+    a.download = 'NAI배치생성기-내자료백업.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    $('backupMsg').textContent = '백업 ZIP을 만드는 중입니다. 다운로드가 시작될 때까지 기다려주세요.';
+  });
+  $('backupChoose').addEventListener('click', () => $('backupFile').click());
+  $('backupFile').addEventListener('change', async () => {
+    const file = $('backupFile').files[0];
+    $('backupFile').value = '';
+    if(!file) return;
+    BACKUP_FILE = file; BACKUP_SHA = '';
+    $('backupRestore').disabled = true;
+    $('backupMsg').textContent = '백업의 경로·크기·내용 해시를 검사하는 중입니다.';
+    try{
+      const r = await (await fetch('/api/backup_preview', {method:'POST',
+        headers:{'X-Filename':encodeURIComponent(file.name)},
+        body:await file.arrayBuffer()})).json();
+      if(!r.ok){ $('backupMsg').textContent = r.error || '백업 검사 실패'; return; }
+      BACKUP_SHA = r.sha256;
+      const c = r.counts || {};
+      $('backupMsg').innerHTML =
+        `<b>${Number(r.files||0).toLocaleString()}개 · ${(Number(r.bytes||0)/1048576).toFixed(1)}MB</b>`
+        + ` — 새 파일 ${Number(c['새 파일']||0).toLocaleString()} · 바뀔 파일 ${Number(c['바뀔 파일']||0).toLocaleString()}`
+        + ` · 같은 파일 ${Number(c['같은 파일']||0).toLocaleString()}`
+        + `<br>백업 시점 ${esc(r.created_at||'?')} · 토큰·생성물·원격 캐시는 복원하지 않습니다.`;
+      $('backupRestore').disabled = false;
+    }catch(e){ $('backupMsg').textContent = '백업 검사 실패: ' + e; }
+  });
+  $('backupRestore').addEventListener('click', async () => {
+    if(!BACKUP_FILE || !BACKUP_SHA) return;
+    if(!confirm('검사한 백업으로 같은 이름의 자료를 바꿀까요?\\n현재 파일은 복원 기록에 보존되며 바로 되돌릴 수 있습니다.')) return;
+    $('backupRestore').disabled = true;
+    $('backupMsg').textContent = '기존 파일을 복원 기록에 보존한 뒤 적용하는 중입니다.';
+    try{
+      const r = await (await fetch('/api/backup_restore', {method:'POST',
+        headers:{'X-Backup-SHA256':BACKUP_SHA}, body:await BACKUP_FILE.arrayBuffer()})).json();
+      if(!r.ok){ $('backupMsg').textContent = r.error || '복원 실패'; $('backupRestore').disabled=false; return; }
+      BACKUP_BATCH = r.batch || '';
+      if(BACKUP_BATCH) sessionStorage.setItem('naisBackupRollback', BACKUP_BATCH);
+      $('backupMsg').textContent = `${r.changed}개 파일 복원 완료 · 토큰과 출력 폴더 설정은 현재 값을 유지했습니다. 화면을 안전하게 다시 불러옵니다.`;
+      $('backupRollback').classList.toggle('hidden', !BACKUP_BATCH);
+      setTimeout(() => location.reload(), 700);
+    }catch(e){ $('backupMsg').textContent = '복원 실패: ' + e; $('backupRestore').disabled=false; }
+  });
+  $('backupRollback').addEventListener('click', async () => {
+    if(!BACKUP_BATCH) return;
+    const r = await (await fetch('/api/backup_rollback', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:BACKUP_BATCH})})).json();
+    const skipped = Number(r.skipped || 0);
+    $('backupMsg').textContent = r.ok
+      ? `${r.restored}개 파일을 복원 전 상태로 되돌렸습니다.`
+        + (skipped ? ` 복원 뒤 다시 바뀐 ${skipped}개 파일은 덮어쓰지 않았습니다.` : '')
+      : (r.error || '되돌리기 실패');
+    if(r.ok){
+      BACKUP_BATCH='';
+      sessionStorage.removeItem('naisBackupRollback');
+      $('backupRollback').classList.add('hidden');
+      setTimeout(() => location.reload(), 700);
+    }
+  });
 }
 
 /* 실제 NAI 토큰 수 — 서버의 T5 토크나이저에 물어본다 (입력이 멈추면 한 번) */
@@ -13587,6 +13939,18 @@ class ConfigServer:
                                     "thumbs": setting_thumbs(unquote(q.get("name", [""])[0]), server.cfg)})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/backup_export"):
+                    try:
+                        blob = export_user_backup(server.cfg)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)}); return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Disposition",
+                                     'attachment; filename="nais-user-backup.zip"')
+                    self.send_header("Content-Length", str(len(blob)))
+                    self.end_headers()
+                    self.wfile.write(blob)
                 elif self.path.startswith("/api/frag_export"):
                     try:
                         blob = export_fragments_zip()
@@ -13801,7 +14165,50 @@ class ConfigServer:
                     self._json({"ok": False, "error": "요청 본문이 너무 큽니다."}, status=413)
                     return
                 body = self.rfile.read(length) if length else b""
-                if self.path.startswith("/api/save"):
+                if self.path.startswith("/api/backup_preview"):
+                    try:
+                        self._json(preview_user_backup(body))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/backup_restore"):
+                    try:
+                        result = restore_user_backup(
+                            body, self.headers.get("X-Backup-SHA256", ""))
+                        if result.get("ok"):
+                            fresh = load_json_recover(SETTINGS_FILE)
+                            merged = dict(DEFAULT_CONFIG)
+                            merged.update(fresh if isinstance(fresh, dict) else {})
+                            migrate_legacy_selections(merged)
+                            migrate_char_slots(merged)
+                            server.cfg.clear()
+                            server.cfg.update(merged)
+                            server.spec = load_spec()
+                            OPTIONS.clear()
+                            OPTIONS.update(load_options())
+                            server.config_revision += 1
+                        self._json(result)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/backup_rollback"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        result = rollback_user_backup(data.get("id"))
+                        if result.get("ok"):
+                            fresh = load_json_recover(SETTINGS_FILE)
+                            merged = dict(DEFAULT_CONFIG)
+                            merged.update(fresh if isinstance(fresh, dict) else {})
+                            migrate_legacy_selections(merged)
+                            migrate_char_slots(merged)
+                            server.cfg.clear()
+                            server.cfg.update(merged)
+                            server.spec = load_spec()
+                            OPTIONS.clear()
+                            OPTIONS.update(load_options())
+                            server.config_revision += 1
+                        self._json(result)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/save"):
                     self._json(server.handle_save(body))
                 elif self.path.startswith("/api/compare_preview"):
                     self._json(server.handle_compare_preview(body))
