@@ -207,6 +207,9 @@ STATE_FILE = PROFILE_DIR / "nsfw_seed_state.json"
 COMPARE_PROGRESS_FILE = PROFILE_DIR / "비교생성-진행.json"
 OUTPUT_BASE = PROFILE_DIR / "output"
 LOG_FILE = PROFILE_DIR / "생성.log"
+# 시작 때 설정과 자동 백업이 모두 손상되면 아래에 복구 사실을 남긴다.
+# 화면은 이 값을 한 번 읽어 사용자가 기본값으로 바뀐 이유와 원본 보관 위치를 알 수 있다.
+STARTUP_RECOVERY_NOTICE = None
 
 
 def out_root(cfg=None):
@@ -544,6 +547,39 @@ def load_json_recover(path):
             log.error(f"손상된 {path.name} 대신 백업을 복구했습니다: {first}")
             atomic_write_json(path, data, keep_backup=False)
             return data
+
+
+def quarantine_corrupt_settings(path, reason):
+    """읽을 수 없는 설정과 자동 백업을 삭제하지 않고 복구보관 폴더로 옮긴다.
+
+    두 JSON이 함께 깨지면 예전에는 웹 화면 자체가 뜨지 않았다. 이 함수는 원본 바이트를
+    보존한 채 시작만 정상화한다. 권한 오류 같은 JSON 손상 이외의 실패에는 호출하지 않는다.
+    """
+    path = Path(path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    recovery_root = path.parent / "복구보관"
+    batch = recovery_root / stamp
+    serial = 2
+    while batch.exists():
+        batch = recovery_root / f"{stamp}-{serial}"
+        serial += 1
+    batch.mkdir(parents=True, exist_ok=False)
+    kept = []
+    for source in (path, path.with_name(path.name + ".bak")):
+        if not source.is_file():
+            continue
+        target = batch / source.name
+        os.replace(source, target)
+        kept.append(target.name)
+    notice = {
+        "schema": "nais-startup-recovery/v1",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "reason": redact_diagnostic_text(reason),
+        "folder": str(batch),
+        "files": kept,
+    }
+    atomic_write_json(batch / "복구기록.json", notice, keep_backup=False)
+    return notice
 
 # 체위 목록 (asset_config.json 의 nude 씬을 5장 단위로 그룹핑한 것) — 브라우저 체크박스용
 POSITIONS = [{"id": 101, "cat": "A", "label": "A01 핸드잡"}, {"id": 106, "cat": "A", "label": "A02 펠라치오"}, {"id": 111, "cat": "A", "label": "A03 파이즈리"}, {"id": 116, "cat": "A", "label": "A04 69"}, {"id": 121, "cat": "A", "label": "A05 허벅지"}, {"id": 126, "cat": "A", "label": "A06 스탠딩69"}, {"id": 131, "cat": "A", "label": "A07 피드백"}, {"id": 136, "cat": "A", "label": "A08 플레시라이트"}, {"id": 141, "cat": "A", "label": "A09 라잉블로우"}, {"id": 146, "cat": "A", "label": "A10 노스폴"}, {"id": 151, "cat": "A", "label": "A11 너싱핑거링"}, {"id": 156, "cat": "A", "label": "A12 너싱핸드잡"}, {"id": 161, "cat": "A", "label": "A13 온사이드핑거링"}, {"id": 166, "cat": "A", "label": "A14 온사이드핸드잡"}, {"id": 171, "cat": "A", "label": "A15 우로보로스"}, {"id": 176, "cat": "A", "label": "A16 싯앤블로우"}, {"id": 181, "cat": "A", "label": "A17 사우스폴"}, {"id": 186, "cat": "A", "label": "A18 스탠드앤블로우"}, {"id": 191, "cat": "A", "label": "A19 스로트스와빙"}, {"id": 201, "cat": "B", "label": "B01 정상위"}, {"id": 206, "cat": "B", "label": "B02 메이팅 프레스"}, {"id": 211, "cat": "B", "label": "B03 레그락정상위"}, {"id": 216, "cat": "B", "label": "B04 다리어깨"}, {"id": 221, "cat": "B", "label": "B05 테이블"}, {"id": 226, "cat": "B", "label": "B06 데크체어"}, {"id": 231, "cat": "B", "label": "B07 이글"}, {"id": 236, "cat": "B", "label": "B08 가드"}, {"id": 241, "cat": "B", "label": "B09 플랫폼미셔너리"}, {"id": 246, "cat": "B", "label": "B10 리버스앤빌"}, {"id": 251, "cat": "B", "label": "B11 시저드데크체어"}, {"id": 256, "cat": "B", "label": "B12 사이드웨이미셔너리"}, {"id": 261, "cat": "B", "label": "B13 티스퀘어"}, {"id": 266, "cat": "B", "label": "B14 빅토리"}, {"id": 301, "cat": "C", "label": "C01 후배위"}, {"id": 306, "cat": "C", "label": "C02 측위"}, {"id": 311, "cat": "C", "label": "C03 프론본"}, {"id": 316, "cat": "C", "label": "C04 립프로그"}, {"id": 321, "cat": "C", "label": "C05 크라우칭타이거"}, {"id": 326, "cat": "C", "label": "C06 백파이프"}, {"id": 331, "cat": "C", "label": "C07 벤트스푼"}, {"id": 336, "cat": "C", "label": "C08 댕글링도기"}, {"id": 341, "cat": "C", "label": "C09 자키"}, {"id": 346, "cat": "C", "label": "C10 라잉버틀러"}, {"id": 351, "cat": "C", "label": "C11 머메이드"}, {"id": 356, "cat": "C", "label": "C12 마운팅"}, {"id": 361, "cat": "C", "label": "C13 사이드바이사이드"}, {"id": 366, "cat": "C", "label": "C14 스피드범프"}, {"id": 371, "cat": "C", "label": "C15 트라이앵글"}, {"id": 376, "cat": "C", "label": "C16 트위스티드스푼"}, {"id": 401, "cat": "D", "label": "D01 기승위"}, {"id": 406, "cat": "D", "label": "D02 역기승위"}, {"id": 411, "cat": "D", "label": "D03 아마존"}, {"id": 416, "cat": "D", "label": "D04 마스터리"}, {"id": 421, "cat": "D", "label": "D05 리버스아마존"}, {"id": 426, "cat": "D", "label": "D06 리버스메이팅프레스"}, {"id": 431, "cat": "D", "label": "D07 리버스미셔너리"}, {"id": 436, "cat": "D", "label": "D08 스쿼트"}, {"id": 501, "cat": "E", "label": "E01 대면좌위"}, {"id": 506, "cat": "E", "label": "E02 배면좌위"}, {"id": 511, "cat": "E", "label": "E03 사이드새들"}, {"id": 516, "cat": "E", "label": "E04 바스켓"}, {"id": 521, "cat": "E", "label": "E05 체어"}, {"id": 526, "cat": "E", "label": "E06 크레이들"}, {"id": 531, "cat": "E", "label": "E07 프롬비하인드"}, {"id": 536, "cat": "E", "label": "E08 프롬프론트"}, {"id": 541, "cat": "E", "label": "E09 닐링바디가드"}, {"id": 546, "cat": "E", "label": "E10 퍼칭"}, {"id": 551, "cat": "E", "label": "E11 리클라인드테이블로터스"}, {"id": 556, "cat": "E", "label": "E12 리버스퍼칭"}, {"id": 561, "cat": "E", "label": "E13 리버스세인트"}, {"id": 566, "cat": "E", "label": "E14 리버스테이블로터스"}, {"id": 571, "cat": "E", "label": "E15 세인트"}, {"id": 576, "cat": "E", "label": "E16 시티드캐리"}, {"id": 581, "cat": "E", "label": "E17 시팅테이블로터스"}, {"id": 586, "cat": "E", "label": "E18 스튜던츠"}, {"id": 591, "cat": "E", "label": "E19 테이블로터스"}, {"id": 596, "cat": "E", "label": "E20 트위스티드체어"}, {"id": 601, "cat": "F", "label": "F01 들박"}, {"id": 606, "cat": "F", "label": "F02 역들박"}, {"id": 611, "cat": "F", "label": "F03 풀넬슨"}, {"id": 616, "cat": "F", "label": "F04 스탠딩백"}, {"id": 621, "cat": "F", "label": "F05 스탠딩대면"}, {"id": 626, "cat": "F", "label": "F06 바디가드"}, {"id": 631, "cat": "F", "label": "F07 발레리나"}, {"id": 636, "cat": "F", "label": "F08 브라이덜캐리"}, {"id": 641, "cat": "F", "label": "F09 버틀러"}, {"id": 646, "cat": "F", "label": "F10 케이블카"}, {"id": 651, "cat": "F", "label": "F11 댄서"}, {"id": 656, "cat": "F", "label": "F12 페어리"}, {"id": 661, "cat": "F", "label": "F13 플랫폼캐리"}, {"id": 666, "cat": "F", "label": "F14 플랫폼스탠딩도기"}, {"id": 671, "cat": "F", "label": "F15 프리즌가드"}, {"id": 676, "cat": "F", "label": "F16 리어애드미럴"}, {"id": 681, "cat": "F", "label": "F17 리버스댄서"}, {"id": 686, "cat": "F", "label": "F18 스텝"}, {"id": 691, "cat": "F", "label": "F19 서스펜디드로터스"}, {"id": 701, "cat": "G", "label": "G01 파일드라이버"}, {"id": 706, "cat": "G", "label": "G02 서스펜션브릿지"}, {"id": 711, "cat": "G", "label": "G03 크랩"}, {"id": 716, "cat": "G", "label": "G04 레그글라이더"}, {"id": 721, "cat": "G", "label": "G05 휠배로우"}, {"id": 726, "cat": "G", "label": "G06 잭해머"}, {"id": 731, "cat": "G", "label": "G07 아치"}, {"id": 736, "cat": "G", "label": "G08 플로어브릿지"}, {"id": 741, "cat": "G", "label": "G09 플랫폼레그글라이더"}, {"id": 746, "cat": "G", "label": "G10 리버스잭해머"}, {"id": 751, "cat": "G", "label": "G11 리버스파일드라이버"}, {"id": 756, "cat": "G", "label": "G12 리버스서스펜션브릿지"}, {"id": 761, "cat": "G", "label": "G13 리버스휠배로우"}, {"id": 766, "cat": "G", "label": "G14 시저드레그글라이더"}, {"id": 771, "cat": "G", "label": "G15 스윙잉"}, {"id": 776, "cat": "G", "label": "G16 트라피즈"}, {"id": 781, "cat": "G", "label": "G17 언유주얼"}]
@@ -5337,8 +5373,27 @@ def _prefill_partner_defaults(cfg):
 
 
 def load_or_init_config():
+    global STARTUP_RECOVERY_NOTICE
+    STARTUP_RECOVERY_NOTICE = None
     if SETTINGS_FILE.exists():
-        cfg = load_json_recover(SETTINGS_FILE)
+        try:
+            cfg = load_json_recover(SETTINGS_FILE)
+        except json.JSONDecodeError as e:
+            # 주 파일과 `.bak`이 모두 JSON으로 읽히지 않는 경우만 구조 시작으로 전환한다.
+            # 권한·디스크 오류는 손상으로 오인해 파일을 옮기지 않고 그대로 알린다.
+            STARTUP_RECOVERY_NOTICE = quarantine_corrupt_settings(
+                SETTINGS_FILE, e)
+            log.critical(
+                "설정과 자동 백업이 모두 손상되어 원본을 보관하고 기본 설정으로 시작합니다: %s",
+                STARTUP_RECOVERY_NOTICE["folder"])
+            cfg = dict(DEFAULT_CONFIG)
+            cfg = _migrate_legacy(cfg)
+            ensure_settings_migration()
+            migrate_legacy_selections(cfg)
+            import_char_files(cfg)
+            sync_chars_to_files(cfg)
+            save_config(cfg)
+            return cfg
         merged = dict(DEFAULT_CONFIG)
         merged.update(cfg)
         ensure_settings_migration()
@@ -6827,6 +6882,7 @@ def trash_output_files(cfg, targets, keep=()):
                 + f"-{time.time_ns() % 1_000_000:06d}")
     batch_dir = trash_root / batch_id
     moved = []
+    picks = load_picks()
     for rel in targets or ():
         rel = str(rel or "").replace("\\", "/").lstrip("/")
         if not rel or rel in keep or rel.startswith(TRASH_DIR_NAME + "/"):
@@ -6841,10 +6897,30 @@ def trash_output_files(cfg, targets, keep=()):
         shutil.move(str(source), str(dest))
         moved.append({"original": rel, "trashed": dest.relative_to(root).as_posix()})
     if moved:
+        moved_paths = {item["original"] for item in moved}
+        labels = {}
+        for rel in moved_paths:
+            record = {}
+            if rel in picks.get("picked", []):
+                record["picked"] = True
+            if rel in picks.get("fav", []):
+                record["fav"] = True
+            folders = [
+                name for name, paths in picks.get("folders", {}).items()
+                if rel in paths
+            ]
+            if folders:
+                record["folders"] = folders
+            for key in ("ranks", "ratings", "tags"):
+                if rel in picks.get(key, {}):
+                    record[key] = picks[key][rel]
+            if record:
+                labels[rel] = record
         atomic_write_json(batch_dir / "manifest.json", {
             "batch_id": batch_id,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "items": moved,
+            "labels": labels,
         }, indent=2)
     return {"deleted": len(moved), "batch_id": batch_id if moved else None}
 
@@ -6861,6 +6937,7 @@ def restore_trash_batch(cfg, batch_id):
         raise FileNotFoundError("복원할 휴지통 묶음을 찾을 수 없습니다.")
     manifest = load_json_recover(manifest_path)
     restored = []
+    restored_map = {}
     for item in manifest.get("items") or []:
         source = (root / str(item.get("trashed") or "")).resolve()
         target = (root / str(item.get("original") or "")).resolve()
@@ -6875,11 +6952,80 @@ def restore_trash_batch(cfg, batch_id):
                 target = target.with_name(f"{stem}_{serial}{suffix}")
                 serial += 1
         shutil.move(str(source), str(target))
-        restored.append(target.relative_to(root).as_posix())
+        restored_rel = target.relative_to(root).as_posix()
+        restored.append(restored_rel)
+        restored_map[str(item.get("original") or "").replace("\\", "/")] = restored_rel
+    # 지울 때 함께 보관한 가상 이름표도 실제 복원 경로에 되붙인다.
+    # 경로 충돌로 `(2)`가 붙었으면 옛 원래 경로가 아니라 새 파일에 붙여야 한다.
+    labels = manifest.get("labels") or {}
+    if restored_map and isinstance(labels, dict):
+        with _JSON_IO_LOCK:
+            picks = load_picks()
+            for original, restored_rel in restored_map.items():
+                record = labels.get(original) or {}
+                # 이동 직후 프로세스가 꺼져 이름표 정리가 끝나지 못한 경우도 있다.
+                # 원래 경로의 낡은 이름표를 먼저 떼고 실제 복원된 경로로 옮긴다.
+                picks["picked"] = [x for x in picks["picked"] if x != original]
+                picks["fav"] = [x for x in picks["fav"] if x != original]
+                for paths in picks["folders"].values():
+                    paths[:] = [x for x in paths if x != original]
+                for key in ("ranks", "ratings", "tags"):
+                    picks[key].pop(original, None)
+                if record.get("picked") and restored_rel not in picks["picked"]:
+                    picks["picked"].append(restored_rel)
+                if record.get("fav") and restored_rel not in picks["fav"]:
+                    picks["fav"].append(restored_rel)
+                for name in record.get("folders") or []:
+                    paths = picks["folders"].setdefault(str(name)[:40], [])
+                    if restored_rel not in paths:
+                        paths.append(restored_rel)
+                for key in ("ranks", "ratings", "tags"):
+                    if key in record:
+                        picks[key][restored_rel] = record[key]
+            save_picks(picks)
     manifest["restored_at"] = datetime.now().isoformat(timespec="seconds")
     manifest["restored"] = restored
     atomic_write_json(manifest_path, manifest, indent=2)
     return {"restored": len(restored), "paths": restored}
+
+
+def list_trash_batches(cfg):
+    """앱을 다시 연 뒤에도 복원할 수 있도록 휴지통 묶음의 가벼운 목록만 만든다."""
+    root = out_root(cfg).resolve()
+    trash_root = (root / TRASH_DIR_NAME).resolve()
+    if not trash_root.is_dir():
+        return {"ok": True, "batches": [], "total_files": 0, "total_bytes": 0}
+    rows = []
+    for batch in sorted(trash_root.iterdir(), reverse=True):
+        manifest_path = batch / "manifest.json"
+        if not batch.is_dir() or not manifest_path.is_file():
+            continue
+        try:
+            manifest = load_json_recover(manifest_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        available, size = 0, 0
+        for item in manifest.get("items") or []:
+            path = (root / str(item.get("trashed") or "")).resolve()
+            if _path_is_inside(path, batch) and path.is_file():
+                available += 1
+                try:
+                    size += path.stat().st_size
+                except OSError:
+                    pass
+        rows.append({
+            "batch_id": str(manifest.get("batch_id") or batch.name),
+            "created_at": str(manifest.get("created_at") or ""),
+            "available": available,
+            "total": len(manifest.get("items") or []),
+            "bytes": size,
+        })
+    return {
+        "ok": True,
+        "batches": rows,
+        "total_files": sum(row["available"] for row in rows),
+        "total_bytes": sum(row["bytes"] for row in rows),
+    }
 
 
 _DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각) — CQA-002 부분 조치
@@ -7806,6 +7952,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     title="최근 생성 패널 접기 / 펴기 (Alt+])">◨</button>
 </div>
 
+<div id="startupRecovery" role="alert"
+  style="position:fixed;z-index:120;left:12px;right:12px;top:54px;padding:11px 13px;
+  border:2px solid var(--warn);border-radius:var(--radius);background:var(--card);
+  box-shadow:0 8px 28px #0005;display:none;align-items:center;gap:10px;flex-wrap:wrap;">
+  <div style="flex:1;min-width:240px;"><b>설정 손상을 안전하게 격리하고 기본 설정으로 시작했습니다.</b>
+    <div class="hint" id="startupRecoveryDetail"></div></div>
+  <button type="button" id="startupRecoveryBackup">내 자료 백업·복원 열기</button>
+  <button type="button" id="startupRecoveryClose">확인</button>
+</div>
+
 <div class="app" id="app">
   <!-- ══ 왼쪽: 프롬프트 패널 ══ -->
   <div class="left"><div id="lwDrag" title="드래그로 패널 폭 조절"></div>
@@ -8094,6 +8250,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div class="pv-status" id="pvStatus">설정을 준비하고 있습니다.</div>
           <div class="bar" style="margin:8px 0 0;"><span class="n" id="pvProg">0 / 0</span>
             <span class="n" id="pvCounts"></span>
+            <span style="font-size:var(--fs-2xs);color:var(--muted);" id="pvEta">남은 시간 —</span>
             <span style="font-size:var(--fs-2xs);color:var(--muted);" id="pvDaily"></span>
             <button id="pvReturn" class="hidden">다시 실행할 화면</button></div>
           <div class="bar" id="pvSeedRow" style="margin:6px 0 0;display:none;">
@@ -8665,6 +8822,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="backupMsg" class="hint" style="margin-top:8px;"></div>
       </div>
 
+      <div class="card" id="trashCard">
+        <h2><span class="n">안전</span>생성물 휴지통
+          <button type="button" id="trashRefresh" style="margin-left:auto;">↻ 새로고침</button></h2>
+        <p class="hint">생성물 탐색기에서 치운 파일은 영구 삭제되지 않고 묶음별로 남습니다.
+        앱을 다시 연 뒤에도 원하는 묶음을 복원할 수 있으며,
+        <b>선별·즐겨찾기·후보군·순위·별점·판단 태그</b>도 함께 돌아옵니다.
+        자동 만료와 영구 비우기는 하지 않습니다.</p>
+        <div id="trashList" class="hint">휴지통을 확인하는 중입니다.</div>
+      </div>
+
       <div class="card" id="localImageCard">
         <h2><span class="n">안전</span>자료 이미지 무결성</h2>
         <p class="hint">그림체·레시피 JSON의 <code>local:</code> 참조와 실제 이미지 바이트를 맞춰 봅니다.
@@ -8852,6 +9019,21 @@ function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;',
 function escA(s){ return esc(s).replace(/"/g,'&quot;'); }
 function $(id){ return document.getElementById(id); }
 
+function showStartupRecovery(notice){
+  const bar = $('startupRecovery');
+  if(!bar || !notice) return;
+  bar.style.display = 'flex';
+  $('startupRecoveryDetail').textContent =
+    `원본 ${Number((notice.files||[]).length).toLocaleString()}개를 ${notice.folder || '복구보관 폴더'}에 보존했습니다.`
+    + ' 아무 자료도 영구 삭제하지 않았습니다.';
+  $('startupRecoveryClose').addEventListener('click', () => bar.style.display = 'none');
+  $('startupRecoveryBackup').addEventListener('click', () => {
+    bar.style.display = 'none';
+    setMode('system');
+    setTimeout(() => $('backupCard') && $('backupCard').scrollIntoView({behavior:'smooth'}), 0);
+  });
+}
+
 async function init(){
   const d = await (await fetch('/api/config')).json();
   STATE = d.config;
@@ -8864,6 +9046,7 @@ async function init(){
   FRAGS = d.fragments || {};
   CLASHES = d.scene_clashes || {};
   SCENES = d.scenes || [];
+  showStartupRecovery(d.startup_recovery);
   paint();
   bindTagSearch(document);
 }
@@ -8894,7 +9077,7 @@ function paint(){
   $('pVariety').value = STATE.variety ? 'on' : 'off';
   paintParams();
   renderPresets(); renderSlots(); renderSettings(); renderLibrary(); renderScenePresets();
-  bindComparison(); bindUserBackup(); bindLocalImageIntegrity();
+  bindComparison(); bindUserBackup(); bindTrashCenter(); bindLocalImageIntegrity();
   renderFrags(); renderScenes(); applySplit3(); paintPace(); acScan(document);
   sbPickList(); paintClash();
   if($('expGrid')) expLoad('');
@@ -9216,6 +9399,51 @@ function bindUserBackup(){
       setTimeout(() => location.reload(), 700);
     }
   });
+}
+
+/* ── 생성물 휴지통 센터 ───────────────────────────────────────────── */
+async function trashCenterLoad(){
+  const box = $('trashList');
+  if(!box) return;
+  box.textContent = '휴지통 묶음을 확인하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/trash', {cache:'no-store'})).json();
+    if(!r.ok){ box.textContent = r.error || '휴지통 확인 실패'; return; }
+    const rows = r.batches || [];
+    if(!rows.length){
+      box.innerHTML = '<span class="n">휴지통이 비어 있습니다.</span>';
+      return;
+    }
+    box.innerHTML = `<div class="bar" style="margin-bottom:7px;">
+      <b>${Number(r.total_files||0).toLocaleString()}개 복원 가능</b>
+      <span>${(Number(r.total_bytes||0)/1048576).toFixed(1)}MB</span></div>`
+      + rows.map(row => `<div class="row" style="display:flex;align-items:center;gap:8px;">
+        <div style="flex:1;min-width:0;"><b>${esc(row.created_at || row.batch_id)}</b>
+          <div class="hint">${Number(row.available||0).toLocaleString()} / ${Number(row.total||0).toLocaleString()}개 남음
+          · ${(Number(row.bytes||0)/1048576).toFixed(1)}MB</div></div>
+        <button type="button" data-trash-restore="${escA(row.batch_id)}"
+          ${Number(row.available||0) ? '' : 'disabled'}>↶ 이 묶음 복원</button></div>`).join('');
+  }catch(e){
+    box.textContent = '휴지통 확인 실패: ' + e;
+  }
+}
+function bindTrashCenter(){
+  if(!$('trashCard') || $('trashCard')._bound) return;
+  $('trashCard')._bound = true;
+  $('trashRefresh').addEventListener('click', trashCenterLoad);
+  $('trashList').addEventListener('click', async event => {
+    const button = event.target.closest('[data-trash-restore]');
+    if(!button || button.disabled) return;
+    if(!confirm('이 묶음을 원래 위치로 복원할까요?\\n같은 이름의 새 파일은 덮어쓰지 않습니다.')) return;
+    button.disabled = true;
+    const r = await (await fetch('/api/picks_restore', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({batch_id:button.dataset.trashRestore})})).json();
+    if(!r.ok) alert(r.error || '복원 실패');
+    else if($('expGrid')) await expLoad(EXP.dir || '');
+    await trashCenterLoad();
+  });
+  trashCenterLoad();
 }
 
 /* ── 자료 이미지 무결성 ────────────────────────────────────────────── */
@@ -14284,6 +14512,12 @@ const LIVE_PHASE_LABEL = {
   idle:'대기', running:'진행 중', stopping:'중지 중', completed:'완료',
   partial:'일부 실패', failed:'실패', stopped:'중지됨'
 };
+function compactDuration(seconds){
+  const n = Math.max(0, Math.round(Number(seconds) || 0));
+  if(n < 60) return `${n}초`;
+  const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60);
+  return h ? `${h}시간 ${m}분` : `${m}분`;
+}
 if($('pvReturn')) $('pvReturn').addEventListener('click', () => {
   const mode = LAST_LIVE_STATUS && LAST_LIVE_STATUS.retry_mode;
   setMode(['preview','settings','builder','library','system'].includes(mode) ? mode : 'preview');
@@ -14300,6 +14534,12 @@ async function poll(){
     $('pvProg').textContent = `${s.index} / ${s.total}`;
     $('pvCounts').textContent = `성공 ${s.completed || 0} · 실패 ${s.failed || 0}`
       + (s.retry_count ? ` · 자동 재시도 ${s.retry_count}` : '');
+    $('pvEta').textContent = s.running
+      ? (s.eta_seconds == null
+          ? `남은 시간 계산 중${s.elapsed_seconds ? ` · 경과 ${compactDuration(s.elapsed_seconds)}` : ''}`
+          : `약 ${compactDuration(s.eta_seconds)} 남음 · 경과 ${compactDuration(s.elapsed_seconds)}`)
+      : (s.phase === 'completed' && s.elapsed_seconds
+          ? `걸린 시간 ${compactDuration(s.elapsed_seconds)}` : '남은 시간 —');
     $('pvDaily').textContent = `오늘 ${s.daily} / ${s.daily_cap}`;
     $('pvReturn').classList.toggle('hidden', !s.can_retry || !!s.running);
     $('pvBar').style.width = (s.total ? Math.round(s.index/s.total*100) : 0) + '%';
@@ -14627,6 +14867,7 @@ class LiveState:
         self.retry_mode = "preview"
         self.started_at = 0.0
         self.finished_at = 0.0
+        self.eta_base_completed = 0
 
     def update(self, **kwargs):
         with self.lock:
@@ -14662,6 +14903,7 @@ class LiveState:
             self.retry_mode = str(retry_mode or "preview")
             self.started_at = time.time()
             self.finished_at = 0.0
+            self.eta_base_completed = 0
             return self._owner
 
     def release(self, token):
@@ -14708,6 +14950,16 @@ class LiveState:
 
     def snapshot(self):
         with self.lock:
+            end = (time.time() if self.running else
+                   (self.finished_at or self.started_at or 0.0))
+            elapsed = max(0.0, end - self.started_at) if self.started_at else 0.0
+            run_done = max(0, int(self.completed) - int(self.eta_base_completed))
+            remaining = max(0, int(self.total) - int(self.completed))
+            eta = None
+            if self.running and run_done > 0 and remaining > 0:
+                eta = elapsed / run_done * remaining
+            elif self.phase == "completed" and self.total:
+                eta = 0.0
             return {
                 "filename": self.filename, "char_name": self.char_name,
                 "index": self.index, "total": self.total,
@@ -14725,6 +14977,9 @@ class LiveState:
                 "retry_mode": self.retry_mode,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
+                "elapsed_seconds": round(elapsed, 1),
+                "eta_seconds": round(eta, 1) if eta is not None else None,
+                "eta_samples": run_done,
             }
 
     def image(self):
@@ -14818,6 +15073,7 @@ class ConfigServer:
             "styles": list_styles(self.spec),
             "builder": load_builder(),
             "scene_presets": list_scene_presets(),
+            "startup_recovery": STARTUP_RECOVERY_NOTICE,
         }
 
     def handle_generate_one(self):
@@ -15855,6 +16111,11 @@ class ConfigServer:
                     self.wfile.write(data)
                 elif self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
+                elif self.path.startswith("/api/trash"):
+                    try:
+                        self._json(list_trash_batches(server.cfg))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/refimg"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
@@ -17351,7 +17612,8 @@ def _run_comparison(server, cfg, plan, styles, chars):
     server.live.update(
         index=done_n, total=plan["count"], char_name=plan["mode_label"],
         filename="", status_text=(f"자료 비교 생성 준비 중 — {done_n:,}/{plan['count']:,}"),
-        daily=daily_count(state), daily_cap=pace(cfg)["daily_cap"])
+        daily=daily_count(state), daily_cap=pace(cfg)["daily_cap"],
+        completed=done_n, eta_base_completed=done_n)
 
     final_status = "complete"
     fatal = False

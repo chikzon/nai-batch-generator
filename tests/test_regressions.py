@@ -1010,6 +1010,68 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(stopped["phase"], "stopped")
         self.assertTrue(stopped["can_retry"])
 
+    def test_live_state_eta_uses_only_work_completed_in_this_run(self):
+        live = APP.LiveState()
+        with patch.object(APP.time, "time", return_value=100.0):
+            token = live.try_claim("이어 하는 비교", "library")
+        live.update(
+            total=10, completed=7, eta_base_completed=5,
+            index=8,
+        )
+        with patch.object(APP.time, "time", return_value=120.0):
+            snap = live.snapshot()
+        self.assertEqual(snap["elapsed_seconds"], 20.0)
+        self.assertEqual(snap["eta_samples"], 2)
+        self.assertEqual(snap["eta_seconds"], 30.0)
+
+        # 성공 표본이 생기기 전에는 숫자를 꾸며내지 않는다.
+        live.update(completed=5, eta_base_completed=5)
+        with patch.object(APP.time, "time", return_value=130.0):
+            self.assertIsNone(live.snapshot()["eta_seconds"])
+        with patch.object(APP.time, "time", return_value=140.0):
+            live.update(completed=10, phase="completed")
+            live.release(token)
+        self.assertEqual(live.snapshot()["eta_seconds"], 0.0)
+        self.assertIn('id="pvEta"', APP.PAGE_TEMPLATE)
+        self.assertIn("남은 시간 계산 중", APP.PAGE_TEMPLATE)
+
+    def test_corrupt_settings_and_backup_are_quarantined_before_safe_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = root / "설정.json"
+            backup = root / "설정.json.bak"
+            settings.write_bytes(b"{broken-primary")
+            backup.write_bytes(b"{broken-backup")
+
+            def save_fixture(cfg):
+                APP.atomic_write_json(settings, cfg, keep_backup=False)
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", settings),
+                patch.object(APP, "_migrate_legacy", side_effect=lambda cfg: cfg),
+                patch.object(APP, "ensure_settings_migration", return_value=None),
+                patch.object(APP, "migrate_legacy_selections", return_value=None),
+                patch.object(APP, "import_char_files", return_value=None),
+                patch.object(APP, "sync_chars_to_files", return_value=None),
+                patch.object(APP, "save_config", side_effect=save_fixture),
+                patch.object(APP, "STARTUP_RECOVERY_NOTICE", None),
+            ):
+                cfg = APP.load_or_init_config()
+                notice = APP.STARTUP_RECOVERY_NOTICE
+                self.assertEqual(cfg["base_prompt"], APP.DEFAULT_CONFIG["base_prompt"])
+                self.assertIsNotNone(notice)
+                kept = Path(notice["folder"])
+                self.assertEqual((kept / "설정.json").read_bytes(), b"{broken-primary")
+                self.assertEqual(
+                    (kept / "설정.json.bak").read_bytes(), b"{broken-backup")
+                self.assertEqual(
+                    json.loads(settings.read_text(encoding="utf-8"))["token"], "")
+                self.assertTrue((kept / "복구기록.json").is_file())
+
+        self.assertIn('id="startupRecovery"', APP.PAGE_TEMPLATE)
+        self.assertIn("startup_recovery", APP.ConfigServer(
+            copy.deepcopy(APP.DEFAULT_CONFIG)).snapshot_config())
+
     def test_single_generation_failure_is_visible_without_paid_network(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["token"] = "pst-fixture"
@@ -1946,6 +2008,7 @@ class RegressionTests(unittest.TestCase):
     def test_output_delete_moves_to_recoverable_trash_and_restores_without_overwrite(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "output"
+            picks_file = Path(td) / "선별.json"
             source = root / "단독" / "one.png"
             outside = Path(td) / "outside.png"
             source.parent.mkdir(parents=True)
@@ -1953,24 +2016,72 @@ class RegressionTests(unittest.TestCase):
             outside.write_bytes(b"outside")
             cfg = {"out_dir": str(root)}
 
-            result = APP.trash_output_files(
-                cfg, ["단독/one.png", "../outside.png"])
-            self.assertEqual(result["deleted"], 1)
-            self.assertFalse(source.exists())
-            self.assertEqual(outside.read_bytes(), b"outside")
-            listing = APP.list_output("", cfg)
-            self.assertNotIn(
-                APP.TRASH_DIR_NAME, [item["name"] for item in listing["dirs"]])
-            self.assertFalse(
-                APP.list_output(APP.TRASH_DIR_NAME, cfg)["ok"])
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                result = APP.trash_output_files(
+                    cfg, ["단독/one.png", "../outside.png"])
+                self.assertEqual(result["deleted"], 1)
+                self.assertFalse(source.exists())
+                self.assertEqual(outside.read_bytes(), b"outside")
+                listing = APP.list_output("", cfg)
+                self.assertNotIn(
+                    APP.TRASH_DIR_NAME, [item["name"] for item in listing["dirs"]])
+                self.assertFalse(
+                    APP.list_output(APP.TRASH_DIR_NAME, cfg)["ok"])
 
-            # 같은 이름이 다시 생겨도 복원 파일로 덮어쓰지 않는다.
-            source.write_bytes(b"new")
-            restored = APP.restore_trash_batch(cfg, result["batch_id"])
-            self.assertEqual(restored["restored"], 1)
-            self.assertEqual(source.read_bytes(), b"new")
-            restored_path = root / restored["paths"][0]
-            self.assertEqual(restored_path.read_bytes(), b"old")
+                # 같은 이름이 다시 생겨도 복원 파일로 덮어쓰지 않는다.
+                source.write_bytes(b"new")
+                restored = APP.restore_trash_batch(cfg, result["batch_id"])
+                self.assertEqual(restored["restored"], 1)
+                self.assertEqual(source.read_bytes(), b"new")
+                restored_path = root / restored["paths"][0]
+                self.assertEqual(restored_path.read_bytes(), b"old")
+
+    def test_trash_center_restores_all_virtual_labels_after_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            picks_file = Path(td) / "선별.json"
+            first = root / "단독" / "one.png"
+            second = root / "단독" / "two.png"
+            first.parent.mkdir(parents=True)
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            cfg = {"out_dir": str(root)}
+            APP.atomic_write_json(picks_file, {
+                "picked": ["단독/one.png"], "fav": ["단독/one.png"],
+                "folders": {"좋은 후보": ["단독/one.png"]},
+                "ranks": {"단독/one.png": 1},
+                "ratings": {"단독/one.png": 5},
+                "tags": {"단독/one.png": ["구도", "색"]},
+            })
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                one = APP.trash_output_files(cfg, ["단독/one.png"])
+                two = APP.trash_output_files(cfg, ["단독/two.png"])
+                batches = APP.list_trash_batches(cfg)
+                self.assertEqual(batches["total_files"], 2)
+                self.assertEqual(len(batches["batches"]), 2)
+
+                # 앱 재시작 뒤 같은 자리에 새 파일이 생긴 경우를 모사한다.
+                first.write_bytes(b"new")
+                restored = APP.restore_trash_batch(cfg, one["batch_id"])
+                self.assertEqual(restored["restored"], 1)
+                restored_rel = restored["paths"][0]
+                self.assertNotEqual(restored_rel, "단독/one.png")
+                picks = APP.load_picks()
+                self.assertNotIn("단독/one.png", picks["picked"])
+                self.assertNotIn("단독/one.png", picks["fav"])
+                self.assertIn(restored_rel, picks["picked"])
+                self.assertIn(restored_rel, picks["fav"])
+                self.assertIn(restored_rel, picks["folders"]["좋은 후보"])
+                self.assertEqual(picks["ranks"][restored_rel], 1)
+                self.assertEqual(picks["ratings"][restored_rel], 5)
+                self.assertEqual(picks["tags"][restored_rel], ["구도", "색"])
+                self.assertEqual(APP.list_trash_batches(cfg)["total_files"], 1)
+                self.assertEqual(
+                    APP.restore_trash_batch(cfg, two["batch_id"])["restored"], 1)
+
+        self.assertIn('id="trashCard"', APP.PAGE_TEMPLATE)
+        self.assertIn("fetch('/api/trash'", APP.PAGE_TEMPLATE)
+        self.assertIn("자동 만료와 영구 비우기는 하지 않습니다.", APP.PAGE_TEMPLATE)
 
     def test_style_restore_keeps_conflicting_deleted_data_in_trash(self):
         """같은 id가 다시 생겨도 새 자료를 덮거나 옛 자료를 휴지통에서 잃지 않는다."""
