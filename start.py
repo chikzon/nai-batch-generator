@@ -29,12 +29,14 @@ import shutil
 import string
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import webbrowser
 import zipfile
 import zlib
+from contextlib import contextmanager
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -388,6 +390,92 @@ def diagnostic_event_line(event):
 # JSON 설정/재개 상태는 자동저장과 생성 worker가 동시에 만질 수 있다.
 # 같은 디렉터리의 임시 파일을 fsync한 뒤 os.replace해야 중간 종료에도 반쪽 JSON이 남지 않는다.
 _JSON_IO_LOCK = threading.RLock()
+_SHARED_DATA_THREAD_LOCK = threading.RLock()
+_SHARED_DATA_LOCAL = threading.local()
+
+
+@contextmanager
+def shared_data_transaction(root, timeout=15.0):
+    """프로필·실행본 둘이 같은 사용자 자료를 고칠 때 한 판씩 처리한다.
+
+    원자 교체만으로는 두 프로세스가 같은 옛 파일을 읽고 각자 쓴 뒤 한쪽 변경을
+    잃는 read-modify-write 경쟁을 막지 못한다. 사용자 자료 경로의 지문으로 TEMP에
+    1바이트 잠금 파일을 두고, 자료를 다시 읽는 시점부터 기록까지를 한 트랜잭션으로
+    묶는다. 같은 스레드의 중첩 호출은 재진입시킨다.
+    """
+    root = Path(root).resolve()
+    # 잠금은 사용자 자료도 프로그램 본체도 아니다. 자료 폴더 안에 두면 개발 트리에
+    # 보이거나 자료팩 인벤토리에 섞이므로, 경로 지문으로 TEMP의 공용 잠금만 가리킨다.
+    lock_home = Path(tempfile.gettempdir()) / "nais-data-locks"
+    lock_path = lock_home / (
+        hashlib.sha256(os.path.normcase(str(root)).encode("utf-8")).hexdigest()
+        + ".lock")
+    with _SHARED_DATA_THREAD_LOCK:
+        held = getattr(_SHARED_DATA_LOCAL, "held", {})
+        key = str(lock_path)
+        if key in held:
+            held[key] += 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+            return
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        acquired = False
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            while not acquired:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except (OSError, BlockingIOError):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "다른 실행본이 사용자 자료를 저장 중입니다. 잠시 후 다시 시도하세요.")
+                    time.sleep(0.05)
+            held[key] = 1
+            _SHARED_DATA_LOCAL.held = held
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+        finally:
+            if acquired:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+
+
+def serialized_data_write(root_getter):
+    """공유 자료를 고치는 공개 진입점을 프로세스 간 직렬화한다."""
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            with shared_data_transaction(root_getter()):
+                return func(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def _atomic_write_bytes(path, payload, keep_backup=True):
@@ -1299,7 +1387,8 @@ def prepare_vibes(cfg, token):
         strengths.append(float(v.get("strength", 0.6)))
         ies.append(ie)
     if changed:
-        save_config(cfg)          # 캐시 상태를 남겨 다음엔 공짜로 쓴다
+        with shared_data_transaction(VIBE_DIR.parent.parent):
+            save_config(cfg)      # 캐시 상태를 남겨 다음엔 공짜로 쓴다
     return encoded, strengths, ies, newly
 
 
@@ -2166,9 +2255,13 @@ def load_combos():
     return _COMBOS["rows"]
 
 
+@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def add_style(rec):
     """새 그림체를 라이브러리에 넣고 파일에 저장 (이미지 추출 결과 등)."""
     with _STYLE_TX_LOCK:
+        # 다른 실행본이 먼저 저장했을 수 있으므로 프로세스 잠금을 얻은 뒤 캐시가
+        # 아니라 디스크 최신판에서 시작한다.
+        forget_collection_caches()
         rows = list(load_combos())
         key = " ".join(sorted((a or "").lower() for a in rec.get("artists", [])))
         p = rec.get("params") or {}
@@ -2213,6 +2306,7 @@ def _write_styles_raw(rows):
     forget_collection_caches()
 
 
+@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def delete_styles(ids):
     """고른 그림체를 지운다 → 지운그림체.json 으로 옮긴다."""
     with _STYLE_TX_LOCK:
@@ -2247,6 +2341,7 @@ def _delete_styles_locked(ids):
     return {"ok": True, "지움": len(gone), "남음": len(keep), "되살릴수있음": len(old)}
 
 
+@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def restore_styles(ids=None):
     """지운 것을 되살린다. ids 가 없으면 **가장 최근에 지운 묶음** 전부."""
     with _STYLE_TX_LOCK:
@@ -2367,7 +2462,7 @@ def load_ratings():
     """파일이 바뀌었으면 다시 읽는다 — 프로필을 둘 돌려도 서로의 평가를 안 잃는다."""
     with _RATINGS_LOCK:
         try:
-            mt = RATINGS_FILE.stat().st_mtime if RATINGS_FILE.exists() else 0
+            mt = RATINGS_FILE.stat().st_mtime_ns if RATINGS_FILE.exists() else 0
         except OSError:
             mt = 0
         if mt != _RATINGS["mtime"]:
@@ -2394,12 +2489,16 @@ def save_ratings(d):
         return d
 
 
+@serialized_data_write(lambda: RATINGS_FILE.parent.parent)
 def rate_artist(name, **fields):
     """작가 하나의 평가를 고친다. fields: score(0~5) · fav · block · memo"""
     key = artist_key(name)
     if not key:
         return {}
     with _RATINGS_LOCK:
+        # 프로세스 잠금을 기다린 사이 바뀐 파일을 반드시 다시 읽는다. Windows의
+        # 짧은 저장 간격에서도 놓치지 않도록 load_ratings는 mtime_ns를 쓴다.
+        _RATINGS["mtime"] = -1
         d = dict(load_ratings())      # 최신을 다시 읽어 병합 (남의 저장을 덮지 않게)
         cur = dict(d.get(key) or {})
         for k in ("score", "fav", "block", "memo"):
@@ -2810,8 +2909,9 @@ def serialized_setting_write(func):
     """
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
-        with _SETTING_TX_LOCK:
-            return func(*args, **kwargs)
+        with shared_data_transaction(SETTINGS_DIR.parent):
+            with _SETTING_TX_LOCK:
+                return func(*args, **kwargs)
     return wrapped
 
 
@@ -3500,6 +3600,7 @@ def _local_image_record_dir(batch):
     return BASE_DIR / "수집" / "이미지무결성기록" / Path(str(batch)).name
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def normalize_local_image_refs(expected_fingerprint=""):
     """참조된 옛 이름만 실제 내용 주소로 바꾼다.
 
@@ -3609,6 +3710,7 @@ def normalize_local_image_refs(expected_fingerprint=""):
         }
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def rollback_local_image_normalize(batch):
     """정규화 직후 사용자가 다시 편집한 JSON은 덮지 않고 나머지만 복원한다."""
     with _LOCAL_IMAGE_LOCK:
@@ -3894,6 +3996,7 @@ def _validate_datapack_manifest(archive):
     }
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def import_datapack_bytes(data, filename="", overwrite=False):
     """자료팩 ZIP 이든 낱개 JSON 이든 받아 자료 종류별 제자리에 넣는다.
 
@@ -4098,6 +4201,7 @@ def pack_log_brief():
             for b in reversed(load_pack_log())]
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def undo_datapack(batch_id):
     """가져온 것을 통째로 되돌린다 — **그때 새로 들어온 것만** 지운다.
     원래 갖고 있던 자료는 건드리지 않는다(열쇠를 그때 기록해 뒀다)."""
@@ -4357,6 +4461,7 @@ def preview_user_backup(blob):
             "profile": manifest.get("profile"), "excluded": manifest.get("excluded") or []}
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def restore_user_backup(blob, expected_sha=""):
     manifest, payloads, archive_sha = _read_user_backup(blob)
     if expected_sha and expected_sha != archive_sha:
@@ -4400,6 +4505,7 @@ def restore_user_backup(blob, expected_sha=""):
             "files": len(payloads)}
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def rollback_user_backup(batch_id):
     if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{6}", str(batch_id or "")):
         return {"ok": False, "error": "복원 기록 번호가 올바르지 않습니다."}
@@ -4606,6 +4712,7 @@ def list_styles(spec):
     return styles
 
 
+@serialized_data_write(lambda: STYLE_DIR.parent)
 def save_style_file(name, prompt="", groups=None, settings=None, negative=""):
     STYLE_DIR.mkdir(exist_ok=True)
     data = {"이름": name}
@@ -15252,18 +15359,23 @@ class ConfigServer:
                 return {"ok": False, "error": "이미지가 비어 있습니다."}
             name = Path(unquote(filename or "")).stem[:40] or "레퍼런스"
             VIBE_DIR.mkdir(parents=True, exist_ok=True)
-            rid = f"{kind}_{int(time.time()*1000) % 10**10}"
+            rid = f"{kind}_{int(time.time()*1000) % 10**10}-{os.urandom(3).hex()}"
             im = Image.open(io.BytesIO(body))
             if kind == "vibe":
-                p, _ = vibe_paths(rid)
-                converted = im.convert("RGB")
-                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
-                item = {"id": rid, "name": name, "enabled": True,
-                        "strength": 0.6, "info_extracted": 0.7, "encoded_ie": None}
-                self.cfg.setdefault("vibes", []).append(item)
-                save_config(self.cfg)
+                with shared_data_transaction(VIBE_DIR.parent.parent):
+                    with self.config_lock:
+                        p, _ = vibe_paths(rid)
+                        converted = im.convert("RGB")
+                        _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
+                        item = {"id": rid, "name": name, "enabled": True,
+                                "strength": 0.6, "info_extracted": 0.7,
+                                "encoded_ie": None}
+                        self.cfg.setdefault("vibes", []).append(item)
+                        save_config(self.cfg)
                 token = (self.cfg.get("token") or "").strip()
-                if token:                      # 바로 인코딩해 두면 이후로는 공짜
+                if token:
+                    # 최대 180초인 유료 인코딩 통신 중에는 다른 자료 저장을 막지 않는다.
+                    # 파일명에 난수가 있어 다른 프로필의 신규 참조와도 충돌하지 않는다.
                     try:
                         prepare_vibes(self.cfg, token)
                         item["encoded"] = True
@@ -15272,18 +15384,22 @@ class ConfigServer:
                                 "warn": f"등록은 됐지만 인코딩 실패: {e}"}
                 return {"ok": True, "item": item, "vibes": self.cfg["vibes"]}
             else:
-                p = VIBE_DIR / f"{rid}.ref.png"
-                converted = im.convert("RGB")
-                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
-                item = {"id": rid, "name": name, "enabled": True,
-                        "ref_type": "character&style", "strength": 0.6, "fidelity": 0.6}
-                self.cfg.setdefault("char_refs", []).append(item)
-                save_config(self.cfg)
+                with shared_data_transaction(VIBE_DIR.parent.parent):
+                    with self.config_lock:
+                        p = VIBE_DIR / f"{rid}.ref.png"
+                        converted = im.convert("RGB")
+                        _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
+                        item = {"id": rid, "name": name, "enabled": True,
+                                "ref_type": "character&style", "strength": 0.6,
+                                "fidelity": 0.6}
+                        self.cfg.setdefault("char_refs", []).append(item)
+                        save_config(self.cfg)
                 return {"ok": True, "item": item, "char_refs": self.cfg["char_refs"]}
         except Exception as e:
             log.warning(f"레퍼런스 추가 실패: {traceback.format_exc()}")
             return {"ok": False, "error": str(e)}
 
+    @serialized_data_write(lambda: VIBE_DIR.parent.parent)
     def handle_ref_save(self, body):
         """목록 갱신(강도·정보추출·켜기/끄기·삭제)."""
         try:
@@ -15360,6 +15476,7 @@ class ConfigServer:
             log.warning(f"디렉터 툴 실패: {traceback.format_exc()}")
             return {"ok": False, "error": str(e)}
 
+    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_norm_save(self, body):
         """규격화 도구 저장: type=char → 캐릭터 등록+파일, type=style → 그림체 파일"""
         try:
@@ -15397,6 +15514,7 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_save(self, body):
         try:
             data = json.loads(body)
@@ -15500,7 +15618,7 @@ class ConfigServer:
         self.start_event.set()
         return {"ok": True}
 
-    def start(self):
+    def start(self, open_browser=True):
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -16436,10 +16554,11 @@ class ConfigServer:
             threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
             self.url = f"http://127.0.0.1:{port}/"
             log.info(f"🖼  설정 / 실시간 미리보기: {self.url}")
-            try:
-                webbrowser.open(self.url)
-            except Exception:
-                pass
+            if open_browser:
+                try:
+                    webbrowser.open(self.url)
+                except Exception:
+                    pass
             return self.url
         log.error("서버용 포트를 찾지 못했습니다 (8787~8796 모두 사용 중).")
         return None
@@ -16868,6 +16987,7 @@ def _style_signature(prompt, negative, settings):
     )
 
 
+@serialized_data_write(lambda: BASE_DIR)
 def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
     """선택 결과를 중복·덮어쓰기 없이 기존 그림체 또는 캐릭터 자료로 승격한다.
 
@@ -17230,7 +17350,7 @@ def main():
     cfg = load_or_init_config()
 
     server = ConfigServer(cfg)
-    url = server.start()
+    url = server.start(open_browser="--no-browser" not in sys.argv[1:])
     if not url:
         input("엔터를 누르면 종료...")
         return

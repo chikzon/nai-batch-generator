@@ -12,7 +12,10 @@ import io
 import importlib.util
 import json
 import socket
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -303,6 +306,88 @@ class RegressionTests(unittest.TestCase):
                 self.assertTrue(all(x["ok"] for x in results))
                 self.assertEqual(saved["방식"], "남녀")
                 self.assertEqual(saved["단계명"], ["도입", "완료"])
+
+    def test_two_processes_preserve_each_others_artist_ratings(self):
+        """실행본 두 개가 같은 옛 JSON을 읽어도 마지막 저장이 앞 변경을 잃지 않는다."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "수집" / "작가평가.json"
+            start = root / "start"
+            ready_a = root / "ready-a"
+            ready_b = root / "ready-b"
+            script = textwrap.dedent(
+                """
+                import importlib.util
+                import sys
+                import time
+                from pathlib import Path
+
+                source = Path(sys.argv[1])
+                target = Path(sys.argv[2])
+                artist = sys.argv[3]
+                ready = Path(sys.argv[4])
+                start = Path(sys.argv[5])
+                spec = importlib.util.spec_from_file_location(
+                    "nai_cross_process_fixture", source)
+                app = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(app)
+                app.RATINGS_FILE = target
+                app._RATINGS.update({"mtime": -1, "data": {}})
+                original_save = app.save_ratings
+
+                def deliberately_slow_save(data):
+                    time.sleep(0.25)
+                    return original_save(data)
+
+                app.save_ratings = deliberately_slow_save
+                ready.write_text("ready", encoding="utf-8")
+                deadline = time.monotonic() + 10
+                while not start.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("start barrier")
+                    time.sleep(0.01)
+                app.rate_artist(artist, score=5)
+                """
+            )
+            command = [
+                sys.executable, "-c", script, str(ROOT / "start.py"),
+                str(target),
+            ]
+            a = subprocess.Popen(
+                command + ["artist a", str(ready_a), str(start)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            b = subprocess.Popen(
+                command + ["artist b", str(ready_b), str(start)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 15
+            while not (ready_a.exists() and ready_b.exists()):
+                if time.monotonic() >= deadline:
+                    a.kill()
+                    b.kill()
+                    self.fail("두 시험 프로세스가 준비되지 않았습니다.")
+                time.sleep(0.02)
+            start.write_text("go", encoding="utf-8")
+            out_a, err_a = a.communicate(timeout=15)
+            out_b, err_b = b.communicate(timeout=15)
+            self.assertEqual(a.returncode, 0, out_a + err_a)
+            self.assertEqual(b.returncode, 0, out_b + err_b)
+            saved = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(set(saved), {"artist a", "artist b"})
+            self.assertEqual(saved["artist a"]["score"], 5)
+            self.assertEqual(saved["artist b"]["score"], 5)
+
+    def test_server_can_start_without_opening_a_browser(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        server = APP.ConfigServer(cfg)
+        with patch.object(APP.webbrowser, "open") as opened:
+            url = server.start(open_browser=False)
+        try:
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            opened.assert_not_called()
+        finally:
+            if server.httpd:
+                server.httpd.shutdown()
+                server.httpd.server_close()
 
     def test_generated_image_is_published_only_after_complete_encoding(self):
         with tempfile.TemporaryDirectory() as td:
