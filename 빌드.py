@@ -238,22 +238,29 @@ def copy_assets(app_dir: Path) -> tuple[list[str], list[str]]:
     return put, miss
 
 
-def build_data_pack(out_dir: Path) -> Path:
-    """기본 후보·태그·세팅을 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다."""
+def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
+    """기본 후보·태그·세팅을 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다.
+
+    `src_root` 는 자료를 읽어올 자리다. 기본은 저장소 폴더(`HERE`)이므로 실제 빌드는
+    예전과 똑같이 돈다. **시험에서 가짜 자료를 넣어 부르라고 열어 뒀다** —
+    `태그/`·`t5_tokenizer.json` 은 남의 저작물이라 저장소에 없어서(`.gitignore`),
+    `HERE` 만 보면 **새로 복제한 곳에서는 자료팩이 비어 시험이 깨진다.**
+    """
+    root_dir = Path(src_root) if src_root else HERE
     target = out_dir / DATA_PACK_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     payloads: dict[str, bytes] = {}
     for name in DATA_PACK_ASSETS:
-        src = HERE / name
+        src = root_dir / name
         if src.is_file():
             payloads[name] = src.read_bytes()
     for name in DATA_PACK_DIRS:
-        root = HERE / name
+        root = root_dir / name
         if not root.is_dir():
             continue
         for src in sorted(root.rglob("*")):
             if src.is_file() and "__pycache__" not in src.parts:
-                payloads[src.relative_to(HERE).as_posix()] = src.read_bytes()
+                payloads[src.relative_to(root_dir).as_posix()] = src.read_bytes()
     entries = [{
         "path": name,
         "size": len(raw),

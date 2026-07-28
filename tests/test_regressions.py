@@ -684,8 +684,23 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertEqual(set(BUILD.DATA_PACK_DIRS), {"태그", "세팅"})
 
+        # ⚠ 자료를 **시험용으로 만들어 넣고** 부른다. `태그/`·`t5_tokenizer.json` 은
+        #    남의 저작물이라 저장소에 없어서(`.gitignore`), 내 폴더의 실제 파일에
+        #    기대면 **새로 복제한 곳·CI 에서는 자료팩이 비어 여기가 깨진다**
+        #    (실제로 공개본에서 이 한 개가 실패했다).
         with tempfile.TemporaryDirectory() as td:
-            pack = BUILD.build_data_pack(Path(td))
+            fake = Path(td) / "자료원본"
+            for name in BUILD.DATA_PACK_ASSETS:
+                (fake / name).parent.mkdir(parents=True, exist_ok=True)
+                (fake / name).write_text("{}", encoding="utf-8")
+            (fake / "태그").mkdir(parents=True, exist_ok=True)
+            (fake / "태그" / "danbooru.csv").write_text(
+                "1girl,0,100\n", encoding="utf-8")
+            (fake / "세팅").mkdir(parents=True, exist_ok=True)
+            (fake / "세팅" / "체위.json").write_text(
+                json.dumps({"이름": "체위", "씬": {}}, ensure_ascii=False),
+                encoding="utf-8")
+            pack = BUILD.build_data_pack(Path(td), src_root=fake)
             with zipfile.ZipFile(pack) as archive:
                 names = set(archive.namelist())
                 manifest = json.loads(archive.read("manifest.json"))
