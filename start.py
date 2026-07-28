@@ -2939,6 +2939,74 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
             "images": list(style.get("images") or [])[:1],
             "ref": compact,
         })
+    for index, recipe in enumerate(load_recipes()):
+        if not isinstance(recipe, dict):
+            continue
+        compact = {
+            key: copy.deepcopy(recipe[key])
+            for key in (
+                "id", "title", "axis", "concept", "concept_ko", "domain",
+                "tags", "positive", "negative", "url", "images",
+            ) if key in recipe
+        }
+        if isinstance(compact.get("images"), list):
+            compact["images"] = compact["images"][:2]
+        rows.append({
+            "id": "recipe:" + str(recipe.get("id") or index),
+            "kind": "레시피", "store": "recipe",
+            "name": str(recipe.get("title") or recipe.get("concept_ko")
+                        or f"레시피 {index + 1}"),
+            "prompt": str(recipe.get("positive") or ""),
+            "negative": str(recipe.get("negative") or ""),
+            "source": "공유 레시피",
+            "images": list(recipe.get("images") or [])[:1],
+            "ref": compact,
+        })
+    for setting in list_settings():
+        data = setting.get("data") if isinstance(setting.get("data"), dict) else {}
+        scenes = data.get("씬") if isinstance(data.get("씬"), dict) else {}
+        scene_names = [
+            str(scene.get("name") or scene.get("이름") or "")
+            for scene in scenes.values() if isinstance(scene, dict)
+        ]
+        rows.append({
+            "id": "setting:" + str(setting.get("file") or setting.get("name")),
+            "kind": "세팅", "store": "setting",
+            "name": str(setting.get("name") or "(이름 없는 세팅)"),
+            "prompt": ", ".join(scene_names),
+            "negative": str(data.get("네거티브") or ""),
+            "source": "내 세팅",
+            "meta": {
+                "mode": str(setting.get("mode") or "단독"),
+                "scenes": len(scenes),
+                "stages": list(data.get("단계명") or []),
+                "options": list((data.get("옵션") or {}).keys())
+                if isinstance(data.get("옵션"), dict) else [],
+            },
+            "ref": {
+                "name": str(setting.get("name") or ""),
+                "file": str(setting.get("file") or ""),
+            },
+        })
+    for run in comparison_runs(cfg, limit=200).get("runs", []):
+        if not isinstance(run, dict):
+            continue
+        status = str(run.get("status") or "상태 미확인")
+        completed = int(run.get("completed") or 0)
+        total = int(run.get("total") or completed)
+        rows.append({
+            "id": "generation:" + str(run.get("folder") or run.get("name")),
+            "kind": "생성 기록", "store": "generation",
+            "name": str(run.get("mode_label") or run.get("name") or "비교 생성"),
+            "prompt": f"{status} · {completed}/{total}장",
+            "negative": "", "source": "비교 생성",
+            "meta": {
+                "status": status, "completed": completed, "total": total,
+                "updated_at": str(run.get("updated_at") or ""),
+                "resumable": bool(run.get("resumable")),
+            },
+            "ref": copy.deepcopy(run),
+        })
 
     all_sources = {}
     all_kinds = {}
@@ -2960,6 +3028,7 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
             haystack = unicodedata.normalize("NFKC", " ".join([
                 row.get("name", ""), row.get("prompt", ""), row.get("negative", ""),
                 row.get("outfit", ""), row.get("source", ""),
+                json.dumps(row.get("meta") or {}, ensure_ascii=False),
             ])).casefold()
             if not all(term in haystack for term in terms):
                 continue
@@ -9255,15 +9324,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar"><button id="booruMore" style="flex:1;display:none;">다음 쪽 ▾</button></div>
       </div>
       <div class="card">
-        <h2><span class="n">자료실</span>캐릭터 · 그림체 한곳에서 보기</h2>
-        <p class="hint">내 캐릭터·내 그림체 프리셋·이미지/자료팩/공개자료에서 가져온
-        그림체를 저장 위치와 관계없이 함께 찾습니다. 목록에는 현재 쪽만 불러와
-        자료가 수천 건이어도 긴 프롬프트와 메타데이터를 한꺼번에 그리지 않습니다.</p>
+        <h2><span class="n">자료실</span>캐릭터 · 그림체 · 레시피 · 세팅 · 생성 기록</h2>
+        <p class="hint">저장 위치가 달라도 모든 큰 묶음을 한곳에서 찾습니다.
+        캐릭터·그림체·레시피는 통째로 가져다 쓰고, 세팅은 편집기로,
+        생성 기록은 결과와 재개 화면으로 이어집니다. 현재 쪽만 불러와 자료가
+        수천 건이어도 긴 프롬프트와 메타데이터를 한꺼번에 그리지 않습니다.</p>
         <div class="filterbar">
-          <input type="search" id="libFilter" placeholder="캐릭터·그림체 이름과 프롬프트 검색">
+          <input type="search" id="libFilter" placeholder="이름·프롬프트·상태를 한 번에 검색">
           <select id="libType" style="width:auto;">
             <option value="">전체 자료</option><option value="캐릭터">캐릭터</option>
-            <option value="그림체">그림체</option>
+            <option value="그림체">그림체</option><option value="레시피">레시피</option>
+            <option value="세팅">세팅</option><option value="생성 기록">생성 기록</option>
           </select>
           <select id="libSource" style="width:auto;"><option value="">모든 출처</option></select>
           <button id="libAddChar">+ 캐릭터 추가</button>
@@ -13486,7 +13557,7 @@ async function renderLibrary(append=false){
   g.appendChild(fragment);
   LIB_OFFSET += (result.items||[]).length;
   if(!LIB_OFFSET){
-    g.innerHTML = '<div class="row hint">조건에 맞는 캐릭터·그림체가 없습니다.</div>';
+    g.innerHTML = '<div class="row hint">조건에 맞는 자료가 없습니다.</div>';
   }
   if($('libCount')) $('libCount').textContent =
     `${LIB_OFFSET.toLocaleString()} / ${Number(result.matched||0).toLocaleString()}개`
@@ -13627,6 +13698,10 @@ $('libAddFolder').addEventListener('click', () => {
   save(); alert('폴더 추가됨 (캐릭터 파일이 이 폴더로 저장됩니다)');
 });
 function openLib(it){
+  if(it.store === 'recipe'){
+    openRecipe(it.ref || {});
+    return;
+  }
   window._mm = 'lib';
   $('modalTitle').textContent = `${it.kind} · ${it.name}`;
   const b = $('modalBody'); b.innerHTML = `<div class="tag">${esc(it.source||'출처 없음')}</div>`;
@@ -13649,6 +13724,48 @@ function openLib(it){
     b.insertAdjacentHTML('beforeend', `<div class="row"><div class="tag">생성 설정</div>
       <div style="font-family:var(--mono);font-size:var(--fs-2xs);white-space:pre-wrap;">
       ${esc(Object.entries(settings).map(([k,v])=>`${k}: ${v}`).join('\n'))}</div></div>`);
+  }
+  const meta = it.meta || {};
+  if(it.store === 'setting'){
+    b.insertAdjacentHTML('beforeend', `<div class="row"><div class="tag">세팅 구성</div>
+      <div style="font-size:var(--fs-xs);">
+        방식 ${esc(meta.mode||'단독')} · 씬 ${Number(meta.scenes||0).toLocaleString()}개
+        ${meta.stages&&meta.stages.length?`<br>단계: ${esc(meta.stages.join(' → '))}`:''}
+        ${meta.options&&meta.options.length?`<br>옵션: ${esc(meta.options.join(', '))}`:''}
+      </div></div>
+      <div class="bar"><button class="primary" id="libOpenSetting">세팅 편집기로 이동</button></div>`);
+    $('libOpenSetting').addEventListener('click', () => {
+      $('modalBg').style.display = 'none';
+      STATE.ui = STATE.ui || {};
+      STATE.ui.settings_work = 'build';
+      setMode('settings');
+      arrangeStudioWorkspace();
+      sbPickList();
+      $('sbPick').value = (it.ref||{}).name || it.name;
+      sbLoad($('sbPick').value);
+      save();
+      $('settingBuilderCard').scrollIntoView({behavior:'smooth', block:'start'});
+    });
+    $('modalFlash').textContent = '';
+    $('modalBg').style.display = 'flex';
+    return;
+  }
+  if(it.store === 'generation'){
+    b.insertAdjacentHTML('beforeend', `<div class="row"><div class="tag">생성 상태</div>
+      <div style="font-size:var(--fs-xs);">
+        ${esc(meta.status||'상태 미확인')} · ${Number(meta.completed||0).toLocaleString()}
+        / ${Number(meta.total||0).toLocaleString()}장
+        ${meta.updated_at?`<br>최근 기록: ${esc(meta.updated_at)}`:''}
+        ${meta.resumable?'<br>중단 지점에서 이어서 생성할 수 있습니다.':''}
+      </div></div>
+      <div class="bar"><button class="primary" id="libOpenGeneration">결과와 생성 기록 열기</button></div>`);
+    $('libOpenGeneration').addEventListener('click', async () => {
+      $('modalBg').style.display = 'none';
+      await openComparisonFolder((it.ref||{}).folder || '', '선택한 생성 기록을 열었습니다.');
+    });
+    $('modalFlash').textContent = '';
+    $('modalBg').style.display = 'flex';
+    return;
   }
   const sourceUrl = it.ref && it.ref.url;
   b.insertAdjacentHTML('beforeend', `<div class="bar"><button class="primary" id="libTake">

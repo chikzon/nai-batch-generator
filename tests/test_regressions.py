@@ -2873,6 +2873,11 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("limit=${LIB_PAGE_SIZE}&offset=${LIB_OFFSET}", page)
         self.assertIn("LIB_OFFSET += (result.items||[]).length", page)
         self.assertIn("LIB_OFFSET < Number(result.matched||0)", page)
+        for kind in ("레시피", "세팅", "생성 기록"):
+            self.assertIn(f'<option value="{kind}">{kind}</option>', page)
+        self.assertIn("if(it.store === 'recipe')", page)
+        self.assertIn("STATE.ui.settings_work = 'build'", page)
+        self.assertIn("openComparisonFolder((it.ref||{}).folder", page)
         # 캐릭터 편집 목록도 화면에 한꺼번에 만들지 않는다.
         self.assertIn("filtered.slice(0, CHAR_EDIT_LIMIT)", page)
         self.assertIn("CHAR_EDIT_LIMIT += 24", page)
@@ -4254,13 +4259,38 @@ class RegressionTests(unittest.TestCase):
                     patch.object(APP, "STYLE_DIR", style_dir),
                     patch.object(APP, "STYLE_FILE", style_file),
                     patch.object(APP, "COMBO_FILE", base / "수집" / "작가조합.json"),
+                    patch.object(APP, "load_recipes", return_value=[{
+                        "id": "recipe-1", "title": "공유 레시피 하나",
+                        "axis": "pose", "positive": "recipe whole positive",
+                        "negative": "recipe whole negative",
+                        "tags": ["pose tag"], "images": ["https://example/one.webp"],
+                    }]),
+                    patch.object(APP, "list_settings", return_value=[{
+                        "file": "시험 세팅.json", "name": "시험 세팅", "mode": "다인",
+                        "data": {
+                            "단계명": ["시작", "끝"],
+                            "옵션": {"시간": {"낮": "day"}},
+                            "씬": {
+                                "101": {"name": "장면 시작"},
+                                "102": {"name": "장면 끝"},
+                            },
+                        },
+                    }]),
+                    patch.object(APP, "comparison_runs", return_value={"ok": True, "runs": [{
+                        "folder": "비교생성/run-1", "name": "run-1",
+                        "mode_label": "그림체 전체 비교", "status": "stopped",
+                        "completed": 3, "total": 10, "resumable": True,
+                    }]}),
                 ):
                     APP._COMBOS.update({"loaded": False, "rows": []})
                     page = APP.search_library(
                         cfg, {"그림체_그룹": []}, limit=100, offset=0)
-                    self.assertEqual(page["total"], 252)
+                    self.assertEqual(page["total"], 255)
                     self.assertEqual(len(page["items"]), 100)
-                    self.assertEqual(page["kinds"], {"캐릭터": 1, "그림체": 251})
+                    self.assertEqual(page["kinds"], {
+                        "캐릭터": 1, "그림체": 251, "레시피": 1,
+                        "세팅": 1, "생성 기록": 1,
+                    })
                     self.assertNotIn(
                         "metadata_raw",
                         json.dumps(page["items"], ensure_ascii=False))
@@ -4281,6 +4311,20 @@ class RegressionTests(unittest.TestCase):
                     self.assertEqual(
                         character["items"][0]["ref"]["negative"],
                         "character whole negative")
+
+                    recipe = APP.search_library(
+                        cfg, {"그림체_그룹": []}, q="recipe", kind="레시피")
+                    self.assertEqual(recipe["matched"], 1)
+                    self.assertEqual(
+                        recipe["items"][0]["negative"], "recipe whole negative")
+                    setting = APP.search_library(
+                        cfg, {"그림체_그룹": []}, q="장면 끝", kind="세팅")
+                    self.assertEqual(setting["matched"], 1)
+                    self.assertEqual(setting["items"][0]["meta"]["scenes"], 2)
+                    generation = APP.search_library(
+                        cfg, {"그림체_그룹": []}, q="stopped", kind="생성 기록")
+                    self.assertEqual(generation["matched"], 1)
+                    self.assertTrue(generation["items"][0]["meta"]["resumable"])
             finally:
                 APP._COMBOS.clear()
                 APP._COMBOS.update(old_cache)
