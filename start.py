@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import webbrowser
 import zipfile
@@ -2870,6 +2871,105 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
             "sources": tally("source", "도랑"), "tabs": tally("tab"),
             "seeded": sum(1 for r in rows if (r.get("params") or {}).get("seed")),
             "items": items, "offset": offset}
+
+
+def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
+    """입력 경로와 저장 위치가 다른 큰 묶음을 한 자료실 규격으로 검색한다.
+
+    전체 레코드는 서버 안에서만 검색하고 현재 페이지의 적용 필드만 보낸다. 수천 건의
+    긴 프롬프트·raw metadata를 브라우저 STATE에 복제하지 않아 자료 탭을 여는 비용이
+    자료 수에 비례해 폭증하지 않는다.
+    """
+    try:
+        limit = max(1, min(200, int(limit)))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        limit, offset = 100, 0
+    rows = []
+    for char in (cfg or {}).get("characters", []):
+        if not isinstance(char, dict):
+            continue
+        name = str(char.get("name") or "(무명)")
+        rows.append({
+            "id": "character:" + str(char.get("id") or name),
+            "kind": "캐릭터", "store": "character", "name": name,
+            "prompt": str(char.get("female") or ""),
+            "negative": str(char.get("negative") or ""),
+            "outfit": str(char.get("clothed") or ""),
+            "source": str(char.get("source") or "내 캐릭터"),
+            "groups": char.get("groups") if isinstance(char.get("groups"), dict) else {},
+            "ref": {
+                key: copy.deepcopy(char.get(key))
+                for key in (
+                    "id", "name", "female", "clothed", "negative", "groups",
+                    "source", "folder_id", "subfolder_id",
+                ) if key in char
+            },
+        })
+    for index, style in enumerate(list_styles(spec or {})):
+        name = str(style.get("name") or f"그림체 {index + 1}")
+        rows.append({
+            "id": "preset:" + name, "kind": "그림체", "store": "preset",
+            "name": name, "prompt": str(style.get("prompt") or ""),
+            "negative": str(style.get("negative") or ""),
+            "source": "내 프리셋", "settings": copy.deepcopy(style.get("settings") or {}),
+            "images": [], "ref": copy.deepcopy(style),
+        })
+    card_fields = (
+        "id", "title", "source", "tab", "posted_at", "recommend", "views",
+        "url", "count", "combo", "artists", "base", "negative",
+        "negative_full", "params", "images",
+    )
+    for index, style in enumerate(load_combos()):
+        if not isinstance(style, dict):
+            continue
+        compact = {key: copy.deepcopy(style[key]) for key in card_fields if key in style}
+        if isinstance(compact.get("images"), list):
+            compact["images"] = compact["images"][:1]
+        name = str(
+            style.get("title") or style.get("combo")
+            or f"수집 그림체 {index + 1}")
+        rows.append({
+            "id": "collected:" + str(style.get("id") or index),
+            "kind": "그림체", "store": "collected", "name": name,
+            "prompt": str(style.get("base") or style.get("combo") or ""),
+            "negative": str(style.get("negative") or ""),
+            "source": str(style.get("source") or "수집 자료"),
+            "settings": copy.deepcopy(style.get("params") or {}),
+            "images": list(style.get("images") or [])[:1],
+            "ref": compact,
+        })
+
+    all_sources = {}
+    all_kinds = {}
+    for row in rows:
+        all_sources[row["source"]] = all_sources.get(row["source"], 0) + 1
+        all_kinds[row["kind"]] = all_kinds.get(row["kind"], 0) + 1
+    terms = [
+        part for part in re.split(
+            r"\s+", unicodedata.normalize("NFKC", str(q or "")).strip().casefold())
+        if part
+    ]
+    matched = []
+    for row in rows:
+        if kind and kind not in {"all", row["kind"]}:
+            continue
+        if source and source not in {"all", row["source"]}:
+            continue
+        if terms:
+            haystack = unicodedata.normalize("NFKC", " ".join([
+                row.get("name", ""), row.get("prompt", ""), row.get("negative", ""),
+                row.get("outfit", ""), row.get("source", ""),
+            ])).casefold()
+            if not all(term in haystack for term in terms):
+                continue
+        matched.append(row)
+    page = matched[offset:offset + limit]
+    return {
+        "ok": True, "total": len(rows), "matched": len(matched),
+        "offset": offset, "items": page, "sources": all_sources,
+        "kinds": all_kinds,
+    }
 
 
 # ══ 캐릭터 빌더 후보사전 (슬롯별 후보 태그 — 후보사전.json 에서 자유롭게 확장) ══
@@ -9155,14 +9255,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar"><button id="booruMore" style="flex:1;display:none;">다음 쪽 ▾</button></div>
       </div>
       <div class="card">
-        <h2><span class="n">DB</span>캐릭터 · 그림체 라이브러리</h2>
-        <p class="hint">캐릭터/ · 그림체/ 폴더의 파일 전부. 남이 만든 파일을 넣으면 여기 뜨고, 눌러서 내 것으로 가져올 수 있습니다.</p>
+        <h2><span class="n">자료실</span>캐릭터 · 그림체 한곳에서 보기</h2>
+        <p class="hint">내 캐릭터·내 그림체 프리셋·이미지/자료팩/공개자료에서 가져온
+        그림체를 저장 위치와 관계없이 함께 찾습니다. 목록에는 현재 쪽만 불러와
+        자료가 수천 건이어도 긴 프롬프트와 메타데이터를 한꺼번에 그리지 않습니다.</p>
         <div class="filterbar">
           <input type="search" id="libFilter" placeholder="캐릭터·그림체 이름과 프롬프트 검색">
           <select id="libType" style="width:auto;">
             <option value="">전체 자료</option><option value="캐릭터">캐릭터</option>
             <option value="그림체">그림체</option>
           </select>
+          <select id="libSource" style="width:auto;"><option value="">모든 출처</option></select>
           <button id="libAddChar">+ 캐릭터 추가</button>
           <button id="libAddFolder">+ 폴더 추가</button>
           <span class="n" id="libCount" style="margin-left:auto;"></span>
@@ -13330,62 +13433,83 @@ $('setThumbs').addEventListener('change', () => {
 });
 
 /* ── 라이브러리 ── */
-var LIB_LIMIT = 100, CHAR_EDIT_LIMIT = 24;
+var LIB_OFFSET = 0, LIB_PAGE_SIZE = 100, LIB_REQUEST_SEQ = 0, CHAR_EDIT_LIMIT = 24;
 var LIB_FILTER_TIMER = null, CHAR_FILTER_TIMER = null;
 function libraryNeedle(value){
   return String(value || '').normalize('NFKC').toLocaleLowerCase();
 }
-function renderLibrary(){
+async function renderLibrary(append=false){
   const g = $('libGrid'); if(!g) return;
-  g.innerHTML = '';
-  LIB_LIMIT = Number(LIB_LIMIT) || 100;
-  const items = [];
-  (STATE.characters||[]).forEach(c => items.push({t:'캐릭터', n:c.name||'(무명)', b:c.female||'', groups:c.groups, ref:c}));
-  STYLES.forEach(s => items.push({t:'그림체', n:s.name, b:s.prompt, ref:s}));
-  const query = libraryNeedle(($('libFilter')||{}).value);
-  const kind = (($('libType')||{}).value) || '';
-  const filtered = items.filter(it => {
-    if(kind && it.t !== kind) return false;
-    if(!query) return true;
-    return libraryNeedle([
-      it.n, it.b, it.ref && it.ref.clothed,
-      it.ref && it.ref.negative, it.ref && it.ref.source,
-    ].join(' ')).includes(query);
-  });
-  const shown = filtered.slice(0, LIB_LIMIT);
-  shown.forEach(it => {
-    const el = document.createElement('div'); el.className = 'row'; el.style.cursor = 'pointer'; el.style.margin = '0';
-    el.innerHTML = `<div class="tag">${it.t}</div><b style="font-size:var(--fs-xs);">${esc(it.n)}</b>
-      <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;max-height:44px;overflow:hidden;">${esc(String(it.b||'').slice(0,100))}</div>`;
+  if(!append){ LIB_OFFSET = 0; g.innerHTML = '<div class="row hint">자료를 찾는 중입니다.</div>'; }
+  const request = ++LIB_REQUEST_SEQ;
+  const query = ($('libFilter')||{}).value || '';
+  const kind = ($('libType')||{}).value || '';
+  const source = ($('libSource')||{}).value || '';
+  const url = `/api/library?q=${encodeURIComponent(query)}&kind=${encodeURIComponent(kind)}`
+    + `&source=${encodeURIComponent(source)}&limit=${LIB_PAGE_SIZE}&offset=${LIB_OFFSET}`;
+  let result;
+  try{ result = await (await fetch(url)).json(); }
+  catch(e){ result = {ok:false,error:String(e)}; }
+  if(request !== LIB_REQUEST_SEQ) return;
+  if(!result.ok){ g.innerHTML = `<div class="row hint">${esc(result.error||'자료를 읽지 못했습니다.')}</div>`; return; }
+  if(!append) g.innerHTML = '';
+  const sourceSelect = $('libSource');
+  if(sourceSelect && !append){
+    const selectedSource = sourceSelect.value;
+    sourceSelect.innerHTML = '<option value="">모든 출처</option>';
+    Object.entries(result.sources||{}).sort((a,b)=>b[1]-a[1]).forEach(([name,count]) => {
+      const option = document.createElement('option');
+      option.value = name; option.textContent = `${name} (${Number(count).toLocaleString()})`;
+      sourceSelect.appendChild(option);
+    });
+    if([...sourceSelect.options].some(option => option.value === selectedSource)){
+      sourceSelect.value = selectedSource;
+    }
+  }
+  const fragment = document.createDocumentFragment();
+  (result.items||[]).forEach(it => {
+    const el = document.createElement('div');
+    el.className = 'row combo-card'; el.style.cursor = 'pointer'; el.style.margin = '0';
+    el._libraryItem = it;
+    el.innerHTML = `<div class="tag">${esc(it.kind)} · ${esc(it.source||'출처 없음')}</div>
+      <div style="display:flex;gap:8px;align-items:flex-start;">
+        ${(it.images&&it.images[0])?`<img src="/img?u=${encodeURIComponent(it.images[0])}"
+          loading="lazy" decoding="async" alt="" style="width:54px;height:54px;object-fit:cover;
+          border-radius:var(--radius);border:1px solid var(--line);flex:none;">`:''}
+        <div style="min-width:0;"><b style="font-size:var(--fs-xs);">${esc(it.name)}</b>
+          <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;
+          max-height:44px;overflow:hidden;">${esc(String(it.prompt||'').slice(0,100))}</div></div>
+      </div>`;
     el.addEventListener('click', () => openLib(it));
-    g.appendChild(el);
+    fragment.appendChild(el);
   });
-  if(!shown.length){
+  g.appendChild(fragment);
+  LIB_OFFSET += (result.items||[]).length;
+  if(!LIB_OFFSET){
     g.innerHTML = '<div class="row hint">조건에 맞는 캐릭터·그림체가 없습니다.</div>';
   }
   if($('libCount')) $('libCount').textContent =
-    `${shown.length.toLocaleString()} / ${filtered.length.toLocaleString()}개`;
+    `${LIB_OFFSET.toLocaleString()} / ${Number(result.matched||0).toLocaleString()}개`
+    + ` · 전체 ${Number(result.total||0).toLocaleString()}개`;
   if($('libMore')){
-    $('libMore').style.display = shown.length < filtered.length ? '' : 'none';
+    $('libMore').style.display = LIB_OFFSET < Number(result.matched||0) ? '' : 'none';
     $('libMore').textContent =
-      `더 보기 · 남은 ${(filtered.length - shown.length).toLocaleString()}개 ▾`;
+      `더 보기 · 남은 ${(Number(result.matched||0) - LIB_OFFSET).toLocaleString()}개 ▾`;
   }
   renderCharCards();
 }
 if($('libFilter')) $('libFilter').addEventListener('input', () => {
   clearTimeout(LIB_FILTER_TIMER);
   LIB_FILTER_TIMER = setTimeout(() => {
-    LIB_LIMIT = 100;
-    renderLibrary();
+    renderLibrary(false);
   }, 100);
 });
 if($('libType')) $('libType').addEventListener('change', () => {
-  LIB_LIMIT = 100;
-  renderLibrary();
+  renderLibrary(false);
 });
+if($('libSource')) $('libSource').addEventListener('change', () => renderLibrary(false));
 if($('libMore')) $('libMore').addEventListener('click', () => {
-  LIB_LIMIT += 100;
-  renderLibrary();
+  renderLibrary(true);
 });
 if($('charFilter')) $('charFilter').addEventListener('input', () => {
   clearTimeout(CHAR_FILTER_TIMER);
@@ -13495,7 +13619,7 @@ $('libAddChar').addEventListener('click', () => {
   (STATE.characters = STATE.characters||[]).push({id:genId(), name:'새 캐릭터', female:'', clothed:'', negative:'', enabled:true});
   if($('libFilter')) $('libFilter').value = '';
   if($('charFilter')) $('charFilter').value = '새 캐릭터';
-  LIB_LIMIT = 100; CHAR_EDIT_LIMIT = 24;
+  LIB_OFFSET = 0; CHAR_EDIT_LIMIT = 24;
   renderLibrary(); save();
 });
 $('libAddFolder').addEventListener('click', () => {
@@ -13504,24 +13628,44 @@ $('libAddFolder').addEventListener('click', () => {
 });
 function openLib(it){
   window._mm = 'lib';
-  $('modalTitle').textContent = `${it.t} · ${it.n}`;
-  const b = $('modalBody'); b.innerHTML = '';
-  if(it.groups && Object.keys(it.groups).length){
-    Object.entries(it.groups).forEach(([k,v]) => b.insertAdjacentHTML('beforeend',
-      `<div class="row"><div class="tag">${esc(k)}</div><div style="font-size:var(--fs-xs);">${esc(String(v))}</div></div>`));
-  } else {
-    b.insertAdjacentHTML('beforeend', `<div class="row"><div style="font-family:var(--mono);font-size:var(--fs-2xs);white-space:pre-wrap;">${esc(it.b)}</div></div>`);
+  $('modalTitle').textContent = `${it.kind} · ${it.name}`;
+  const b = $('modalBody'); b.innerHTML = `<div class="tag">${esc(it.source||'출처 없음')}</div>`;
+  if(it.images && it.images[0]){
+    b.insertAdjacentHTML('beforeend', `<img src="/img?u=${encodeURIComponent(it.images[0])}"
+      alt="" style="display:block;max-width:min(100%,420px);max-height:360px;object-fit:contain;
+      margin:8px auto;border-radius:var(--radius);background:#000;">`);
   }
-  b.insertAdjacentHTML('beforeend', `<div class="bar"><button class="primary" id="libTake">${it.t==='캐릭터'?'왼쪽 캐릭터 칸에 추가':'현재 베이스로 적용'}</button></div>`);
+  const groups = it.groups || (it.ref&&it.ref.groups) || {};
+  if(Object.keys(groups).length){
+    Object.entries(groups).forEach(([k,v]) => b.insertAdjacentHTML('beforeend',
+      `<div class="row"><div class="tag">${esc(k)}</div><div style="font-size:var(--fs-xs);">${esc(String(v))}</div></div>`));
+  }
+  const readonly = (label,value) => value ? `<div class="field"><label>${label}</label>
+    <textarea readonly style="min-height:64px;">${esc(value)}</textarea></div>` : '';
+  b.insertAdjacentHTML('beforeend', readonly('포지티브 전체', it.prompt||'')
+    + readonly('착의·변형', it.outfit||'') + readonly('네거티브 전체', it.negative||''));
+  const settings = it.settings || {};
+  if(Object.keys(settings).length){
+    b.insertAdjacentHTML('beforeend', `<div class="row"><div class="tag">생성 설정</div>
+      <div style="font-family:var(--mono);font-size:var(--fs-2xs);white-space:pre-wrap;">
+      ${esc(Object.entries(settings).map(([k,v])=>`${k}: ${v}`).join('\n'))}</div></div>`);
+  }
+  const sourceUrl = it.ref && it.ref.url;
+  b.insertAdjacentHTML('beforeend', `<div class="bar"><button class="primary" id="libTake">
+    ${it.kind==='캐릭터'?'캐릭터 칸에 추가':'그림체 통째로 적용'}</button>
+    ${sourceUrl?`<a href="${escA(sourceUrl)}" target="_blank">원본 게시글 ↗</a>`:''}</div>`);
   $('libTake').addEventListener('click', () => {
-    if(it.t === '캐릭터'){
+    if(it.kind === '캐릭터'){
       (STATE.char_slots = STATE.char_slots||[]).push({name:it.ref.name||'', prompt:it.ref.female||'', negative:it.ref.negative||''});
       renderSlots(); tokens(); save();
       $('modalFlash').textContent = '왼쪽 캐릭터 칸에 추가됨 ✓';
     } else {
-      $('presetSel').value = STYLES.indexOf(it.ref);
-      $('presetSel').dispatchEvent(new Event('change'));
-      $('modalFlash').textContent = '베이스로 적용됨 ✓';
+      const style = it.store === 'collected' ? it.ref : {
+        id:it.id, title:it.name, base:it.prompt||'', negative:it.negative||'',
+        params:it.settings||{}
+      };
+      applyStyle(style);
+      $('modalFlash').textContent = '베이스 + 네거티브 + 생성 설정 적용됨 ✓';
     }
   });
   $('modalFlash').textContent = '';
@@ -17204,6 +17348,20 @@ class ConfigServer:
                 elif self.path.startswith("/api/compare_progress"):
                     try:
                         self._json(comparison_progress_summary(server.cfg))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/library"):
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    try:
+                        self._json(search_library(
+                            server.cfg, server.spec,
+                            q=q.get("q", [""])[0],
+                            kind=q.get("kind", [""])[0],
+                            source=q.get("source", [""])[0],
+                            limit=int(q.get("limit", ["100"])[0]),
+                            offset=int(q.get("offset", ["0"])[0]),
+                        ))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/combos"):

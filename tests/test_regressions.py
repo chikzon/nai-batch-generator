@@ -2862,13 +2862,19 @@ class RegressionTests(unittest.TestCase):
     def test_large_character_library_renders_bounded_searchable_pages(self):
         page = APP.render_page()
         for element_id in (
-            "libFilter", "libType", "libCount", "libMore",
+            "libFilter", "libType", "libSource", "libCount", "libMore",
             "charFilter", "charCount", "charMore",
         ):
             self.assertIn(f'id="{element_id}"', page)
-        self.assertIn("filtered.slice(0, LIB_LIMIT)", page)
+        # 자료실은 브라우저에 모든 자료를 싣지 않고 서버에서 100개씩 찾는다.
+        self.assertIn("LIB_PAGE_SIZE = 100", page)
+        self.assertIn("LIB_OFFSET = 0", page)
+        self.assertIn("/api/library?", page)
+        self.assertIn("limit=${LIB_PAGE_SIZE}&offset=${LIB_OFFSET}", page)
+        self.assertIn("LIB_OFFSET += (result.items||[]).length", page)
+        self.assertIn("LIB_OFFSET < Number(result.matched||0)", page)
+        # 캐릭터 편집 목록도 화면에 한꺼번에 만들지 않는다.
         self.assertIn("filtered.slice(0, CHAR_EDIT_LIMIT)", page)
-        self.assertIn("LIB_LIMIT += 100", page)
         self.assertIn("CHAR_EDIT_LIMIT += 24", page)
         self.assertIn("libraryNeedle", page)
         self.assertIn(
@@ -4213,6 +4219,71 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(snap["can_resume"])
             self.assertEqual(snap["cursor"], 1)
             self.assertEqual(len(snap["queue"]), 2)
+
+    def test_unified_library_pages_characters_presets_and_collected_styles_without_raw_bulk(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            style_dir = base / "그림체"
+            style_file = base / "수집" / "그림체.json"
+            style_dir.mkdir(parents=True)
+            style_file.parent.mkdir(parents=True, exist_ok=True)
+            (style_dir / "내 프리셋.json").write_text(json.dumps({
+                "이름": "내 프리셋", "프롬프트": "preset whole positive",
+                "네거티브": "preset whole negative",
+                "설정": {"cfg_scale": 6.2, "steps": 28},
+            }, ensure_ascii=False), encoding="utf-8")
+            collected = [{
+                "id": f"collected-{index}", "title": f"수집 {index}",
+                "source": "아카라이브", "base": f"collected whole {index}",
+                "negative": f"negative {index}",
+                "params": {"scale": 5.5, "steps": 28},
+                "metadata_raw": {"huge": "x" * 10000},
+                "images": [f"local:{index}.png", f"local:{index}-2.png"],
+            } for index in range(250)]
+            style_file.write_text(
+                json.dumps(collected, ensure_ascii=False), encoding="utf-8")
+            cfg = {"characters": [{
+                "id": "char-1", "name": "캐릭터 하나",
+                "female": "character whole positive",
+                "clothed": "character whole outfit",
+                "negative": "character whole negative",
+            }]}
+            old_cache = copy.deepcopy(APP._COMBOS)
+            try:
+                with (
+                    patch.object(APP, "STYLE_DIR", style_dir),
+                    patch.object(APP, "STYLE_FILE", style_file),
+                    patch.object(APP, "COMBO_FILE", base / "수집" / "작가조합.json"),
+                ):
+                    APP._COMBOS.update({"loaded": False, "rows": []})
+                    page = APP.search_library(
+                        cfg, {"그림체_그룹": []}, limit=100, offset=0)
+                    self.assertEqual(page["total"], 252)
+                    self.assertEqual(len(page["items"]), 100)
+                    self.assertEqual(page["kinds"], {"캐릭터": 1, "그림체": 251})
+                    self.assertNotIn(
+                        "metadata_raw",
+                        json.dumps(page["items"], ensure_ascii=False))
+                    self.assertLess(len(json.dumps(page["items"])), 150000)
+
+                    filtered = APP.search_library(
+                        cfg, {"그림체_그룹": []},
+                        q="whole 249", kind="그림체", source="아카라이브")
+                    self.assertEqual(filtered["matched"], 1)
+                    self.assertEqual(
+                        filtered["items"][0]["prompt"], "collected whole 249")
+                    self.assertEqual(
+                        filtered["items"][0]["images"], ["local:249.png"])
+
+                    character = APP.search_library(
+                        cfg, {"그림체_그룹": []}, kind="캐릭터")
+                    self.assertEqual(character["matched"], 1)
+                    self.assertEqual(
+                        character["items"][0]["ref"]["negative"],
+                        "character whole negative")
+            finally:
+                APP._COMBOS.clear()
+                APP._COMBOS.update(old_cache)
 
 
 if __name__ == "__main__":
