@@ -9337,6 +9337,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <option value="세팅">세팅</option><option value="생성 기록">생성 기록</option>
           </select>
           <select id="libSource" style="width:auto;"><option value="">모든 출처</option></select>
+          <button type="button" id="libManage" disabled>종류를 고르면 정리할 수 있습니다</button>
           <button id="libAddChar">+ 캐릭터 추가</button>
           <button id="libAddFolder">+ 폴더 추가</button>
           <span class="n" id="libCount" style="margin-left:auto;"></span>
@@ -9344,7 +9345,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="libGrid" class="items" style="grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:7px;"></div>
         <div class="bar"><button type="button" id="libMore" style="flex:1;display:none;">더 보기 ▾</button></div>
       </div>
-      <div class="card">
+      <div class="card" id="recipeLibraryCard">
         <h2><span class="n">레시피</span>남들의 조합 <span class="n" id="recStat" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);"></span></h2>
         <p class="hint">도랑위키 등에서 모은 실제 사용 프롬프트입니다. 눌러서 태그·포지티브·네거티브를 보고 내 것으로 가져오세요.</p>
         <div class="bar">
@@ -9355,7 +9356,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar" style="margin-top:10px;"><button id="recMore" style="flex:1;">더 보기 ▾</button></div>
       </div>
 
-      <div class="card">
+      <div class="card" id="charEditorCard">
         <h2><span class="n">편집</span>캐릭터 상세
           <button type="button" id="charUndo" class="hidden" style="margin-left:auto;">↶ 최근 삭제 되돌리기</button></h2>
         <p class="hint" id="charEditMsg">복제로 의상·예술적 변형을 나누고, 삭제한 항목은 이 화면을 닫기 전 되돌릴 수 있습니다.</p>
@@ -13569,6 +13570,58 @@ async function renderLibrary(append=false){
   }
   renderCharCards();
 }
+function updateLibraryManage(){
+  const button = $('libManage');
+  if(!button) return;
+  const kind = ($('libType')||{}).value || '';
+  const labels = {
+    '캐릭터':'캐릭터 상세 편집',
+    '그림체':'그림체 중복·삭제·복구',
+    '레시피':'레시피 상세 보기',
+    '세팅':'세팅 편집기로 이동',
+    '생성 기록':'비교 결과·재개 관리',
+  };
+  button.disabled = !labels[kind];
+  button.textContent = labels[kind] || '종류를 고르면 정리할 수 있습니다';
+}
+async function manageLibraryKind(){
+  const kind = ($('libType')||{}).value || '';
+  if(kind === '그림체'){
+    openCombos();
+    return;
+  }
+  if(kind === '캐릭터'){
+    $('charEditorCard').scrollIntoView({behavior:'smooth', block:'start'});
+    $('charFilter').focus();
+    return;
+  }
+  if(kind === '레시피'){
+    const query = ($('libFilter')||{}).value || '';
+    if(query) $('recQ').value = query;
+    await ensureRecipes();
+    $('recipeLibraryCard').scrollIntoView({behavior:'smooth', block:'start'});
+    $('recQ').focus();
+    return;
+  }
+  if(kind === '세팅'){
+    STATE.ui = STATE.ui || {};
+    STATE.ui.settings_work = 'build';
+    setMode('settings');
+    arrangeStudioWorkspace();
+    sbPickList();
+    save();
+    $('settingBuilderCard').scrollIntoView({behavior:'smooth', block:'start'});
+    return;
+  }
+  if(kind === '생성 기록'){
+    STATE.ui = STATE.ui || {};
+    STATE.ui.library_work = 'compare';
+    arrangeStudioWorkspace();
+    await comparisonRunsLoad();
+    $('compareCard').scrollIntoView({behavior:'smooth', block:'start'});
+    save();
+  }
+}
 if($('libFilter')) $('libFilter').addEventListener('input', () => {
   clearTimeout(LIB_FILTER_TIMER);
   LIB_FILTER_TIMER = setTimeout(() => {
@@ -13576,12 +13629,15 @@ if($('libFilter')) $('libFilter').addEventListener('input', () => {
   }, 100);
 });
 if($('libType')) $('libType').addEventListener('change', () => {
+  updateLibraryManage();
   renderLibrary(false);
 });
 if($('libSource')) $('libSource').addEventListener('change', () => renderLibrary(false));
+if($('libManage')) $('libManage').addEventListener('click', manageLibraryKind);
 if($('libMore')) $('libMore').addEventListener('click', () => {
   renderLibrary(true);
 });
+updateLibraryManage();
 if($('charFilter')) $('charFilter').addEventListener('input', () => {
   clearTimeout(CHAR_FILTER_TIMER);
   CHAR_FILTER_TIMER = setTimeout(() => {

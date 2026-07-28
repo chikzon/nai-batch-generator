@@ -2862,7 +2862,8 @@ class RegressionTests(unittest.TestCase):
     def test_large_character_library_renders_bounded_searchable_pages(self):
         page = APP.render_page()
         for element_id in (
-            "libFilter", "libType", "libSource", "libCount", "libMore",
+            "libFilter", "libType", "libSource", "libManage", "libCount",
+            "libMore", "recipeLibraryCard", "charEditorCard",
             "charFilter", "charCount", "charMore",
         ):
             self.assertIn(f'id="{element_id}"', page)
@@ -2878,6 +2879,9 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("if(it.store === 'recipe')", page)
         self.assertIn("STATE.ui.settings_work = 'build'", page)
         self.assertIn("openComparisonFolder((it.ref||{}).folder", page)
+        self.assertIn("openCombos();", page)
+        self.assertIn("'그림체':'그림체 중복·삭제·복구'", page)
+        self.assertIn("await comparisonRunsLoad();", page)
         # 캐릭터 편집 목록도 화면에 한꺼번에 만들지 않는다.
         self.assertIn("filtered.slice(0, CHAR_EDIT_LIMIT)", page)
         self.assertIn("CHAR_EDIT_LIMIT += 24", page)
