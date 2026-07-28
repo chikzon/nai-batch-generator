@@ -8639,6 +8639,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .hist-g img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);cursor:pointer;}
   .hist-g:empty::before{content:"생성된 이미지가 여기에 쌓입니다.";grid-column:1/-1;color:var(--muted);
     font-size:var(--fs-xs);line-height:1.6;padding:14px 4px;}
+  .result-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:9px;
+    padding-top:9px;border-top:1px solid var(--line);}
+  .result-actions .label{margin-right:2px;color:var(--muted);font-size:var(--fs-2xs);font-weight:700;}
+  .result-actions button{min-height:30px;padding:5px 9px;font-size:var(--fs-xs);}
+  .result-actions .result-action-msg{min-width:140px;color:var(--muted);font-size:var(--fs-2xs);}
 
   /* ── 모달 ── */
   .modal-bg{position:fixed;inset:0;background:#000c;z-index:60;display:flex;align-items:flex-start;
@@ -9055,6 +9060,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <span class="n" id="pvSeed" title="이 그림의 NAI 시드"></span>
             <button id="pvSeedCopy" title="시드 복사">복사</button>
             <button id="pvSeedLock" title="이 시드로 고정">고정</button></div>
+          <div class="result-actions hidden" id="pvResultActions" aria-label="최근 결과로 다음 작업">
+            <span class="label">이 결과로</span>
+            <button type="button" data-latest-action="vibe">바이브</button>
+            <button type="button" data-latest-action="cref">캐릭터 레퍼런스</button>
+            <button type="button" data-latest-action="i2i">img2img·인페인트</button>
+            <span class="result-action-msg" id="pvResultMsg"></span>
+          </div>
           <div class="pbar"><div id="pvBar"></div></div>
         </div>
       </div>
@@ -12029,6 +12041,67 @@ function i2iLoad(file){
   };
   fr.readAsDataURL(file);
 }
+/* 생성 결과를 다시 파일로 내려받아 다음 작업에 넘긴다.
+   최근 결과와 탐색기 결과가 Vibe·Reference·img2img 구현을 각각 복제하지 않고
+   같은 경계를 쓴다. 다운로드가 실패하면 기존 상태는 하나도 바꾸지 않는다. */
+async function resultFile(url, name){
+  const r = await fetch(url, {cache:'no-store'});
+  if(!r.ok) throw new Error(`결과 그림을 읽지 못했습니다 (HTTP ${r.status}).`);
+  const blob = await r.blob();
+  if(!blob.type.startsWith('image/')) throw new Error('결과가 이미지 형식이 아닙니다.');
+  let safe = String(name || 'result.webp').replace(/[\\/:*?"<>|]/g, '_');
+  if(!/\.(png|webp)$/i.test(safe)) safe += '.webp';
+  return new File([blob], safe, {type:blob.type || 'image/webp'});
+}
+async function resultToReference(url, name, kind, msg){
+  if(kind === 'vibe' && !confirm(
+    '이 결과를 바이브로 등록할까요?\n토큰이 있으면 처음 한 번 인코딩에 2 Anlas가 듭니다.'
+  )) return false;
+  if(msg) msg.textContent = '결과 그림을 준비하는 중...';
+  try{
+    const file = await resultFile(url, name);
+    await addRefs([file], kind);
+    setMode('preview');
+    const tab = document.querySelector(`[data-reftab="${kind === 'vibe' ? 'vibe' : 'cref'}"]`);
+    const opener = document.querySelector('[data-ovl="refs"]');
+    if(opener) opener.click();
+    if(tab) tab.click();
+    if(msg) msg.textContent = kind === 'vibe'
+      ? '바이브에 등록했습니다.' : '캐릭터 레퍼런스에 등록했습니다.';
+    return true;
+  }catch(e){
+    if(msg) msg.textContent = String(e.message || e);
+    return false;
+  }
+}
+async function resultToI2I(url, name, msg){
+  if(msg) msg.textContent = '결과 그림을 준비하는 중...';
+  try{
+    const file = await resultFile(url, name);
+    expClose();
+    setMode('preview');
+    i2iLoad(file);
+    if(msg) msg.textContent = 'img2img·인페인트에 넣었습니다.';
+    setTimeout(() => $('i2iStage').scrollIntoView({behavior:'smooth', block:'start'}), 80);
+    return true;
+  }catch(e){
+    if(msg) msg.textContent = String(e.message || e);
+    return false;
+  }
+}
+function bindLatestResultActions(){
+  const host = $('pvResultActions');
+  if(!host || host._bound) return;
+  host._bound = true;
+  host.querySelectorAll('[data-latest-action]').forEach(button => button.addEventListener('click', async () => {
+    const url = '/latest.webp?t=' + Date.now();
+    const name = lastFile || '최근 생성.webp';
+    const msg = $('pvResultMsg');
+    const action = button.dataset.latestAction;
+    if(action === 'i2i') await resultToI2I(url, name, msg);
+    else await resultToReference(url, name, action, msg);
+  }));
+}
 function i2iPainted(){
   const m = $('i2iMask'); if(!m.width) return false;
   const d = m.getContext('2d').getImageData(0, 0, m.width, m.height).data;
@@ -12572,6 +12645,14 @@ function expOpen(i){
         placeholder="판단 태그 (쉼표로 구분)" style="width:220px;">
       <button type="button" id="expTagSave">태그 저장</button>
       <span class="hint">←→ 넘기기 · Esc 닫기</span>
+    </div>
+    <div class="result-actions" style="max-width:96vw;background:var(--paper);padding:7px 11px;
+      margin:0;border:0;border-radius:var(--radius);">
+      <span class="label">이 결과로</span>
+      <button type="button" data-exp-result="vibe">바이브</button>
+      <button type="button" data-exp-result="cref">캐릭터 레퍼런스</button>
+      <button type="button" data-exp-result="i2i">img2img·인페인트</button>
+      <span class="result-action-msg" id="expResultMsg"></span>
     </div>`;
   $('expRate').addEventListener('change', async () => {
     const value = Number($('expRate').value) || 0;
@@ -12587,6 +12668,16 @@ function expOpen(i){
     else delete EXP.tags[f.path];
     await picksSave(); expDraw(); expOpen(EXP.open);
   });
+  ov.querySelectorAll('[data-exp-result]').forEach(button => button.addEventListener('click', async () => {
+    const action = button.dataset.expResult;
+    const url = '/setout?p=' + encodeURIComponent(f.path);
+    const msg = $('expResultMsg');
+    if(action === 'i2i') await resultToI2I(url, f.name, msg);
+    else {
+      const done = await resultToReference(url, f.name, action, msg);
+      if(done) expClose();
+    }
+  }));
 }
 function expClose(){ const o = $('expViewer'); if(o) o.remove(); EXP.open = -1; }
 window.addEventListener('keydown', async e => {
@@ -15872,6 +15963,7 @@ async function poll(){
         $('hist').innerHTML = HIST.map(x => `<img src="${x}">`).join('');
       }
     }
+    $('pvResultActions').classList.toggle('hidden', !s.has_image);
     $('batchBtn').disabled = s.running;
     $('genBtn').disabled = s.running;
     $('genBtn').textContent = s.running ? '생성 중...' : '생성';
@@ -15888,6 +15980,7 @@ async function poll(){
 }
 
 init();
+bindLatestResultActions();
 poll();
 
 /* ── 왼쪽 패널 폭 드래그 조절 — 브라우저별 취향이라 localStorage 에 저장 ── */

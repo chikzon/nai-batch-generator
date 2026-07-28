@@ -179,6 +179,30 @@ class RegressionTests(unittest.TestCase):
             page,
         )
 
+    def test_generated_result_has_one_path_to_reference_and_img2img(self):
+        """최근 결과와 탐색기 결과가 같은 무손실 전달 함수를 써야 한다."""
+        page = APP.PAGE_TEMPLATE
+        for marker in (
+            'id="pvResultActions"',
+            'data-latest-action="vibe"',
+            'data-latest-action="cref"',
+            'data-latest-action="i2i"',
+            'data-exp-result="vibe"',
+            'data-exp-result="cref"',
+            'data-exp-result="i2i"',
+            "async function resultFile(url, name)",
+            "async function resultToReference(url, name, kind, msg)",
+            "async function resultToI2I(url, name, msg)",
+            "await addRefs([file], kind)",
+            "i2iLoad(file)",
+        ):
+            self.assertIn(marker, page)
+        self.assertIn(
+            "$('pvResultActions').classList.toggle('hidden', !s.has_image);",
+            page,
+        )
+        self.assertIn("인코딩에 2 Anlas", page)
+
     def test_builder_routes_character_variants_and_negative_separately(self):
         """캐릭터 외형을 바꾸는 후보는 베이스에, 네거티브 후보는 양성에 섞지 않는다."""
         builder = APP.load_builder()
