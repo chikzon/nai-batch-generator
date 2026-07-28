@@ -65,21 +65,29 @@ jobs:
           $portable = "dist/NAI배치생성기-Windows-x64-portable.zip"
           Compress-Archive -Path "dist/NAI배치생성기/*" -DestinationPath $portable
 
-          $files = @(
-            $portable
-            "dist/NAI배치생성기-기본자료팩.zip"
-            "dist/NAI배치생성기-1.0.0-setup.exe"
-          )
-          foreach ($path in $files) {
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "release file missing: $path"
+          # ⚠ Release 첨부파일 이름은 **ASCII 여야 한다.** 한글을 그대로 올리면
+          #   GitHub 이 글자를 점으로 뭉개서 `NAI배치생성기-기본자료팩.zip` 이
+          #   `NAI.-.zip` 이 된다 — 무엇인지 알 수 없고 SHA256SUMS 와도 어긋난다.
+          #   (v1.0.0 첫 게시에서 실제로 그렇게 나왔다.)
+          $ver = "1.0.0"
+          $rename = [ordered]@{
+            $portable                        = "NAI-batch-generator-$ver-portable-win-x64.zip"
+            "dist/NAI배치생성기-기본자료팩.zip" = "NAI-batch-generator-$ver-datapack.zip"
+            "dist/NAI배치생성기-$ver-setup.exe" = "NAI-batch-generator-$ver-setup.exe"
+          }
+          $files = @()
+          foreach ($src in $rename.Keys) {
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+              throw "release file missing: $src"
             }
+            $dst = "dist/" + $rename[$src]
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+            $files += $dst
           }
           $lines = foreach ($path in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
             "$hash  $([IO.Path]::GetFileName($path))"
           }
-          # 산출물 이름에 한글이 있으므로 ASCII로 쓰면 파일명이 `?`로 손상된다.
           $lines | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding utf8
 
       - uses: actions/upload-artifact@v6
@@ -87,9 +95,9 @@ jobs:
           name: NAI-batch-generator-Windows-x64
           if-no-files-found: error
           path: |
-            dist/NAI배치생성기-Windows-x64-portable.zip
-            dist/NAI배치생성기-기본자료팩.zip
-            dist/NAI배치생성기-1.0.0-setup.exe
+            dist/NAI-batch-generator-1.0.0-portable-win-x64.zip
+            dist/NAI-batch-generator-1.0.0-datapack.zip
+            dist/NAI-batch-generator-1.0.0-setup.exe
             dist/SHA256SUMS.txt
 
       - name: Publish GitHub Release
@@ -99,9 +107,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" `
-            "dist/NAI배치생성기-Windows-x64-portable.zip" `
-            "dist/NAI배치생성기-기본자료팩.zip" `
-            "dist/NAI배치생성기-1.0.0-setup.exe" `
+            "dist/NAI-batch-generator-1.0.0-portable-win-x64.zip" `
+            "dist/NAI-batch-generator-1.0.0-datapack.zip" `
+            "dist/NAI-batch-generator-1.0.0-setup.exe" `
             "dist/SHA256SUMS.txt" `
             --title "NAI 배치 생성기 ${{ github.ref_name }}" `
             --generate-notes
