@@ -6391,6 +6391,20 @@ def _setting_ctx(acfg, scene):
     return acfg.get("_settings", {}).get(scene.get("_setting", ""), {})
 
 
+def remove_prompt_tags(text, removals):
+    """쉼표 단위 프롬프트에서 사용자가 지정한 태그를 제외한다."""
+    if isinstance(removals, str):
+        removals = re.split(r"[,\n]", removals)
+    needles = [str(x).strip().lower() for x in (removals or []) if str(x).strip()]
+    if not needles:
+        return text
+    parts = [tag.strip() for tag in (text or "").split(",") if tag.strip()]
+    return ", ".join(
+        tag for tag in parts
+        if not any(needle in tag.lower() for needle in needles)
+    )
+
+
 def build_scene(acfg, char, cfg, scene_num):
     """방식(남녀/백합/단독)에 따라 프롬프트 조립. 반환: (base, cap1, cap2, neg1, neg2, w, h)"""
     scene = acfg["scenes"][str(scene_num)]
@@ -6413,13 +6427,13 @@ def _build_std(acfg, char, scene, mode):
     location = scene.get("location", "")
     if location:
         base = f"{base}, {location}"
+    if scene.get("base_tags"):
+        base = _join_tags(base, scene.get("base_tags"))
 
-    remove_char_tags = scene.get("remove_char_tags", [])
-    if remove_char_tags:
-        subs = [s.lower() for s in remove_char_tags]
-        parts = [t.strip() for t in cleaned_char.split(",") if t.strip()]
-        parts = [t for t in parts if not any(sub in t.lower() for sub in subs)]
-        cleaned_char = ", ".join(parts)
+    cleaned_char = remove_prompt_tags(
+        cleaned_char, scene.get("remove_char_tags", []))
+    char_negative = _join_tags(
+        char_negative, scene.get("female_negative", ""))
 
     female_scene = scene.get("female_prompt", "")
     male_caption = scene.get("male_prompt", "")
@@ -6443,6 +6457,8 @@ def _build_std(acfg, char, scene, mode):
     if mode == "남녀":
         # 상대역(남자)은 세팅 파일의 것 — 씬 태그가 비어 있어도 항상 포함
         male_base = clean_char_prompt(role.get("외형", "") or char.get("male_prompt_base", ""))
+        male_base = remove_prompt_tags(
+            male_base, scene.get("remove_male_tags", []))
         wear_mode = opts_chosen.get("남자옷", "나체")
         outfit = role.get("의상", "")
         wear = ""
@@ -6455,7 +6471,8 @@ def _build_std(acfg, char, scene, mode):
                 wear = "topless male, open pants, clothed sex"
         add_m = apply_axes(specs, options, opts_chosen, scene, "남자")
         male_caption = ", ".join(x for x in (male_base, wear, male_caption, add_m) if x)
-        male_negative = role.get("네거티브", "")
+        male_negative = _join_tags(
+            role.get("네거티브", ""), scene.get("male_negative", ""))
     else:  # 단독
         male_caption = apply_axes(specs, options, opts_chosen, scene, "남자")
         male_negative = ""
@@ -6518,8 +6535,12 @@ def _build_yuri(acfg, char, scene):
         extra = undress_tags.get(str(level), "")
         return f"{text}, {extra}" if extra else text
 
-    female_text = girl_text(char.get("female", ""), char.get("clothed", ""), u1)
-    partner_text = girl_text(role.get("외형", ""), role.get("착의", ""), u2)
+    female_text = remove_prompt_tags(
+        girl_text(char.get("female", ""), char.get("clothed", ""), u1),
+        scene.get("remove_char_tags", []))
+    partner_text = remove_prompt_tags(
+        girl_text(role.get("외형", ""), role.get("착의", ""), u2),
+        scene.get("remove_partner_tags", []))
 
     female_scene = scene.get("female_prompt", "")
     partner_scene = scene.get("partner_prompt", "")
@@ -6527,8 +6548,11 @@ def _build_yuri(acfg, char, scene):
     female_caption = _join_tags(female_text, female_scene)
     partner_caption = _join_tags(partner_text, partner_scene)
 
-    return (base, female_caption, partner_caption, char.get("negative", ""),
-            role.get("네거티브", ""), scene["width"], scene["height"])
+    return (
+        base, female_caption, partner_caption,
+        _join_tags(char.get("negative", ""), scene.get("female_negative", "")),
+        _join_tags(role.get("네거티브", ""), scene.get("partner_negative", "")),
+        scene["width"], scene["height"])
 
 
 # ═══════════════ NAI API ═══════════════
@@ -15386,6 +15410,15 @@ async function openScene(setName, ids){
   if(!r.ok || !r.scenes.length){ alert('불러오기 실패'); return; }
   $('modalTitle').textContent = `${setName} · ${r.scenes[0].name}${ids.length>1?` 외 ${ids.length}단계`:''}`;
   const f = (id,k,l,v) => `<div class="field"><label>${l}</label><textarea data-sid="${id}" data-sk="${k}" style="min-height:42px;">${esc(v||'')}</textarea></div>`;
+  const actor = (s, title, promptKey, removeKey, negativeKey, promptLabel) =>
+    `<div class="field" style="border-left:3px solid var(--accent);padding:8px 10px;background:var(--paper);">
+      <b>${title}</b>
+      ${f(s.id, promptKey, promptLabel, s[promptKey])}
+      <div class="grid2">
+        ${f(s.id, removeKey, '이 캐릭터에서 제외할 태그 (쉼표)', s[removeKey])}
+        ${f(s.id, negativeKey, '이 캐릭터에만 적용할 네거티브', s[negativeKey])}
+      </div>
+    </div>`;
   const pos = s => {
     const mode = s.mode || st.mode || '단독';
     const count = mode === '단독' ? 1 : 2;
@@ -15431,9 +15464,16 @@ async function openScene(setName, ids){
         <input type="number" data-sid="${s.id}" data-sk="height" value="${s.height||1216}"
           min="64" max="2048" step="64" title="세로" style="width:74px;text-align:center;">
       </div>`;
-    if(st.mode === '백합'){ x += f(s.id,'base_tags','장면 공통',s.base_tags) + f(s.id,'female_prompt','주인공 쪽',s.female_prompt) + f(s.id,'partner_prompt','상대역 쪽',s.partner_prompt); }
-    else if(st.mode === '단독'){ x += f(s.id,'female_prompt','프롬프트',s.female_prompt); }
-    else { x += f(s.id,'female_prompt','여성 쪽',s.female_prompt) + f(s.id,'male_prompt','남성 (장면)',s.male_prompt); }
+    x += f(s.id, 'base_tags', '장면 공통·관계 태그 (모든 캐릭터 밖의 베이스에 붙습니다)', s.base_tags);
+    if(st.mode === '백합'){
+      x += actor(s, '주인공', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
+      x += actor(s, '상대역', 'partner_prompt', 'remove_partner_tags', 'partner_negative', '이 장면에서 추가할 태그');
+    } else if(st.mode === '단독'){
+      x += actor(s, '캐릭터', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
+    } else {
+      x += actor(s, '여성', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
+      x += actor(s, '남성', 'male_prompt', 'remove_male_tags', 'male_negative', '이 장면에서 추가할 태그');
+    }
     return x + f(s.id, 'negative', '이 씬 전용 네거티브 (선택 · 기본 네거티브 뒤에 붙습니다)', s.negative)
              + pos(s) + `<div class="hint" id="pv-${s.id}"></div></div>`;
   }).join('') + `<div class="bar"><button type="button" id="sceneUndo" disabled>↶ 방금 저장 되돌리기</button>
@@ -17661,7 +17701,11 @@ class ConfigServer:
             if not isinstance(updates, dict):
                 return {"ok": False, "error": "씬 수정 내용의 형식이 잘못되었습니다."}
             allowed = ("female_prompt", "male_prompt", "partner_prompt", "base_tags",
+                       "female_negative", "male_negative", "partner_negative",
+                       "remove_char_tags", "remove_male_tags", "remove_partner_tags",
                        "negative", "width", "height", "char_centers")
+            list_fields = ("remove_char_tags", "remove_male_tags",
+                           "remove_partner_tags")
             pack = load_json_recover(path)
             raw_revision = json.dumps(
                 pack, ensure_ascii=False, sort_keys=True,
@@ -17690,11 +17734,26 @@ class ConfigServer:
                         value = normalize_resolution(value)
                     elif key == "char_centers":
                         value = normalize_scene_centers(value)
+                    elif key in list_fields:
+                        if isinstance(value, str):
+                            value = [x.strip() for x in re.split(r"[,\n]", value)
+                                     if x.strip()]
+                        elif isinstance(value, list):
+                            value = [str(x).strip() for x in value if str(x).strip()]
+                        else:
+                            raise ValueError(f"{key} 값은 문자열 또는 목록이어야 합니다.")
                     elif not isinstance(value, str):
                         raise ValueError(f"{key} 값은 문자열이어야 합니다.")
                     clean[key] = value
                     if key == "char_centers":
                         old[key] = normalize_scene_centers(sc.get(key))
+                    elif key in list_fields:
+                        previous = sc.get(key) or []
+                        old[key] = (
+                            [x.strip() for x in re.split(r"[,\n]", previous) if x.strip()]
+                            if isinstance(previous, str)
+                            else [str(x).strip() for x in previous if str(x).strip()]
+                        )
                     else:
                         old[key] = sc.get(key, "" if key not in ("width", "height") else value)
                 if clean:
@@ -17706,7 +17765,8 @@ class ConfigServer:
             for sid, fields in prepared.items():
                 scene_changed = False
                 for key, value in fields.items():
-                    if scenes[sid].get(key, [] if key == "char_centers" else "") != value:
+                    empty = [] if key == "char_centers" or key in list_fields else ""
+                    if scenes[sid].get(key, empty) != value:
                         scenes[sid][key] = value
                         changed_fields += 1
                         scene_changed = True
@@ -18082,6 +18142,21 @@ class ConfigServer:
                                             "male_prompt": sc.get("male_prompt", ""),
                                             "partner_prompt": sc.get("partner_prompt", ""),
                                             "base_tags": sc.get("base_tags", ""),
+                                            "female_negative": sc.get("female_negative", ""),
+                                            "male_negative": sc.get("male_negative", ""),
+                                            "partner_negative": sc.get("partner_negative", ""),
+                                            "remove_char_tags": (
+                                                ", ".join(sc.get("remove_char_tags") or [])
+                                                if isinstance(sc.get("remove_char_tags"), list)
+                                                else str(sc.get("remove_char_tags") or "")),
+                                            "remove_male_tags": (
+                                                ", ".join(sc.get("remove_male_tags") or [])
+                                                if isinstance(sc.get("remove_male_tags"), list)
+                                                else str(sc.get("remove_male_tags") or "")),
+                                            "remove_partner_tags": (
+                                                ", ".join(sc.get("remove_partner_tags") or [])
+                                                if isinstance(sc.get("remove_partner_tags"), list)
+                                                else str(sc.get("remove_partner_tags") or "")),
                                             "pair": sc.get("pair", ""),
                                             "negative": sc.get("negative", ""),
                                             "width": sc.get("width", 832),

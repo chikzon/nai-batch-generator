@@ -489,6 +489,70 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("setting:window._sceneSetting", page)
         self.assertIn("expect_revision:last.revision", page)
 
+    def test_setting_scene_common_and_per_character_tags_reach_final_values(self):
+        acfg = {
+            "base": {
+                "nsfw_base_prompt": "2people, style",
+                "base_prompt": "1girl, style",
+                "yuri_base_prompt": "2girls, yuri, style",
+            },
+            "_settings": {
+                "시험": {
+                    "role": {
+                        "외형": "1boy, black hair, tall",
+                        "착의": "shirt",
+                        "네거티브": "bad boy",
+                    },
+                    "opts": {"남자옷": "나체"},
+                    "specs": {},
+                    "options": {},
+                }
+            },
+        }
+        scene = {
+            "_setting": "시험", "_mode": "남녀", "_num": 101, "_stage": 0,
+            "width": 832, "height": 1216,
+            "base_tags": "holding hands, close relationship",
+            "female_prompt": "smile", "male_prompt": "looking at viewer",
+            "remove_char_tags": ["red hair"],
+            "remove_male_tags": ["black hair"],
+            "female_negative": "bad hands",
+            "male_negative": "bad face",
+        }
+        character = {
+            "female": "1girl, red hair, blue eyes",
+            "negative": "bad anatomy",
+        }
+        base, female, male, female_neg, male_neg, width, height = \
+            APP._build_std(acfg, character, scene, "남녀")
+        self.assertEqual(base, "2people, style, holding hands, close relationship")
+        self.assertEqual(female, "1girl, blue eyes, smile")
+        self.assertNotIn("black hair", male)
+        self.assertIn("looking at viewer", male)
+        self.assertEqual(female_neg, "bad anatomy, bad hands")
+        self.assertEqual(male_neg, "bad boy, bad face")
+        self.assertEqual((width, height), (832, 1216))
+
+        yuri = dict(scene, _mode="백합", partner_prompt="partner smile",
+                    remove_partner_tags=["brown hair"],
+                    partner_negative="partner blur")
+        acfg["_settings"]["시험"]["role"] = {
+            "외형": "1girl, brown hair, green eyes",
+            "착의": "", "네거티브": "partner bad anatomy",
+        }
+        base, female, partner, female_neg, partner_neg, _, _ = \
+            APP._build_yuri(acfg, character, yuri)
+        self.assertIn("holding hands, close relationship", base)
+        self.assertNotIn("red hair", female)
+        self.assertNotIn("brown hair", partner)
+        self.assertIn("partner smile", partner)
+        self.assertEqual(partner_neg, "partner bad anatomy, partner blur")
+
+        page = APP.render_page()
+        self.assertIn("장면 공통·관계 태그", page)
+        self.assertIn("remove_partner_tags", page)
+        self.assertIn("female_negative", page)
+
     def test_concurrent_setting_edits_are_one_read_modify_write_transaction(self):
         """서로 다른 정상 저장 두 개가 겹쳐도 마지막 요청이 앞 변경을 지우면 안 된다."""
         with tempfile.TemporaryDirectory() as td:
