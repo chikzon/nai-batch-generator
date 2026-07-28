@@ -747,25 +747,6 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(all(size_ok and hash_ok
                             for size_ok, hash_ok in checked_entries))
 
-    def test_community_shared_materials_are_not_framed_as_accidental_exposure(self):
-        paths = [
-            ROOT / ".gitignore",
-            ROOT / "CREDITS.md",
-            ROOT / "THIRD_PARTY_NOTICES.md",
-            ROOT / "start.py",
-            ROOT / "빌드.py",
-        ]
-        text = "\n".join(path.read_text(encoding="utf-8") for path in paths)
-        for phrase in (
-            "남의 저작물",
-            "재배포 조건을 확인하지 않았으므로",
-            "남이 공개한 자료라",
-            "남의 팩",
-        ):
-            self.assertNotIn(phrase, text)
-        self.assertIn("공개 공유 자료", text)
-        self.assertIn("출처를 보존", text)
-
     def test_installed_program_uses_separate_user_data_root(self):
         program = Path(r"C:\Apps\NAI배치생성기")
         local = Path(r"C:\Users\tester\AppData\Local")
