@@ -2970,7 +2970,134 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
             "items": items, "offset": offset}
 
 
-def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
+LIBRARY_REVIEW_FILE = BASE_DIR / "수집" / "자료정리.json"
+_LIBRARY_REVIEW_LOCK = threading.RLock()
+LIBRARY_REVIEW_STATUSES = {"pending", "reviewed", "hold"}
+
+
+def load_library_review(strict=False):
+    if not LIBRARY_REVIEW_FILE.is_file():
+        return {"schema": "nais-library-review/v1", "items": {}}
+    try:
+        data = load_json_recover(LIBRARY_REVIEW_FILE)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), dict):
+            raise ValueError("자료 정리 장부 형식이 올바르지 않습니다.")
+        return data
+    except Exception as e:
+        log.warning(f"자료 정리 장부를 읽지 못했습니다: {e}")
+        # 보기 화면은 원본 자료를 계속 보여 주되, 쓰기에서는 손상된 장부를 빈 장부로
+        # 오인해 덮지 않는다. .bak도 못 살렸다면 사용자가 복구할 증거를 그대로 남긴다.
+        if strict:
+            raise ValueError(
+                "자료 정리 장부가 손상되어 저장을 멈췄습니다. "
+                "자료정리.json과 .bak을 확인하세요.") from e
+        return {"schema": "nais-library-review/v1", "items": {}}
+
+
+def library_review_revision(data):
+    raw = json.dumps(
+        data or {}, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def normalize_library_labels(value):
+    if isinstance(value, str):
+        value = re.split(r"[,\n]", value)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("자료 이름표는 문자열 또는 목록이어야 합니다.")
+    out = []
+    for label in value:
+        label = unicodedata.normalize("NFKC", str(label or "")).strip()
+        if not label:
+            continue
+        if len(label) > 40:
+            raise ValueError("자료 이름표는 40자 이하여야 합니다.")
+        if label not in out:
+            out.append(label)
+        if len(out) >= 20:
+            break
+    return out
+
+
+def organize_library_items(request):
+    """큰 묶음 원문을 건드리지 않고 검토 상태·이름표 장부만 원자 저장한다."""
+    if not isinstance(request, dict):
+        raise ValueError("자료 정리 요청 형식이 올바르지 않습니다.")
+    ids = request.get("ids") or []
+    if not isinstance(ids, list):
+        raise ValueError("정리할 자료 id는 목록이어야 합니다.")
+    ids = list(dict.fromkeys(str(value or "").strip() for value in ids))
+    ids = [value for value in ids if value]
+    if not ids:
+        raise ValueError("정리할 자료를 먼저 고르세요.")
+    if len(ids) > 500:
+        raise ValueError("한 번에 정리할 자료는 500개까지입니다.")
+    if any(len(value) > 240 or ":" not in value for value in ids):
+        raise ValueError("자료 id 형식이 올바르지 않습니다.")
+    action = str(request.get("action") or "apply")
+    with _LIBRARY_REVIEW_LOCK:
+        data = load_library_review(strict=True)
+        revision = library_review_revision(data)
+        expected = str(request.get("expect_revision") or "")
+        if expected and expected != revision:
+            return {
+                "ok": False, "conflict": True, "revision": revision,
+                "error": "다른 화면에서 자료 정리가 먼저 바뀌었습니다. 목록을 새로 불러와 다시 적용하세요.",
+            }
+        items = data.setdefault("items", {})
+        before = {item_id: copy.deepcopy(items.get(item_id)) for item_id in ids}
+        if action == "restore":
+            restore = request.get("records")
+            if not isinstance(restore, dict):
+                raise ValueError("되돌릴 자료 정리 기록이 없습니다.")
+            for item_id in ids:
+                old = restore.get(item_id)
+                if isinstance(old, dict):
+                    items[item_id] = copy.deepcopy(old)
+                else:
+                    items.pop(item_id, None)
+        elif action == "apply":
+            raw_status = request.get("status")
+            status = str(raw_status or "").strip()
+            if status and status not in LIBRARY_REVIEW_STATUSES:
+                raise ValueError("알 수 없는 검토 상태입니다.")
+            labels = normalize_library_labels(request.get("labels"))
+            label_mode = str(request.get("label_mode") or "add")
+            if label_mode not in {"add", "replace", "clear"}:
+                raise ValueError("알 수 없는 이름표 적용 방식입니다.")
+            for item_id in ids:
+                record = copy.deepcopy(items.get(item_id) or {})
+                if status:
+                    record["status"] = status
+                if label_mode == "clear":
+                    record["labels"] = []
+                elif label_mode == "replace":
+                    record["labels"] = labels
+                elif labels:
+                    record["labels"] = normalize_library_labels(
+                        list(record.get("labels") or []) + labels)
+                record["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                if (record.get("status", "pending") == "pending"
+                        and not record.get("labels")):
+                    items.pop(item_id, None)
+                else:
+                    items[item_id] = record
+        else:
+            raise ValueError("알 수 없는 자료 정리 동작입니다.")
+        data["schema"] = "nais-library-review/v1"
+        data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        atomic_write_json(LIBRARY_REVIEW_FILE, data)
+        return {
+            "ok": True, "changed": len(ids), "before": before,
+            "revision": library_review_revision(data),
+        }
+
+
+def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
+                   review="", label=""):
     """입력 경로와 저장 위치가 다른 큰 묶음을 한 자료실 규격으로 검색한다.
 
     전체 레코드는 서버 안에서만 검색하고 현재 페이지의 적용 필드만 보낸다. 수천 건의
@@ -3026,8 +3153,13 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
         name = str(
             style.get("title") or style.get("combo")
             or f"수집 그림체 {index + 1}")
+        # 예전 자료에는 id가 없다. 목록 순번은 자료팩 병합 때 바뀌므로 검토 장부의
+        # 열쇠로 쓰면 안 된다. 실제 카드 내용으로 만든 지문은 재시작·재정렬 뒤에도 같다.
+        fallback_id = hashlib.sha256(json.dumps(
+            compact, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
         rows.append({
-            "id": "collected:" + str(style.get("id") or index),
+            "id": "collected:" + str(style.get("id") or fallback_id),
             "kind": "그림체", "store": "collected", "name": name,
             "prompt": str(style.get("base") or style.get("combo") or ""),
             "negative": str(style.get("negative") or ""),
@@ -3048,8 +3180,11 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
         }
         if isinstance(compact.get("images"), list):
             compact["images"] = compact["images"][:2]
+        fallback_id = hashlib.sha256(json.dumps(
+            compact, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
         rows.append({
-            "id": "recipe:" + str(recipe.get("id") or index),
+            "id": "recipe:" + str(recipe.get("id") or fallback_id),
             "kind": "레시피", "store": "recipe",
             "name": str(recipe.get("title") or recipe.get("concept_ko")
                         or f"레시피 {index + 1}"),
@@ -3105,6 +3240,28 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
             "ref": copy.deepcopy(run),
         })
 
+    review_data = load_library_review()
+    review_items = review_data.get("items") or {}
+    review_counts = {"pending": 0, "reviewed": 0, "hold": 0}
+    all_labels = {}
+    for row in rows:
+        record = review_items.get(row["id"])
+        if not isinstance(record, dict):
+            record = {}
+        status = str(record.get("status") or "pending")
+        if status not in LIBRARY_REVIEW_STATUSES:
+            status = "pending"
+        try:
+            labels = normalize_library_labels(record.get("labels"))
+        except ValueError:
+            # 한 항목의 낡거나 손상된 이름표 때문에 수천 건 자료실 전체를 막지 않는다.
+            labels = []
+        row["review_status"] = status
+        row["labels"] = labels
+        review_counts[status] += 1
+        for value in labels:
+            all_labels[value] = all_labels.get(value, 0) + 1
+
     all_sources = {}
     all_kinds = {}
     for row in rows:
@@ -3121,10 +3278,15 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
             continue
         if source and source not in {"all", row["source"]}:
             continue
+        if review and review not in {"all", row["review_status"]}:
+            continue
+        if label and label not in row["labels"]:
+            continue
         if terms:
             haystack = unicodedata.normalize("NFKC", " ".join([
                 row.get("name", ""), row.get("prompt", ""), row.get("negative", ""),
                 row.get("outfit", ""), row.get("source", ""),
+                " ".join(row.get("labels") or []), row.get("review_status", ""),
                 json.dumps(row.get("meta") or {}, ensure_ascii=False),
             ])).casefold()
             if not all(term in haystack for term in terms):
@@ -3134,7 +3296,8 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0):
     return {
         "ok": True, "total": len(rows), "matched": len(matched),
         "offset": offset, "items": page, "sources": all_sources,
-        "kinds": all_kinds,
+        "kinds": all_kinds, "review_counts": review_counts,
+        "labels": all_labels, "revision": library_review_revision(review_data),
     }
 
 
@@ -9622,10 +9785,40 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <option value="세팅">세팅</option><option value="생성 기록">생성 기록</option>
           </select>
           <select id="libSource" style="width:auto;"><option value="">모든 출처</option></select>
+          <select id="libReview" style="width:auto;" aria-label="검토 상태">
+            <option value="">모든 검토 상태</option>
+            <option value="pending">미검토</option>
+            <option value="reviewed">검토 완료</option>
+            <option value="hold">보류</option>
+          </select>
+          <select id="libLabel" style="width:auto;" aria-label="자료 이름표">
+            <option value="">모든 이름표</option>
+          </select>
           <button type="button" id="libManage" disabled>종류를 고르면 정리할 수 있습니다</button>
           <button id="libAddChar">+ 캐릭터 추가</button>
           <button id="libAddFolder">+ 폴더 추가</button>
           <span class="n" id="libCount" style="margin-left:auto;"></span>
+        </div>
+        <div class="bar" id="libBulkBar" style="margin:8px 0;flex-wrap:wrap;">
+          <label class="hint"><input type="checkbox" id="libSelectPage"> 이 화면 전체</label>
+          <span class="tag" id="libSelectedN">0개 선택</span>
+          <select id="libBulkStatus" style="width:auto;" aria-label="선택 자료 검토 상태">
+            <option value="">상태 유지</option>
+            <option value="pending">미검토</option>
+            <option value="reviewed">검토 완료</option>
+            <option value="hold">보류</option>
+          </select>
+          <input type="text" id="libBulkLabels" style="width:190px;"
+            placeholder="이름표, 쉼표로 여러 개" aria-label="선택 자료 이름표">
+          <select id="libLabelMode" style="width:auto;" aria-label="이름표 적용 방식">
+            <option value="add">이름표 더하기</option>
+            <option value="replace">이름표 바꾸기</option>
+            <option value="clear">이름표 비우기</option>
+          </select>
+          <button type="button" id="libBulkApply" class="primary" disabled>선택 자료 정리</button>
+          <button type="button" id="libBulkUndo" disabled>↶ 방금 정리 되돌리기</button>
+          <button type="button" id="libClearSelection" disabled>선택 해제</button>
+          <span class="hint" id="libBulkMsg" aria-live="polite">원본 자료는 바꾸지 않고 별도 정리 장부에 저장합니다.</span>
         </div>
         <div id="libGrid" class="items" style="grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:7px;"></div>
         <div class="bar"><button type="button" id="libMore" style="flex:1;display:none;">더 보기 ▾</button></div>
@@ -13883,8 +14076,28 @@ $('setThumbs').addEventListener('change', () => {
 /* ── 라이브러리 ── */
 var LIB_OFFSET = 0, LIB_PAGE_SIZE = 100, LIB_REQUEST_SEQ = 0, CHAR_EDIT_LIMIT = 24;
 var LIB_FILTER_TIMER = null, CHAR_FILTER_TIMER = null;
+var LIB_REVISION = '';
+var LIB_UNDO = null, LIB_VISIBLE_IDS = [];
+const LIB_SELECTED = new Set();
+const LIB_REVIEW_LABELS = {pending:'미검토', reviewed:'검토 완료', hold:'보류'};
 function libraryNeedle(value){
   return String(value || '').normalize('NFKC').toLocaleLowerCase();
+}
+function updateLibrarySelection(){
+  document.querySelectorAll('[data-libpick]').forEach(box => {
+    box.checked = LIB_SELECTED.has(box.dataset.libpick);
+  });
+  const selected = LIB_SELECTED.size;
+  if($('libSelectedN')) $('libSelectedN').textContent = `${selected.toLocaleString()}개 선택`;
+  if($('libBulkApply')) $('libBulkApply').disabled = !selected;
+  if($('libClearSelection')) $('libClearSelection').disabled = !selected;
+  if($('libBulkUndo')) $('libBulkUndo').disabled = !LIB_UNDO;
+  const page = LIB_VISIBLE_IDS.length;
+  if($('libSelectPage')){
+    const picked = LIB_VISIBLE_IDS.filter(id => LIB_SELECTED.has(id)).length;
+    $('libSelectPage').checked = !!page && picked === page;
+    $('libSelectPage').indeterminate = picked > 0 && picked < page;
+  }
 }
 async function renderLibrary(append=false){
   const g = $('libGrid'); if(!g) return;
@@ -13893,13 +14106,17 @@ async function renderLibrary(append=false){
   const query = ($('libFilter')||{}).value || '';
   const kind = ($('libType')||{}).value || '';
   const source = ($('libSource')||{}).value || '';
+  const review = ($('libReview')||{}).value || '';
+  const label = ($('libLabel')||{}).value || '';
   const url = `/api/library?q=${encodeURIComponent(query)}&kind=${encodeURIComponent(kind)}`
-    + `&source=${encodeURIComponent(source)}&limit=${LIB_PAGE_SIZE}&offset=${LIB_OFFSET}`;
+    + `&source=${encodeURIComponent(source)}&review=${encodeURIComponent(review)}`
+    + `&label=${encodeURIComponent(label)}&limit=${LIB_PAGE_SIZE}&offset=${LIB_OFFSET}`;
   let result;
   try{ result = await (await fetch(url)).json(); }
   catch(e){ result = {ok:false,error:String(e)}; }
   if(request !== LIB_REQUEST_SEQ) return;
   if(!result.ok){ g.innerHTML = `<div class="row hint">${esc(result.error||'자료를 읽지 못했습니다.')}</div>`; return; }
+  LIB_REVISION = result.revision || '';
   if(!append) g.innerHTML = '';
   const sourceSelect = $('libSource');
   if(sourceSelect && !append){
@@ -13914,38 +14131,139 @@ async function renderLibrary(append=false){
       sourceSelect.value = selectedSource;
     }
   }
+  const labelSelect = $('libLabel');
+  if(labelSelect && !append){
+    const selectedLabel = labelSelect.value;
+    labelSelect.innerHTML = '<option value="">모든 이름표</option>';
+    Object.entries(result.labels||{}).sort((a,b)=>b[1]-a[1] || a[0].localeCompare(b[0]))
+      .forEach(([name,count]) => {
+        const option = document.createElement('option');
+        option.value = name; option.textContent = `${name} (${Number(count).toLocaleString()})`;
+        labelSelect.appendChild(option);
+      });
+    if([...labelSelect.options].some(option => option.value === selectedLabel)){
+      labelSelect.value = selectedLabel;
+    }
+  }
   const fragment = document.createDocumentFragment();
   (result.items||[]).forEach(it => {
     const el = document.createElement('div');
     el.className = 'row combo-card'; el.style.cursor = 'pointer'; el.style.margin = '0';
+    el.dataset.libcard = it.id;
     el._libraryItem = it;
-    el.innerHTML = `<div class="tag">${esc(it.kind)} · ${esc(it.source||'출처 없음')}</div>
+    const status = LIB_REVIEW_LABELS[it.review_status] || '미검토';
+    const labelTags = (it.labels||[]).map(value =>
+      `<span class="tag" style="font-size:var(--fs-2xs);">${esc(value)}</span>`).join('');
+    el.innerHTML = `<div class="bar" style="gap:6px;">
+        <label class="hint" title="이 자료 선택"><input type="checkbox"
+          data-libpick="${escA(it.id)}" ${LIB_SELECTED.has(it.id)?'checked':''}></label>
+        <span class="tag">${esc(it.kind)} · ${esc(it.source||'출처 없음')}</span>
+        <span class="tag" style="margin-left:auto;">${esc(status)}</span>
+      </div>
       <div style="display:flex;gap:8px;align-items:flex-start;">
         ${(it.images&&it.images[0])?`<img src="/img?u=${encodeURIComponent(it.images[0])}"
           loading="lazy" decoding="async" alt="" style="width:54px;height:54px;object-fit:cover;
           border-radius:var(--radius);border:1px solid var(--line);flex:none;">`:''}
         <div style="min-width:0;"><b style="font-size:var(--fs-xs);">${esc(it.name)}</b>
           <div style="font-size:var(--fs-2xs);color:var(--muted);margin-top:4px;
-          max-height:44px;overflow:hidden;">${esc(String(it.prompt||'').slice(0,100))}</div></div>
+          max-height:44px;overflow:hidden;">${esc(String(it.prompt||'').slice(0,100))}</div>
+          ${labelTags?`<div class="bar" style="gap:4px;margin-top:5px;flex-wrap:wrap;">${labelTags}</div>`:''}
+        </div>
       </div>`;
-    el.addEventListener('click', () => openLib(it));
+    el.querySelector('[data-libpick]').addEventListener('click', event => event.stopPropagation());
+    el.querySelector('[data-libpick]').addEventListener('change', event => {
+      if(event.target.checked) LIB_SELECTED.add(it.id);
+      else LIB_SELECTED.delete(it.id);
+      updateLibrarySelection();
+    });
+    el.addEventListener('click', event => {
+      if(!event.target.closest('[data-libpick]')) openLib(it);
+    });
     fragment.appendChild(el);
   });
   g.appendChild(fragment);
+  LIB_VISIBLE_IDS = [...g.querySelectorAll('[data-libcard]')].map(el => el.dataset.libcard);
   LIB_OFFSET += (result.items||[]).length;
   if(!LIB_OFFSET){
     g.innerHTML = '<div class="row hint">조건에 맞는 자료가 없습니다.</div>';
   }
   if($('libCount')) $('libCount').textContent =
     `${LIB_OFFSET.toLocaleString()} / ${Number(result.matched||0).toLocaleString()}개`
-    + ` · 전체 ${Number(result.total||0).toLocaleString()}개`;
+    + ` · 전체 ${Number(result.total||0).toLocaleString()}개`
+    + ` · 완료 ${Number((result.review_counts||{}).reviewed||0).toLocaleString()}`
+    + ` · 보류 ${Number((result.review_counts||{}).hold||0).toLocaleString()}`;
   if($('libMore')){
     $('libMore').style.display = LIB_OFFSET < Number(result.matched||0) ? '' : 'none';
     $('libMore').textContent =
       `더 보기 · 남은 ${(Number(result.matched||0) - LIB_OFFSET).toLocaleString()}개 ▾`;
   }
+  updateLibrarySelection();
   renderCharCards();
 }
+async function organizeSelectedLibrary(payload, undo=false){
+  const button = undo ? $('libBulkUndo') : $('libBulkApply');
+  if(button) button.disabled = true;
+  if($('libBulkMsg')) $('libBulkMsg').textContent =
+    undo ? '방금 정리를 되돌리는 중입니다.' : '선택 자료를 정리하는 중입니다.';
+  let result;
+  try{
+    result = await (await fetch('/api/library_organize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    })).json();
+  }catch(error){ result = {ok:false,error:String(error)}; }
+  if(!result.ok){
+    if($('libBulkMsg')) $('libBulkMsg').textContent =
+      result.error || '자료 정리를 저장하지 못했습니다.';
+    if(result.conflict) await renderLibrary(false);
+    updateLibrarySelection();
+    return false;
+  }
+  LIB_REVISION = result.revision || LIB_REVISION;
+  if($('libBulkMsg')) $('libBulkMsg').textContent =
+    `${Number(result.changed||0).toLocaleString()}개 ${undo?'되돌림':'정리 완료'} · 원본 자료는 그대로입니다.`;
+  return result;
+}
+if($('libSelectPage')) $('libSelectPage').addEventListener('change', event => {
+  LIB_VISIBLE_IDS.forEach(id => {
+    if(event.target.checked) LIB_SELECTED.add(id);
+    else LIB_SELECTED.delete(id);
+  });
+  updateLibrarySelection();
+});
+if($('libClearSelection')) $('libClearSelection').addEventListener('click', () => {
+  LIB_SELECTED.clear();
+  updateLibrarySelection();
+});
+if($('libBulkApply')) $('libBulkApply').addEventListener('click', async () => {
+  const ids = [...LIB_SELECTED];
+  const status = $('libBulkStatus').value;
+  const labels = $('libBulkLabels').value;
+  const labelMode = $('libLabelMode').value;
+  if(!status && !labels.trim() && labelMode !== 'clear'){
+    $('libBulkMsg').textContent = '바꿀 상태나 이름표를 먼저 적으세요.';
+    return;
+  }
+  const result = await organizeSelectedLibrary({
+    action:'apply', ids, status, labels, label_mode:labelMode,
+    expect_revision:LIB_REVISION,
+  });
+  if(!result) return;
+  LIB_UNDO = {ids, records:result.before};
+  LIB_SELECTED.clear();
+  await renderLibrary(false);
+});
+if($('libBulkUndo')) $('libBulkUndo').addEventListener('click', async () => {
+  if(!LIB_UNDO) return;
+  const undo = LIB_UNDO;
+  const result = await organizeSelectedLibrary({
+    action:'restore', ids:undo.ids, records:undo.records,
+    expect_revision:LIB_REVISION,
+  }, true);
+  if(!result) return;
+  LIB_UNDO = null;
+  await renderLibrary(false);
+});
 function updateLibraryManage(){
   const button = $('libManage');
   if(!button) return;
@@ -14009,6 +14327,8 @@ if($('libType')) $('libType').addEventListener('change', () => {
   renderLibrary(false);
 });
 if($('libSource')) $('libSource').addEventListener('change', () => renderLibrary(false));
+if($('libReview')) $('libReview').addEventListener('change', () => renderLibrary(false));
+if($('libLabel')) $('libLabel').addEventListener('change', () => renderLibrary(false));
 if($('libManage')) $('libManage').addEventListener('click', manageLibraryKind);
 if($('libMore')) $('libMore').addEventListener('click', () => {
   renderLibrary(true);
@@ -18280,6 +18600,8 @@ class ConfigServer:
                             q=q.get("q", [""])[0],
                             kind=q.get("kind", [""])[0],
                             source=q.get("source", [""])[0],
+                            review=q.get("review", [""])[0],
+                            label=q.get("label", [""])[0],
                             limit=int(q.get("limit", ["100"])[0]),
                             offset=int(q.get("offset", ["0"])[0]),
                         ))
@@ -19008,6 +19330,12 @@ class ConfigServer:
                             OPTIONS.clear()
                             OPTIONS.update(load_options())
                         self._json(r)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/library_organize"):
+                    try:
+                        payload = json.loads(body or b"{}")
+                        self._json(organize_library_items(payload))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/public_collection_start"):

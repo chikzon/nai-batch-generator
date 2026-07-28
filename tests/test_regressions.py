@@ -4655,6 +4655,96 @@ class RegressionTests(unittest.TestCase):
                 APP._COMBOS.clear()
                 APP._COMBOS.update(old_cache)
 
+    def test_library_review_ledger_bulk_labels_conflict_and_undo_leave_sources_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            style_file = base / "수집" / "그림체.json"
+            style_file.parent.mkdir(parents=True)
+            styles = [{
+                "id": "style-one", "title": "그림체 하나", "source": "공유 자료",
+                "base": "style whole positive", "negative": "style whole negative",
+                "params": {"scale": 5.0},
+            }]
+            style_file.write_text(
+                json.dumps(styles, ensure_ascii=False), encoding="utf-8")
+            cfg = {"characters": [{
+                "id": "char-one", "name": "캐릭터 하나",
+                "female": "character whole positive",
+                "negative": "character whole negative",
+            }]}
+            source_before = style_file.read_bytes()
+            cfg_before = copy.deepcopy(cfg)
+            review_file = base / "수집" / "자료정리.json"
+            with (
+                patch.object(APP, "LIBRARY_REVIEW_FILE", review_file),
+                patch.object(APP, "list_styles", return_value=[]),
+                patch.object(APP, "load_combos", return_value=styles),
+                patch.object(APP, "load_recipes", return_value=[]),
+                patch.object(APP, "list_settings", return_value=[]),
+                patch.object(APP, "comparison_runs", return_value={"ok": True, "runs": []}),
+            ):
+                initial = APP.search_library(cfg, {})
+                self.assertEqual(initial["review_counts"]["pending"], 2)
+                ids = [row["id"] for row in initial["items"]]
+                applied = APP.organize_library_items({
+                    "ids": ids,
+                    "status": "reviewed",
+                    "labels": ["즐겨찾을 자료", "빨강"],
+                    "label_mode": "add",
+                    "expect_revision": initial["revision"],
+                })
+                self.assertTrue(applied["ok"])
+                reviewed = APP.search_library(
+                    cfg, {}, review="reviewed", label="즐겨찾을 자료")
+                self.assertEqual(reviewed["matched"], 2)
+                self.assertTrue(all(
+                    row["labels"] == ["즐겨찾을 자료", "빨강"]
+                    for row in reviewed["items"]))
+
+                ledger_before_conflict = review_file.read_bytes()
+                conflict = APP.organize_library_items({
+                    "ids": ids, "status": "hold",
+                    "expect_revision": initial["revision"],
+                })
+                self.assertFalse(conflict["ok"])
+                self.assertTrue(conflict["conflict"])
+                self.assertEqual(review_file.read_bytes(), ledger_before_conflict)
+
+                restored = APP.organize_library_items({
+                    "action": "restore", "ids": ids,
+                    "records": applied["before"],
+                    "expect_revision": reviewed["revision"],
+                })
+                self.assertTrue(restored["ok"])
+                final = APP.search_library(cfg, {})
+                self.assertEqual(final["review_counts"]["pending"], 2)
+                self.assertEqual(final["labels"], {})
+                self.assertEqual(style_file.read_bytes(), source_before)
+                self.assertEqual(cfg, cfg_before)
+
+                ledger_before_invalid = review_file.read_bytes()
+                with self.assertRaises(ValueError):
+                    APP.organize_library_items({
+                        "ids": ids, "status": "unknown",
+                        "expect_revision": final["revision"],
+                    })
+                self.assertEqual(review_file.read_bytes(), ledger_before_invalid)
+                corrupt = base / "수집" / "손상된-자료정리.json"
+                corrupt.write_bytes(b'{"items":')
+                with patch.object(APP, "LIBRARY_REVIEW_FILE", corrupt):
+                    with self.assertRaisesRegex(ValueError, "손상"):
+                        APP.organize_library_items({
+                            "ids": ids, "status": "reviewed",
+                        })
+                self.assertEqual(corrupt.read_bytes(), b'{"items":')
+
+            page = APP.render_page()
+            for marker in (
+                    'id="libReview"', 'id="libLabel"', 'id="libSelectPage"',
+                    'id="libBulkApply"', 'id="libBulkUndo"',
+                    "/api/library_organize", "expect_revision:LIB_REVISION"):
+                self.assertIn(marker, page)
+
 
 if __name__ == "__main__":
     unittest.main()
