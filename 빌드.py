@@ -246,8 +246,8 @@ def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
 
     `src_root` 는 공개 자료를 읽어올 자리다. 기본은 저장소 폴더(`HERE`)다.
     **시험에서 가짜 자료를 넣어 부르라고 열어 뒀다** —
-    `태그/`·`t5_tokenizer.json` 은 남의 저작물이라 저장소에 없어서(`.gitignore`),
-    `HERE` 만 보면 **새로 복제한 곳에서는 자료팩이 비어 시험이 깨진다.**
+    `태그/`·`t5_tokenizer.json` 은 프로그램 본체와 자료를 분리해 저장소에 없으므로
+    (`.gitignore`), `HERE` 만 보면 **새로 복제한 곳에서는 자료팩이 비어 시험이 깨진다.**
 
     개인 `세팅/`은 src_root에 있어도 읽지 않는다. 공개 자료팩과 개인 세팅의 경계를
     빌드 호출자의 주의에 맡기지 않고 이 허용 목록으로 고정한다.

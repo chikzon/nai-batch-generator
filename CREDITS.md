@@ -38,14 +38,14 @@
 
 | 자료 | 출처 · 조건 |
 |---|---|
-| `t5_tokenizer.json` (2.3MB) | `sunanakgo/NAIS3` commit `6bff595`의 `resources/t5_tokenizer.json`과 JSON 의미 구조가 같다. NAIS3의 GPL-3.0을 따른다. 그보다 앞선 원출처는 확인하지 못했다 |
+| `t5_tokenizer.json` (2.3MB) | `sunanakgo/NAIS3` commit `6bff595`의 `resources/t5_tokenizer.json`. NAIS3의 GPL-3.0을 따른다 |
 | `태그/*.csv` (6MB) | `DominikDoom/a1111-sd-webui-tagcomplete` commit `4170882f90b47be130a0ff9314f663c230b9153d`의 태그 CSV와 SHA-256이 같다. MIT 고지와 해시는 `THIRD_PARTY_NOTICES.md`에 보존했다 |
 
 ### 저장소·배포본 **어디에도 없는 것** (자료팩으로만 따로 전달)
 
 | 자료 | 출처 · 조건 |
 |---|---|
-| `수집/그림체.json` · `작가통계.json` · `레시피.json` | 아카라이브 · 도랑 위키에서 사람들이 공개한 프롬프트 조합을 모은 것. 본 배포본 대신 자료팩.zip 으로 따로 전달한다 |
+| `수집/그림체.json` · `작가통계.json` · `레시피.json` | 아카라이브 AI 그림 채널·AI 데이트 채널·도랑 위키 공개 공유 자료. 각 항목의 출처를 보존한다 |
 | `수집/이미지캐시/` | 위 그림체의 예시 이미지 (자료팩으로만 전달) |
 | 모델 `ntd11_v5.pt` | Civitai 1313556. 자동 검열용 — **이 저장소 밖의 별도 로컬 도구**에서 쓰며, 저장소·배포본 어디에도 포함되지 않는다 |
 

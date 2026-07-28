@@ -41,9 +41,8 @@ SOFTWARE.
 ## T5 토크나이저
 
 - 파일: `t5_tokenizer.json`
-- 확인 가능한 직접 출처: `sunanakgo/NAIS3`, commit `6bff595`,
+- 출처: `sunanakgo/NAIS3`, commit `6bff595`,
   `resources/t5_tokenizer.json`
 - 검증: 배포 파일과 위 파일은 공백·직렬화 표현은 다르지만, JSON 전체를 정규화하면
   의미 구조가 같다(vocab 32,100개).
 - 조건: NAIS3 저장소의 GPL-3.0. 이 프로젝트도 GPL-3.0으로 배포하며 본문 `LICENSE`를 포함한다.
-- 한계: NAIS3보다 앞선 원출처는 이번 감사에서 확인하지 못했다.
