@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chikzon.github.io/nai-batch-generator/contracts/chatbot-nai/v1/render-result.schema.json",
+  "title": "Chatbot NAI render result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "request_id",
+    "status",
+    "retryable",
+    "artifacts"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "render-result/v1"
+    },
+    "request_id": {
+      "$ref": "#/$defs/id"
+    },
+    "status": {
+      "enum": ["queued", "running", "succeeded", "failed", "cancelled"]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/id"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact_id", "sha256", "width", "height"],
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/$defs/id"
+          },
+          "local_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        },
+        "anyOf": [
+          {
+            "required": ["local_path"]
+          },
+          {
+            "required": ["url"]
+          }
+        ]
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["style_id", "setting_id", "character_ids", "actual_settings"],
+      "properties": {
+        "style_id": {
+          "$ref": "#/$defs/id"
+        },
+        "setting_id": {
+          "$ref": "#/$defs/id"
+        },
+        "character_ids": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "actual_settings": {
+          "type": "object"
+        }
+      }
+    },
+    "publish": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["not_requested", "pending", "published", "failed"]
+        },
+        "r2_key": {
+          "type": "string"
+        },
+        "scene_url": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "succeeded"
+          }
+        }
+      },
+      "then": {
+        "required": ["reproduction"],
+        "properties": {
+          "artifacts": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        }
+      },
+      "then": {
+        "required": ["error"]
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    }
+  }
+}
+

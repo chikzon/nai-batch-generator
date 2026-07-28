@@ -34,7 +34,9 @@ def main():
         ROOT / "start.py",
         ROOT / "빌드.py",
         ROOT / "배포준비.py",
+        ROOT / "contracts" / "chatbot-nai" / "validate_contract.py",
     )
+    run("챗봇↔NAI 연결 계약", ROOT / "tests" / "test_contracts.py")
     run("무과금 회귀", ROOT / "tests" / "test_regressions.py")
     print("\n✔ 배포 전 smoke 검증 통과")
 

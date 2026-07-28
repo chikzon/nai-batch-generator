@@ -1,0 +1,46 @@
+{
+  "contract_version": "render-request/v1",
+  "request_id": "request:test-0001",
+  "project_id": "chatbot:isekai-mia",
+  "scene_id": "scene:chapter-01-0001",
+  "context": {
+    "location_id": "location:damaged-home",
+    "time_id": "time:evening",
+    "cast": [
+      {
+        "character_id": "character:se",
+        "outfit_id": "outfit:default",
+        "action_id": "action:standing",
+        "emotion_id": "emotion:neutral"
+      }
+    ]
+  },
+  "nai_refs": {
+    "style_id": "style:default",
+    "setting_id": "setting:standing",
+    "setting_scene_id": "setting-scene:standing-01",
+    "characters": [
+      {
+        "character_id": "character:se",
+        "preset_id": "nai-character:se"
+      }
+    ]
+  },
+  "generation": {
+    "width": 832,
+    "height": 1216,
+    "count": 1,
+    "seed_mode": "fixed",
+    "seed": 424242
+  },
+  "output": {
+    "logical_name": "chapter-01/scene-0001",
+    "preserve_exif": true,
+    "postprocess": [
+      "background_remove",
+      "composite"
+    ],
+    "r2_key_candidate": "ar/default/a00.webp"
+  }
+}
+

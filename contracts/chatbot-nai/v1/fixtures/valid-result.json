@@ -1,0 +1,32 @@
+{
+  "contract_version": "render-result/v1",
+  "request_id": "request:test-0001",
+  "status": "succeeded",
+  "retryable": false,
+  "artifacts": [
+    {
+      "artifact_id": "artifact:test-0001-01",
+      "local_path": "output/contracts/test-0001-01.webp",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "width": 832,
+      "height": 1216,
+      "seed": 424242
+    }
+  ],
+  "reproduction": {
+    "style_id": "style:default",
+    "setting_id": "setting:standing",
+    "character_ids": [
+      "nai-character:se"
+    ],
+    "actual_settings": {
+      "width": 832,
+      "height": 1216,
+      "seed": 424242
+    }
+  },
+  "publish": {
+    "status": "not_requested"
+  }
+}
+

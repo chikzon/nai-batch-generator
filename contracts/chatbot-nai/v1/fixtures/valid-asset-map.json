@@ -1,0 +1,17 @@
+{
+  "contract_version": "asset-map/v1",
+  "revision": 1,
+  "characters": {
+    "character:se": {
+      "nai_character_id": "nai-character:se",
+      "default_outfit_id": "outfit:default"
+    }
+  },
+  "locations": {
+    "location:damaged-home": {
+      "background_asset_id": "background:damaged-home",
+      "nai_setting_id": "setting:standing"
+    }
+  }
+}
+

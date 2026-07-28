@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chikzon.github.io/nai-batch-generator/contracts/chatbot-nai/v1/render-request.schema.json",
+  "title": "Chatbot NAI render request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "request_id",
+    "project_id",
+    "scene_id",
+    "context",
+    "nai_refs",
+    "generation",
+    "output"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "render-request/v1"
+    },
+    "request_id": {
+      "$ref": "#/$defs/id"
+    },
+    "project_id": {
+      "$ref": "#/$defs/id"
+    },
+    "scene_id": {
+      "$ref": "#/$defs/id"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location_id", "cast"],
+      "properties": {
+        "location_id": {
+          "$ref": "#/$defs/id"
+        },
+        "time_id": {
+          "$ref": "#/$defs/id"
+        },
+        "cast": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["character_id"],
+            "properties": {
+              "character_id": {
+                "$ref": "#/$defs/id"
+              },
+              "outfit_id": {
+                "$ref": "#/$defs/id"
+              },
+              "action_id": {
+                "$ref": "#/$defs/id"
+              },
+              "emotion_id": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          }
+        }
+      }
+    },
+    "nai_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["style_id", "setting_id", "characters"],
+      "properties": {
+        "style_id": {
+          "$ref": "#/$defs/id"
+        },
+        "setting_id": {
+          "$ref": "#/$defs/id"
+        },
+        "setting_scene_id": {
+          "$ref": "#/$defs/id"
+        },
+        "characters": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["character_id", "preset_id"],
+            "properties": {
+              "character_id": {
+                "$ref": "#/$defs/id"
+              },
+              "preset_id": {
+                "$ref": "#/$defs/id"
+              },
+              "reference_ids": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/id"
+                }
+              },
+              "vibe_ids": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/id"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "count", "seed_mode"],
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2048,
+          "multipleOf": 64
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2048,
+          "multipleOf": 64
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "seed_mode": {
+          "enum": ["random", "fixed", "sequence"]
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_name", "preserve_exif"],
+      "properties": {
+        "logical_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "preserve_exif": {
+          "type": "boolean"
+        },
+        "postprocess": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["background_remove", "composite", "censor"]
+          }
+        },
+        "r2_key_candidate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    }
+  }
+}
+

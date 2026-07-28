@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chikzon.github.io/nai-batch-generator/contracts/chatbot-nai/v1/asset-map.schema.json",
+  "title": "Chatbot NAI asset map v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "revision", "characters", "locations"],
+  "properties": {
+    "contract_version": {
+      "const": "asset-map/v1"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "characters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["nai_character_id"],
+        "properties": {
+          "nai_character_id": {
+            "$ref": "#/$defs/id"
+          },
+          "default_outfit_id": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "locations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["background_asset_id"],
+        "properties": {
+          "background_asset_id": {
+            "$ref": "#/$defs/id"
+          },
+          "nai_setting_id": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    }
+  }
+}
+
