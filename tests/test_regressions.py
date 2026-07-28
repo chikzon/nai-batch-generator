@@ -32,6 +32,10 @@ from PIL.PngImagePlugin import PngInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# start.py가 유지보수 가능한 보조 모듈을 불러오므로, 파일 경로로 직접 로드하는
+# 이 시험도 일반 `python start.py`와 같은 모듈 검색 경로를 갖게 한다.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location("nai_helper_under_test", ROOT / "start.py")
 assert SPEC and SPEC.loader
 APP = importlib.util.module_from_spec(SPEC)
@@ -4117,6 +4121,98 @@ class RegressionTests(unittest.TestCase):
                 self.assertTrue(undone["changed_config"])
                 self.assertEqual([c["id"] for c in cfg["characters"]], ["keep"])
                 self.assertEqual(len(list((base / "캐릭터").glob("*.json"))), 1)
+
+    def test_public_collection_parser_finds_only_matching_nai_posts_and_original_images(self):
+        html = """
+        <a class="vrow column" href="/b/aiart/101">
+          <span class="badge">NAI</span><span class="title">그림체 공유 첫째</span>
+          <time datetime="2026-07-28T10:00:00+09:00"></time>
+        </a>
+        <a class="vrow column" href="/b/aiart/102">
+          <span class="badge">잡담</span><span class="title">그림체 공유 둘째</span>
+        </a>
+        <a class="vrow column" href="/b/aiart/103">
+          <span class="badge">NAI</span><span class="title">다른 제목</span>
+        </a>
+        """
+        rows = APP.arca_public.extract_search_results(html, "그림체 공유")
+        self.assertEqual([row["article_id"] for row in rows], ["101"])
+        self.assertEqual(rows[0]["posted_at"], "2026-07-28")
+
+        article = APP.arca_public.extract_article("""
+          <title>공유 글</title>
+          <div class="article-content">
+            설명
+            <img src="https://ac.namu.la/202607/a.png?type=thumb&key=x">
+            <img data-original="https://ac.namu.la/202607/a.png?type=orig&key=y">
+            <img src="http://127.0.0.1/private.png">
+          </div>
+        """, "https://arca.live/b/aiart/101")
+        self.assertEqual(len(article["image_urls"]), 1)
+        self.assertIn("type=orig", article["image_urls"][0])
+        self.assertNotIn("127.0.0.1", "".join(article["image_urls"]))
+
+    def test_public_collection_keeps_original_nai_image_and_whole_prompt_bundle(self):
+        prompt = "artist:test, " + ("긴 프롬프트, " * 700)
+        negative = "lowres, " + ("긴 네거티브, " * 700)
+        comment = {
+            "prompt": prompt,
+            "uc": negative,
+            "steps": 28,
+            "scale": 6.5,
+            "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
+            "seed": 123,
+            "width": 832,
+            "height": 1216,
+            "software": "NovelAI",
+        }
+        metadata = PngInfo()
+        metadata.add_text("Comment", json.dumps(comment, ensure_ascii=False))
+        source = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(
+            source, "PNG", pnginfo=metadata)
+        raw = source.getvalue()
+        article = {
+            "article_id": "101", "title": "공유 글",
+            "source_url": "https://arca.live/b/aiart/101",
+            "posted_at": "2026-07-28", "board_tab": "NAI",
+        }
+        record = APP._style_record_from_public_image(raw, "image/png", article)
+        self.assertIsNotNone(record)
+        # 끝 구분자 정리는 허용하되, 긴 본문은 한 글자도 길이 제한으로 잘리지 않는다.
+        self.assertEqual(record["base"], prompt.rstrip(", "))
+        self.assertEqual(record["negative_full"], negative)
+        self.assertEqual(record["url"], article["source_url"])
+
+        with tempfile.TemporaryDirectory() as td, patch.object(
+                APP, "IMG_CACHE", Path(td) / "이미지캐시"):
+            local_ref, created = APP._local_import_image(
+                raw, "image/png", "https://ac.namu.la/202607/a.png")
+            expected = hashlib.sha256(raw).hexdigest() + ".png"
+            self.assertTrue(created)
+            self.assertEqual(local_ref, "local:" + expected)
+            self.assertEqual((APP.IMG_CACHE / expected).read_bytes(), raw)
+
+    def test_public_collection_marks_crashed_job_resumable_without_losing_queue(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_file = Path(td) / "진행.json"
+            state_file.write_text(json.dumps({
+                "schema": "nais-public-collection/v1",
+                "status": "running",
+                "stage": "downloading",
+                "queue": [
+                    "https://arca.live/b/aiart/101",
+                    "https://arca.live/b/aiart/102",
+                ],
+                "cursor": 1,
+            }), encoding="utf-8")
+            manager = APP.PublicCollectionManager(state_file)
+            snap = manager.snapshot()
+            self.assertEqual(snap["status"], "interrupted")
+            self.assertTrue(snap["can_resume"])
+            self.assertEqual(snap["cursor"], 1)
+            self.assertEqual(len(snap["queue"]), 2)
 
 
 if __name__ == "__main__":

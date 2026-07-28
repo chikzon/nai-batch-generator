@@ -46,6 +46,7 @@ from pathlib import Path
 
 import requests
 from PIL import Image
+import arca_public_import as arca_public
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -9005,6 +9006,36 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <span id="studioCompareHome" hidden aria-hidden="true"></span>
       <div id="studioLibraryBrowse">
+      <div class="card">
+        <h2><span class="n">수집</span>공개 그림체 자료 가져오기
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">결과는 공통 그림체 자료로 바로 정리</span></h2>
+        <p class="hint">아카라이브 AI 그림 채널의 공개 게시글 주소를 넣거나
+        <b>그림체 공유</b> 검색 결과를 훑습니다. NAI 메타데이터가 있는 원본만
+        <b>베이스+네거티브+생성 설정</b> 한 묶음으로 보관하며, 같은 묶음은 새로
+        복제하지 않고 이미지와 출처만 더합니다. 앱을 꺼도 진행 위치가 남습니다.</p>
+        <div class="grid3" style="align-items:end;">
+          <div class="field" style="grid-column:span 2;">
+            <label>공개 게시글 주소 <span class="hint">(여러 개면 줄바꿈)</span></label>
+            <textarea id="publicCollectUrls" style="min-height:52px;"
+              placeholder="https://arca.live/b/aiart/123456789"></textarea>
+          </div>
+          <div class="field"><label>검색어</label>
+            <input id="publicCollectKeyword" type="text" value="그림체 공유"></div>
+          <div class="field"><label>검색 페이지 <span class="hint">(0=주소만)</span></label>
+            <input id="publicCollectPages" type="number" value="2" min="0" max="20"></div>
+          <div class="field"><label>최대 게시글</label>
+            <input id="publicCollectMax" type="number" value="100" min="1" max="1000"></div>
+          <div class="bar" style="align-self:end;">
+            <button id="publicCollectStart" class="primary">수집 시작</button>
+            <button id="publicCollectPause">일시정지</button>
+            <button id="publicCollectResume">이어가기</button>
+            <button id="publicCollectStop">중지</button>
+          </div>
+        </div>
+        <div id="publicCollectStatus" class="hint" aria-live="polite"
+          style="margin-top:9px;white-space:pre-wrap;">수집 기록을 확인하는 중입니다.</div>
+      </div>
+
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
       <div class="card">
         <h2><span class="n">생성물</span>탐색기 · 선별
@@ -13156,6 +13187,62 @@ if($('dataIndexBuild')) $('dataIndexBuild').addEventListener('click', async () =
   finally{ btn.disabled = false; }
 });
 
+let PUBLIC_COLLECT_TIMER = null;
+function renderPublicCollection(r){
+  const host = $('publicCollectStatus'); if(!host) return;
+  if(!r || !r.ok){ host.textContent = (r && r.error) || '수집 기록을 읽지 못했습니다.'; return; }
+  const labels = {
+    idle:'대기', searching:'검색 중', downloading:'게시글·이미지 확인 중',
+    paused:'일시정지', interrupted:'앱 종료로 중단됨', stopping:'중지 중',
+    stopped:'중지됨', failed:'실패', completed:'완료'
+  };
+  const total = Number((r.queue||[]).length || r.found_posts || 0);
+  const done = Number(r.scanned_posts||0);
+  const bits = [
+    `${labels[r.stage] || labels[r.status] || r.status} · 게시글 ${done}/${total}`,
+    `이미지 ${Number(r.scanned_images||0)}장 확인 · NAI 메타 ${Number(r.metadata_images||0)}장`,
+    `새 묶음 ${Number(r.added||0)} · 기존 묶음에 근거 추가 ${Number(r.updated||0)} · 이미 있음 ${Number(r.existing||0)}`
+  ];
+  if(r.current) bits.push(`현재: ${r.current}`);
+  if((r.errors||[]).length) bits.push(`최근 오류: ${r.errors[r.errors.length-1]}`);
+  host.textContent = bits.join('\n');
+  const active = ['running','paused','stopping'].includes(r.status);
+  if($('publicCollectStart')) $('publicCollectStart').disabled = active;
+  if($('publicCollectPause')) $('publicCollectPause').disabled = r.status !== 'running';
+  if($('publicCollectResume')) $('publicCollectResume').disabled = !r.can_resume && r.status !== 'paused';
+  if($('publicCollectStop')) $('publicCollectStop').disabled = !active;
+  if(['completed','stopped','failed'].includes(r.status)) reloadConfig().catch(()=>{});
+}
+async function loadPublicCollection(){
+  if(!$('publicCollectStatus')) return;
+  try{
+    renderPublicCollection(await (await fetch('/api/public_collection')).json());
+  }catch(e){ renderPublicCollection({ok:false,error:String(e)}); }
+}
+async function publicCollectionPost(path, payload){
+  const r = await (await fetch(path, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload||{})})).json();
+  renderPublicCollection(r);
+  return r;
+}
+if($('publicCollectStart')){
+  $('publicCollectStart').addEventListener('click', () => publicCollectionPost(
+    '/api/public_collection_start', {
+      urls:$('publicCollectUrls').value,
+      keyword:$('publicCollectKeyword').value,
+      pages:Number($('publicCollectPages').value||0),
+      max_posts:Number($('publicCollectMax').value||100)
+    }));
+  $('publicCollectPause').addEventListener('click', () =>
+    publicCollectionPost('/api/public_collection_control', {action:'pause'}));
+  $('publicCollectResume').addEventListener('click', () =>
+    publicCollectionPost('/api/public_collection_control', {action:'resume'}));
+  $('publicCollectStop').addEventListener('click', () =>
+    publicCollectionPost('/api/public_collection_control', {action:'stop'}));
+  loadPublicCollection();
+  PUBLIC_COLLECT_TIMER = setInterval(loadPublicCollection, 2000);
+}
+
 async function sendPack(files){
   if(!files.length) return;
   const lines = [];
@@ -15295,6 +15382,375 @@ def validate_config_value(key, value, current):
     return True, used, fixed
 
 
+PUBLIC_COLLECTION_FILE = BASE_DIR / "수집" / "공개자료수집-진행.json"
+
+
+def _local_import_image(data, content_type, source_url=""):
+    """수집한 NAI 원본을 내용 주소로 보관한다.
+
+    썸네일로 다시 인코딩하지 않아 EXIF/스텔스 메타데이터를 잃지 않는다. 브라우저는
+    카드가 화면에 들어올 때만 `/img`를 요청하므로 원본 보관과 지연 표시가 양립한다.
+    """
+    content_type = str(content_type or "").split(";", 1)[0].lower()
+    ext = {"image/png": ".png", "image/webp": ".webp",
+           "image/jpeg": ".jpg"}.get(content_type)
+    if not ext:
+        raise ValueError("PNG/WebP/JPEG 이미지만 보관할 수 있습니다.")
+    digest = hashlib.sha256(data).hexdigest()
+    name = digest + ext
+    path = IMG_CACHE / name
+    created = False
+    IMG_CACHE.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        _atomic_write_bytes(path, data, keep_backup=False)
+        created = True
+    if source_url:
+        note_image_origin(source_url, data, pack="아카라이브 공개자료")
+    return f"local:{name}", created
+
+
+def _style_record_from_public_image(data, content_type, article):
+    """공개 이미지의 NAI 메타를 프롬프트 무손실 그림체 묶음으로 바꾼다."""
+    meta = extract_nai_metadata(data, content_type)
+    if meta["metadata_status"] != "ok":
+        return None
+    params = dict(meta.get("params") or {})
+    source_model = model_id_from_metadata(
+        params.get("model"), "nai-diffusion-4-5-full")
+    uc_preset, user_negative = split_uc_preset(
+        meta.get("negative") or "", source_model)
+    if "uc_preset" not in params and uc_preset is not None:
+        params["uc_preset"] = uc_preset
+        params["uc_preset_guessed"] = True
+    base_prompt, quality_toggle = restore_quality_prompt(
+        meta.get("base") or "", source_model, params)
+    if "quality_toggle" not in params:
+        params["quality_toggle"] = quality_toggle
+        params["quality_toggle_guessed"] = True
+    artists, rest = parse_artist_combo(base_prompt)
+    article_id = str(article.get("article_id") or "")
+    image_digest = hashlib.sha256(data).hexdigest()
+    return {
+        "id": f"arca-{article_id}-{image_digest[:12]}",
+        "title": str(article.get("title") or f"아카라이브 {article_id}")[:160],
+        "source": "아카라이브",
+        "tab": str(article.get("board_tab") or ""),
+        "posted_at": str(article.get("posted_at") or ""),
+        "recommend": article.get("recommend"),
+        "views": article.get("views"),
+        "url": str(article.get("source_url") or ""),
+        "count": len(artists),
+        "combo": ", ".join(
+            f"{weight:g}::artist:{name}::" if weight is not None
+            else f"artist:{name}" for weight, name in artists),
+        "artists": [name for _, name in artists],
+        "weights": {
+            name: (weight if weight is not None else 1.0)
+            for weight, name in artists
+        },
+        "base": base_prompt,
+        "rest": ", ".join(rest),
+        "negative": (
+            user_negative if uc_preset is not None
+            else meta.get("negative") or ""),
+        "negative_full": meta.get("negative") or "",
+        "characters": copy.deepcopy(meta.get("characters") or []),
+        "metadata_raw": copy.deepcopy(meta.get("raw") or {}),
+        "params": params,
+        "images": [],
+    }
+
+
+class PublicCollectionManager:
+    """작업 기록만 지속하고 결과는 곧바로 공통 임포트에 합치는 수집기."""
+
+    def __init__(self, state_file=None):
+        self.state_file = Path(state_file or PUBLIC_COLLECTION_FILE)
+        self.lock = threading.RLock()
+        self.thread = None
+        self.state = self._load_state()
+
+    @staticmethod
+    def _empty():
+        return {
+            "schema": "nais-public-collection/v1", "status": "idle",
+            "stage": "idle", "keyword": arca_public.DEFAULT_KEYWORD,
+            "pages": 2, "max_posts": 100, "direct_urls": [], "queue": [],
+            "cursor": 0, "found_posts": 0, "scanned_posts": 0,
+            "scanned_images": 0, "metadata_images": 0, "added": 0,
+            "updated": 0, "existing": 0, "skipped": 0, "errors": [],
+            "current": "", "started_at": "", "updated_at": "",
+            "finished_at": "",
+        }
+
+    def _load_state(self):
+        state = self._empty()
+        try:
+            saved = load_json_recover(self.state_file)
+            if isinstance(saved, dict):
+                state.update(saved)
+        except Exception:
+            pass
+        if state.get("status") in {"running", "pausing", "stopping"}:
+            state["status"] = "interrupted"
+            state["stage"] = "interrupted"
+            state["current"] = ""
+        return state
+
+    def _save_locked(self):
+        self.state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.state_file, self.state, indent=1)
+
+    def snapshot(self):
+        with self.lock:
+            data = copy.deepcopy(self.state)
+            data["ok"] = True
+            data["can_resume"] = (
+                data.get("status") in {"paused", "interrupted", "failed"}
+                and int(data.get("cursor") or 0) < len(data.get("queue") or [])
+            )
+            return data
+
+    @staticmethod
+    def _direct_urls(payload):
+        raw = payload.get("urls") or payload.get("direct_urls") or []
+        if isinstance(raw, str):
+            raw = re.split(r"[\s,]+", raw)
+        if not isinstance(raw, list):
+            raise ValueError("게시글 주소 목록의 형식이 올바르지 않습니다.")
+        result = []
+        for value in raw:
+            if not str(value or "").strip():
+                continue
+            url = arca_public.normalize_article_url(value)
+            if url not in result:
+                result.append(url)
+        return result
+
+    def start(self, payload=None, resume=False):
+        payload = payload if isinstance(payload, dict) else {}
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                if resume and self.state.get("status") == "paused":
+                    self.state["status"] = "running"
+                    self.state["stage"] = "downloading"
+                    self._save_locked()
+                    return self.snapshot()
+                return {"ok": False, "error": "공개자료 수집이 이미 진행 중입니다."}
+            if resume:
+                if self.state.get("status") not in {"paused", "interrupted", "failed"}:
+                    return {"ok": False, "error": "이어갈 수집 작업이 없습니다."}
+                if int(self.state.get("cursor") or 0) >= len(self.state.get("queue") or []):
+                    return {"ok": False, "error": "남은 게시글이 없습니다."}
+                self.state["status"] = "running"
+                self.state["stage"] = "downloading"
+                self.state["errors"] = []
+                self.state["finished_at"] = ""
+            else:
+                keyword = str(
+                    payload.get("keyword") or arca_public.DEFAULT_KEYWORD).strip()
+                if len(keyword) > 200:
+                    return {"ok": False, "error": "검색어는 200자 이하여야 합니다."}
+                try:
+                    pages = max(0, min(20, int(payload.get("pages") or 0)))
+                    max_posts = max(
+                        1, min(1000, int(payload.get("max_posts") or 100)))
+                    direct_urls = self._direct_urls(payload)
+                except (TypeError, ValueError, arca_public.PublicImportError) as exc:
+                    return {"ok": False, "error": str(exc)}
+                if not direct_urls and not pages:
+                    return {
+                        "ok": False,
+                        "error": "게시글 주소를 넣거나 검색 페이지 수를 1 이상으로 정해 주세요.",
+                    }
+                self.state = self._empty()
+                self.state.update({
+                    "status": "running", "stage": "searching",
+                    "keyword": keyword, "pages": pages, "max_posts": max_posts,
+                    "direct_urls": direct_urls,
+                    "queue": list(direct_urls), "found_posts": len(direct_urls),
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                })
+            self._save_locked()
+            self.thread = threading.Thread(
+                target=self._run, name="public-material-import", daemon=True)
+            self.thread.start()
+            return self.snapshot()
+
+    def control(self, action):
+        action = str(action or "").lower()
+        if action == "resume":
+            return self.start(resume=True)
+        with self.lock:
+            if not self.thread or not self.thread.is_alive():
+                return {"ok": False, "error": "진행 중인 수집 작업이 없습니다."}
+            if action == "pause":
+                self.state["status"] = "paused"
+                self.state["stage"] = "paused"
+            elif action == "stop":
+                self.state["status"] = "stopping"
+                self.state["stage"] = "stopping"
+            else:
+                return {"ok": False, "error": "pause, resume, stop 중 하나가 필요합니다."}
+            self._save_locked()
+            return self.snapshot()
+
+    def _checkpoint(self):
+        while True:
+            with self.lock:
+                status = self.state.get("status")
+                if status == "stopping":
+                    self.state["status"] = "stopped"
+                    self.state["stage"] = "stopped"
+                    self.state["current"] = ""
+                    self.state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    self._save_locked()
+                    return False
+                if status != "paused":
+                    return True
+            time.sleep(0.25)
+
+    def _append_error(self, message):
+        with self.lock:
+            errors = self.state.setdefault("errors", [])
+            errors.append(str(message)[:500])
+            del errors[:-20]
+            self._save_locked()
+
+    def _discover(self, session):
+        with self.lock:
+            pages = int(self.state.get("pages") or 0)
+            keyword = self.state.get("keyword") or arca_public.DEFAULT_KEYWORD
+            max_posts = int(self.state.get("max_posts") or 100)
+            queue = list(self.state.get("queue") or [])
+        if not pages:
+            return
+        board_html = arca_public.fetch_text(
+            session, arca_public.ARCA_BASE_URL + arca_public.ARCA_BOARD_PATH)
+        categories = arca_public.discover_category_params(board_html)
+        category = categories.get("NAI") or {}
+        for page in range(1, pages + 1):
+            if not self._checkpoint():
+                return
+            url = arca_public.build_search_url(keyword, page, category)
+            html = arca_public.fetch_text(session, url)
+            rows = arca_public.extract_search_results(html, keyword)
+            if not rows:
+                break
+            for row in rows:
+                article_url = row["source_url"]
+                if article_url not in queue:
+                    queue.append(article_url)
+                if len(queue) >= max_posts:
+                    break
+            with self.lock:
+                self.state["queue"] = queue
+                self.state["found_posts"] = len(queue)
+                self.state["current"] = f"검색 {page}/{pages}페이지"
+                self._save_locked()
+            if len(queue) >= max_posts:
+                break
+            time.sleep(0.7)
+
+    def _import_article(self, session, url):
+        html = arca_public.fetch_text(session, url)
+        article = arca_public.extract_article(html, url)
+        article["board_tab"] = "NAI"
+        found_metadata = 0
+        for image_index, image_url in enumerate(article.get("image_urls") or [], 1):
+            if not self._checkpoint():
+                return False
+            with self.lock:
+                self.state["current"] = (
+                    f"{article.get('title') or article['article_id']} · "
+                    f"이미지 {image_index}/{len(article['image_urls'])}")
+                self._save_locked()
+            try:
+                data, content_type = arca_public.fetch_image(session, image_url)
+                record = _style_record_from_public_image(data, content_type, article)
+                with self.lock:
+                    self.state["scanned_images"] += 1
+                if record is None:
+                    with self.lock:
+                        self.state["skipped"] += 1
+                        self._save_locked()
+                    continue
+                local_ref, created = _local_import_image(
+                    data, content_type, image_url)
+                record["images"] = [local_ref]
+                filename = local_ref[6:]
+                detail = add_style(
+                    record,
+                    import_info={
+                        "kind": "crawler",
+                        "file": article["source_url"],
+                        "files": (
+                            {"수집/이미지캐시": [filename]} if created else {}),
+                    },
+                    return_detail=True,
+                )
+                found_metadata += 1
+                with self.lock:
+                    self.state["metadata_images"] += 1
+                    action = detail.get("action")
+                    if action in {"added", "updated", "existing"}:
+                        self.state[action] += 1
+                    self._save_locked()
+            except Exception as exc:
+                self._append_error(
+                    f"{article.get('article_id')} 이미지 {image_index}: {exc}")
+        return found_metadata > 0
+
+    def _run(self):
+        session = arca_public.create_session()
+        try:
+            self._discover(session)
+            with self.lock:
+                if self.state.get("status") in {"stopped", "stopping"}:
+                    return
+                self.state["stage"] = "downloading"
+                self.state["current"] = ""
+                self._save_locked()
+            while True:
+                if not self._checkpoint():
+                    return
+                with self.lock:
+                    cursor = int(self.state.get("cursor") or 0)
+                    queue = list(self.state.get("queue") or [])
+                if cursor >= len(queue):
+                    break
+                url = queue[cursor]
+                try:
+                    self._import_article(session, url)
+                except Exception as exc:
+                    self._append_error(f"{url}: {exc}")
+                with self.lock:
+                    self.state["cursor"] = cursor + 1
+                    self.state["scanned_posts"] = cursor + 1
+                    self._save_locked()
+                time.sleep(0.8)
+            with self.lock:
+                self.state["status"] = "completed"
+                self.state["stage"] = "completed"
+                self.state["current"] = ""
+                self.state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                self._save_locked()
+        except Exception as exc:
+            with self.lock:
+                self.state["status"] = "failed"
+                self.state["stage"] = "failed"
+                self.state["current"] = ""
+                self.state["errors"].append(str(exc)[:500])
+                self.state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                self._save_locked()
+        finally:
+            session.close()
+
+
+PUBLIC_COLLECTION = PublicCollectionManager()
+
+
 class LiveState:
     """생성 진행 상황을 브라우저에 공유하기 위한 상태 저장소."""
 
@@ -16718,6 +17174,11 @@ class ConfigServer:
                         self._json({"ok": True, "log": pack_log_brief()})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/public_collection"):
+                    try:
+                        self._json(PUBLIC_COLLECTION.snapshot())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/data_storage"):
                     try:
                         self._json(data_storage_status())
@@ -17400,6 +17861,18 @@ class ConfigServer:
                             OPTIONS.clear()
                             OPTIONS.update(load_options())
                         self._json(r)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/public_collection_start"):
+                    try:
+                        payload = json.loads(body or b"{}")
+                        self._json(PUBLIC_COLLECTION.start(payload))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/public_collection_control"):
+                    try:
+                        payload = json.loads(body or b"{}")
+                        self._json(PUBLIC_COLLECTION.control(payload.get("action")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/pack_undo"):
