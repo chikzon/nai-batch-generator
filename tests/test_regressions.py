@@ -508,6 +508,83 @@ class RegressionTests(unittest.TestCase):
                     APP.load_json_recover(first)["씬"]["101"]["female_prompt"],
                     "old prompt")
 
+    def test_setting_scene_duplicate_preserves_all_fields_and_only_undoes_untouched_clone(self):
+        with tempfile.TemporaryDirectory() as td:
+            settings_dir = Path(td) / "세팅"
+            settings_dir.mkdir()
+            source = {
+                "name": "연인 장면", "female_prompt": "hero tags",
+                "male_prompt": "partner tags", "base_tags": "room, evening",
+                "relationship_name": "연인",
+                "relationship_tags": "romantic couple",
+                "female_negative": "hero negative",
+                "male_negative": "partner negative",
+                "negative": "scene negative", "width": 832, "height": 1216,
+                "use_character_refs": True,
+                "character_refs": ["ref-a", "ref-b"],
+                "char_centers": [{"x": 0.25, "y": 0.5}, {"x": 0.75, "y": 0.5}],
+                "nested_future_field": {"keep": ["all", "values"]},
+            }
+            first = settings_dir / "첫째.json"
+            other = settings_dir / "둘째.json"
+            APP.atomic_write_json(first, {
+                "이름": "첫째", "방식": "남녀", "씬": {"101": source},
+            }, keep_backup=False)
+            APP.atomic_write_json(other, {
+                "이름": "둘째", "방식": "단독",
+                "씬": {"102": {"name": "다른 세팅 장면"}},
+            }, keep_backup=False)
+            with patch.object(APP, "SETTINGS_DIR", settings_dir):
+                initial = APP.setting_content_revision(
+                    APP.load_json_recover(first))
+                duplicated = APP.duplicate_setting_scene(
+                    "첫째", "101", initial)
+                self.assertTrue(duplicated["ok"])
+                self.assertEqual(duplicated["new_id"], "103")
+                clone = APP.load_json_recover(first)["씬"]["103"]
+                self.assertEqual(clone["name"], "연인 장면 사본")
+                self.assertEqual(
+                    {k: v for k, v in clone.items() if k != "name"},
+                    {k: v for k, v in source.items() if k != "name"})
+                self.assertTrue(first.with_suffix(".json.bak").is_file())
+
+                stale = APP.duplicate_setting_scene("첫째", "101", initial)
+                self.assertFalse(stale["ok"])
+                self.assertTrue(stale["conflict"])
+                self.assertEqual(
+                    set(APP.load_json_recover(first)["씬"]), {"101", "103"})
+
+                wrong = APP.undo_duplicate_setting_scene(
+                    "첫째", "103", "wrong", duplicated["revision"])
+                self.assertFalse(wrong["ok"])
+                self.assertIn("103", APP.load_json_recover(first)["씬"])
+                undone = APP.undo_duplicate_setting_scene(
+                    "첫째", "103", duplicated["scene_sha256"],
+                    duplicated["revision"])
+                self.assertTrue(undone["ok"])
+                self.assertEqual(
+                    set(APP.load_json_recover(first)["씬"]), {"101"})
+
+                duplicated_again = APP.duplicate_setting_scene(
+                    "첫째", "101", undone["revision"])
+                pack = APP.load_json_recover(first)
+                pack["씬"][duplicated_again["new_id"]]["base_tags"] = "user changed"
+                APP.atomic_write_json(first, pack)
+                protected = APP.undo_duplicate_setting_scene(
+                    "첫째", duplicated_again["new_id"],
+                    duplicated_again["scene_sha256"],
+                    duplicated_again["revision"])
+                self.assertFalse(protected["ok"])
+                self.assertIn(
+                    duplicated_again["new_id"],
+                    APP.load_json_recover(first)["씬"])
+
+            page = APP.render_page()
+            for marker in (
+                    "data-scenedup", 'id="sceneCloneUndo"',
+                    "/api/scene_duplicate", "/api/scene_duplicate_undo"):
+                self.assertIn(marker, page)
+
     def test_setting_batch_people_keeps_scene_positions_aligned(self):
         character = {
             "extras": [{

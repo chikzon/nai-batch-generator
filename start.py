@@ -3750,6 +3750,91 @@ def duplicate_setting_group(name, gid):
     return {"ok": True, "new_id": start, "count": span}
 
 
+def setting_content_revision(data):
+    return hashlib.sha256(json.dumps(
+        data, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+@serialized_setting_write
+def duplicate_setting_scene(name, scene_id, expect_revision=""):
+    """장면 하나의 모든 필드를 복제한다. 아직 저장하지 않은 화면 값은 대상이 아니다."""
+    p = setting_path(name)
+    if not p:
+        return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
+    pack = load_json_recover(p)
+    revision = setting_content_revision(pack)
+    if expect_revision and str(expect_revision) != revision:
+        return {
+            "ok": False, "conflict": True,
+            "error": "다른 저장이 먼저 반영되어 장면을 복제하지 않았습니다. 다시 열어 확인해주세요.",
+        }
+    scenes = pack.get("씬") or {}
+    scene_id = str(scene_id)
+    source = scenes.get(scene_id)
+    if not isinstance(source, dict):
+        return {"ok": False, "error": f"{scene_id}번 장면을 찾을 수 없습니다."}
+    used = set(used_scene_nums())
+    try:
+        candidate = int(scene_id) + 1
+    except ValueError:
+        candidate = max(used, default=99) + 1
+    while candidate in used:
+        candidate += 1
+    clone = copy.deepcopy(source)
+    root = str(clone.get("name") or "장면").strip() + " 사본"
+    names = {
+        str(scene.get("name") or "").casefold()
+        for scene in scenes.values() if isinstance(scene, dict)
+    }
+    clone_name = root
+    serial = 2
+    while clone_name.casefold() in names:
+        clone_name = f"{root} {serial}"
+        serial += 1
+    clone["name"] = clone_name
+    new_id = str(candidate)
+    scenes[new_id] = clone
+    pack["씬"] = scenes
+    atomic_write_json(p, pack, indent=1)
+    return {
+        "ok": True, "setting": name, "new_id": new_id,
+        "name": clone_name, "scene_sha256": setting_content_revision(clone),
+        "revision": setting_content_revision(pack),
+    }
+
+
+@serialized_setting_write
+def undo_duplicate_setting_scene(name, scene_id, scene_sha256,
+                                 expect_revision=""):
+    """방금 복제한 장면이 그대로일 때만 제거한다."""
+    p = setting_path(name)
+    if not p:
+        return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
+    pack = load_json_recover(p)
+    revision = setting_content_revision(pack)
+    if expect_revision and str(expect_revision) != revision:
+        return {
+            "ok": False, "conflict": True,
+            "error": "복제 뒤 다른 저장이 반영되어 자동으로 취소하지 않았습니다.",
+        }
+    scene_id = str(scene_id)
+    scene = (pack.get("씬") or {}).get(scene_id)
+    if not isinstance(scene, dict):
+        return {"ok": False, "error": "취소할 복제 장면을 찾을 수 없습니다."}
+    if not scene_sha256 or setting_content_revision(scene) != str(scene_sha256):
+        return {
+            "ok": False, "conflict": True,
+            "error": "복제한 장면이 이미 수정되어 자동으로 지우지 않았습니다.",
+        }
+    pack["씬"].pop(scene_id, None)
+    atomic_write_json(p, pack, indent=1)
+    return {
+        "ok": True, "setting": name, "removed_id": scene_id,
+        "revision": setting_content_revision(pack),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  세팅 빌더 — 세팅을 앱 안에서 만들고 고친다
 #    세트(묶음) = 이름이 같고 단계명만 다른 씬들. 그래서 씬 이름을
@@ -15948,6 +16033,7 @@ async function openScene(setName, ids){
   const r = await (await fetch('/api/scenes?setting=' + encodeURIComponent(setName)
     + '&ids=' + ids.join(','))).json();
   if(!r.ok || !r.scenes.length){ alert('불러오기 실패'); return; }
+  window._sceneRevision = r.revision || '';
   $('modalTitle').textContent = `${setName} · ${r.scenes[0].name}${ids.length>1?` 외 ${ids.length}단계`:''}`;
   const f = (id,k,l,v) => `<div class="field"><label>${l}</label><textarea data-sid="${id}" data-sk="${k}" style="min-height:42px;">${esc(v||'')}</textarea></div>`;
   const line = (id,k,l,v,placeholder='') => `<div class="field"><label>${l}</label>
@@ -16013,8 +16099,12 @@ async function openScene(setName, ids){
   };
   $('modalBody').innerHTML = r.scenes.map(s => {
     const isPreset = RES_PRESETS.some(r => r.w === s.width && r.h === s.height);
-    let x = `<div class="row"><div class="tag">#${s.id} · ${esc(s.name)}
-      <button data-preview="${s.id}" style="float:right;">🔍 최종 프롬프트 보기</button></div>
+    let x = `<div class="row"><div class="bar" style="margin-bottom:7px;">
+      <div class="tag">#${s.id} · ${esc(s.name)}</div>
+      <button type="button" data-preview="${s.id}" style="margin-left:auto;">🔍 최종 프롬프트 보기</button>
+      <button type="button" data-scenedup="${s.id}"
+        title="디스크에 저장된 이 장면의 태그·관계·Reference·위치를 모두 복제합니다">⧉ 저장값 복제</button>
+      </div>
       <div class="filterbar" style="margin:0 0 6px;">
         <span class="hint" style="white-space:nowrap;">해상도</span>
         <select data-sid="${s.id}" data-sk="_res" style="width:132px;">
@@ -16045,9 +16135,34 @@ async function openScene(setName, ids){
     return x + f(s.id, 'negative', '이 씬 전용 네거티브 (선택 · 기본 네거티브 뒤에 붙습니다)', s.negative)
              + pos(s) + `<div class="hint" id="pv-${s.id}"></div></div>`;
   }).join('') + `<div class="bar"><button type="button" id="sceneUndo" disabled>↶ 방금 저장 되돌리기</button>
+    <button type="button" id="sceneCloneUndo"${window._sceneCloneUndo&&window._sceneCloneUndo.setting===setName?'':' disabled'}>↶ 방금 복제 취소</button>
     <span class="hint">세팅 파일은 저장할 때마다 마지막 정상본을 백업합니다.</span></div>`;
   $('modalBody').querySelectorAll('[data-preview]').forEach(b =>
     b.addEventListener('click', () => scenePreview(b.dataset.preview)));
+  $('modalBody').querySelectorAll('[data-scenedup]').forEach(button =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      const response = await (await fetch('/api/scene_duplicate', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          setting:setName, id:button.dataset.scenedup,
+          expect_revision:window._sceneRevision,
+        })
+      })).json();
+      if(!response.ok){
+        $('modalFlash').textContent = response.error || '장면 복제 실패';
+        button.disabled = false;
+        return;
+      }
+      window._sceneCloneUndo = {
+        setting:setName, id:response.new_id, scene_sha256:response.scene_sha256,
+        revision:response.revision, original_ids:[...ids],
+      };
+      const message =
+        `#${response.new_id} '${response.name}' 복제됨 · 저장하지 않은 화면 값은 포함하지 않았습니다.`;
+      await openScene(setName, [...ids, Number(response.new_id)]);
+      $('modalFlash').textContent = message;
+    }));
   /* 해상도 프리셋 → 숫자칸 채우기 (저장은 숫자칸 값으로 나간다) */
   $('modalBody').querySelectorAll('[data-sk="_res"]').forEach(sel =>
     sel.addEventListener('change', () => {
@@ -16090,6 +16205,25 @@ async function openScene(setName, ids){
     $('sceneUndo').disabled = true;
     window._sceneUndo = null;
     await openScene(setName, ids);
+  });
+  $('sceneCloneUndo').addEventListener('click', async () => {
+    const last = window._sceneCloneUndo;
+    if(!last || last.setting !== setName) return;
+    const response = await (await fetch('/api/scene_duplicate_undo', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        setting:last.setting, id:last.id, scene_sha256:last.scene_sha256,
+        expect_revision:last.revision,
+      })
+    })).json();
+    if(!response.ok){
+      $('modalFlash').textContent = response.error || '복제 취소 실패';
+      return;
+    }
+    const originalIds = last.original_ids || ids.filter(id => String(id) !== String(last.id));
+    window._sceneCloneUndo = null;
+    await openScene(setName, originalIds);
+    $('modalFlash').textContent = `#${last.id} 복제를 취소했습니다.`;
   });
   $('modalFlash').textContent = ''; $('modalBg').style.display = 'flex';
 }
@@ -16245,6 +16379,7 @@ $('modalSave').addEventListener('click', async () => {
       })})).json();
     if(r.ok){
       window._sceneUndo = {setting:r.setting, before:r.before, revision:r.revision};
+      window._sceneRevision = r.revision || window._sceneRevision;
       if($('sceneUndo')) $('sceneUndo').disabled = !r.fields;
       $('modalFlash').textContent = `저장됨 ✓ ${r.updated}씬 · ${r.fields}항목`;
     } else $('modalFlash').textContent = r.error || '실패';
@@ -18475,10 +18610,7 @@ class ConfigServer:
                 if isinstance(ref, dict) and ref.get("id")
             }
             pack = load_json_recover(path)
-            raw_revision = json.dumps(
-                pack, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"), default=str).encode("utf-8")
-            revision = hashlib.sha256(raw_revision).hexdigest()
+            revision = setting_content_revision(pack)
             expected = str(data.get("expect_revision") or "")
             if expected and expected != revision:
                 return {"ok": False, "conflict": True,
@@ -18559,9 +18691,7 @@ class ConfigServer:
                 changed_scenes += int(scene_changed)
             if changed_fields:
                 atomic_write_json(path, pack)
-            after_revision = hashlib.sha256(json.dumps(
-                pack, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+            after_revision = setting_content_revision(pack)
             return {"ok": True, "updated": changed_scenes, "fields": changed_fields,
                     "setting": setting, "before": before,
                     "revision": after_revision}
@@ -18915,10 +19045,12 @@ class ConfigServer:
                             pack = load_json_recover(path)
                             source_scenes = pack.get("씬") or {}
                             mode = pack.get("방식", "단독")
+                            revision = setting_content_revision(pack)
                         else:
                             ac = load_asset_config(server.cfg)
                             source_scenes = ac["scenes"]
                             mode = ""
+                            revision = ""
                         out = []
                         for i in ids:
                             sc = source_scenes.get(i)
@@ -18959,7 +19091,7 @@ class ConfigServer:
                                             "char_centers": normalize_scene_centers(
                                                 sc.get("char_centers"))})
                         self._json({
-                            "ok": True, "scenes": out,
+                            "ok": True, "scenes": out, "revision": revision,
                             "char_refs": [
                                 {"id": str(ref.get("id") or ""),
                                  "name": str(ref.get("name") or ref.get("id") or "무제")}
@@ -19105,6 +19237,23 @@ class ConfigServer:
                     try:
                         d = json.loads(body) if body else {}
                         self._json(verify_tags(d.get("text") or ""))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/scene_duplicate_undo"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        self._json(undo_duplicate_setting_scene(
+                            data.get("setting", ""), data.get("id", ""),
+                            data.get("scene_sha256", ""),
+                            data.get("expect_revision", "")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/scene_duplicate"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        self._json(duplicate_setting_scene(
+                            data.get("setting", ""), data.get("id", ""),
+                            data.get("expect_revision", "")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/scene_save"):
