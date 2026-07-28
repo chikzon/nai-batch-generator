@@ -668,6 +668,7 @@ DEFAULT_CONFIG = {
     "out_by_date": False,       # 켜면 모드 폴더 아래 날짜(YYYY-MM-DD)로 또 나눈다
     "char_slots": [],        # ① 설정의 캐릭터 칸들 (한 그림에 함께 들어갈 인물): [{name, prompt, negative}]
     "setting_state": {},        # 세팅 이름 → {use, selected, opts, cast: [{name, prompt, negative}]}
+    "cast_presets": [],         # 세팅 사이에서 재사용하는 캐릭터 조합: [{id, name, members}]
     "ui": {},                   # 화면 설정 {theme, accent, fs, radius}
 }
 
@@ -12056,6 +12057,18 @@ function stState(name){
   s.opts = s.opts || {}; s.selected = s.selected || []; s.cast = s.cast || [];
   return s;
 }
+function castPresets(){
+  STATE.cast_presets = Array.isArray(STATE.cast_presets) ? STATE.cast_presets : [];
+  return STATE.cast_presets;
+}
+function castPresetId(){
+  const tail = (globalThis.crypto && crypto.randomUUID)
+    ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `cast-${tail}`;
+}
+function castPresetOptions(){
+  return castPresets().map(p => `<option value="${escA(p.id)}">${esc(p.name)} · ${(p.members||[]).length}명</option>`).join('');
+}
 /* 어느 세팅이 펼쳐져 있었는지 기억한다 — 단계 칩 하나 눌렀다고 다시 접히면
    자리를 잃는다 (대표 그림도 숨은 채라 안 뜬다). */
 const SET_OPEN = new Set();
@@ -12093,7 +12106,14 @@ function renderSettings(){
     b.insertAdjacentHTML('beforeend', `<div class="field"><label>전용 캐스트 (각자 따로 전체 씬 생성 · 비우면 왼쪽 [캐릭터] 사용)</label>
       <div data-cast="${escA(st.name)}"></div>
       <div class="bar" style="margin:5px 0 0;"><button data-castadd="${escA(st.name)}">+ 직접 입력</button>
-      <select data-castlib="${escA(st.name)}" style="flex:1;"><option value="">+ 라이브러리에서...</option></select></div></div>`);
+      <select data-castlib="${escA(st.name)}" style="flex:1;"><option value="">+ 라이브러리에서...</option></select></div>
+      <div class="bar" style="margin:5px 0 0;">
+        <select data-castpreset="${escA(st.name)}" style="flex:1;"><option value="">저장한 캐스트 조합...</option>${castPresetOptions()}</select>
+        <button data-castload="${escA(st.name)}">불러오기</button>
+        <button data-castsave="${escA(st.name)}">현재 조합 저장</button>
+        <button class="danger" data-castpresetdel="${escA(st.name)}">삭제</button>
+      </div>
+      <div class="hint" data-castmsg="${escA(st.name)}">캐릭터 조합만 저장하며 세팅·장면·생성 설정은 바꾸지 않습니다.</div></div>`);
 
     const role = st.role || {};
     if(st.mode === '남녀' || st.mode === '백합'){
@@ -12311,6 +12331,53 @@ function bindSettings(){
       sel.value = '';
     });
   });
+  h.querySelectorAll('[data-castsave]').forEach(b => b.addEventListener('click', () => {
+    const setting = b.dataset.castsave;
+    const members = stState(setting).cast;
+    const msg = h.querySelector(`[data-castmsg="${CSS.escape(setting)}"]`);
+    if(!members.length){ msg.textContent = '저장할 캐릭터가 없습니다.'; return; }
+    const entered = prompt('캐스트 조합 이름:');
+    const name = (entered || '').trim();
+    if(!name) return;
+    const presets = castPresets();
+    const same = presets.find(p => (p.name || '').trim().toLowerCase() === name.toLowerCase());
+    if(same && !confirm(`"${name}" 조합을 현재 내용으로 바꿀까요?`)) return;
+    const record = {
+      id: same ? same.id : castPresetId(),
+      name,
+      members: JSON.parse(JSON.stringify(members)),
+    };
+    if(same) presets[presets.indexOf(same)] = record; else presets.push(record);
+    save(); renderSettings();
+    const next = h.querySelector(`[data-castpreset="${CSS.escape(setting)}"]`);
+    if(next) next.value = record.id;
+    const nextMsg = h.querySelector(`[data-castmsg="${CSS.escape(setting)}"]`);
+    if(nextMsg) nextMsg.textContent = `"${name}" 조합을 저장했습니다.`;
+  }));
+  h.querySelectorAll('[data-castload]').forEach(b => b.addEventListener('click', () => {
+    const setting = b.dataset.castload;
+    const select = h.querySelector(`[data-castpreset="${CSS.escape(setting)}"]`);
+    const preset = castPresets().find(p => p.id === (select || {}).value);
+    const msg = h.querySelector(`[data-castmsg="${CSS.escape(setting)}"]`);
+    if(!preset){ msg.textContent = '불러올 조합을 먼저 고르세요.'; return; }
+    const state = stState(setting);
+    if(state.cast.length && !confirm('현재 전용 캐스트를 고른 조합으로 바꿀까요?')) return;
+    state.cast = JSON.parse(JSON.stringify(preset.members || []));
+    renderCast(setting); tokens(); save();
+    msg.textContent = `"${preset.name}" ${state.cast.length}명을 불러왔습니다.`;
+  }));
+  h.querySelectorAll('[data-castpresetdel]').forEach(b => b.addEventListener('click', () => {
+    const setting = b.dataset.castpresetdel;
+    const select = h.querySelector(`[data-castpreset="${CSS.escape(setting)}"]`);
+    const preset = castPresets().find(p => p.id === (select || {}).value);
+    const msg = h.querySelector(`[data-castmsg="${CSS.escape(setting)}"]`);
+    if(!preset){ msg.textContent = '삭제할 조합을 먼저 고르세요.'; return; }
+    if(!confirm(`"${preset.name}" 저장 조합을 삭제할까요? 현재 세팅의 캐스트는 유지됩니다.`)) return;
+    STATE.cast_presets = castPresets().filter(p => p.id !== preset.id);
+    save(); renderSettings();
+    const nextMsg = h.querySelector(`[data-castmsg="${CSS.escape(setting)}"]`);
+    if(nextMsg) nextMsg.textContent = `"${preset.name}" 저장 조합만 삭제했습니다.`;
+  }));
   counts();
 }
 function counts(){
@@ -16811,6 +16878,51 @@ def normalize_resolution(value):
     return max(64, min(2048, raw // 64 * 64))
 
 
+def normalize_cast_presets(value):
+    """캐스트 조합의 구조만 검증한다. 프롬프트 원문은 길이 제한 없이 보존한다."""
+    if not isinstance(value, list) or len(value) > 200:
+        raise ValueError("cast presets must be a list with at most 200 items")
+    result, seen_ids, seen_names = [], set(), set()
+    for preset in value:
+        if not isinstance(preset, dict):
+            raise ValueError("cast preset must be an object")
+        preset_id = preset.get("id")
+        name = preset.get("name")
+        members = preset.get("members")
+        if (not isinstance(preset_id, str) or not preset_id
+                or len(preset_id) > 120
+                or not re.fullmatch(r"[A-Za-z0-9._:-]+", preset_id)):
+            raise ValueError("invalid cast preset id")
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ValueError("invalid cast preset name")
+        folded_name = name.strip().casefold()
+        if preset_id in seen_ids or folded_name in seen_names:
+            raise ValueError("duplicate cast preset")
+        if not isinstance(members, list) or not members or len(members) > 64:
+            raise ValueError("cast preset must contain 1 to 64 members")
+        clean_members = []
+        for member in members:
+            if not isinstance(member, dict):
+                raise ValueError("cast member must be an object")
+            if set(member) - {"name", "prompt", "negative"}:
+                raise ValueError("unknown cast member fields")
+            clean = {}
+            for field in ("name", "prompt", "negative"):
+                text = member.get(field, "")
+                if not isinstance(text, str):
+                    raise ValueError("cast member fields must be strings")
+                clean[field] = text
+            clean_members.append(clean)
+        result.append({
+            "id": preset_id,
+            "name": name.strip(),
+            "members": clean_members,
+        })
+        seen_ids.add(preset_id)
+        seen_names.add(folded_name)
+    return result
+
+
 def validate_config_value(key, value, current):
     """(ok, value, corrections). corrections는 UI에 보낼 dotted-key 사전."""
     fixed = {}
@@ -16845,6 +16957,8 @@ def validate_config_value(key, value, current):
                 sent = used["delay_max"]
                 used["delay_max"] = used["delay_min"]
                 fixed["pace.delay_max"] = {"sent": sent, "used": used["delay_max"]}
+        elif key == "cast_presets":
+            used = normalize_cast_presets(value)
         else:
             return True, value, fixed
     except (TypeError, ValueError, OverflowError):

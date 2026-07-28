@@ -4929,6 +4929,48 @@ class RegressionTests(unittest.TestCase):
                     "/api/library_organize", "expect_revision:LIB_REVISION"):
                 self.assertIn(marker, page)
 
+    def test_reusable_cast_presets_preserve_long_prompts_and_reject_bad_shapes(self):
+        long_prompt = (
+            "1.2::character prompt::, {red|blue}, (nier:automata), "
+            "||literal pipe||, 한글 😀, \"quote\", \\\\path\n" + "x" * 6500
+        )
+        presets = [{
+            "id": "cast-fixture-1",
+            "name": "주역 둘",
+            "members": [
+                {"name": "첫째", "prompt": long_prompt, "negative": "bad hands"},
+                {"name": "둘째", "prompt": "second whole prompt", "negative": ""},
+            ],
+        }]
+        ok, used, fixed = APP.validate_config_value(
+            "cast_presets", presets, [])
+        self.assertTrue(ok)
+        self.assertEqual(used[0]["members"][0]["prompt"], long_prompt)
+        self.assertEqual(fixed, {})
+
+        for invalid in (
+            {"not": "a list"},
+            [{"id": "bad id", "name": "이름", "members": [
+                {"name": "", "prompt": "", "negative": ""}]}],
+            [{"id": "same", "name": "중복", "members": [
+                {"name": "", "prompt": "", "negative": ""}]},
+             {"id": "same", "name": "다른 이름", "members": [
+                {"name": "", "prompt": "", "negative": ""}]}],
+            [{"id": "unknown", "name": "미지", "members": [
+                {"name": "", "prompt": "", "negative": "", "extra": True}]}],
+        ):
+            ok, used, _ = APP.validate_config_value(
+                "cast_presets", invalid, presets)
+            self.assertFalse(ok)
+            self.assertEqual(used, presets)
+
+        page = APP.render_page()
+        for marker in (
+                "cast_presets", "data-castpreset=", "data-castload=",
+                "data-castsave=", "data-castpresetdel=",
+                "캐릭터 조합만 저장하며 세팅·장면·생성 설정은 바꾸지 않습니다."):
+            self.assertIn(marker, page)
+
 
 if __name__ == "__main__":
     unittest.main()
