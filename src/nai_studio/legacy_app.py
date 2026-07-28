@@ -10162,8 +10162,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div id="dataStorageStatus" class="hint" style="flex:1;min-width:0;">
             자료 저장 위치를 확인하는 중입니다.
           </div>
+          <button type="button" id="dataOriginsShow">이미지 출처·중복</button>
           <button type="button" id="dataIndexBuild">자료 색인 다시 만들기</button>
         </div>
+        <div id="dataOriginsStatus" class="hint hidden" style="margin-top:7px;"></div>
         <p class="hint" style="margin-top:6px;">색인은 자료 파일의 경로·크기·SHA-256만 다시 세는
         파생 목록입니다. 원본을 옮기거나 지우지 않으며, 대용량 자료에서는 시간이 걸릴 수 있습니다.</p>
       </div>
@@ -12044,8 +12046,9 @@ async function loadJobCenter(){
   const host = $('jobCenterList'); if(!host) return;
   host.innerHTML = '<div class="row hint">작업 상태를 확인하는 중입니다.</div>';
   try{
-    const [live, comparisons, collection] = await Promise.all([
+    const [live, ledger, comparisons, collection] = await Promise.all([
       fetch('/status.json', {cache:'no-store'}).then(r => r.json()),
+      fetch('/api/jobs', {cache:'no-store'}).then(r => r.json()),
       fetch('/api/compare_runs', {cache:'no-store'}).then(r => r.json()),
       fetch('/api/public_collection', {cache:'no-store'}).then(r => r.json()),
     ]);
@@ -12054,6 +12057,7 @@ async function loadJobCenter(){
       ? `${live.operation || '생성'} · ${Number(live.completed||0)}/${Number(live.total||0)}`
       : `대기 · 최근 ${live.phase || 'idle'}`;
     const collectState = collection.status || 'idle';
+    const recent = (ledger.jobs || []).slice(0, 5);
     host.innerHTML = `
       <div class="row"><div><b>현재 생성 실행권</b><div class="hint">${esc(liveState)}</div>
         <div class="hint">${esc(live.status_text || '')}</div></div>
@@ -12062,7 +12066,13 @@ async function loadJobCenter(){
         <button type="button" data-job-go="compare">비교 실험으로</button></div>
       <div class="row"><div><b>공개자료 수집</b><div class="hint">${esc(collectState)}
         · ${Number(collection.cursor||0)}/${Number((collection.queue||[]).length||collection.found_posts||0)}</div></div>
-        <button type="button" data-job-go="library">자료 수집으로</button></div>`;
+        <button type="button" data-job-go="library">자료 수집으로</button></div>
+      <div class="row" style="grid-column:1/-1;display:block;"><b>최근 실행 기록</b>
+        <div class="hint" style="margin-top:5px;">${recent.length ? recent.map(job =>
+          `${esc(job.operation || job.kind)} · ${esc(job.status || '')}`
+          + ` · 성공 ${Number(job.completed||0)} / 실패 ${Number(job.failed||0)}`
+          + `${job.can_resume ? ' · 재개 기록 있음' : ''}`
+        ).join('<br>') : '아직 기록이 없습니다.'}</div></div>`;
     host.querySelectorAll('[data-job-go]').forEach(button => button.addEventListener('click', () => {
       const target = button.dataset.jobGo;
       if(target === 'compare'){
@@ -14829,6 +14839,21 @@ if($('dataIndexBuild')) $('dataIndexBuild').addEventListener('click', async () =
     await loadDataStorageStatus();
   }catch(e){ $('dataStorageStatus').textContent = '자료 색인 생성 실패: ' + e; }
   finally{ btn.disabled = false; }
+});
+if($('dataOriginsShow')) $('dataOriginsShow').addEventListener('click', async () => {
+  const host = $('dataOriginsStatus');
+  host.classList.remove('hidden');
+  host.textContent = '이미지 내용 해시와 원문 주소 장부를 확인하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/img_origins', {cache:'no-store'})).json();
+    if(!r.ok){ host.textContent = r.error || '출처 장부를 읽지 못했습니다.'; return; }
+    const examples = (r['예시'] || []).slice(0,5).map(item =>
+      `${esc(item.sha256)} · 주소 ${(item.urls||[]).length}개`).join('<br>');
+    host.innerHTML = `<b>내용이 확인된 그림 ${Number(r['그림']||0).toLocaleString()}개</b>`
+      + ` · 같은 그림을 가리키는 주소가 여러 개인 항목 ${Number(r['주소여럿']||0).toLocaleString()}개`
+      + ` · 중복 주소 ${Number(r['낭비주소']||0).toLocaleString()}개`
+      + (examples ? `<div style="margin-top:4px;">${examples}</div>` : '');
+  }catch(error){ host.textContent = '출처 장부 확인 실패: ' + error; }
 });
 
 let PUBLIC_COLLECT_TIMER = null;
@@ -18320,10 +18345,98 @@ class PublicCollectionManager:
 PUBLIC_COLLECTION = PublicCollectionManager()
 
 
+JOB_LEDGER_FILE = PROFILE_DIR / "작업대기열.json"
+
+
+def load_job_ledger():
+    """모든 생성 경로의 최근 실행 기록. 실제 재개 자료는 각 기능의 기존 장부가 기준이다."""
+    if not JOB_LEDGER_FILE.is_file():
+        return {"schema": "nais-job-ledger/v1", "jobs": []}
+    data = load_json_recover(JOB_LEDGER_FILE)
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        raise ValueError("작업대기열 기록 형식이 올바르지 않습니다.")
+    jobs = [
+        dict(item) for item in data["jobs"][-200:]
+        if isinstance(item, dict) and item.get("id")
+    ]
+    return {"schema": "nais-job-ledger/v1", "jobs": jobs}
+
+
+def _save_job_ledger(data):
+    data = {
+        "schema": "nais-job-ledger/v1",
+        "jobs": list(data.get("jobs") or [])[-200:],
+    }
+    atomic_write_json(JOB_LEDGER_FILE, data, indent=1)
+    return data
+
+
+def recover_job_ledger():
+    """프로세스가 꺼진 채 남은 running 기록만 interrupted로 닫는다."""
+    with _JSON_IO_LOCK:
+        data = load_job_ledger()
+        changed = False
+        now = datetime.now().isoformat(timespec="seconds")
+        for job in data["jobs"]:
+            if job.get("status") in ("running", "stopping"):
+                job["status"] = "interrupted"
+                job["updated_at"] = now
+                job["can_resume"] = job.get("kind") in (
+                    "settings", "comparison", "collection", "recovery")
+                changed = True
+        return _save_job_ledger(data) if changed else data
+
+
+def start_job_record(operation, kind):
+    with _JSON_IO_LOCK:
+        data = recover_job_ledger()
+        now = datetime.now().isoformat(timespec="seconds")
+        record = {
+            "id": f"job-{uuid.uuid4().hex}",
+            "operation": str(operation or "생성")[:120],
+            "kind": str(kind or "preview")[:40],
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "completed": 0,
+            "failed": 0,
+            "can_resume": False,
+        }
+        data["jobs"].append(record)
+        _save_job_ledger(data)
+        return record["id"]
+
+
+def finish_job_record(job_id, *, status, completed=0, failed=0,
+                      can_resume=False, message=""):
+    if not job_id:
+        return
+    with _JSON_IO_LOCK:
+        data = load_job_ledger()
+        for job in reversed(data["jobs"]):
+            if job.get("id") != job_id:
+                continue
+            job.update({
+                "status": str(status or "completed"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "completed": max(0, int(completed or 0)),
+                "failed": max(0, int(failed or 0)),
+                "can_resume": bool(can_resume),
+                "message": str(message or "")[:500],
+            })
+            break
+        _save_job_ledger(data)
+
+
+def job_ledger_summary():
+    data = load_job_ledger()
+    return {"ok": True, **data, "jobs": list(reversed(data["jobs"]))}
+
+
 class LiveState:
     """생성 진행 상황을 브라우저에 공유하기 위한 상태 저장소."""
 
-    def __init__(self):
+    def __init__(self, persist_jobs=False):
         self.lock = threading.Lock()
         self.image_bytes = None
         self.filename = ""
@@ -18349,6 +18462,8 @@ class LiveState:
         self.started_at = 0.0
         self.finished_at = 0.0
         self.eta_base_completed = 0
+        self.persist_jobs = bool(persist_jobs)
+        self.job_id = ""
 
     def update(self, **kwargs):
         with self.lock:
@@ -18385,6 +18500,8 @@ class LiveState:
             self.started_at = time.time()
             self.finished_at = 0.0
             self.eta_base_completed = 0
+            if self.persist_jobs:
+                self.job_id = start_job_record(self.operation, self.retry_mode)
             return self._owner
 
     def release(self, token):
@@ -18399,6 +18516,16 @@ class LiveState:
                 self.finished_at = time.time()
                 self.running = False
                 self.stop_req = False
+                if self.persist_jobs:
+                    finish_job_record(
+                        self.job_id,
+                        status=self.phase,
+                        completed=self.completed,
+                        failed=self.failed,
+                        can_resume=self.can_retry,
+                        message=self.status_text,
+                    )
+                    self.job_id = ""
 
     def wait_cancelable(self, seconds):
         """중지를 존중하는 대기 — 중지되면 즉시 True 를 돌려준다 (CQA-019).
@@ -18474,10 +18601,10 @@ class LiveState:
 class ConfigServer:
     """설정 편집(실시간 자동저장) + 생성 시작 신호 + 실시간 미리보기를 모두 담당."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, persist_jobs=False):
         self.cfg = cfg
         self.spec = load_spec()
-        self.live = LiveState()
+        self.live = LiveState(persist_jobs=persist_jobs)
         self.start_event = threading.Event()
         self.httpd = None
         self.url = None
@@ -19706,6 +19833,11 @@ class ConfigServer:
                 elif self.path.startswith("/api/blueprint"):
                     try:
                         self._json(server.snapshot_blueprint())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/jobs"):
+                    try:
+                        self._json(job_ledger_summary())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/config"):
@@ -21586,7 +21718,8 @@ def _run_comparison(server, cfg, plan, styles, chars):
 def main():
     cfg = load_or_init_config()
 
-    server = ConfigServer(cfg)
+    recover_job_ledger()
+    server = ConfigServer(cfg, persist_jobs=True)
     url = server.start(open_browser="--no-browser" not in sys.argv[1:])
     if not url:
         input("엔터를 누르면 종료...")

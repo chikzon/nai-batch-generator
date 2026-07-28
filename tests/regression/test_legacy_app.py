@@ -1592,6 +1592,27 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(stopped["phase"], "stopped")
         self.assertTrue(stopped["can_retry"])
 
+        with tempfile.TemporaryDirectory() as td, patch.object(
+                APP, "JOB_LEDGER_FILE", Path(td) / "작업대기열.json"):
+            durable = APP.LiveState(persist_jobs=True)
+            durable_token = durable.try_claim("세팅 배치 생성", "settings")
+            durable.update(completed=3, failed=1, phase="partial",
+                           can_retry=True, status_text="일부 완료")
+            durable.release(durable_token)
+            jobs = APP.job_ledger_summary()["jobs"]
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["status"], "partial")
+            self.assertEqual((jobs[0]["completed"], jobs[0]["failed"]), (3, 1))
+            self.assertTrue(jobs[0]["can_resume"])
+            jobs[0]["status"] = "running"
+            APP.atomic_write_json(
+                APP.JOB_LEDGER_FILE,
+                {"schema": "nais-job-ledger/v1", "jobs": jobs},
+            )
+            recovered = APP.recover_job_ledger()["jobs"][0]
+            self.assertEqual(recovered["status"], "interrupted")
+            self.assertTrue(recovered["can_resume"])
+
     def test_live_state_eta_uses_only_work_completed_in_this_run(self):
         live = APP.LiveState()
         with patch.object(APP.time, "time", return_value=100.0):
@@ -3071,6 +3092,11 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('data-manage-work="jobs"', page)
         self.assertIn("panel.dataset.managePanel !== manageWork", page)
         self.assertIn("async function loadJobCenter()", page)
+        self.assertIn("fetch('/api/jobs'", page)
+        self.assertIn('id="dataOriginsShow"', page)
+        self.assertIn("fetch('/api/img_origins'", page)
+        self.assertIn("if(last && imgs.length === 1) openApplyPicker(last);", page)
+        self.assertNotIn("applyStyle(last)", page)
 
     def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
         """비교 실험은 세팅 안에 두고 기존 화면에서도 같은 DOM 하나를 써야 한다."""
