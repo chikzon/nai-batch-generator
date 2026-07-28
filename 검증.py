@@ -37,6 +37,7 @@ def main():
         ROOT / "contracts" / "chatbot-nai" / "validate_contract.py",
     )
     run("챗봇↔NAI 연결 계약", ROOT / "tests" / "test_contracts.py")
+    run("모듈 경계 호환", ROOT / "tests" / "test_module_boundaries.py")
     run("무과금 회귀", ROOT / "tests" / "test_regressions.py")
     print("\n✔ 배포 전 smoke 검증 통과")
 
