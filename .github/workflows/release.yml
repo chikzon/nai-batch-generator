@@ -1,0 +1,107 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install runtime and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller==6.21.0"
+          choco install innosetup --yes --no-progress
+
+      - name: Fetch pinned redistributable assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force "태그" | Out-Null
+
+          $tagUrl = "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/4170882f90b47be130a0ff9314f663c230b9153d/tags/danbooru_e621_merged.csv"
+          $t5Url = "https://raw.githubusercontent.com/sunanakgo/NAIS3/6bff595/resources/t5_tokenizer.json"
+          Invoke-WebRequest -Uri $tagUrl -OutFile "태그/danbooru_e621_merged.csv"
+          Invoke-WebRequest -Uri $t5Url -OutFile "t5_tokenizer.json"
+
+          $expected = @{
+            "태그/danbooru_e621_merged.csv" = "AA9EAB8435562F86D7AC0D81F2F7BEDCBA9F6B93A806010708702406BBA85E18"
+            "t5_tokenizer.json" = "5F0ED8AB5B8CFA9812BB73752F1D80C292E52BCF5A87A144DC9AB2D251056CBB"
+          }
+          foreach ($path in $expected.Keys) {
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($actual -ne $expected[$path]) {
+              throw "$path SHA-256 mismatch: $actual"
+            }
+          }
+
+      - name: Run no-cost regressions
+        run: python 검증.py
+
+      - name: Build portable app, data pack, and installer
+        run: python 빌드.py --설치본
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $portable = "dist/NAI배치생성기-Windows-x64-portable.zip"
+          Compress-Archive -Path "dist/NAI배치생성기/*" -DestinationPath $portable
+
+          $files = @(
+            $portable
+            "dist/NAI배치생성기-기본자료팩.zip"
+            "dist/NAI배치생성기-1.0.0-setup.exe"
+          )
+          foreach ($path in $files) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "release file missing: $path"
+            }
+          }
+          $lines = foreach ($path in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            "$hash  $([IO.Path]::GetFileName($path))"
+          }
+          # 산출물 이름에 한글이 있으므로 ASCII로 쓰면 파일명이 `?`로 손상된다.
+          $lines | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding utf8
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: NAI-batch-generator-Windows-x64
+          if-no-files-found: error
+          path: |
+            dist/NAI배치생성기-Windows-x64-portable.zip
+            dist/NAI배치생성기-기본자료팩.zip
+            dist/NAI배치생성기-1.0.0-setup.exe
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/NAI배치생성기-Windows-x64-portable.zip" `
+            "dist/NAI배치생성기-기본자료팩.zip" `
+            "dist/NAI배치생성기-1.0.0-setup.exe" `
+            "dist/SHA256SUMS.txt" `
+            --title "NAI 배치 생성기 ${{ github.ref_name }}" `
+            --generate-notes

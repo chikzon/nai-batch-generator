@@ -8,12 +8,20 @@ on:
 jobs:
   regression:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
+      # 회귀 검사는 start.py가 렌더한 JavaScript도 `node --check`로 확인한다.
+      # Actions 자체가 쓰는 내장 Node는 PATH에 있다는 보장이 없으므로 명시한다.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - name: Install runtime dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile and run no-cost regressions

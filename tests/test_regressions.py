@@ -139,6 +139,18 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("⚠ 입력은 보존", APP.PAGE_TEMPLATE)
         self.assertNotIn("뒷부분이 잘립니다", APP.PAGE_TEMPLATE)
 
+    def test_first_run_guide_leads_to_token_data_pack_and_prompt(self):
+        page = APP.PAGE_TEMPLATE
+        self.assertIn("세 가지만 준비하면 바로 생성할 수 있습니다", page)
+        self.assertIn('id="welcomeApi"', page)
+        self.assertIn('id="welcomePack"', page)
+        self.assertIn('id="welcomeSkip"', page)
+        self.assertIn("setMode('system')", page)
+        self.assertIn("setMode('library')", page)
+        self.assertIn('type="password" id="token"', page)
+        self.assertIn('id="tokenShow"', page)
+        self.assertIn("tokenReady && (promptReady || dismissed)", page)
+
     def test_weight_highlight_does_not_draw_text_twice(self):
         page = APP.PAGE_TEMPLATE
         self.assertIn(
@@ -682,7 +694,11 @@ class RegressionTests(unittest.TestCase):
             set(BUILD.DATA_PACK_ASSETS),
             {"후보사전.json", "규격.json", "옵션.json"},
         )
-        self.assertEqual(set(BUILD.DATA_PACK_DIRS), {"태그", "세팅"})
+        self.assertEqual(set(BUILD.DATA_PACK_DIRS), {"태그"})
+        self.assertEqual(
+            set(BUILD.DATA_PACK_DOCS),
+            {"자료팩-안내.md", "LICENSE", "THIRD_PARTY_NOTICES.md"},
+        )
 
         # ⚠ 자료를 **시험용으로 만들어 넣고** 부른다. `태그/`·`t5_tokenizer.json` 은
         #    남의 저작물이라 저장소에 없어서(`.gitignore`), 내 폴더의 실제 파일에
@@ -696,8 +712,9 @@ class RegressionTests(unittest.TestCase):
             (fake / "태그").mkdir(parents=True, exist_ok=True)
             (fake / "태그" / "danbooru.csv").write_text(
                 "1girl,0,100\n", encoding="utf-8")
+            # 개인 세팅이 자료원에 있어도 공개 기본자료팩에는 들어가면 안 된다.
             (fake / "세팅").mkdir(parents=True, exist_ok=True)
-            (fake / "세팅" / "체위.json").write_text(
+            (fake / "세팅" / "개인세팅.json").write_text(
                 json.dumps({"이름": "체위", "씬": {}}, ensure_ascii=False),
                 encoding="utf-8")
             pack = BUILD.build_data_pack(Path(td), src_root=fake)
@@ -715,9 +732,12 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("후보사전.json", names)
         self.assertIn("규격.json", names)
         self.assertIn("옵션.json", names)
+        self.assertIn("자료팩-안내.md", names)
+        self.assertIn("LICENSE", names)
+        self.assertIn("THIRD_PARTY_NOTICES.md", names)
         self.assertIn("manifest.json", names)
         self.assertTrue(any(x.startswith("태그/") for x in names))
-        self.assertTrue(any(x.startswith("세팅/") for x in names))
+        self.assertFalse(any(x.startswith("세팅/") for x in names))
         self.assertNotIn("asset_config.json", names)
         self.assertFalse(any(x.startswith("수집/") for x in names))
 
@@ -1817,7 +1837,10 @@ class RegressionTests(unittest.TestCase):
         page = APP.PAGE_TEMPLATE
         self.assertIn("아직 넣은 세팅이 없습니다.", page)
         self.assertIn("빌더 후보 자료가 아직 없습니다.", page)
-        self.assertIn("앱 본체에는 <b>후보사전·태그·세팅·수집 자료가 들어 있지 않습니다.", page)
+        self.assertIn(
+            "앱 본체에는 <b>후보사전·태그·개인 세팅·수집 자료가 들어 있지 않습니다.",
+            page,
+        )
 
     def test_basic_data_pack_installs_and_undoes_each_data_kind(self):
         with tempfile.TemporaryDirectory() as td:

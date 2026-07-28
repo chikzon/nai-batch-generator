@@ -17,7 +17,8 @@ PyInstaller 는 지금 구조를 **그대로 두고** 파이썬 런타임만 함
    설치 실행본의 사용자 데이터(`설정.json`·`output/`)는
    `%LOCALAPPDATA%\\NAI배치생성기\\데이터`에 쌓여 제거·재설치와 분리된다.
    `--portable`을 명시한 경우에만 exe 옆을 쓴다.
-   후보사전·태그·세팅 같은 내용물은 `기본자료팩.zip`으로 따로 만든다.
+   후보사전·태그 같은 공개 내용물은 `기본자료팩.zip`으로 따로 만든다.
+   개인 세팅은 어느 공개 산출물에도 자동으로 넣지 않는다.
 """
 from __future__ import annotations
 
@@ -55,11 +56,13 @@ ASSETS = [
 # 개인 자료가 아니라 실행에 필요한 코드 자산이므로 exe 옆에 반드시 복사한다.
 ASSET_DIRS: list[str] = ["ui"]
 
-# 사용자가 원할 때 자료 탭으로 넣는 **별도 기본 자료팩**.
-# `asset_config.json`은 세팅 3종의 구형 중복본이라 넣지 않는다. 둘을 함께 넣으면
-# 세팅을 뺐는데도 첫 실행 마이그레이션이 다시 만들어 내는 원인이 된다.
+# 사용자가 원할 때 자료 탭으로 넣는 **별도 공개 기본 자료팩**.
+# 개인 `세팅/`은 여기서 자동으로 읽지 않는다. 개발자 PC에서 빌드한 공개 팩에 개인 세팅이
+# 조용히 따라가는 일을 막기 위해서다. 세팅 공유는 앱의 세팅 내보내기를 명시적으로 쓴다.
+# `asset_config.json`도 세팅 3종의 구형 중복본이므로 넣지 않는다.
 DATA_PACK_ASSETS = ["후보사전.json", "규격.json", "옵션.json"]
-DATA_PACK_DIRS = ["태그", "세팅"]
+DATA_PACK_DIRS = ["태그"]
+DATA_PACK_DOCS = ["자료팩-안내.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 DATA_PACK_NAME = f"{APP_NAME}-기본자료팩.zip"
 
 
@@ -239,12 +242,15 @@ def copy_assets(app_dir: Path) -> tuple[list[str], list[str]]:
 
 
 def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
-    """기본 후보·태그·세팅을 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다.
+    """기본 후보·태그를 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다.
 
-    `src_root` 는 자료를 읽어올 자리다. 기본은 저장소 폴더(`HERE`)이므로 실제 빌드는
-    예전과 똑같이 돈다. **시험에서 가짜 자료를 넣어 부르라고 열어 뒀다** —
+    `src_root` 는 공개 자료를 읽어올 자리다. 기본은 저장소 폴더(`HERE`)다.
+    **시험에서 가짜 자료를 넣어 부르라고 열어 뒀다** —
     `태그/`·`t5_tokenizer.json` 은 남의 저작물이라 저장소에 없어서(`.gitignore`),
     `HERE` 만 보면 **새로 복제한 곳에서는 자료팩이 비어 시험이 깨진다.**
+
+    개인 `세팅/`은 src_root에 있어도 읽지 않는다. 공개 자료팩과 개인 세팅의 경계를
+    빌드 호출자의 주의에 맡기지 않고 이 허용 목록으로 고정한다.
     """
     root_dir = Path(src_root) if src_root else HERE
     target = out_dir / DATA_PACK_NAME
@@ -252,6 +258,12 @@ def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
     payloads: dict[str, bytes] = {}
     for name in DATA_PACK_ASSETS:
         src = root_dir / name
+        if src.is_file():
+            payloads[name] = src.read_bytes()
+    # 자료팩만 따로 전달해도 사용법과 제3자 고지가 떨어져 나가지 않게 한다.
+    # 시험용 src_root에는 문서가 없을 수 있으므로 문서는 프로그램 소스에서 읽는다.
+    for name in DATA_PACK_DOCS:
+        src = HERE / name
         if src.is_file():
             payloads[name] = src.read_bytes()
     for name in DATA_PACK_DIRS:
@@ -292,7 +304,8 @@ def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
             "NAI 배치 생성기 기본 자료팩\n\n"
             "1. 프로그램을 실행합니다.\n"
             "2. [자료] → [자료 넣기]에 이 ZIP을 그대로 끌어다 놓습니다.\n"
-            "3. 후보사전·규격·옵션·태그·세팅이 각각 제자리에 들어갑니다.\n\n"
+            "3. 후보사전·규격·옵션·태그가 각각 제자리에 들어갑니다.\n\n"
+            "개인 캐릭터·그림체·세팅·생성물·API 토큰은 이 팩에 없습니다. "
             "본체에는 이 자료가 포함되지 않습니다. manifest.json의 파일별 SHA-256을 "
             "검사한 뒤 장착하며, 같은 팩을 다시 넣어도 기존 개인 자료를 덮어쓰지 않습니다. "
             "가져온 기록에서 이번에 추가한 자료만 해제할 수 있습니다.\n",

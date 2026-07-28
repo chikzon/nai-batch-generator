@@ -7747,6 +7747,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   /* 켜진 탭은 칠해서 확실히 구분한다 (테두리 색만 바꾸면 밝은 테마에서 잘 안 보였다) */
   .modes button.on{background:var(--accent-dim);border-bottom-color:var(--accent);color:var(--accent);font-weight:800;}
   .modes button.on:hover{color:var(--accent);}
+  .welcome-steps{margin:12px 0;border-top:1px solid var(--line);}
+  .welcome-step{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;
+    align-items:center;padding:11px 0;border-bottom:1px solid var(--line);}
+  .welcome-step-no{display:grid;place-items:center;width:26px;height:26px;border-radius:50%;
+    background:var(--accent-dim);color:var(--accent);font-size:var(--fs-xs);font-weight:800;}
+  .welcome-step b{display:block;margin-bottom:2px;}
+  .welcome-step .hint{margin:0;}
   .titlebar .spacer{flex:1;}
   .titlebar .stat{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}
 
@@ -8012,6 +8019,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     #app{display:flex;flex-direction:column;height:auto;min-height:calc(100vh - 56px);}
     body[data-mode="preview"] .left{order:1;}
     body[data-mode="preview"] .center{order:2;}
+    body[data-mode="preview"][data-onboarding="1"] .center{order:1;}
+    body[data-mode="preview"][data-onboarding="1"] .left{order:2;}
     body:not([data-mode="preview"]) .center{order:1;}
     body:not([data-mode="preview"]) .left{order:2;}
     .right{order:3;}
@@ -8037,6 +8046,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     #app{min-height:calc(100vh - 98px);}
     .center{padding:14px 10px;}
     .card{padding:15px 13px;margin-bottom:12px;}
+    .welcome-step{grid-template-columns:28px minmax(0,1fr);}
+    .welcome-step>button{grid-column:2;justify-self:start;}
     .grid2,.grid3{grid-template-columns:1fr;}
     .left{min-height:0;}
     /* ⚠ 예전엔 max-height:150px 였다. 390×844 실측에서 내용 999px 중 150px 만 보여
@@ -8355,8 +8366,26 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="view" id="vPreview">
       <!-- 첫 실행 안내 — 프롬프트가 비어 있을 때만 -->
       <div class="card hidden" id="welcome">
-        <h2><span class="n">시작</span>마음에 드는 그림에서 설정을 가져오세요</h2>
-        <p class="hint">직접 프롬프트를 짤 필요 없습니다. NAI로 만든 그림 파일을 넣으면
+        <h2><span class="n">처음</span>세 가지만 준비하면 바로 생성할 수 있습니다</h2>
+        <div class="welcome-steps">
+          <div class="welcome-step">
+            <span class="welcome-step-no">1</span>
+            <div><b>NovelAI 연결</b><p class="hint" id="welcomeApiStatus">토큰을 확인하는 중입니다.</p></div>
+            <button class="primary" id="welcomeApi">API 토큰 넣기</button>
+          </div>
+          <div class="welcome-step">
+            <span class="welcome-step-no">2</span>
+            <div><b>기본자료팩 넣기 <span class="hint">(선택)</span></b>
+              <p class="hint" id="welcomeDataStatus">빌더 후보와 태그 사전 상태를 확인하는 중입니다.</p></div>
+            <button id="welcomePack">자료팩 넣기</button>
+          </div>
+          <div class="welcome-step">
+            <span class="welcome-step-no">3</span>
+            <div><b>프롬프트 준비</b><p class="hint">직접 쓰거나 NAI 원본 그림에서 그대로 읽어옵니다.</p></div>
+            <button id="welcomeSkip">직접 입력</button>
+          </div>
+        </div>
+        <p class="hint">NAI로 만든 PNG/WebP를 넣으면
         <b>프롬프트·네거티브·설정값(CFG·리스케일·스텝·샘플러·시드)</b>을 통째로 읽어옵니다.</p>
         <div id="welcomeDrop" class="row" style="text-align:center;padding:26px 14px;border-style:dashed;cursor:pointer;">
           <div style="font-size:var(--fs);font-weight:600;">🖼️ 여기에 그림을 끌어다 놓으세요</div>
@@ -8366,11 +8395,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <p class="hint" style="margin-top:10px;">
           가진 그림이 없다면 <b>[자료]</b>의 그림체 라이브러리(<span id="welcomeCount">…</span>개)에서 골라도 됩니다.
           카톡·디스코드를 거친 그림은 정보가 지워져 있으니 <b>원본 파일</b>을 넣어주세요.</p>
-        <div class="bar" style="margin-top:8px;">
-          <button class="primary" id="welcomeLib">📚 그림체 고르러 가기</button>
-          <button id="welcomeSkip">직접 입력할래요</button>
-          <span class="n" id="welcomeMsg" style="margin-left:auto;"></span>
-        </div>
+        <div class="bar" style="margin-top:8px;"><button id="welcomeLib">📚 그림체 고르기</button>
+          <span class="n" id="welcomeMsg"></span></div>
       </div>
       <div class="pv">
         <div class="pv-img" id="pvImg"><span style="color:var(--muted);font-size:var(--fs-xs);text-align:center;">
@@ -8784,9 +8810,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="card">
         <h2><span class="n">자료팩</span>자료 넣기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">후보·태그·세팅·수집물을 한 번에</span></h2>
-        <p class="hint">앱 본체에는 <b>후보사전·태그·세팅·수집 자료가 들어 있지 않습니다.</b>
-        <b>기본자료팩.zip</b>, 개인 자료팩 또는 <b>그림체.json · 레시피.json · 작가통계.json</b>을
-        여기에 넣으면 후보사전·규격·옵션·태그·세팅·수집물별 제자리로 정리됩니다.<br>
+        <p class="hint">앱 본체에는 <b>후보사전·태그·개인 세팅·수집 자료가 들어 있지 않습니다.</b>
+        공개 <b>기본자료팩.zip</b>에는 빌더 후보·규격·옵션·태그만 들어 있습니다.
+        개인 자료팩 또는 <b>그림체.json · 레시피.json · 작가통계.json</b>을 넣으면
+        세팅·수집물을 포함해 자료 종류별 제자리로 정리됩니다.<br>
         <b>덮어쓰지 않고 없는 것만 더합니다</b> — 이미 갖고 있는 자료는 그대로 둡니다.
         같은 팩을 두 번 넣어도 안전합니다.</p>
         <div id="packDrop" class="drop" style="padding:18px;text-align:center;
@@ -8877,7 +8904,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="card">
         <h2><span class="n">01</span>API</h2>
         <p class="hint">novelai.net → 설정(톱니바퀴) → Account → Get Persistent API Token</p>
-        <div class="field"><label>NAI 토큰 (pst-...)</label><input type="text" id="token" placeholder="pst-..."></div>
+        <div class="field"><label>NAI 토큰 (pst-...)</label>
+          <div class="bar"><input type="password" id="token" placeholder="pst-..." autocomplete="off" style="flex:1;">
+            <button type="button" id="tokenShow" aria-pressed="false">보기</button></div>
+        </div>
         <hr style="border:0;border-top:1px solid var(--line);margin:14px 0 10px;">
         <label style="font-weight:600;">부루 계정 <span class="hint">— 자료 탭의 태그 검색에 씁니다 (선택)</span></label>
         <p class="hint" style="margin:4px 0 8px;">
@@ -10444,9 +10474,15 @@ window.addEventListener('pagehide', () => {
     STATE.scheduler = $('pSched').value || 'karras';
     STATE.variety = $('pVariety').value === 'on';
     if(STYLE_PARAM_IDS.has(id)) clearActiveStyle();
-    tokens(); save();
+    tokens(); refreshWelcome(); save();
   };
   el.addEventListener('input', h); el.addEventListener('change', h);
+});
+$('tokenShow').addEventListener('click', () => {
+  const input = $('token'), show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  $('tokenShow').textContent = show ? '숨기기' : '보기';
+  $('tokenShow').setAttribute('aria-pressed', show ? 'true' : 'false');
 });
 /* 부루 계정 — 다른 파라미터 저장 훅과 섞으면 서로 덮어쓰므로 따로 둔다 */
 [['bkDanUser','danbooru','user'],['bkDanKey','danbooru','key'],['bkGelUser','gelbooru','user'],['bkGelKey','gelbooru','key'],['bkE6User','e621','user'],['bkE6Key','e621','key']].forEach(([id, site, f]) => {
@@ -13761,13 +13797,36 @@ async function inspectImages(files){
 function refreshWelcome(){
   const w = $('welcome');
   if(!w) return;
-  const empty = !(STATE.base_prompt || '').trim();
-  w.classList.toggle('hidden', !empty || (STATE.ui || {}).welcome_off === true);
+  const tokenReady = /^pst-\S+/.test((STATE.token || '').trim());
+  const promptReady = !!(STATE.base_prompt || '').trim();
+  const dismissed = (STATE.ui || {}).welcome_off === true;
+  const show = !(tokenReady && (promptReady || dismissed));
+  w.classList.toggle('hidden', !show);
+  document.body.dataset.onboarding = show ? '1' : '0';
+  const api = $('welcomeApiStatus');
+  if(api) api.textContent = tokenReady
+    ? '연결 정보가 저장되어 있습니다. 생성 전에 잔액 확인으로 점검할 수 있습니다.'
+    : '아직 토큰이 없습니다. 토큰 없이는 유료·무료 생성 요청을 보내지 않습니다.';
+  const steps = [...(BUILDER['캐릭터단계'] || []), ...(BUILDER['베이스단계'] || [])];
+  const data = $('welcomeDataStatus');
+  if(data) data.textContent = steps.length
+    ? `기본 후보 ${steps.length}단계가 준비되어 있습니다.`
+    : '본체만 설치된 상태입니다. 생성은 가능하고, 빌더·태그 자동완성은 자료팩을 넣으면 열립니다.';
 }
 function bindWelcome(){
   if(window._welcomeBound) return;
   window._welcomeBound = true;
   bindDropZone($('welcomeDrop'), $('welcomeFile'));
+  $('welcomeApi').addEventListener('click', () => {
+    setMode('system');
+    const token = $('token');
+    if(token){ token.scrollIntoView({behavior:'smooth', block:'center'}); token.focus(); }
+  });
+  $('welcomePack').addEventListener('click', () => {
+    setMode('library');
+    const pack = $('packDrop');
+    if(pack) pack.scrollIntoView({behavior:'smooth', block:'center'});
+  });
   $('welcomeLib').addEventListener('click', () => {
     const b = document.querySelector('[data-mode="library"]');
     if(b) b.click();
