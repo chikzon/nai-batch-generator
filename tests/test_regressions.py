@@ -4551,6 +4551,113 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(snap["cursor"], 1)
             self.assertEqual(len(snap["queue"]), 2)
 
+    def test_public_collection_detects_new_changed_unchanged_and_retries_only_failed_posts(self):
+        class DummySession:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            url = "https://arca.live/b/aiart/101"
+            state_file = Path(td) / "진행.json"
+            article = {
+                "source_url": url, "article_id": "101", "title": "공유 글",
+                "posted_at": "2026-07-28", "body_text": "첫 본문",
+                "image_urls": ["https://ac.namu.la/a.png?type=orig"],
+            }
+            mode = {"fail": False}
+            image_calls = []
+
+            def fetch_image(_session, image_url):
+                image_calls.append(image_url)
+                if mode["fail"]:
+                    raise APP.arca_public.PublicImportError("시험 이미지 실패")
+                return b"image-bytes", "image/png"
+
+            def begin(manager):
+                with manager.lock:
+                    manager.state = manager._fresh_job(
+                        status="running", stage="downloading",
+                        queue=[url], direct_urls=[url], pages=0, max_posts=1)
+                    manager._save_locked()
+
+            manager = APP.PublicCollectionManager(state_file)
+            with (
+                patch.object(APP.arca_public, "create_session",
+                             side_effect=lambda: DummySession()),
+                patch.object(APP.arca_public, "fetch_text", return_value="<html>"),
+                patch.object(APP.arca_public, "extract_article",
+                             side_effect=lambda _html, _url: copy.deepcopy(article)),
+                patch.object(APP.arca_public, "fetch_image", side_effect=fetch_image),
+                patch.object(APP, "_style_record_from_public_image",
+                             side_effect=lambda *_args: {"id": "style-1", "images": []}),
+                patch.object(APP, "_local_import_image",
+                             return_value=("local:one.png", False)),
+                patch.object(APP, "add_style",
+                             return_value={"action": "added"}),
+                patch.object(APP.time, "sleep", return_value=None),
+            ):
+                begin(manager)
+                manager._run()
+                first = manager.snapshot()
+                self.assertEqual(first["new_posts"], 1)
+                self.assertEqual(first["changed_posts"], 0)
+                self.assertEqual(first["status"], "completed")
+                self.assertEqual(len(image_calls), 1)
+
+                begin(manager)
+                manager._run()
+                same = manager.snapshot()
+                self.assertEqual(same["unchanged_posts"], 1)
+                self.assertEqual(len(image_calls), 1)
+
+                article["body_text"] = "수정된 본문"
+                begin(manager)
+                manager._run()
+                changed = manager.snapshot()
+                self.assertEqual(changed["changed_posts"], 1)
+                self.assertEqual(len(image_calls), 2)
+
+                article["body_text"] = "다시 수정된 본문"
+                mode["fail"] = True
+                begin(manager)
+                manager._run()
+                failed = manager.snapshot()
+                self.assertEqual(failed["status"], "partial")
+                self.assertEqual(failed["failed_posts"], 1)
+                self.assertEqual(len(failed["failed_items"]), 1)
+                self.assertEqual(failed["failed_items"][0]["url"], url)
+
+                bad_selection = manager.retry_failed(
+                    {"urls": ["https://arca.live/b/aiart/999"]})
+                self.assertFalse(bad_selection["ok"])
+                mode["fail"] = False
+                retry = manager.retry_failed({"urls": [url]})
+                self.assertTrue(retry["ok"])
+                manager.thread.join(timeout=5)
+                self.assertFalse(manager.thread.is_alive())
+                retried = manager.snapshot()
+                self.assertEqual(retried["status"], "completed")
+                self.assertEqual(retried["new_posts"], 0)
+                self.assertEqual(retried["changed_posts"], 1)
+                self.assertEqual(retried["failed_items"], [])
+
+            restarted = APP.PublicCollectionManager(state_file)
+            self.assertEqual(
+                restarted.state["articles"][url]["title"], "공유 글")
+            corrupt_file = Path(td) / "손상된-진행.json"
+            corrupt_file.write_bytes(b'{"queue":')
+            corrupt = APP.PublicCollectionManager(corrupt_file)
+            blocked = corrupt.start({"urls": [url]})
+            self.assertFalse(blocked["ok"])
+            self.assertIn("손상", blocked["error"])
+            self.assertEqual(corrupt_file.read_bytes(), b'{"queue":')
+            page = APP.render_page()
+            for marker in (
+                    'id="publicCollectFailures"', 'id="publicCollectRetry"',
+                    "/api/public_collection_retry", "changed_posts",
+                    "data-public-retry"):
+                self.assertIn(marker, page)
+
     def test_unified_library_pages_characters_presets_and_collected_styles_without_raw_bulk(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

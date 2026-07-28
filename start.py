@@ -9651,6 +9651,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div id="publicCollectStatus" class="hint" aria-live="polite"
           style="margin-top:9px;white-space:pre-wrap;">수집 기록을 확인하는 중입니다.</div>
+        <div id="publicCollectFailures" class="hidden"
+          style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line);">
+          <div class="bar" style="flex-wrap:wrap;">
+            <strong style="font-size:var(--fs-xs);">다시 확인할 게시글</strong>
+            <span class="hint">성공한 자료는 건드리지 않고 고른 실패 글만 다시 읽습니다.</span>
+            <button type="button" id="publicCollectRetry" style="margin-left:auto;">
+              선택 실패 재시도
+            </button>
+          </div>
+          <div id="publicCollectFailureList" style="margin-top:5px;"></div>
+        </div>
       </div>
 
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
@@ -13938,13 +13949,14 @@ function renderPublicCollection(r){
   const labels = {
     idle:'대기', searching:'검색 중', downloading:'게시글·이미지 확인 중',
     paused:'일시정지', interrupted:'앱 종료로 중단됨', stopping:'중지 중',
-    stopped:'중지됨', failed:'실패', completed:'완료'
+    stopped:'중지됨', failed:'실패', partial:'일부 실패', completed:'완료'
   };
   const total = Number((r.queue||[]).length || r.found_posts || 0);
   const done = Number(r.scanned_posts||0);
   const bits = [
     `${labels[r.stage] || labels[r.status] || r.status} · 게시글 ${done}/${total}`,
     `이미지 ${Number(r.scanned_images||0)}장 확인 · NAI 메타 ${Number(r.metadata_images||0)}장`,
+    `새 글 ${Number(r.new_posts||0)} · 변경 ${Number(r.changed_posts||0)} · 그대로 ${Number(r.unchanged_posts||0)}`,
     `새 묶음 ${Number(r.added||0)} · 기존 묶음에 근거 추가 ${Number(r.updated||0)} · 이미 있음 ${Number(r.existing||0)}`
   ];
   if(r.current) bits.push(`현재: ${r.current}`);
@@ -13955,7 +13967,24 @@ function renderPublicCollection(r){
   if($('publicCollectPause')) $('publicCollectPause').disabled = r.status !== 'running';
   if($('publicCollectResume')) $('publicCollectResume').disabled = !r.can_resume && r.status !== 'paused';
   if($('publicCollectStop')) $('publicCollectStop').disabled = !active;
-  if(['completed','stopped','failed'].includes(r.status)) reloadConfig().catch(()=>{});
+  const failedHost = $('publicCollectFailures'), failedList = $('publicCollectFailureList');
+  const failedItems = (r.failed_items||[]).filter(item => item && item.url);
+  if(failedHost && failedList){
+    failedHost.classList.toggle('hidden', !failedItems.length);
+    failedList.innerHTML = failedItems.map(item => `<label class="row"
+        style="display:flex;gap:8px;align-items:flex-start;margin:4px 0;">
+      <input type="checkbox" data-public-retry="${escA(item.url)}" checked
+        style="width:auto;min-height:0;margin-top:3px;">
+      <span style="min-width:0;"><b>${esc(item.title||('게시글 '+(item.article_id||'')))}</b>
+        <span class="hint" style="display:block;word-break:break-all;">
+          ${esc(item.error||'확인 실패')} · ${Number(item.attempts||1)}회
+        </span></span>
+    </label>`).join('');
+  }
+  if($('publicCollectRetry')){
+    $('publicCollectRetry').disabled = active || !failedItems.length;
+  }
+  if(['completed','partial','stopped','failed'].includes(r.status)) reloadConfig().catch(()=>{});
 }
 async function loadPublicCollection(){
   if(!$('publicCollectStatus')) return;
@@ -13983,6 +14012,15 @@ if($('publicCollectStart')){
     publicCollectionPost('/api/public_collection_control', {action:'resume'}));
   $('publicCollectStop').addEventListener('click', () =>
     publicCollectionPost('/api/public_collection_control', {action:'stop'}));
+  $('publicCollectRetry').addEventListener('click', () => {
+    const urls = [...document.querySelectorAll('[data-public-retry]:checked')]
+      .map(box => box.dataset.publicRetry);
+    if(!urls.length){
+      $('publicCollectStatus').textContent = '재시도할 실패 게시글을 먼저 고르세요.';
+      return;
+    }
+    publicCollectionPost('/api/public_collection_retry', {urls});
+  });
   loadPublicCollection();
   PUBLIC_COLLECT_TIMER = setInterval(loadPublicCollection, 2000);
 }
@@ -16767,33 +16805,46 @@ class PublicCollectionManager:
         self.state_file = Path(state_file or PUBLIC_COLLECTION_FILE)
         self.lock = threading.RLock()
         self.thread = None
+        self.load_error = ""
         self.state = self._load_state()
 
     @staticmethod
     def _empty():
         return {
-            "schema": "nais-public-collection/v1", "status": "idle",
+            "schema": "nais-public-collection/v2", "status": "idle",
             "stage": "idle", "keyword": arca_public.DEFAULT_KEYWORD,
             "pages": 2, "max_posts": 100, "direct_urls": [], "queue": [],
             "cursor": 0, "found_posts": 0, "scanned_posts": 0,
             "scanned_images": 0, "metadata_images": 0, "added": 0,
             "updated": 0, "existing": 0, "skipped": 0, "errors": [],
+            "new_posts": 0, "changed_posts": 0, "unchanged_posts": 0,
+            "failed_posts": 0, "articles": {}, "failures": {},
             "current": "", "started_at": "", "updated_at": "",
             "finished_at": "",
         }
 
     def _load_state(self):
         state = self._empty()
+        if not self.state_file.is_file():
+            return state
         try:
             saved = load_json_recover(self.state_file)
             if isinstance(saved, dict):
                 state.update(saved)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.load_error = str(exc)
+            return state
+        state["schema"] = "nais-public-collection/v2"
+        if not isinstance(state.get("errors"), list):
+            state["errors"] = []
         if state.get("status") in {"running", "pausing", "stopping"}:
             state["status"] = "interrupted"
             state["stage"] = "interrupted"
             state["current"] = ""
+        if not isinstance(state.get("articles"), dict):
+            state["articles"] = {}
+        if not isinstance(state.get("failures"), dict):
+            state["failures"] = {}
         return state
 
     def _save_locked(self):
@@ -16809,7 +16860,35 @@ class PublicCollectionManager:
                 data.get("status") in {"paused", "interrupted", "failed"}
                 and int(data.get("cursor") or 0) < len(data.get("queue") or [])
             )
+            data["failed_items"] = sorted(
+                [
+                    copy.deepcopy(value)
+                    for value in (data.get("failures") or {}).values()
+                    if isinstance(value, dict) and value.get("url")
+                ],
+                key=lambda value: str(value.get("failed_at") or ""),
+                reverse=True,
+            )
+            data["can_retry_failed"] = bool(data["failed_items"])
             return data
+
+    def _fresh_job(self, *, status, stage, queue, direct_urls=None,
+                   keyword=None, pages=0, max_posts=100):
+        """수집 이력·미해결 실패는 지키고 이번 실행의 계수만 새로 연다."""
+        articles = copy.deepcopy(self.state.get("articles") or {})
+        failures = copy.deepcopy(self.state.get("failures") or {})
+        state = self._empty()
+        state.update({
+            "status": status, "stage": stage,
+            "keyword": str(keyword or self.state.get("keyword")
+                           or arca_public.DEFAULT_KEYWORD),
+            "pages": int(pages or 0), "max_posts": int(max_posts or 100),
+            "direct_urls": list(direct_urls or queue),
+            "queue": list(queue), "found_posts": len(queue),
+            "articles": articles, "failures": failures,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        return state
 
     @staticmethod
     def _direct_urls(payload):
@@ -16830,6 +16909,12 @@ class PublicCollectionManager:
     def start(self, payload=None, resume=False):
         payload = payload if isinstance(payload, dict) else {}
         with self.lock:
+            if self.load_error:
+                return {
+                    "ok": False,
+                    "error": "공개자료 수집 진행 기록이 손상되어 저장을 멈췄습니다. "
+                             "공개자료수집-진행.json과 .bak을 확인하세요.",
+                }
             if self.thread and self.thread.is_alive():
                 if resume and self.state.get("status") == "paused":
                     self.state["status"] = "running"
@@ -16863,17 +16948,50 @@ class PublicCollectionManager:
                         "ok": False,
                         "error": "게시글 주소를 넣거나 검색 페이지 수를 1 이상으로 정해 주세요.",
                     }
-                self.state = self._empty()
-                self.state.update({
-                    "status": "running", "stage": "searching",
-                    "keyword": keyword, "pages": pages, "max_posts": max_posts,
-                    "direct_urls": direct_urls,
-                    "queue": list(direct_urls), "found_posts": len(direct_urls),
-                    "started_at": datetime.now().isoformat(timespec="seconds"),
-                })
+                self.state = self._fresh_job(
+                    status="running", stage="searching",
+                    queue=direct_urls, direct_urls=direct_urls,
+                    keyword=keyword, pages=pages, max_posts=max_posts)
             self._save_locked()
             self.thread = threading.Thread(
                 target=self._run, name="public-material-import", daemon=True)
+            self.thread.start()
+            return self.snapshot()
+
+    def retry_failed(self, payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        with self.lock:
+            if self.load_error:
+                return {
+                    "ok": False,
+                    "error": "공개자료 수집 진행 기록이 손상되어 재시도를 멈췄습니다.",
+                }
+            if self.thread and self.thread.is_alive():
+                return {"ok": False, "error": "공개자료 수집이 이미 진행 중입니다."}
+            failures = self.state.get("failures") or {}
+            raw = payload.get("urls") or []
+            if isinstance(raw, str):
+                raw = re.split(r"[\s,]+", raw)
+            if not isinstance(raw, list):
+                return {"ok": False, "error": "재시도할 게시글 목록이 올바르지 않습니다."}
+            selected = []
+            for value in raw:
+                try:
+                    url = arca_public.normalize_article_url(value)
+                except arca_public.PublicImportError as exc:
+                    return {"ok": False, "error": str(exc)}
+                if url in failures and url not in selected:
+                    selected.append(url)
+            if not selected:
+                return {"ok": False, "error": "실패 목록에서 재시도할 게시글을 고르세요."}
+            self.state = self._fresh_job(
+                status="running", stage="downloading", queue=selected,
+                direct_urls=selected, pages=0,
+                max_posts=max(len(selected), 1))
+            self.state["retrying_failed"] = True
+            self._save_locked()
+            self.thread = threading.Thread(
+                target=self._run, name="public-material-retry", daemon=True)
             self.thread.start()
             return self.snapshot()
 
@@ -16917,6 +17035,60 @@ class PublicCollectionManager:
             del errors[:-20]
             self._save_locked()
 
+    @staticmethod
+    def _article_digest(article):
+        """제목·본문·원본 이미지 목록이 같으면 같은 게시글 판으로 본다."""
+        stable = {
+            "title": str(article.get("title") or ""),
+            "body_text": str(article.get("body_text") or ""),
+            "image_urls": list(article.get("image_urls") or []),
+        }
+        return hashlib.sha256(json.dumps(
+            stable, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _record_failure(self, url, error, article=None):
+        with self.lock:
+            failures = self.state.setdefault("failures", {})
+            prior = failures.get(url) if isinstance(failures.get(url), dict) else {}
+            failures[url] = {
+                "url": url,
+                "article_id": str((article or {}).get("article_id") or
+                                  url.rstrip("/").split("/")[-1]),
+                "title": str((article or {}).get("title") or
+                             prior.get("title") or ""),
+                "error": str(error)[:500],
+                "attempts": int(prior.get("attempts") or 0) + 1,
+                "failed_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.state["failed_posts"] = int(
+                self.state.get("failed_posts") or 0) + 1
+            errors = self.state.setdefault("errors", [])
+            errors.append(f"{url}: {str(error)[:400]}")
+            del errors[:-20]
+            self._save_locked()
+
+    def _remember_article(self, article, digest, classification, metadata_images):
+        url = str(article.get("source_url") or "")
+        with self.lock:
+            self.state.setdefault("articles", {})[url] = {
+                "url": url,
+                "article_id": str(article.get("article_id") or ""),
+                "title": str(article.get("title") or "")[:200],
+                "posted_at": str(article.get("posted_at") or ""),
+                "content_sha256": digest,
+                "image_count": len(article.get("image_urls") or []),
+                "metadata_images": int(metadata_images or 0),
+                "last_seen": datetime.now().isoformat(timespec="seconds"),
+            }
+            key = {
+                "new": "new_posts", "changed": "changed_posts",
+                "unchanged": "unchanged_posts",
+            }[classification]
+            self.state[key] = int(self.state.get(key) or 0) + 1
+            self.state.setdefault("failures", {}).pop(url, None)
+            self._save_locked()
+
     def _discover(self, session):
         with self.lock:
             pages = int(self.state.get("pages") or 0)
@@ -16956,10 +17128,28 @@ class PublicCollectionManager:
         html = arca_public.fetch_text(session, url)
         article = arca_public.extract_article(html, url)
         article["board_tab"] = "NAI"
+        digest = self._article_digest(article)
+        with self.lock:
+            previous = copy.deepcopy(
+                (self.state.get("articles") or {}).get(url) or {})
+        if previous.get("content_sha256") == digest:
+            self._remember_article(
+                article, digest, "unchanged",
+                previous.get("metadata_images") or 0)
+            return {
+                "ok": True, "classification": "unchanged",
+                "metadata_images": int(previous.get("metadata_images") or 0),
+                "article": article,
+            }
+        classification = "changed" if previous else "new"
         found_metadata = 0
+        image_errors = []
         for image_index, image_url in enumerate(article.get("image_urls") or [], 1):
             if not self._checkpoint():
-                return False
+                return {
+                    "ok": False, "stopped": True,
+                    "classification": classification, "article": article,
+                }
             with self.lock:
                 self.state["current"] = (
                     f"{article.get('title') or article['article_id']} · "
@@ -16997,9 +17187,20 @@ class PublicCollectionManager:
                         self.state[action] += 1
                     self._save_locked()
             except Exception as exc:
-                self._append_error(
-                    f"{article.get('article_id')} 이미지 {image_index}: {exc}")
-        return found_metadata > 0
+                image_errors.append(
+                    f"이미지 {image_index}/{len(article['image_urls'])}: {exc}")
+        if image_errors:
+            return {
+                "ok": False, "classification": classification,
+                "metadata_images": found_metadata, "article": article,
+                "error": " · ".join(image_errors),
+            }
+        self._remember_article(
+            article, digest, classification, found_metadata)
+        return {
+            "ok": True, "classification": classification,
+            "metadata_images": found_metadata, "article": article,
+        }
 
     def _run(self):
         session = arca_public.create_session()
@@ -17021,17 +17222,24 @@ class PublicCollectionManager:
                     break
                 url = queue[cursor]
                 try:
-                    self._import_article(session, url)
+                    result = self._import_article(session, url)
+                    if result.get("stopped"):
+                        return
+                    if not result.get("ok"):
+                        self._record_failure(
+                            url, result.get("error") or "게시글 수집 실패",
+                            result.get("article"))
                 except Exception as exc:
-                    self._append_error(f"{url}: {exc}")
+                    self._record_failure(url, exc)
                 with self.lock:
                     self.state["cursor"] = cursor + 1
                     self.state["scanned_posts"] = cursor + 1
                     self._save_locked()
                 time.sleep(0.8)
             with self.lock:
-                self.state["status"] = "completed"
-                self.state["stage"] = "completed"
+                partial = int(self.state.get("failed_posts") or 0) > 0
+                self.state["status"] = "partial" if partial else "completed"
+                self.state["stage"] = "partial" if partial else "completed"
                 self.state["current"] = ""
                 self.state["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 self._save_locked()
@@ -19342,6 +19550,12 @@ class ConfigServer:
                     try:
                         payload = json.loads(body or b"{}")
                         self._json(PUBLIC_COLLECTION.start(payload))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/public_collection_retry"):
+                    try:
+                        payload = json.loads(body or b"{}")
+                        self._json(PUBLIC_COLLECTION.retry_failed(payload))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/public_collection_control"):
