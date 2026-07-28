@@ -8371,6 +8371,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     font-size:var(--fs-2xs);font-weight:600;vertical-align:2px;}
   .titlebar .app .save-state.busy{color:var(--accent);border-color:var(--accent);}
   .titlebar .app .save-state.fail{color:var(--danger);border-color:var(--danger);}
+  .app-sub,.navcopy small,.workspace-context{display:none;}
+  .navcopy b{font:inherit;}
   .modes{display:flex;align-self:stretch;gap:2px;}
   .modes button{padding:0 16px;border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;font-size:var(--fs-sm);font-weight:600;}
   /* 켜진 탭은 칠해서 확실히 구분한다 (테두리 색만 바꾸면 밝은 테마에서 잘 안 보였다) */
@@ -8436,6 +8438,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .paneltog{display:inline-flex;align-items:center;justify-content:center;width:26px;height:24px;
     border:1px solid var(--line);background:var(--paper);color:var(--muted);cursor:pointer;
     border-radius:var(--radius);font-size:var(--fs-xs);line-height:1;padding:0;}
+  .panel-label{display:none;}
   .paneltog:hover{color:var(--fg);border-color:var(--accent);}
   .paneltog[aria-pressed="true"]{color:var(--accent);border-color:var(--accent);background:var(--accent-dim);}
 
@@ -8704,24 +8707,25 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 <body data-mode="preview">
 
 <div class="titlebar">
-  <div class="app">NAI <span>배치 생성기</span>__PROFBADGE__
+  <div class="app">NAI <span>배치 생성기</span>
+    <small class="app-sub">자료에서 생성까지 한 작업실</small>__PROFBADGE__
     <span class="save-state" id="saveState" title="설정.json 자동저장 상태">저장됨 ✓</span></div>
   <!-- 계획서의 5탭 순서 그대로: 기본 생성 · 자료 · 빌더 · 세팅 · 기타.
        숫자키 1~5 로도 옮긴다. -->
   <div class="modes" id="modes">
-    <button data-mode="preview" class="on" title="Alt+1"><span class="navico" aria-hidden="true">◉</span><span>생성</span></button>
-    <button data-mode="library" title="Alt+2"><span class="navico" aria-hidden="true">▦</span><span>자료</span></button>
-    <button data-mode="builder" title="Alt+3"><span class="navico" aria-hidden="true">◇</span><span>빌더</span></button>
-    <button data-mode="settings" title="Alt+4"><span class="navico" aria-hidden="true">≋</span><span>세팅</span></button>
-    <button data-mode="system" title="Alt+5"><span class="navico" aria-hidden="true">⚙</span><span>기타</span></button>
+    <button data-mode="preview" class="on" title="Alt+1"><span class="navico" aria-hidden="true">01</span><span class="navcopy"><b>생성</b><small>프롬프트와 실행</small></span></button>
+    <button data-mode="library" title="Alt+2"><span class="navico" aria-hidden="true">02</span><span class="navcopy"><b>자료</b><small>수집·검색·정리</small></span></button>
+    <button data-mode="builder" title="Alt+3"><span class="navico" aria-hidden="true">03</span><span class="navcopy"><b>빌더</b><small>그림체·캐릭터 조립</small></span></button>
+    <button data-mode="settings" title="Alt+4"><span class="navico" aria-hidden="true">04</span><span class="navcopy"><b>세팅</b><small>장면과 캐스트 설계</small></span></button>
+    <button data-mode="system" title="Alt+5"><span class="navico" aria-hidden="true">05</span><span class="navcopy"><b>기타</b><small>출력·복구·환경</small></span></button>
   </div>
   <div class="spacer"></div>
   <div class="stat" id="topStat">-</div>
   <!-- 패널 접기 — Forge 는 타이틀바 우측에 같은 것을 둔다 (`CustomTitleBar.tsx:110-`) -->
   <button class="paneltog" id="togLeft" aria-pressed="false"
-    title="프롬프트 패널 접기 / 펴기 (Alt+[)">◧</button>
+    title="프롬프트 패널 접기 / 펴기 (Alt+[)"><span class="panel-symbol">◧</span><span class="panel-label">프롬프트 패널</span></button>
   <button class="paneltog" id="togRight" aria-pressed="false"
-    title="최근 생성 패널 접기 / 펴기 (Alt+])">◨</button>
+    title="최근 생성 패널 접기 / 펴기 (Alt+])"><span class="panel-symbol">◨</span><span class="panel-label">최근 생성 패널</span></button>
 </div>
 
 <div id="startupRecovery" role="alert"
@@ -8992,6 +8996,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- ══ 가운데: 모드 영역 ══ -->
   <div class="center" id="center">
+    <header class="workspace-context" id="workspaceContext">
+      <div class="workspace-step" id="workspaceStep">01 · GENERATE</div>
+      <div class="workspace-context-copy">
+        <h1 id="workspaceTitle">생성</h1>
+        <p id="workspaceDesc">프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.</p>
+      </div>
+    </header>
     <div class="view" id="vPreview">
       <!-- 첫 실행 안내 — 프롬프트가 비어 있을 때만 -->
       <div class="card hidden" id="welcome">
@@ -9264,6 +9275,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <!-- 세팅 삭제는 씬 수백 개가 함께 사라진다. `+ 새 세팅` 바로 옆은 위험하다.
                스페이서 대신 `margin-left:auto` — 위 캐릭터 칸 주석 참조. -->
           <button id="sbDel" class="danger" style="margin-left:auto;">세팅 삭제</button>
+        </div>
+        <div class="builder-empty-flow" id="sbEmpty">
+          <div><b>1 · 세팅 파일</b><span>기존 세팅을 고르거나 새로 만듭니다.</span></div>
+          <div><b>2 · 씬 세트</b><span>시작·중간·끝 같은 단계를 한 묶음으로 구성합니다.</span></div>
+          <div><b>3 · 장면 내용</b><span>공통 태그, 캐릭터별 태그·네거티브·위치를 채웁니다.</span></div>
         </div>
         <div id="sbBody" class="hidden" style="margin-top:8px;">
           <div class="grid3">
@@ -11273,11 +11289,22 @@ function arrangeStudioWorkspace(){
     });
   }
 }
+const MODE_CONTEXT = {
+  preview: ['01 · GENERATE', '생성', '프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.'],
+  library: ['02 · LIBRARY', '자료', '공개 자료와 내 자료를 수집하고, 큰 묶음 그대로 찾고 정리합니다.'],
+  builder: ['03 · BUILD', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
+  settings: ['04 · SETTING', '세팅', '장면 공통값, 캐릭터별 태그와 위치를 한 흐름으로 설계합니다.'],
+  system: ['05 · SYSTEM', '기타', '출력, 백업·복구, 화면과 고급 환경을 관리합니다.'],
+};
 function setMode(m){
   document.body.dataset.mode = m;
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   ['preview','settings','builder','library','system'].forEach(x =>
     $('v' + x[0].toUpperCase() + x.slice(1)).style.display = (x === m ? '' : 'none'));
+  const context = MODE_CONTEXT[m] || MODE_CONTEXT.preview;
+  if($('workspaceStep')) $('workspaceStep').textContent = context[0];
+  if($('workspaceTitle')) $('workspaceTitle').textContent = context[1];
+  if($('workspaceDesc')) $('workspaceDesc').textContent = context[2];
   arrangeStudioWorkspace();
 }
 document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
@@ -12908,6 +12935,7 @@ function sbLoad(name){
   const st = SETTINGS.find(x => x.name === name);
   SB.name = name;
   $('sbBody').classList.toggle('hidden', !st);
+  if($('sbEmpty')) $('sbEmpty').classList.toggle('hidden', !!st);
   if(!st) return;
   $('sbName').value = st.name;
   $('sbMode').value = st.mode || '단독';

@@ -2835,8 +2835,22 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("r.removeAttribute('data-layout')", page)
         self.assertIn(':root[data-layout="studio"] .titlebar', css)
         self.assertIn('body:not([data-mode="preview"]) .left', css)
-        self.assertIn('@media (max-width: 1479px)', css)
+        self.assertIn('@media (max-width: 1279px)', css)
         self.assertNotIn("수집", BUILD.ASSET_DIRS)
+
+    def test_studio_workflow_has_context_and_descriptions_at_common_desktop_width(self):
+        page = APP.render_page()
+        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        for marker in ('id="workspaceContext"', 'id="workspaceStep"',
+                       'id="workspaceTitle"', 'id="workspaceDesc"'):
+            self.assertEqual(page.count(marker), 1)
+        self.assertEqual(page.count('class="navcopy"'), 5)
+        self.assertIn("const MODE_CONTEXT = {", page)
+        self.assertIn("workspaceDesc", page)
+        self.assertIn('@media (min-width: 1280px)', css)
+        self.assertIn('.navcopy small', css)
+        self.assertIn('.workspace-context', css)
+        self.assertIn('--studio-rail: 196px', css)
 
     def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
         """비교 생성은 복제하지 않고 작업실/기존 화면 사이에서 같은 DOM을 옮겨야 한다."""
@@ -2860,12 +2874,15 @@ class RegressionTests(unittest.TestCase):
             page.index('id="vSettings"'):page.index('id="vBuilder"')
         ]
         for marker in ('id="studioSettingsNav"', 'id="settingSelectCard"',
-                       'id="sceneQuickCard"', 'id="settingBuilderCard"'):
+                       'id="sceneQuickCard"', 'id="settingBuilderCard"',
+                       'id="sbEmpty"'):
             self.assertEqual(page.count(marker), 1)
             self.assertIn(marker, settings_view)
         self.assertIn("STATE.ui.settings_work = next", page)
         self.assertIn("settingsCard.classList.toggle('hidden', studio && key !== settingsWork)", page)
         self.assertIn("settingsNav.classList.toggle('hidden', !studio)", page)
+        self.assertIn("$('sbEmpty').classList.toggle('hidden', !!st)", page)
+        self.assertIn(".builder-empty-flow.hidden", css)
         self.assertIn("#studioSettingsNav .studio-subnav-actions", css)
 
     def test_character_duplicate_uses_latest_client_state_and_unique_identity(self):

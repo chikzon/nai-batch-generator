@@ -7,9 +7,9 @@
  */
 
 :root[data-layout="studio"] {
-  --studio-rail: 210px;
+  --studio-rail: 196px;
   --studio-gap: 20px;
-  --studio-shadow: 0 10px 28px rgba(15, 23, 42, .07);
+  --studio-shadow: 0 1px 2px rgba(15, 23, 42, .05);
 }
 
 :root[data-layout="studio"] body {
@@ -49,6 +49,88 @@
 :root[data-layout="studio"] .builder-intro,
 :root[data-layout="studio"] .builder-summary {
   box-shadow: none;
+}
+
+:root[data-layout="studio"] .builder-empty-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  margin-top: 18px;
+  border-block: 1px solid var(--line);
+}
+
+:root[data-layout="studio"] .builder-empty-flow.hidden {
+  display: none;
+}
+
+:root[data-layout="studio"] .builder-empty-flow > div {
+  min-width: 0;
+  padding: 15px 18px;
+  border-right: 1px solid var(--line);
+}
+
+:root[data-layout="studio"] .builder-empty-flow > div:last-child {
+  border-right: 0;
+}
+
+:root[data-layout="studio"] .builder-empty-flow b,
+:root[data-layout="studio"] .builder-empty-flow span {
+  display: block;
+}
+
+:root[data-layout="studio"] .builder-empty-flow b {
+  margin-bottom: 5px;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+}
+
+:root[data-layout="studio"] .builder-empty-flow span {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+}
+
+:root[data-layout="studio"] .workspace-context {
+  width: 100%;
+  max-width: 1240px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  margin: 0 auto 20px;
+  padding: 0 2px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+:root[data-layout="studio"] .workspace-step {
+  padding: 6px 9px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+
+:root[data-layout="studio"] .workspace-context-copy {
+  min-width: 0;
+}
+
+:root[data-layout="studio"] .workspace-context h1 {
+  margin: 0;
+  font-size: calc(var(--fs-lg) + 3px);
+  line-height: 1.25;
+  letter-spacing: -.025em;
+}
+
+:root[data-layout="studio"] .workspace-context p {
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 :root[data-layout="studio"] .studio-subnav {
@@ -116,7 +198,7 @@
   box-shadow: 0 3px 10px rgba(15, 23, 42, .08);
 }
 
-@media (min-width: 1480px) {
+@media (min-width: 1280px) {
   :root[data-layout="studio"] body {
     overflow: hidden;
   }
@@ -144,6 +226,15 @@
     border-bottom: 1px solid var(--line);
     white-space: normal;
     line-height: 1.25;
+  }
+
+  :root[data-layout="studio"] .titlebar .app-sub {
+    display: block;
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: var(--fs-2xs);
+    font-weight: 500;
+    line-height: 1.4;
   }
 
   :root[data-layout="studio"] .titlebar .app > span:first-child {
@@ -185,6 +276,34 @@
     font-size: var(--fs-sm);
   }
 
+  :root[data-layout="studio"] .navcopy {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  :root[data-layout="studio"] .navcopy b {
+    color: inherit;
+    font-size: var(--fs-sm);
+    font-weight: 750;
+    line-height: 1.2;
+  }
+
+  :root[data-layout="studio"] .navcopy small {
+    display: block;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: var(--fs-2xs);
+    font-weight: 500;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  :root[data-layout="studio"] .modes button.on .navcopy small {
+    color: color-mix(in srgb, var(--accent) 72%, var(--muted));
+  }
+
   :root[data-layout="studio"] .modes button:hover {
     background: var(--paper2);
     color: var(--text);
@@ -224,13 +343,21 @@
     height: 32px;
   }
 
+  :root[data-layout="studio"] .titlebar .panel-label {
+    display: inline;
+  }
+
+  :root[data-layout="studio"] .titlebar .panel-symbol {
+    display: none;
+  }
+
   :root[data-layout="studio"] #app {
     width: calc(100vw - var(--studio-rail));
     height: 100vh;
     margin-left: var(--studio-rail);
-    --colL: var(--lw, 400px);
-    --colR: 280px;
-    grid-template-columns: var(--colL) minmax(520px, 1fr) var(--colR);
+    --colL: var(--lw, 320px);
+    --colR: 250px;
+    grid-template-columns: var(--colL) minmax(500px, 1fr) var(--colR);
   }
 
   :root[data-layout="studio"] .left {
@@ -276,6 +403,10 @@
     max-width: 1460px;
   }
 
+  :root[data-layout="studio"] body:not([data-mode="preview"]) .workspace-context {
+    max-width: 1460px;
+  }
+
   :root[data-layout="studio"] body:not([data-mode="preview"]) .titlebar .paneltog {
     display: none;
   }
@@ -301,10 +432,28 @@
   }
 }
 
+@media (min-width: 1400px) and (max-width: 1599px) {
+  :root[data-layout="studio"] #app {
+    --colL: var(--lw, 360px);
+  }
+}
+
+@media (min-width: 1600px) {
+  :root[data-layout="studio"] {
+    --studio-rail: 210px;
+  }
+
+  :root[data-layout="studio"] #app {
+    --colL: var(--lw, 400px);
+    --colR: 280px;
+    grid-template-columns: var(--colL) minmax(520px, 1fr) var(--colR);
+  }
+}
+
 /* 위쪽 탭을 쓰는 폭에서도 자료·빌더·세팅·기타의 불필요한 양옆 패널은 숨긴다.
    1280px에 세로 레일을 억지로 끼우지 않고, 모바일에서 작업 화면 아래에 프롬프트와
    최근 생성이 다시 나타나는 혼동도 막는다. 생성 탭만 원래의 세 패널을 유지한다. */
-@media (max-width: 1479px) {
+@media (max-width: 1279px) {
   :root[data-layout="studio"] body:not([data-mode="preview"]) #app {
     --colL: 0px;
     --colR: 0px;
@@ -337,6 +486,30 @@
 }
 
 @media (max-width: 700px) {
+  :root[data-layout="studio"] .workspace-context {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+
+  :root[data-layout="studio"] .workspace-context p {
+    overflow: visible;
+    white-space: normal;
+  }
+
+  :root[data-layout="studio"] .builder-empty-flow {
+    grid-template-columns: 1fr;
+  }
+
+  :root[data-layout="studio"] .builder-empty-flow > div {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  :root[data-layout="studio"] .builder-empty-flow > div:last-child {
+    border-bottom: 0;
+  }
+
   :root[data-layout="studio"] .studio-subnav {
     position: static;
     align-items: stretch;
