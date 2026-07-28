@@ -2521,7 +2521,11 @@ class RegressionTests(unittest.TestCase):
 
     def test_setout_serves_normal_output_but_blocks_trashed_files(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "output"
+            # ⚠ 임시 폴더를 **편 뒤에** 쓴다. 계정 이름이 8자를 넘는 윈도우에서는
+            #    `tempfile` 이 8.3 단축 이름(`C:\Users\RUNNER~1\…`)을 돌려주는데,
+            #    앱은 경로 탈출을 막으려고 `.resolve()` 한 긴 이름을 돌려준다.
+            #    펴지 않고 견주면 같은 파일인데도 다르다고 나온다 (CI 에서 겪었다).
+            root = (Path(td) / "output").resolve()
             safe = root / "safe.png"
             trashed = root / APP.TRASH_DIR_NAME / "batch" / "hidden.png"
             safe.parent.mkdir(parents=True)
@@ -3623,11 +3627,12 @@ class RegressionTests(unittest.TestCase):
 
     def test_custom_output_root_and_date_are_used_by_batch_and_thumbnails(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "chosen"
+            # ⚠ 8.3 단축 이름 때문에 임시 폴더를 먼저 편다 (위 설명 참조).
+            root = (Path(td) / "chosen").resolve()
             cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
             cfg.update(out_dir=str(root), out_by_date=True)
             batch = APP.out_sub(cfg, "nsfw_seed")
-            self.assertEqual(batch, root.resolve() / "nsfw_seed" / APP.date.today().isoformat())
+            self.assertEqual(batch, root / "nsfw_seed" / APP.date.today().isoformat())
             image = batch / "101_sample.webp"
             image.write_bytes(b"image")
             settings = [{"name": "S", "data": {"\uC52C": {"101": {}}}}]
