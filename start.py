@@ -2453,6 +2453,103 @@ def parse_artist_combo(text):
     return artists, rest
 
 
+def compose_artist_workspace(rows, mode="custom", curve_start=1.2,
+                             curve_end=0.8, seed=""):
+    """작가 조합 작업공간의 행을 NAI 가중치 prompt로 만든다.
+
+    순서는 사용자가 정한 실제 prompt 순서다. ``locked`` 행은 균형·곡선·무작위
+    모드에서도 고정하고, 무작위는 행별 min/max 안에서만 뽑는다.
+    """
+    if not isinstance(rows, list):
+        raise ValueError("작가 목록 형식이 올바르지 않습니다.")
+    mode = str(mode or "custom").strip().lower()
+    if mode not in {"custom", "balanced", "curve", "random"}:
+        raise ValueError("알 수 없는 가중치 방식입니다.")
+    cleaned, seen = [], set()
+
+    def number(value, fallback=1.0):
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = float(fallback)
+        if not math.isfinite(result):
+            raise ValueError("가중치는 유한한 숫자여야 합니다.")
+        return result
+
+    for raw in rows[:20]:
+        if not isinstance(raw, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(raw.get("name") or "")).strip()
+        if not name:
+            continue
+        if len(name) > 60 or any(mark in name for mark in (",", "\n", "\r", "::")):
+            raise ValueError(f"작가 이름 형식이 올바르지 않습니다: {name[:30]}")
+        key = name.casefold()
+        if key in seen:
+            raise ValueError(f"같은 작가가 두 번 들어 있습니다: {name}")
+        seen.add(key)
+        weight = number(raw.get("weight"), 1.0)
+        low = number(raw.get("min"), weight)
+        high = number(raw.get("max"), weight)
+        if low > high:
+            low, high = high, low
+        cleaned.append({
+            "name": name, "weight": weight, "min": low, "max": high,
+            "locked": bool(raw.get("locked")),
+        })
+    if not cleaned:
+        return {"rows": [], "combo": ""}
+
+    unlocked = [row for row in cleaned if not row["locked"]]
+    if mode == "balanced":
+        for row in unlocked:
+            row["weight"] = 1.0
+    elif mode == "curve":
+        start, end = number(curve_start, 1.2), number(curve_end, 0.8)
+        for index, row in enumerate(unlocked):
+            ratio = index / max(1, len(unlocked) - 1)
+            row["weight"] = start + (end - start) * ratio
+    elif mode == "random":
+        rng = random.Random(str(seed)) if str(seed) else random.SystemRandom()
+        for row in unlocked:
+            row["weight"] = rng.uniform(row["min"], row["max"])
+
+    def weight_text(value):
+        text = f"{value:.3f}".rstrip("0").rstrip(".")
+        return "0" if text in {"-0", ""} else text
+
+    combo = ", ".join(
+        f"{weight_text(row['weight'])}::artist:{row['name']}::"
+        for row in cleaned
+    )
+    return {"rows": cleaned, "combo": combo}
+
+
+def artist_workspace_request(data):
+    """작가 조합 UI의 parse/compose를 한 규칙으로 처리한다."""
+    if not isinstance(data, dict):
+        raise ValueError("잘못된 요청 형식입니다.")
+    action = str(data.get("action") or "compose")
+    base = str(data.get("base") or "")
+    if action == "parse":
+        artists, _ = parse_artist_combo(base)
+        rows = [{
+            "name": name, "weight": weight if weight is not None else 1.0,
+            "min": weight if weight is not None else 0.7,
+            "max": weight if weight is not None else 1.3,
+            "locked": False,
+        } for weight, name in artists]
+        return {"ok": True, "rows": rows}
+    result = compose_artist_workspace(
+        data.get("rows") or [], mode=data.get("mode"),
+        curve_start=data.get("curve_start"), curve_end=data.get("curve_end"),
+        seed=data.get("seed"),
+    )
+    _, rest = parse_artist_combo(base)
+    prompt = _join_tags(result["combo"], ", ".join(rest))
+    return {"ok": True, **result, "prompt": prompt}
+
+
 def load_combos():
     if _COMBOS["loaded"]:
         return _COMBOS["rows"]
@@ -13886,6 +13983,30 @@ function openCombos(target){
     <p class="hint">작가 조합만이 아니라 <b>베이스 + 네거티브 + 설정값(CFG·리스케일·스텝·샘플러·시드)</b>이
     합쳐진 한 세트입니다. <b>쪼개지 않고 통째로만</b> 적용합니다 —
     일부만 가져오면 원래 그림이 재현되지 않기 때문입니다.</p>
+    <details id="comboComposer" class="row" style="margin-bottom:10px;">
+      <summary style="cursor:pointer;font-weight:700;">작가 조합 직접 만들기 · 고정 작가 · 범위 · 곡선</summary>
+      <p class="hint">행 순서가 실제 프롬프트 순서입니다. 고정한 작가는 다른 방식을 골라도
+      그 가중치를 지키고, 무작위는 각 행의 최소~최대 안에서만 뽑습니다.</p>
+      <div class="filterbar">
+        <select id="comboWeightMode" style="width:auto;">
+          <option value="custom">직접 가중치</option><option value="balanced">균형 1.0</option>
+          <option value="curve">순서대로 곡선</option><option value="random">행별 범위 무작위</option>
+        </select>
+        <label class="hint">곡선 시작 <input type="number" id="comboCurveStart" value="1.2" step="0.05" style="width:68px;"></label>
+        <label class="hint">끝 <input type="number" id="comboCurveEnd" value="0.8" step="0.05" style="width:68px;"></label>
+        <label class="hint">무작위 시드 <input type="text" id="comboWeightSeed" placeholder="비우면 매번 새로" style="width:112px;"></label>
+        <button type="button" id="comboLoadCurrent">현재 프롬프트에서 읽기</button>
+      </div>
+      <div id="comboArtistRows"></div>
+      <div class="bar">
+        <button type="button" id="comboArtistAdd">+ 작가</button>
+        <button type="button" id="comboArtistPreview">가중치 조합 미리보기</button>
+        <button type="button" class="primary" id="comboArtistApply">${window._comboTarget ? '빌더 칸에 넣기' : '베이스의 작가 조합으로 적용'}</button>
+      </div>
+      <div class="field"><label>실제 들어갈 작가 프롬프트</label>
+        <textarea id="comboArtistPrompt" readonly style="min-height:58px;"></textarea></div>
+      <div id="comboArtistMsg" class="hint"></div>
+    </details>
     <div class="filterbar">
       <input type="text" id="comboQ" placeholder="🔍 작가·제목·프롬프트 검색 (띄어쓰기로 여러 단어)">
       <select id="comboSort" title="정렬">
@@ -13928,6 +14049,7 @@ function openCombos(target){
     <div id="comboList"></div>
     <div class="bar"><button id="comboMore" style="flex:1;">더 보기 ▾</button></div>`;
   if($('comboBack')) $('comboBack').addEventListener('click', () => returnToBuilder());
+  setupArtistWorkspace();
   bindTidy();
   $('comboQ').addEventListener('input', () => { clearTimeout(comboT); comboT = setTimeout(() => loadCombos(false), 300); });
   ['comboSort','comboTab','comboSrc','comboSize','comboSeeded','comboRate'].forEach(id =>
@@ -13973,6 +14095,118 @@ function discardComboReturn(){
   COMBO_RETURN = null;
   window._comboTarget = null;
   $('modalSave').style.display = '';
+}
+
+function artistWorkspaceRows(){
+  return [...($('comboArtistRows')||document).querySelectorAll('[data-artist-row]')].map(row => ({
+    name:(row.querySelector('[data-aw="name"]')||{}).value || '',
+    weight:(row.querySelector('[data-aw="weight"]')||{}).value || '1',
+    min:(row.querySelector('[data-aw="min"]')||{}).value || '0.7',
+    max:(row.querySelector('[data-aw="max"]')||{}).value || '1.3',
+    locked:!!(row.querySelector('[data-aw="locked"]')||{}).checked,
+  }));
+}
+function drawArtistWorkspace(rows){
+  const host = $('comboArtistRows'); if(!host) return;
+  const list = (rows&&rows.length) ? rows : [{
+    name:'', weight:1, min:0.7, max:1.3, locked:false,
+  }];
+  host.innerHTML = list.map((row,index) => `<div class="filterbar" data-artist-row="${index}"
+      style="margin:5px 0;padding:6px;border:1px solid var(--line);border-radius:var(--radius);">
+    <span class="n" style="min-width:20px;text-align:center;">${index+1}</span>
+    <input type="text" data-aw="name" value="${escA(row.name||'')}" placeholder="작가 이름" style="flex:1;min-width:180px;">
+    <label class="hint">값 <input type="number" data-aw="weight" value="${escA(String(row.weight??1))}" step="0.05" style="width:66px;"></label>
+    <label class="hint">범위 <input type="number" data-aw="min" value="${escA(String(row.min??0.7))}" step="0.05" style="width:66px;"></label>
+    <span>~</span><input type="number" data-aw="max" value="${escA(String(row.max??1.3))}" step="0.05" style="width:66px;">
+    <label class="hint"><input type="checkbox" data-aw="locked" ${row.locked?'checked':''}
+      style="width:auto;"> 고정</label>
+    <button type="button" data-aw-up title="프롬프트에서 앞으로">↑</button>
+    <button type="button" data-aw-down title="프롬프트에서 뒤로">↓</button>
+    <button type="button" data-aw-del class="danger" title="이 행 빼기">×</button>
+  </div>`).join('');
+}
+async function parseArtistWorkspace(){
+  const source = window._comboTarget ? (window._comboTarget.value||'') : (STATE.base_prompt||'');
+  try{
+    const r = await (await fetch('/api/artist_workspace', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'parse',base:source})})).json();
+    if(!r.ok) throw new Error(r.error||'작가 조합을 읽지 못했습니다.');
+    drawArtistWorkspace(r.rows);
+    $('comboArtistMsg').textContent = r.rows.length
+      ? `현재 프롬프트에서 작가 ${r.rows.length}명을 읽었습니다.`
+      : '현재 프롬프트에 작가가 없어 빈 행으로 시작합니다.';
+  }catch(e){ $('comboArtistMsg').textContent = String(e); }
+}
+function artistWorkspacePayload(){
+  return {
+    action:'compose',
+    base:window._comboTarget ? (window._comboTarget.value||'') : (STATE.base_prompt||''),
+    mode:$('comboWeightMode').value,
+    curve_start:$('comboCurveStart').value,
+    curve_end:$('comboCurveEnd').value,
+    seed:$('comboWeightSeed').value,
+    rows:artistWorkspaceRows(),
+  };
+}
+async function composeArtistWorkspace(apply=false){
+  const payload = artistWorkspacePayload();
+  $('comboArtistMsg').textContent = '조합하는 중...';
+  try{
+    const r = await (await fetch('/api/artist_workspace', {method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
+    if(!r.ok) throw new Error(r.error||'작가 조합 실패');
+    drawArtistWorkspace(r.rows);
+    $('comboArtistPrompt').value = r.combo || '';
+    STATE.ui = STATE.ui || {};
+    STATE.ui.artist_composer = {
+      mode:payload.mode, curve_start:payload.curve_start,
+      curve_end:payload.curve_end, seed:payload.seed, rows:r.rows,
+    };
+    save();
+    if(!apply){
+      $('comboArtistMsg').textContent = `작가 ${r.rows.length}명 · 실제 순서와 가중치를 확인하세요.`;
+      return;
+    }
+    if(window._comboTarget){
+      returnToBuilder(r.combo || '');
+      return;
+    }
+    STATE.base_prompt = r.prompt || '';
+    $('basePrompt').value = STATE.base_prompt;
+    clearActiveStyle(); tokens(); save();
+    $('comboArtistMsg').textContent = '기존 비작가 태그는 지키고 작가 조합만 바꿨습니다 ✓';
+  }catch(e){ $('comboArtistMsg').textContent = String(e); }
+}
+function setupArtistWorkspace(){
+  const host = $('comboArtistRows'); if(!host) return;
+  const saved = !window._comboTarget && ((STATE.ui||{}).artist_composer||{});
+  if(saved.mode) $('comboWeightMode').value = saved.mode;
+  if(saved.curve_start != null) $('comboCurveStart').value = saved.curve_start;
+  if(saved.curve_end != null) $('comboCurveEnd').value = saved.curve_end;
+  if(saved.seed != null) $('comboWeightSeed').value = saved.seed;
+  if(saved.rows&&saved.rows.length) drawArtistWorkspace(saved.rows);
+  else parseArtistWorkspace();
+  $('comboLoadCurrent').addEventListener('click', parseArtistWorkspace);
+  $('comboArtistAdd').addEventListener('click', () => {
+    const rows = artistWorkspaceRows();
+    rows.push({name:'',weight:1,min:0.7,max:1.3,locked:false});
+    drawArtistWorkspace(rows);
+    host.querySelector('[data-artist-row]:last-child [data-aw="name"]').focus();
+  });
+  host.addEventListener('click', event => {
+    const row = event.target.closest('[data-artist-row]'); if(!row) return;
+    const rows = artistWorkspaceRows(), index = Number(row.dataset.artistRow);
+    if(event.target.closest('[data-aw-del]')) rows.splice(index,1);
+    else if(event.target.closest('[data-aw-up]') && index>0)
+      [rows[index-1],rows[index]]=[rows[index],rows[index-1]];
+    else if(event.target.closest('[data-aw-down]') && index<rows.length-1)
+      [rows[index+1],rows[index]]=[rows[index],rows[index+1]];
+    else return;
+    drawArtistWorkspace(rows);
+  });
+  $('comboArtistPreview').addEventListener('click', () => composeArtistWorkspace(false));
+  $('comboArtistApply').addEventListener('click', () => composeArtistWorkspace(true));
 }
 
 /* ── 그림에서 읽은 그림체 보여 주기 ────────────────────────────────
@@ -17945,6 +18179,14 @@ class ConfigServer:
                     # 중지 — 취소 **플래그**만 세운다 (CQA-001: running 을 직접 끄면
                     # 옛 작업이 마저 도는 동안 새 작업이 실행권을 얻어 겹친다).
                     self._json({"ok": server.live.request_stop()})
+                elif self.path.startswith("/api/artist_workspace"):
+                    try:
+                        if len(body or b"") > 128 * 1024:
+                            self._json({"ok": False, "error": "요청이 너무 큽니다."}); return
+                        self._json(artist_workspace_request(
+                            json.loads(body or b"{}")))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/rate"):
                     # 작가 평가 — 별점·즐겨찾기·차단·메모 (rater 의 ratings 를 우리 구조로)
                     try:

@@ -263,6 +263,67 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(
                 made["groups"]["예술적 변형·의상 변경"], "alternate costume")
 
+    def test_artist_workspace_supports_fixed_balanced_curve_and_random_ranges(self):
+        rows = [
+            {"name": "fixed artist", "weight": 1.7, "min": 0.2,
+             "max": 2.0, "locked": True},
+            {"name": "second artist", "weight": 0.9, "min": 0.5,
+             "max": 0.7},
+            {"name": "third artist", "weight": 1.1, "min": 1.2,
+             "max": 1.4},
+        ]
+        balanced = APP.compose_artist_workspace(rows, mode="balanced")
+        self.assertEqual(
+            [item["weight"] for item in balanced["rows"]], [1.7, 1.0, 1.0])
+        self.assertIn("1.7::artist:fixed artist::", balanced["combo"])
+        curve = APP.compose_artist_workspace(
+            rows, mode="curve", curve_start=1.5, curve_end=0.5)
+        self.assertEqual(
+            [item["weight"] for item in curve["rows"]], [1.7, 1.5, 0.5])
+        first_random = APP.compose_artist_workspace(
+            rows, mode="random", seed="repeatable")
+        second_random = APP.compose_artist_workspace(
+            rows, mode="random", seed="repeatable")
+        self.assertEqual(first_random, second_random)
+        self.assertEqual(first_random["rows"][0]["weight"], 1.7)
+        self.assertTrue(0.5 <= first_random["rows"][1]["weight"] <= 0.7)
+        self.assertTrue(1.2 <= first_random["rows"][2]["weight"] <= 1.4)
+
+    def test_artist_workspace_replaces_only_artist_tags_and_rejects_duplicates(self):
+        result = APP.artist_workspace_request({
+            "action": "compose",
+            "base": "1girl, artist:old one, detailed eyes",
+            "mode": "custom",
+            "rows": [
+                {"name": "new one", "weight": 1.25},
+                {"name": "new two", "weight": 0.8},
+            ],
+        })
+        self.assertTrue(result["ok"])
+        self.assertIn("1.25::artist:new one::", result["prompt"])
+        self.assertIn("0.8::artist:new two::", result["prompt"])
+        self.assertIn("1girl", result["prompt"])
+        self.assertIn("detailed eyes", result["prompt"])
+        self.assertNotIn("old one", result["prompt"])
+        parsed = APP.artist_workspace_request({
+            "action": "parse", "base": result["prompt"]})
+        self.assertEqual(
+            [row["name"] for row in parsed["rows"]], ["new one", "new two"])
+        with self.assertRaisesRegex(ValueError, "두 번"):
+            APP.compose_artist_workspace([
+                {"name": "Same", "weight": 1},
+                {"name": "same", "weight": 0.5},
+            ])
+
+        page = APP.render_page()
+        for element_id in (
+            "comboComposer", "comboWeightMode", "comboArtistRows",
+            "comboArtistPrompt", "comboArtistApply",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("STATE.ui.artist_composer =", page)
+        self.assertIn("if(window._comboTarget)", page)
+
     def test_style_file_round_trip_preserves_extended_generation_settings(self):
         settings = {
             "model": "nai-diffusion-4-5-full",
