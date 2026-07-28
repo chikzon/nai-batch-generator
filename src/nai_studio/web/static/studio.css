@@ -381,7 +381,7 @@
   }
 
   /*
-   * 자료·빌더·세팅·기타는 그 자체가 주 작업이다. 생성 프롬프트와 최근 결과가
+   * 세팅·자료·빌더·관리는 그 자체가 주 작업이다. 생성 프롬프트와 최근 결과가
    * 화면의 절반을 계속 차지하지 않도록 작업면 전체를 돌려준다.
    */
   :root[data-layout="studio"] body:not([data-mode="preview"]) #app {
@@ -427,9 +427,41 @@
     padding: 12px 16px;
   }
 
-  :root[data-layout="studio"] .genrow {
+:root[data-layout="studio"] .genrow {
     padding-inline: 16px;
   }
+}
+
+.blueprint-plan {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper2);
+}
+
+.blueprint-plan > summary {
+  padding: 9px 11px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.blueprint-summary {
+  padding: 0 11px 9px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.blueprint-json {
+  max-height: 340px;
+  margin: 0;
+  padding: 11px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  color: var(--text);
+  background: var(--card);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--fs-2xs)/1.55 var(--mono);
 }
 
 @media (min-width: 1400px) and (max-width: 1599px) {
@@ -450,7 +482,7 @@
   }
 }
 
-/* 위쪽 탭을 쓰는 폭에서도 자료·빌더·세팅·기타의 불필요한 양옆 패널은 숨긴다.
+/* 위쪽 탭을 쓰는 폭에서도 세팅·자료·빌더·관리의 불필요한 양옆 패널은 숨긴다.
    1280px에 세로 레일을 억지로 끼우지 않고, 모바일에서 작업 화면 아래에 프롬프트와
    최근 생성이 다시 나타나는 혼동도 막는다. 생성 탭만 원래의 세 패널을 유지한다. */
 @media (max-width: 1279px) {
@@ -527,7 +559,11 @@
   }
 
   :root[data-layout="studio"] #studioSettingsNav .studio-subnav-actions {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  :root[data-layout="studio"] #studioManageNav .studio-subnav-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   :root[data-layout="studio"] .navico {
@@ -536,5 +572,86 @@
 
   :root[data-layout="studio"] .card {
     box-shadow: none;
+  }
+}
+
+.cast-advanced {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 7px;
+}
+
+.cast-advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.cast-position {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 9px 0;
+}
+
+.cast-position label {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.cast-position input {
+  width: 100px;
+}
+
+.cast-resource {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 7px;
+}
+
+.cast-resource > b {
+  padding-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.cast-resource-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.cast-resource-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.cast-resource-chip:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.cast-resource-chip input {
+  width: auto;
+  margin: 0;
+}
+
+@media (max-width: 720px) {
+  .cast-resource {
+    grid-template-columns: 1fr;
   }
 }

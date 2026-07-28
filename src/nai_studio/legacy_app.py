@@ -48,6 +48,11 @@ from pathlib import Path
 import requests
 from PIL import Image
 from src.nai_studio.collection import arca as arca_public
+from src.nai_studio.domain.blueprint import (
+    canonical_blueprint,
+    fingerprint_blueprint,
+    summarize_blueprint,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -245,7 +250,7 @@ def out_sub(cfg, name):
 NAI_API_URL = "https://image.novelai.net/ai/generate-image"
 MAX_CHARS = 6            # NAI 가 한 그림에 받는 인물 수 상한
 
-# 밴 예방 기본값. 전부 설정.json 의 `pace` 로 덮어쓸 수 있다 (기타 탭에서 조절).
+# 밴 예방 기본값. 전부 설정.json 의 `pace` 로 덮어쓸 수 있다 (관리 탭에서 조절).
 DELAY_NORMAL = 8          # 장당 기본 딜레이(초) — 실제로는 ±랜덤 변동
 SOFT_REST_EVERY = 350     # N장마다 소프트 휴식
 SOFT_REST_SECONDS = 30    # 소프트 휴식 길이
@@ -1677,7 +1682,7 @@ def search_booru(site="danbooru", tags="", page=1, limit=40):
         if len(parts) > cap:
             note = (f"단부루는 태그 {cap}개까지만 검색됩니다 — 앞 {cap}개만 씁니다: "
                     f"{' '.join(parts[:cap])}"
-                    + ("" if cap > 2 else " (기타 → API 에 단부루 계정을 넣으면 6개까지)"))
+                    + ("" if cap > 2 else " (관리 → API 에 단부루 계정을 넣으면 6개까지)"))
             parts = parts[:cap]
     tags = " ".join(parts)[:200]
     headers = {"User-Agent": BOORU_UA}
@@ -1694,7 +1699,7 @@ def search_booru(site="danbooru", tags="", page=1, limit=40):
     elif site == "gelbooru":
         return {"ok": False,
                 "error": "겔부루는 API 키가 있어야 검색됩니다. "
-                         "기타 → API 의 '부루 계정' 에 user_id 와 api_key 를 넣어 주세요."}
+                         "관리 → API 의 '부루 계정' 에 user_id 와 api_key 를 넣어 주세요."}
     try:
         # 단부루는 본 도메인이 막히면 미러를 차례로 시도한다.
         urls = [cfg["url"]]
@@ -1734,7 +1739,7 @@ def search_booru(site="danbooru", tags="", page=1, limit=40):
             return {"ok": False, "error": f"{cfg['name']} 은 이 지역에서 막혀 있습니다 (451)."}
         if r.status_code in (401, 403):
             return {"ok": False,
-                    "error": f"{cfg['name']} 인증 실패({r.status_code}) — 기타 → API 의 "
+                    "error": f"{cfg['name']} 인증 실패({r.status_code}) — 관리 → API 의 "
                              f"'부루 계정' 을 확인해 주세요. {BOORU_AUTH_HELP.get(site, '')}"}
         if r.status_code == 422 and "TagLimit" in r.text:
             return {"ok": False,
@@ -5687,8 +5692,12 @@ def _comparison_character_prompt(item):
 
 
 def comparison_characters(cfg):
-    """라이브러리의 캐릭터 전체. 켜짐 여부는 현재 화면용 상태라 전수 비교에서는 무시한다."""
-    out = []
+    """라이브러리의 캐릭터 전체.
+
+    변형 묶음은 켜 둔 변형만 비교하고, 전부 꺼져 있으면 첫 항목을 안전한
+    fallback으로 쓴다. 묶음이 없는 기존 캐릭터는 과거와 같이 모두 포함한다.
+    """
+    out, grouped, standalone = [], {}, []
     for i, raw in enumerate((cfg or {}).get("characters") or []):
         if not isinstance(raw, dict):
             continue
@@ -5699,8 +5708,44 @@ def comparison_characters(cfg):
         item["_compare_id"] = str(item.get("id") or _comparison_id(
             "char", item.get("name"), prompt, item.get("negative"), i))
         item["_compare_name"] = (item.get("name") or f"캐릭터 {i + 1}").strip()
-        out.append(item)
+        variant = item.get("variant") if isinstance(item.get("variant"), dict) else {}
+        group = str(variant.get("group") or "").strip()
+        if group:
+            grouped.setdefault(group, []).append(item)
+        else:
+            standalone.append(item)
+    out.extend(standalone)
+    for members in grouped.values():
+        active = [
+            item for item in members
+            if (item.get("variant") or {}).get("enabled") is not False
+        ]
+        out.extend(active or members[:1])
     return out
+
+
+def setting_cast_members(cfg, state):
+    """세팅 실행용 캐스트를 저장 방식과 무관하게 한 구조로 돌려준다.
+
+    `all_characters`는 캐릭터 자료를 설정 안에 수백 번 복사하지 않고 실행할 때
+    참조한다. 사용자가 직접 적은 cast는 그대로 남아 있어 이 계획을 꺼도 복구된다.
+    """
+    if (state or {}).get("cast_source") == "all_characters":
+        return [{
+            "id": item.get("id", ""),
+            "name": item.get("name", ""),
+            "prompt": item.get("female", ""),
+            "outfit": item.get("clothed", ""),
+            "negative": item.get("negative", ""),
+            "variant": copy.deepcopy(item.get("variant") or {}),
+            "reference_ids": copy.deepcopy(item.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(item.get("vibe_ids") or []),
+            "enabled": True,
+        } for item in comparison_characters(cfg)]
+    return [
+        item for item in ((state or {}).get("cast") or [])
+        if isinstance(item, dict)
+    ]
 
 
 def _compare_bool(value, default=False):
@@ -6006,7 +6051,7 @@ def comparison_recipe_context(cfg, plan, styles, chars):
     if options.get("include_refs"):
         config["vibes"] = cfg.get("vibes") or []
         config["char_refs"] = cfg.get("char_refs") or []
-    return {
+    context = {
         "version": 1,
         "options": options,
         "config": config,
@@ -6031,6 +6076,24 @@ def comparison_recipe_context(cfg, plan, styles, chars):
         } for item in chars
             if options.get("mode") in ("characters", "both")],
     }
+    # 기존 비교 기록 필드는 그대로 두고 같은 내용을 생성 설계도 관점에서도 남긴다.
+    # 과거 기록을 읽는 코드는 영향을 받지 않고, 새 화면·챗봇 계약은 한 경계를 사용한다.
+    context["blueprint"] = generation_blueprint(
+        cfg,
+        source={"kind": "comparison-plan"},
+        experiment={
+            "mode": options.get("mode") or "single",
+            "fixed_size": bool(options.get("fixed_size")),
+            "width": options.get("width"),
+            "height": options.get("height"),
+            "same_seed": bool(options.get("same_seed")),
+            "seed": options.get("seed"),
+            "seed_count": options.get("seed_count"),
+            "limit": options.get("limit"),
+            "include_references": bool(options.get("include_refs")),
+        },
+    )
+    return context
 
 
 class RateLimitError(Exception):
@@ -6352,6 +6415,9 @@ def import_char_files(cfg):
                 "folder_id": folder_id,
                 "subfolder_id": subfolder_id,
             })
+            for field in ("variant", "reference_ids", "vibe_ids"):
+                if field in data:
+                    current[field] = copy.deepcopy(data[field])
             if data.get("그룹"):
                 current["groups"] = data["그룹"]
             else:
@@ -6365,6 +6431,9 @@ def import_char_files(cfg):
             "negative": data.get("네거티브", ""), "source": data.get("출처", ""),
             "enabled": True, "folder_id": folder_id, "subfolder_id": subfolder_id,
         }
+        for field in ("variant", "reference_ids", "vibe_ids"):
+            if field in data:
+                new_char[field] = copy.deepcopy(data[field])
         if data.get("그룹"):
             new_char["groups"] = data["그룹"]
         cfg.setdefault("characters", []).append(new_char)
@@ -6440,6 +6509,9 @@ def sync_chars_to_files(cfg):
             "id": c["id"], "이름": c.get("name", ""), "외형": c.get("female", ""),
             "착의": c.get("clothed", ""), "네거티브": c.get("negative", ""),
         })
+        for field in ("variant", "reference_ids", "vibe_ids"):
+            if field in c:
+                data[field] = copy.deepcopy(c[field])
         if c.get("groups"):
             data["그룹"] = c["groups"]
         else:
@@ -6710,13 +6782,19 @@ def _build_std(acfg, char, scene, mode):
 
     if mode == "남녀":
         # 상대역(남자)은 세팅 파일의 것 — 씬 태그가 비어 있어도 항상 포함
-        male_base = clean_char_prompt(role.get("외형", "") or char.get("male_prompt_base", ""))
+        # 캐릭터 칸/동시 캐스트의 둘째 인물이 있으면 세팅의 기본 상대역보다 우선한다.
+        partner_from_cast = char.get("male_prompt_base", "")
+        male_base = clean_char_prompt(partner_from_cast or role.get("외형", ""))
         male_base = remove_prompt_tags(
             male_base, scene.get("remove_male_tags", []))
         wear_mode = opts_chosen.get("남자옷", "나체")
         outfit = role.get("의상", "")
         wear = ""
-        if wear_mode == "착의":
+        if partner_from_cast:
+            # 둘째 캐릭터의 착의는 slot_prompt에 이미 들어 있다. 세팅 기본 상대역 옷을
+            # 다시 붙이면 두 의상이 충돌하므로 캐스트 원문을 그대로 우선한다.
+            wear = ""
+        elif wear_mode == "착의":
             wear = f"{outfit}, clothed male, clothed sex, open pants"
         elif wear_mode == "탈의진행":
             if stage <= 1:
@@ -6726,7 +6804,8 @@ def _build_std(acfg, char, scene, mode):
         add_m = apply_axes(specs, options, opts_chosen, scene, "남자")
         male_caption = ", ".join(x for x in (male_base, wear, male_caption, add_m) if x)
         male_negative = _join_tags(
-            role.get("네거티브", ""), scene.get("male_negative", ""))
+            char.get("partner_negative", "") or role.get("네거티브", ""),
+            scene.get("male_negative", ""))
     else:  # 단독
         male_caption = apply_axes(specs, options, opts_chosen, scene, "남자")
         male_negative = ""
@@ -6748,6 +6827,73 @@ def slot_prompt(sl):
         return ""
     return _join_tags(strip_comment_lines(sl.get("prompt", "")),
                       strip_comment_lines(sl.get("outfit", "")))
+
+
+def slot_bundle_identity(sl):
+    """재개·중복 판정용 캐릭터 묶음.
+
+    화면 표시 이름과 달리 생성 결과를 바꿀 수 있는 원문·참조·변형을 모두 포함한다.
+    사용자가 저장한 원문은 정규화하지 않고 JSON 직렬화만 안정적으로 수행한다.
+    """
+    if not isinstance(sl, dict):
+        return ""
+    bundle = {
+        "id": sl.get("id", ""),
+        "prompt": sl.get("prompt", ""),
+        "outfit": sl.get("outfit", ""),
+        "negative": sl.get("negative", ""),
+        "variant": sl.get("variant") or {},
+        "reference_ids": sl.get("reference_ids") or [],
+        "vibe_ids": sl.get("vibe_ids") or [],
+        "position": sl.get("position") or {},
+    }
+    return json.dumps(
+        bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    )
+
+
+def character_run_from_group(group, fallback_index=0):
+    """캐릭터 슬롯/캐스트 여러 명을 한 장의 세팅 입력 구조로 바꾼다."""
+    members = [item for item in (group or [])
+               if isinstance(item, dict) and slot_prompt(item).strip()]
+    if not members:
+        return {}
+    primary = members[0]
+    partner = members[1] if len(members) > 1 else {}
+    names = [str(item.get("name") or "").strip() for item in members]
+    names = [name for name in names if name]
+    centers = []
+    for item in members:
+        center = item.get("position") or item.get("center")
+        if isinstance(center, dict) and center.get("x") is not None:
+            centers.append(copy.deepcopy(center))
+        else:
+            centers.append(None)
+    return {
+        "name": " + ".join(names) or f"인물{fallback_index + 1}",
+        "female": slot_prompt(primary),
+        "negative": primary.get("negative", ""),
+        "male_prompt_base": slot_prompt(partner),
+        "partner_negative": partner.get("negative", ""),
+        "extras": [
+            {
+                "prompt": slot_prompt(item),
+                "negative": item.get("negative", ""),
+                "center": copy.deepcopy(item.get("position") or item.get("center")),
+            }
+            for item in members[2:]
+        ],
+        "centers": centers,
+        "reference_ids": list(dict.fromkeys(
+            str(resource_id)
+            for item in members for resource_id in (item.get("reference_ids") or [])
+            if resource_id)),
+        "vibe_ids": list(dict.fromkeys(
+            str(resource_id)
+            for item in members for resource_id in (item.get("vibe_ids") or [])
+            if resource_id)),
+    }
 
 
 def _join_tags(*parts):
@@ -6794,8 +6940,10 @@ def _build_yuri(acfg, char, scene):
     female_text = remove_prompt_tags(
         girl_text(char.get("female", ""), char.get("clothed", ""), u1),
         scene.get("remove_char_tags", []))
+    partner_from_cast = char.get("male_prompt_base", "")
     partner_text = remove_prompt_tags(
-        girl_text(role.get("외형", ""), role.get("착의", ""), u2),
+        (clean_char_prompt(partner_from_cast) if partner_from_cast
+         else girl_text(role.get("외형", ""), role.get("착의", ""), u2)),
         scene.get("remove_partner_tags", []))
 
     female_scene = scene.get("female_prompt", "")
@@ -6807,7 +6955,8 @@ def _build_yuri(acfg, char, scene):
     return (
         base, female_caption, partner_caption,
         _join_tags(char.get("negative", ""), scene.get("female_negative", "")),
-        _join_tags(role.get("네거티브", ""), scene.get("partner_negative", "")),
+        _join_tags(char.get("partner_negative", "") or role.get("네거티브", ""),
+                   scene.get("partner_negative", "")),
         scene["width"], scene["height"])
 
 
@@ -7197,6 +7346,96 @@ def active_people(slots, centers=None, extra=None):
     return people, ctrs
 
 
+BLUEPRINT_GENERATION_KEYS = (
+    "model", "width", "height", "nai_seed", "steps", "cfg_scale",
+    "cfg_rescale", "sampler", "scheduler", "uc_preset", "quality_toggle",
+    "variety", "smea", "smea_dyn", "dynamic_thresholding",
+    "uncond_scale", "controlnet_strength", "prefer_brownian",
+    "deliberate_euler_ancestral_bug", "use_coords",
+)
+
+
+def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
+    """현재 여러 저장 구조를 한 번의 실행 가능한 생성 설계도로 해석한다.
+
+    파생 모델만 만들며 설정·캐릭터·세팅 파일에는 아무것도 쓰지 않는다. 화면, 비교,
+    챗봇 연결 계약이 같은 값을 읽게 하는 경계다.
+    """
+    cfg = cfg or {}
+    slots = cfg.get("char_slots") or []
+    centers = cfg.get("char_centers") or []
+    characters = []
+    for index, slot in enumerate(slots):
+        if not isinstance(slot, dict):
+            continue
+        center = (centers[index] if index < len(centers)
+                  and isinstance(centers[index], dict) else {"x": 0.5, "y": 0.5})
+        characters.append({
+            "id": str(slot.get("id") or ""),
+            "name": str(slot.get("name") or ""),
+            "enabled": slot.get("enabled") is not False,
+            "appearance": str(slot.get("prompt") or slot.get("female") or ""),
+            "clothed": str(slot.get("outfit") or slot.get("clothed") or ""),
+            "negative": str(slot.get("negative") or ""),
+            "resolved_prompt": slot_prompt(slot),
+            "position": {
+                "x": center.get("x", 0.5),
+                "y": center.get("y", 0.5),
+                "enabled": bool(cfg.get("use_coords")),
+            },
+            "variant": copy.deepcopy(slot.get("variant") or {}),
+            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
+        })
+
+    active_settings = {}
+    for name, state in (cfg.get("setting_state") or {}).items():
+        if isinstance(state, dict) and state.get("use"):
+            active_settings[str(name)] = copy.deepcopy(state)
+
+    generation = {
+        key: copy.deepcopy(cfg.get(key))
+        for key in BLUEPRINT_GENERATION_KEYS
+    }
+    generation["seed"] = generation.pop("nai_seed", cfg.get("nai_seed", 0))
+    blueprint = canonical_blueprint({
+        "source": copy.deepcopy(source or {"kind": "current-config"}),
+        "style": {
+            "name": str(cfg.get("style_name") or ""),
+            "base": str(cfg.get("base_prompt") or ""),
+            "negative": str(cfg.get("negative_prompt") or ""),
+            "parts": {
+                "fixed": str(cfg.get("base_fixed") or ""),
+                "variable": str(cfg.get("base_var") or ""),
+                "detail": str(cfg.get("base_detail") or ""),
+            },
+        },
+        "characters": characters,
+        "resources": {
+            "vibes": copy.deepcopy(cfg.get("vibes") or []),
+            "character_references": copy.deepcopy(cfg.get("char_refs") or []),
+        },
+        "setting": copy.deepcopy(setting or {
+            "name": next(iter(active_settings), ""),
+            "active": active_settings,
+            "cast_presets": copy.deepcopy(cfg.get("cast_presets") or []),
+        }),
+        "experiment": copy.deepcopy(experiment or {"mode": "single"}),
+        "generation": generation,
+        "output": {
+            "format": str(cfg.get("save_format") or "webp"),
+            "quality": cfg.get("save_quality", 92),
+            "clean_metadata": bool(cfg.get("save_clean")),
+            "max_side": cfg.get("save_max_side", 0),
+            "directory": str(cfg.get("out_dir") or ""),
+            "by_date": bool(cfg.get("out_by_date")),
+        },
+    })
+    blueprint["fingerprint"] = fingerprint_blueprint(blueprint)
+    blueprint["summary"] = summarize_blueprint(blueprint)
+    return blueprint
+
+
 def with_centers(cfg, ctrs):
     """params 사본에 이 장에 쓸 좌표를 실어 준다 (원본 cfg 는 안 건드린다)."""
     q = dict(cfg or {})
@@ -7320,6 +7559,30 @@ def setting_reference_config(cfg, scene):
     return scoped, True, names
 
 
+def character_resource_config(cfg, character):
+    """저장 캐스트가 가리키는 Vibe·Reference만 이 작업에 활성화한다.
+
+    id 목록이 비어 있으면 기존 전역 선택을 그대로 쓴다. 따라서 과거 캐스트와 설정은
+    동작이 바뀌지 않고, 새 출연 구성에서 자료 id를 명시했을 때만 범위를 좁힌다.
+    """
+    scoped = dict(cfg)
+    for key, id_key in (("char_refs", "reference_ids"), ("vibes", "vibe_ids")):
+        wanted = [str(value) for value in (character.get(id_key) or []) if value]
+        if not wanted:
+            continue
+        by_id = {
+            str(item.get("id") or ""): item
+            for item in (cfg.get(key) or [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        scoped[key] = [
+            dict(by_id[resource_id], enabled=True)
+            for resource_id in dict.fromkeys(wanted)
+            if resource_id in by_id
+        ]
+    return scoped
+
+
 def setting_scene_people(scene, female, male, char_negative, male_negative,
                          char, cfg):
     """세팅 배치 한 장의 인물과 위치를 같은 순서로 만든다.
@@ -7342,13 +7605,29 @@ def setting_scene_people(scene, female, male, char_negative, male_negative,
     people = people[:MAX_CHARS]
 
     explicit = normalize_scene_centers(scene.get("char_centers"))
-    use_positions = bool(explicit) or bool(cfg.get("use_coords"))
+    raw_cast_centers = char.get("centers") or []
+    has_cast_centers = any(
+        isinstance(center, dict) and center.get("x") is not None
+        for center in raw_cast_centers)
+    use_positions = bool(explicit) or has_cast_centers or bool(cfg.get("use_coords"))
     if not use_positions:
         return people, [], False
 
     defaults = spread_centers(len(people))
+    cast_centers = []
+    if has_cast_centers:
+        for index in range(len(people)):
+            center = raw_cast_centers[index] if index < len(raw_cast_centers) else None
+            try:
+                cast_centers.append(
+                    normalize_scene_centers([center])[0]
+                    if center else defaults[index])
+            except (ValueError, TypeError, IndexError):
+                cast_centers.append(defaults[index])
     if explicit:
         centers = list(explicit)
+    elif cast_centers:
+        centers = list(cast_centers)
     else:
         centers = normalize_scene_centers(cfg.get("char_centers") or [])
     for i in range(len(centers), len(people)):
@@ -7754,13 +8033,15 @@ def load_picks():
                 d.setdefault("folders", {})     # 폴더이름 → [경로…]
                 d.setdefault("ranks", {})       # 경로 → 월드컵 순위(1등이 1)
                 d.setdefault("ratings", {})     # 경로 → 0~5점
+                d.setdefault("elo", {})         # 경로 → 블라인드 비교 ELO
+                d.setdefault("elo_matches", {}) # 경로 → 누적 비교 횟수
                 d.setdefault("tags", {})        # 경로 → [짧은 판단 태그…]
                 return normalize_picks(d)
         except Exception as e:
             log.warning(f"선별.json 읽기 실패: {e}")
     return {
         "picked": [], "fav": [], "folders": {}, "ranks": {},
-        "ratings": {}, "tags": {},
+        "ratings": {}, "elo": {}, "elo_matches": {}, "tags": {},
     }
 
 
@@ -7795,6 +8076,21 @@ def normalize_picks(d):
         str(path).replace("\\", "/"): max(1, min(5, int(score)))
         for path, score in (d.get("ratings") or {}).items()
         if str(path).strip() and str(score).isdigit() and int(score) > 0
+    }
+    clean_elo = {}
+    for path, score in (d.get("elo") or {}).items():
+        try:
+            number = float(score)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if str(path).strip() and math.isfinite(number):
+            clean_elo[str(path).replace("\\", "/")] = round(
+                max(0.0, min(3000.0, number)), 1)
+    d["elo"] = clean_elo
+    d["elo_matches"] = {
+        str(path).replace("\\", "/"): max(0, min(1_000_000, int(count)))
+        for path, count in (d.get("elo_matches") or {}).items()
+        if str(path).strip() and str(count).isdigit()
     }
     clean_tags = {}
     for path, tags in (d.get("tags") or {}).items():
@@ -7903,7 +8199,7 @@ def trash_output_files(cfg, targets, keep=()):
         ]
         if folders:
             record["folders"] = folders
-        for key in ("ranks", "ratings", "tags"):
+        for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
             if rel in picks.get(key, {}):
                 record[key] = picks[key][rel]
         if record:
@@ -8039,7 +8335,7 @@ def restore_trash_batch(cfg, batch_id):
                 picks["fav"] = [x for x in picks["fav"] if x != original]
                 for paths in picks["folders"].values():
                     paths[:] = [x for x in paths if x != original]
-                for key in ("ranks", "ratings", "tags"):
+                for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
                     picks[key].pop(original, None)
                 if record.get("picked") and restored_rel not in picks["picked"]:
                     picks["picked"].append(restored_rel)
@@ -8049,7 +8345,7 @@ def restore_trash_batch(cfg, batch_id):
                     paths = picks["folders"].setdefault(str(name)[:40], [])
                     if restored_rel not in paths:
                         paths.append(restored_rel)
-                for key in ("ranks", "ratings", "tags"):
+                for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
                     if key in record:
                         picks[key][restored_rel] = record[key]
             save_picks(picks)
@@ -8166,6 +8462,8 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
             "picked": picks["picked"], "fav": picks["fav"],
             "folders": picks["folders"], "ranks": picks.get("ranks", {}),
             "ratings": picks.get("ratings", {}),
+            "elo": picks.get("elo", {}),
+            "elo_matches": picks.get("elo_matches", {}),
             "tags": picks.get("tags", {}),
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
 
@@ -9030,14 +9328,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   <div class="app">NAI <span>배치 생성기</span>
     <small class="app-sub">자료에서 생성까지 한 작업실</small>__PROFBADGE__
     <span class="save-state" id="saveState" title="설정.json 자동저장 상태">저장됨 ✓</span></div>
-  <!-- 계획서의 5탭 순서 그대로: 기본 생성 · 자료 · 빌더 · 세팅 · 기타.
+  <!-- 실제 작업 순서: 생성 · 세팅 · 자료 · 빌더 · 관리.
        숫자키 1~5 로도 옮긴다. -->
   <div class="modes" id="modes">
     <button data-mode="preview" class="on" title="Alt+1"><span class="navico" aria-hidden="true">01</span><span class="navcopy"><b>생성</b><small>프롬프트와 실행</small></span></button>
-    <button data-mode="library" title="Alt+2"><span class="navico" aria-hidden="true">02</span><span class="navcopy"><b>자료</b><small>수집·검색·정리</small></span></button>
-    <button data-mode="builder" title="Alt+3"><span class="navico" aria-hidden="true">03</span><span class="navcopy"><b>빌더</b><small>그림체·캐릭터 조립</small></span></button>
-    <button data-mode="settings" title="Alt+4"><span class="navico" aria-hidden="true">04</span><span class="navcopy"><b>세팅</b><small>장면과 캐스트 설계</small></span></button>
-    <button data-mode="system" title="Alt+5"><span class="navico" aria-hidden="true">05</span><span class="navcopy"><b>기타</b><small>출력·복구·환경</small></span></button>
+    <button data-mode="settings" title="Alt+2"><span class="navico" aria-hidden="true">02</span><span class="navcopy"><b>세팅</b><small>장면·캐스트·비교</small></span></button>
+    <button data-mode="library" title="Alt+3"><span class="navico" aria-hidden="true">03</span><span class="navcopy"><b>자료</b><small>수집·검색·정리</small></span></button>
+    <button data-mode="builder" title="Alt+4"><span class="navico" aria-hidden="true">04</span><span class="navcopy"><b>빌더</b><small>그림체·캐릭터 조립</small></span></button>
+    <button data-mode="system" title="Alt+5"><span class="navico" aria-hidden="true">05</span><span class="navcopy"><b>관리</b><small>작업·복구·환경</small></span></button>
   </div>
   <div class="spacer"></div>
   <div class="stat" id="topStat">-</div>
@@ -9080,6 +9378,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="psec" style="flex:1.2;">
       <div class="psec-head" data-fold="pPos"><span class="chev">▾</span><span class="t">프롬프트</span>
         <span class="count" id="posTok">0</span>
+        <span class="ed" id="weightDownBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 낮춤">−강조</span>
+        <span class="ed" id="weightUpBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 높임">+강조</span>
         <span class="ed" id="tagVerifyBtn" title="단부루에 실제로 있는 태그인지 확인 (없는 태그는 토큰만 먹는다)">✓태그</span>
         <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄바꾸기</span>
         <span class="ed" id="split3Btn" title="고정 / 가변 / 디테일 세 칸으로 나누기">⋮⋮</span></div>
@@ -9259,7 +9559,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <select id="pOutDate">
               <option value="off">한 폴더에 모으기 (기본)</option>
               <option value="on">모드 폴더 아래 날짜별로</option></select></div>
-          <!-- 저장 시점에 메타를 아예 안 넣는 선택. 나중에 따로 지우는 기능(기타 탭)은 그대로 둔다. -->
+          <!-- 저장 시점에 메타를 아예 안 넣는 선택. 나중에 따로 지우는 기능(관리 탭)은 그대로 둔다. -->
           <div class="field"><label>메타데이터 <span class="hint">(저장 시점)</span></label>
             <select id="pClean">
               <option value="off">넣기 — 나중에 끌어다 놓아 그림체 복원 가능 (기본)</option>
@@ -9382,7 +9682,24 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <button type="button" data-latest-action="i2i">img2img·인페인트</button>
             <span class="result-action-msg" id="pvResultMsg"></span>
           </div>
+          <details class="blueprint-plan" id="blueprintPlan">
+            <summary>최종 생성 설계도 <span class="hint">Prompt·캐릭터·자료·세팅·실험·출력</span></summary>
+            <div class="blueprint-summary" id="blueprintSummary">현재 값을 해석하는 중입니다.</div>
+            <pre class="blueprint-json" id="blueprintJson"></pre>
+          </details>
           <div class="pbar"><div id="pvBar"></div></div>
+        </div>
+      </div>
+      <div class="card" id="generateImportCard">
+        <h2><span class="n">임포트</span>NAI 이미지에서 생성값 가져오기
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">PNG · WebP · 여러 장</span></h2>
+        <p class="hint">원본 이미지의 베이스·네거티브·캐릭터·생성 설정을 읽습니다.
+        한 장이면 읽은 묶음을 확인한 뒤 통째로 적용하고, 여러 장이면 자료실에 연속 등록합니다.</p>
+        <div id="generateInspectDrop" class="row"
+             style="text-align:center;padding:18px 14px;border-style:dashed;cursor:pointer;">
+          <b>＋ 생성값을 가져올 이미지를 놓거나 눌러서 고르세요</b>
+          <div class="hint" style="margin-top:4px;">원문은 자르거나 세부 자료로 임의 분해하지 않습니다.</div>
+          <input type="file" id="generateInspectFile" accept="image/png,image/webp" multiple style="display:none;">
         </div>
       </div>
       <!-- img2img · 인페인트 — 왼쪽 프롬프트·파라미터를 그대로 쓰고 원본만 더한다 -->
@@ -9459,6 +9776,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <p class="hint">디렉터 툴은 Anlas 를 씁니다 — Opus 는 409,600px 까지 대부분 무료(배경 제거는 예외).
         배경 제거는 rembg 같은 로컬 무료 도구로 대신할 수도 있습니다.</p>
       </div>
+      <span id="mosaicGenerateHome" hidden aria-hidden="true"></span>
 
     </div>
 
@@ -9472,6 +9790,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button type="button" data-settings-work="select" role="tab">씬 고르기</button>
           <button type="button" data-settings-work="quick" role="tab">빠른 변주</button>
           <button type="button" data-settings-work="build" role="tab">세팅 만들기</button>
+          <button type="button" data-settings-work="compare" role="tab">비교 실험</button>
         </div>
       </div>
       <span id="compareClassicHome" hidden aria-hidden="true"></span>
@@ -9493,6 +9812,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <label class="row" style="cursor:pointer;margin:0;">
             <input type="radio" name="cmpMode" value="both" style="width:auto;flex:none;">
             <span><b>둘 다 조합</b><br><span class="hint">그림체 × 캐릭터</span></span></label>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <div style="flex:1;min-width:220px;"><b>캐릭터 × 선택 세팅 계획</b>
+            <div class="hint">캐릭터 자료를 복사하지 않고, 현재 켠 세팅·씬을 캐릭터마다 순회합니다.
+            세팅의 직접 입력 캐스트는 보존되어 언제든 돌아갈 수 있습니다.</div></div>
+          <button type="button" id="cmpPlanAllChars" class="primary">전 캐릭터 계획 적용</button>
+          <button type="button" id="cmpPlanManual">직접 캐스트로 복귀</button>
+          <span class="hint" id="cmpPlanMsg"></span>
         </div>
 
         <div class="grid3" style="margin-top:8px;">
@@ -9700,17 +10027,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vLibrary" style="display:none;">
-      <div id="studioLibraryNav" class="studio-subnav hidden" aria-label="자료 작업 선택">
-        <div class="studio-subnav-copy">
-          <span class="eyebrow">Library workspace</span>
-          <strong>자료를 찾고 정리한 뒤, 같은 조건으로 비교합니다</strong>
-        </div>
-        <div class="studio-subnav-actions" role="tablist" aria-label="자료 작업">
-          <button type="button" data-library-work="browse" role="tab">찾기·정리</button>
-          <button type="button" data-library-work="compare" role="tab">비교·선별</button>
-        </div>
-      </div>
-      <span id="studioCompareHome" hidden aria-hidden="true"></span>
       <div id="studioLibraryBrowse">
       <div class="card">
         <h2><span class="n">수집</span>공개 그림체 자료 가져오기
@@ -9777,6 +10093,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
              않았고 빨간색도 그대로다(경고는 유지해야 한다). 옆에 붙어 잘못 눌리는 것만 막는다. -->
         <div class="bar" style="margin-top:6px;">
           <button id="expCup" title="보이는 그림들을 1:1 로 붙여 순위를 매깁니다 (SDStudio 의 이미지 월드컵)">🏆 월드컵</button>
+          <button id="expElo" title="파일명과 기존 점수를 가리고 반복 비교해 선호 ELO를 누적합니다">⚖ 블라인드 ELO</button>
           <button id="expCompare">🔍 비교함 보기 (<span id="expCmpN">0</span>)</button>
           <button id="expCmpClear">비교함 비우기</button>
           <button id="expApplyPicked" title="이 폴더에서 선별한 비교 결과 한 장의 원문 설정을 생성 화면에 적용합니다">↳ 선별 1장 생성에 적용</button>
@@ -9950,7 +10267,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vSystem" style="display:none;">
-      <div class="card">
+      <div id="studioManageNav" class="studio-subnav hidden" aria-label="관리 작업 선택">
+        <div class="studio-subnav-copy">
+          <span class="eyebrow">Manage workspace</span>
+          <strong>설정과 안전장치, 진행 작업, 출력 도구를 나눠 봅니다</strong>
+        </div>
+        <div class="studio-subnav-actions" role="tablist" aria-label="관리 작업">
+          <button type="button" data-manage-work="environment" role="tab">환경</button>
+          <button type="button" data-manage-work="safety" role="tab">안전·복구</button>
+          <button type="button" data-manage-work="jobs" role="tab">작업·진단</button>
+          <button type="button" data-manage-work="tools" role="tab">출력 도구</button>
+        </div>
+      </div>
+      <div class="card" data-manage-panel="environment">
         <h2><span class="n">01</span>API</h2>
         <p class="hint">novelai.net → 설정(톱니바퀴) → Account → Get Persistent API Token</p>
         <div class="field"><label>NAI 토큰 (pst-...)</label>
@@ -9977,7 +10306,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <span class="hint" id="bkMsg"></span>
         </div>
       </div>
-      <div class="card">
+      <div class="card" data-manage-panel="environment">
         <h2><span class="n">02</span>화면 · 디자인</h2>
         <p class="hint">화면 구성과 색 테마·강조색·글씨 크기·모서리를 바꿀 수 있습니다. 즉시 반영되고 저장됩니다.</p>
         <div class="field"><label>화면 구성</label><div id="layoutChips"></div>
@@ -10004,7 +10333,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-manage-panel="environment">
         <h2><span class="n">03</span>계정 여러 개 (프로필)
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">지금: __PROFNOW__</span></h2>
         <p class="hint">계정을 <b>따로 결제해서 두 대를 동시에</b> 돌릴 때 씁니다.
@@ -10017,7 +10346,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         요청이 겹쳐 제한에 걸릴 위험이 커집니다. 프로필은 계정이 <b>다를 때</b> 쓰는 기능입니다.</p>
       </div>
 
-      <div class="card" id="backupCard">
+      <div class="card" id="jobCenterCard" data-manage-panel="jobs">
+        <h2><span class="n">작업</span>진행·재개 센터
+          <button type="button" id="jobCenterRefresh" style="margin-left:auto;">↻ 새로고침</button></h2>
+        <p class="hint">현재 생성 실행권과 앱 재시작 뒤에도 남는 세팅 배치·비교 실험·공개자료 수집 기록을 함께 봅니다.
+        각 기능의 원래 저장 구조를 유지하고 이 화면은 상태를 한곳에 모아 보여 줍니다.</p>
+        <div id="jobCenterList" class="items" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:7px;">
+          <div class="row hint">작업 상태를 확인하는 중입니다.</div>
+        </div>
+      </div>
+
+      <div class="card" id="backupCard" data-manage-panel="safety">
         <h2><span class="n">안전</span>내 자료 전체 백업</h2>
         <p class="hint">현재 프로필의 설정·선별과 공용 캐릭터·그림체·세팅·조각·자료 원문을
         manifest와 SHA-256 내용 검사로 한 ZIP에 묶습니다.
@@ -10033,7 +10372,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="backupMsg" class="hint" style="margin-top:8px;"></div>
       </div>
 
-      <div class="card" id="trashCard">
+      <div class="card" id="trashCard" data-manage-panel="safety">
         <h2><span class="n">안전</span>생성물 휴지통
           <button type="button" id="trashRefresh" style="margin-left:auto;">↻ 새로고침</button></h2>
         <p class="hint">생성물 탐색기에서 치운 파일은 영구 삭제되지 않고 묶음별로 남습니다.
@@ -10043,7 +10382,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="trashList" class="hint">휴지통을 확인하는 중입니다.</div>
       </div>
 
-      <div class="card" id="localImageCard">
+      <div class="card" id="localImageCard" data-manage-panel="safety">
         <h2><span class="n">안전</span>자료 이미지 무결성</h2>
         <p class="hint">그림체·레시피 JSON의 <code>local:</code> 참조와 실제 이미지 바이트를 맞춰 봅니다.
         과거 판의 파일명 해시가 현재 WebP 바이트와 다른 것은 곧바로 손상으로 판정하지 않습니다.
@@ -10056,7 +10395,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="localImageMsg" class="hint" style="margin-top:8px;"></div>
       </div>
 
-      <div class="card">
+      <div class="card" data-manage-panel="jobs">
         <h2><span class="n">04</span>알림 · 단축키
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">565장은 몇 시간이 걸립니다</span></h2>
         <div class="bar" style="flex-wrap:wrap;">
@@ -10074,7 +10413,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <!-- 진단 — 무엇이 왜 실패했는지 앱 안에서 본다 (nais_blue 의 DiagnosticDrawer) -->
-      <div class="card">
+      <div class="card" data-manage-panel="jobs">
         <h2><span class="n">04b</span>진단 · 최근 기록
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">생성.log 를 앱 안에서</span></h2>
         <p class="hint">실패 원인을 파일을 찾아 열지 않고 시간·심각도·종류별로 봅니다.
@@ -10091,7 +10430,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           font-size:var(--fs-2xs);line-height:1.45;white-space:pre-wrap;word-break:break-all;margin:6px 0 0;"></pre>
       </div>
 
-      <div class="card">
+      <span id="mosaicClassicHome" hidden aria-hidden="true"></span>
+      <div class="card" id="mosaicCard" data-manage-panel="tools">
         <h2><span class="n">05</span>모자이크 칠하기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">내 컴퓨터에서 · Anlas 안 듦</span></h2>
         <p class="hint">가릴 곳을 붓으로 칠하면 그 부분만 모자이크로 바꿉니다. NAI 를 거치지 않아 <b>공짜</b>입니다.
@@ -10116,7 +10456,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-manage-panel="jobs">
         <h2><span class="n">06</span>밴 예방 · 속도 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">쉬는 자리는 장과 장 사이입니다</span></h2>
         <p class="hint">한꺼번에 몰아치면 NAI 가 요청을 막습니다. 장 사이에 쉬고, 일정 장수마다 길게 쉽니다.
         <b>생성 도중에는 절대 끊지 않습니다</b> — 항상 한 장을 끝낸 뒤에 쉽니다.</p>
@@ -10139,7 +10479,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <p class="hint" id="paceCalc"></p>
       </div>
 
-      <div class="card">
+      <div class="card" data-manage-panel="tools">
         <h2><span class="n">07</span>메타데이터 제거 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">남에게 줄 사본 만들기</span></h2>
         <p class="hint">NAI 그림에는 프롬프트가 <b>두 군데</b> 들어 있습니다 —
         파일 정보(EXIF·PNG 텍스트)와 <b>알파 채널에 숨은 스텔스</b>. 앞엣것만 지우면
@@ -10164,7 +10504,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar" style="margin-top:6px;"><span class="n" id="stripMsg"></span></div>
       </div>
 
-      <div class="card">
+      <div class="card" data-manage-panel="environment">
         <h2><span class="n">08</span>파일 구조</h2>
         <p class="hint">
         <b>세팅/</b> 씬 세트 · <b>캐릭터/</b> 캐릭터 DB · <b>그림체/</b> 베이스 프리셋 · <b>태그/</b> 태그 사전 CSV<br>
@@ -10245,6 +10585,27 @@ function showStartupRecovery(notice){
   });
 }
 
+async function loadBlueprint(){
+  const host = $('blueprintPlan');
+  if(!host || !host.open) return;
+  $('blueprintSummary').textContent = '현재 저장값을 생성 설계도로 해석하는 중입니다.';
+  try{
+    const result = await (await fetch('/api/blueprint')).json();
+    if(!result.ok) throw new Error(result.error || '설계도를 만들지 못했습니다.');
+    const bp = result.blueprint || {};
+    const s = bp.summary || {};
+    const size = s.width && s.height ? `${s.width}×${s.height}` : '크기 미정';
+    $('blueprintSummary').textContent =
+      `${s.model || '모델 미정'} · ${size} · 캐릭터 ${Number(s.characters||0)}명`
+      + ` · 바이브 ${Number(s.vibes||0)} · 레퍼런스 ${Number(s.references||0)}`
+      + ` · ${s.experiment_mode || 'single'} · 지문 ${(s.fingerprint||'').slice(0,12)}`;
+    $('blueprintJson').textContent = JSON.stringify(bp, null, 2);
+  }catch(error){
+    $('blueprintSummary').textContent = String(error);
+    $('blueprintJson').textContent = '';
+  }
+}
+
 async function init(){
   const d = await (await fetch('/api/config')).json();
   STATE = d.config;
@@ -10259,7 +10620,12 @@ async function init(){
   SCENES = d.scenes || [];
   showStartupRecovery(d.startup_recovery);
   paint();
+  bindDropZone($('generateInspectDrop'), $('generateInspectFile'));
   bindTagSearch(document);
+  if($('blueprintPlan') && !$('blueprintPlan')._bound){
+    $('blueprintPlan')._bound = true;
+    $('blueprintPlan').addEventListener('toggle', loadBlueprint);
+  }
 }
 
 /* 세팅 파일이 디스크에서 바뀐 뒤 목록만 다시 받는다.
@@ -10409,7 +10775,6 @@ async function comparisonRunsLoad(){
 async function openComparisonFolder(folder, message='비교 결과를 선별하세요.'){
   if(!folder) return;
   STATE.ui = STATE.ui || {};
-  STATE.ui.library_work = 'browse';
   setMode('library');
   arrangeStudioWorkspace();
   await expLoad(folder);
@@ -10474,6 +10839,43 @@ function bindComparison(){
   if(!$('compareCard') || $('compareCard')._bound) return;
   $('compareCard')._bound = true;
   comparisonRestore();
+  $('cmpPlanAllChars').addEventListener('click', () => {
+    const characters = comparisonCharacterChoices();
+    const targets = SETTINGS.filter(setting => {
+      const state = stState(setting.name);
+      return state.use !== false && (state.selected || []).length;
+    });
+    if(!characters.length){
+      $('cmpPlanMsg').textContent = '사용할 캐릭터 자료가 없습니다.';
+      return;
+    }
+    if(!targets.length){
+      $('cmpPlanMsg').textContent = '먼저 씬 고르기에서 사용할 세팅과 세트를 켜세요.';
+      return;
+    }
+    targets.forEach(setting => {
+      const state = stState(setting.name);
+      state.cast_source = 'all_characters';
+      state.cast_mode = 'sequence';
+    });
+    save(); renderSettings(); counts();
+    STATE.ui = STATE.ui || {}; STATE.ui.settings_work = 'select';
+    arrangeStudioWorkspace(); save();
+    $('cmpPlanMsg').textContent =
+      `${characters.length}명 × ${targets.length}개 선택 세팅 계획을 적용했습니다. 직접 캐스트 원문은 보존됩니다.`;
+  });
+  $('cmpPlanManual').addEventListener('click', () => {
+    let changed = 0;
+    SETTINGS.forEach(setting => {
+      const state = stState(setting.name);
+      if(state.cast_source === 'all_characters'){
+        state.cast_source = 'manual'; changed++;
+      }
+    });
+    save(); renderSettings(); counts();
+    $('cmpPlanMsg').textContent =
+      changed ? `${changed}개 세팅을 기존 직접 캐스트로 돌렸습니다.` : '전 캐릭터 계획이 적용된 세팅이 없습니다.';
+  });
   document.querySelectorAll('input[name="cmpMode"]').forEach(x => x.addEventListener('change', comparisonSchedule));
   ['cmpRes','cmpFix','cmpSameSeed','cmpSeed','cmpSeedCount',
    'cmpLimit','cmpRefs','cmpW','cmpH'].forEach(id => {
@@ -10828,8 +11230,9 @@ function tokens(){
     });
     /* 전용 캐스트만 벌을 늘린다 ("각자 따로 전체 씬 생성").
        ① 설정의 캐릭터 칸은 한 그림에 함께 들어가므로 장수를 곱하지 않는다. */
-    const cast = (s.cast||[]).filter(c=>(c.prompt||'').trim()).length;
-    total += shots * (cast || 1);
+    const cast = (s.cast||[]).filter(c=>[(c.prompt||''),(c.outfit||'')]
+      .some(v=>v.replace(/^[ \t]*#.*$/gm, '').trim())).length;
+    total += shots * (cast && castMode(s)==='sequence' ? cast : 1);
   });
   $('topStat').textContent = `캐릭터 ${n} · 세팅 ${sets} · 일괄 ${total}장`;
 }
@@ -10904,7 +11307,7 @@ function attachHL(ta){
   draw();
 }
 /* 겹친 거울층은 브라우저·배율에 따라 글자가 번져 보일 수 있다. 기본은 원문 한 층만
-   쓰고, 사용자가 기타 → 화면에서 직접 켰을 때만 가중치 배경을 그린다. */
+   쓰고, 사용자가 관리 → 화면에서 직접 켰을 때만 가중치 배경을 그린다. */
 function hlOn(){ return (STATE.ui || {}).highlight === true; }
 function redrawHL(){
   document.querySelectorAll('textarea').forEach(t => { if(t._hlDraw) t._hlDraw(); });
@@ -10913,6 +11316,52 @@ function setupHL(){
   ['basePrompt','negPrompt'].forEach(id => attachHL($(id)));
   redrawHL();
 }
+let LAST_WEIGHT_FIELD = 'basePrompt';
+function weightField(){
+  const ids = ['basePrompt','baseFixed','baseVar','baseDetail'];
+  const active = document.activeElement;
+  if(active && ids.includes(active.id)) LAST_WEIGHT_FIELD = active.id;
+  return $(LAST_WEIGHT_FIELD) || $('basePrompt');
+}
+function caretWeightRange(ta){
+  let start = ta.selectionStart || 0, end = ta.selectionEnd || start;
+  if(start !== end) return [start, end];
+  /* 가중치 묶음 안에 쉼표가 있어도 묶음 전체를 먼저 찾는다. */
+  const groups = [...ta.value.matchAll(/-?(?:\d+\.\d*|\.\d+|\d+)\s*::[\s\S]*?::/g)];
+  const group = groups.find(m => m.index <= start && start <= m.index + m[0].length);
+  if(group) return [group.index, group.index + group[0].length];
+  const left = ta.value.lastIndexOf(',', Math.max(0, start - 1));
+  const right = ta.value.indexOf(',', start);
+  return [left < 0 ? 0 : left + 1, right < 0 ? ta.value.length : right];
+}
+function weightText(value){
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? rounded.toFixed(1)
+    : String(rounded).replace(/0+$/, '').replace(/\.$/, '');
+}
+function adjustCaretWeight(delta){
+  const ta = weightField();
+  if(!ta) return;
+  const [start, end] = caretWeightRange(ta);
+  const raw = ta.value.slice(start, end);
+  const lead = (raw.match(/^\s*/) || [''])[0];
+  const tail = (raw.match(/\s*$/) || [''])[0];
+  const core = raw.slice(lead.length, raw.length - tail.length);
+  if(!core){ ta.focus(); return; }
+  const match = core.match(/^(-?(?:\d+\.\d*|\.\d+|\d+))\s*::([\s\S]*)::$/);
+  const content = match ? match[2] : core;
+  const weight = match ? Number(match[1]) + delta : (delta > 0 ? 1.1 : 0.9);
+  const replacement = `${lead}${weightText(weight)}::${content}::${tail}`;
+  ta.setRangeText(replacement, start, end, 'select');
+  ta.dispatchEvent(new Event('input', {bubbles:true}));
+  ta.focus();
+}
+['basePrompt','baseFixed','baseVar','baseDetail'].forEach(id => {
+  const field = $(id);
+  if(field) field.addEventListener('focus', () => { LAST_WEIGHT_FIELD = id; });
+});
+if($('weightDownBtn')) $('weightDownBtn').addEventListener('click', () => adjustCaretWeight(-0.1));
+if($('weightUpBtn')) $('weightUpBtn').addEventListener('click', () => adjustCaretWeight(0.1));
 function bindHLToggle(){
   const s = $('uiHighlight');
   if(!s || s._bound) return;
@@ -11576,22 +12025,6 @@ document.querySelectorAll('[data-ovl-close]').forEach(b => b.addEventListener('c
   document.querySelectorAll('.ovl').forEach(o => o.classList.add('hidden'));
 }));
 
-/* 작업실의 자료 화면은 "찾기·정리 → 비교·선별" 흐름으로 나눈다.
-   비교 생성의 DOM·이벤트·설정은 복제하지 않고 카드 하나를 옮긴다. 기존 화면으로
-   돌아가면 원래 세팅 탭의 앵커로 즉시 복원되므로 두 구현이 어긋나지 않는다. */
-function bindStudioLibraryNav(){
-  const nav = $('studioLibraryNav');
-  if(!nav || nav._bound) return;
-  nav._bound = true;
-  nav.querySelectorAll('[data-library-work]').forEach(button => {
-    button.addEventListener('click', () => {
-      STATE.ui = STATE.ui || {};
-      STATE.ui.library_work = button.dataset.libraryWork === 'compare' ? 'compare' : 'browse';
-      arrangeStudioWorkspace();
-      save();
-    });
-  });
-}
 function bindStudioSettingsNav(){
   const nav = $('studioSettingsNav');
   if(!nav || nav._bound) return;
@@ -11599,7 +12032,7 @@ function bindStudioSettingsNav(){
   nav.querySelectorAll('[data-settings-work]').forEach(button => {
     button.addEventListener('click', () => {
       const next = button.dataset.settingsWork;
-      if(!['select','quick','build'].includes(next)) return;
+      if(!['select','quick','build','compare'].includes(next)) return;
       STATE.ui = STATE.ui || {};
       STATE.ui.settings_work = next;
       arrangeStudioWorkspace();
@@ -11607,32 +12040,70 @@ function bindStudioSettingsNav(){
     });
   });
 }
+async function loadJobCenter(){
+  const host = $('jobCenterList'); if(!host) return;
+  host.innerHTML = '<div class="row hint">작업 상태를 확인하는 중입니다.</div>';
+  try{
+    const [live, comparisons, collection] = await Promise.all([
+      fetch('/status.json', {cache:'no-store'}).then(r => r.json()),
+      fetch('/api/compare_runs', {cache:'no-store'}).then(r => r.json()),
+      fetch('/api/public_collection', {cache:'no-store'}).then(r => r.json()),
+    ]);
+    const unfinished = (comparisons.runs || []).filter(run => run.resumable);
+    const liveState = live.running
+      ? `${live.operation || '생성'} · ${Number(live.completed||0)}/${Number(live.total||0)}`
+      : `대기 · 최근 ${live.phase || 'idle'}`;
+    const collectState = collection.status || 'idle';
+    host.innerHTML = `
+      <div class="row"><div><b>현재 생성 실행권</b><div class="hint">${esc(liveState)}</div>
+        <div class="hint">${esc(live.status_text || '')}</div></div>
+        <button type="button" data-job-go="preview">생성으로</button></div>
+      <div class="row"><div><b>비교 실험</b><div class="hint">이어갈 기록 ${unfinished.length}개 · 전체 ${(comparisons.runs||[]).length}개</div></div>
+        <button type="button" data-job-go="compare">비교 실험으로</button></div>
+      <div class="row"><div><b>공개자료 수집</b><div class="hint">${esc(collectState)}
+        · ${Number(collection.cursor||0)}/${Number((collection.queue||[]).length||collection.found_posts||0)}</div></div>
+        <button type="button" data-job-go="library">자료 수집으로</button></div>`;
+    host.querySelectorAll('[data-job-go]').forEach(button => button.addEventListener('click', () => {
+      const target = button.dataset.jobGo;
+      if(target === 'compare'){
+        STATE.ui = STATE.ui || {}; STATE.ui.settings_work = 'compare';
+        setMode('settings'); arrangeStudioWorkspace(); comparisonRunsLoad();
+      }else setMode(target);
+    }));
+  }catch(error){
+    host.innerHTML = `<div class="row" style="color:var(--danger);">${esc(String(error))}</div>`;
+  }
+}
+function bindStudioManageNav(){
+  const nav = $('studioManageNav');
+  if(!nav || nav._bound) return;
+  nav._bound = true;
+  nav.querySelectorAll('[data-manage-work]').forEach(button => {
+    button.addEventListener('click', () => {
+      STATE.ui = STATE.ui || {};
+      STATE.ui.manage_work = button.dataset.manageWork;
+      arrangeStudioWorkspace(); save();
+      if(button.dataset.manageWork === 'jobs') loadJobCenter();
+    });
+  });
+  if($('jobCenterRefresh')) $('jobCenterRefresh').addEventListener('click', loadJobCenter);
+}
 function arrangeStudioWorkspace(){
   if(!STATE) return;
-  bindStudioLibraryNav();
   bindStudioSettingsNav();
+  bindStudioManageNav();
   const studio = (STATE.ui || {}).layout !== 'classic';
+
+  const mosaicCard = $('mosaicCard');
+  const mosaicHome = studio ? $('mosaicGenerateHome') : $('mosaicClassicHome');
+  if(mosaicCard && mosaicHome && mosaicHome.nextElementSibling !== mosaicCard){
+    mosaicHome.insertAdjacentElement('afterend', mosaicCard);
+  }
 
   const card = $('compareCard');
   const classicHome = $('compareClassicHome');
-  const studioHome = $('studioCompareHome');
-  const libraryNav = $('studioLibraryNav');
-  const browse = $('studioLibraryBrowse');
-  if(card && classicHome && studioHome && libraryNav && browse){
-    const libraryWork = (STATE.ui || {}).library_work === 'compare' ? 'compare' : 'browse';
-    const home = studio ? studioHome : classicHome;
-    if(home.nextElementSibling !== card) home.insertAdjacentElement('afterend', card);
-
-    libraryNav.classList.toggle('hidden', !studio);
-    browse.classList.toggle('hidden', studio && libraryWork === 'compare');
-    card.classList.toggle('hidden',
-      studio && (document.body.dataset.mode !== 'library' || libraryWork !== 'compare'));
-    libraryNav.querySelectorAll('[data-library-work]').forEach(button => {
-      const on = button.dataset.libraryWork === libraryWork;
-      button.classList.toggle('on', on);
-      button.setAttribute('aria-selected', on ? 'true' : 'false');
-      button.tabIndex = on ? 0 : -1;
-    });
+  if(card && classicHome && classicHome.nextElementSibling !== card){
+    classicHome.insertAdjacentElement('afterend', card);
   }
 
   const settingsNav = $('studioSettingsNav');
@@ -11640,10 +12111,11 @@ function arrangeStudioWorkspace(){
     select: $('settingSelectCard'),
     quick: $('sceneQuickCard'),
     build: $('settingBuilderCard'),
+    compare: card,
   };
   if(settingsNav && Object.values(settingsCards).every(Boolean)){
     const savedSettingsWork = (STATE.ui || {}).settings_work;
-    const settingsWork = ['select','quick','build'].includes(savedSettingsWork)
+    const settingsWork = ['select','quick','build','compare'].includes(savedSettingsWork)
       ? savedSettingsWork : 'select';
     settingsNav.classList.toggle('hidden', !studio);
     Object.entries(settingsCards).forEach(([key, settingsCard]) => {
@@ -11656,13 +12128,30 @@ function arrangeStudioWorkspace(){
       button.tabIndex = on ? 0 : -1;
     });
   }
+
+  const manageNav = $('studioManageNav');
+  const manageWork = ['environment','safety','jobs','tools'].includes(
+    (STATE.ui || {}).manage_work) ? STATE.ui.manage_work : 'environment';
+  if(manageNav){
+    manageNav.classList.toggle('hidden', !studio);
+    document.querySelectorAll('[data-manage-panel]').forEach(panel => {
+      panel.classList.toggle(
+        'hidden', studio && panel.dataset.managePanel !== manageWork);
+    });
+    manageNav.querySelectorAll('[data-manage-work]').forEach(button => {
+      const on = button.dataset.manageWork === manageWork;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-selected', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+    });
+  }
 }
 const MODE_CONTEXT = {
   preview: ['01 · GENERATE', '생성', '프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.'],
-  library: ['02 · LIBRARY', '자료', '공개 자료와 내 자료를 수집하고, 큰 묶음 그대로 찾고 정리합니다.'],
-  builder: ['03 · BUILD', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
-  settings: ['04 · SETTING', '세팅', '장면 공통값, 캐릭터별 태그와 위치를 한 흐름으로 설계합니다.'],
-  system: ['05 · SYSTEM', '기타', '출력, 백업·복구, 화면과 고급 환경을 관리합니다.'],
+  settings: ['02 · SETTING', '세팅', '씬, 캐스트, 단계와 비교 실험을 한 생성 계획으로 설계합니다.'],
+  library: ['03 · LIBRARY', '자료', '공개 자료와 내 자료를 수집하고, 큰 묶음 그대로 찾고 정리합니다.'],
+  builder: ['04 · BUILD', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
+  system: ['05 · MANAGE', '관리', '작업 큐, 출력, 백업·복구와 앱 환경을 관리합니다.'],
 };
 function setMode(m){
   document.body.dataset.mode = m;
@@ -11674,6 +12163,7 @@ function setMode(m){
   if($('workspaceTitle')) $('workspaceTitle').textContent = context[1];
   if($('workspaceDesc')) $('workspaceDesc').textContent = context[2];
   arrangeStudioWorkspace();
+  if(m === 'system' && (STATE.ui || {}).manage_work === 'jobs') loadJobCenter();
 }
 document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
 document.querySelectorAll('[data-mode-jump]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.modeJump)));
@@ -11787,6 +12277,58 @@ $('presetSave').addEventListener('click', async () => {
 });
 
 /* ── 캐릭터 슬롯 ── */
+function characterVariantChoice(character){
+  character = character || {};
+  const variant = character.variant && typeof character.variant === 'object'
+    ? character.variant : {};
+  const group = String(variant.group || '').trim();
+  if(!group || variant.enabled !== false) return character;
+  const same = (STATE.characters || []).filter(item => {
+    const value = item && item.variant && typeof item.variant === 'object'
+      ? item.variant : {};
+    return String(value.group || '').trim() === group && value.enabled !== false;
+  });
+  return same[0] || character;
+}
+function characterVariantLabel(character){
+  const variant = character && character.variant && typeof character.variant === 'object'
+    ? character.variant : {};
+  const name = String(variant.name || '').trim();
+  const group = String(variant.group || '').trim();
+  return group ? ` · ${name || '기본 변형'}${variant.enabled === false ? ' (꺼짐·fallback)' : ''}` : '';
+}
+function comparisonCharacterChoices(){
+  const standalone = [], grouped = new Map();
+  (STATE.characters || []).forEach(character => {
+    const prompt = [character.female, character.clothed].filter(Boolean).join(', ').trim();
+    if(!prompt) return;
+    const variant = character.variant && typeof character.variant === 'object'
+      ? character.variant : {};
+    const group = String(variant.group || '').trim();
+    if(!group) standalone.push(character);
+    else{
+      if(!grouped.has(group)) grouped.set(group, []);
+      grouped.get(group).push(character);
+    }
+  });
+  grouped.forEach(members => {
+    const active = members.filter(item => (item.variant || {}).enabled !== false);
+    standalone.push(...(active.length ? active : members.slice(0,1)));
+  });
+  return standalone;
+}
+function characterBundle(c, forSlot=true){
+  c = characterVariantChoice(c);
+  const result = {
+    id:c.id||'', name:c.name||'', prompt:c.female||c.prompt||'',
+    outfit:c.clothed||c.outfit||'', negative:c.negative||'',
+    variant:JSON.parse(JSON.stringify(c.variant||{})),
+    reference_ids:JSON.parse(JSON.stringify(c.reference_ids||[])),
+    vibe_ids:JSON.parse(JSON.stringify(c.vibe_ids||[]))
+  };
+  if(forSlot) result.enabled = c.enabled !== false;
+  return result;
+}
 function renderSlots(){
   const h = $('slotList'); h.innerHTML = '';
   (STATE.char_slots || []).forEach((s,i) => {
@@ -11846,7 +12388,11 @@ function renderSlots(){
   }));
   const lib = $('slotLib');
   lib.innerHTML = '<option value="">+ 라이브러리에서...</option>';
-  (STATE.characters||[]).forEach(c => { const o = document.createElement('option'); o.value = c.id; o.textContent = c.name || '(무명)'; lib.appendChild(o); });
+  (STATE.characters||[]).forEach(c => {
+    const o = document.createElement('option'); o.value = c.id;
+    o.textContent = (c.name || '(무명)') + characterVariantLabel(c);
+    lib.appendChild(o);
+  });
   if(window._paintCoords) window._paintCoords();   // 인물 수가 바뀌면 몸 붙음 경고도 다시
 }
 /* 공홈은 **인물을 둘째로 넣는 순간 좌표를 켠다**. 그래야 몸이 안 붙는다.
@@ -12011,7 +12557,7 @@ if($('slotDelOff')) $('slotDelOff').addEventListener('click', () => {
 });
 $('slotLib').addEventListener('change', () => {
   const c = (STATE.characters||[]).find(x => x.id === $('slotLib').value);
-  if(c){ (STATE.char_slots = STATE.char_slots || []).push({name: c.name||'', prompt: c.female||'', negative: c.negative||''});
+  if(c){ (STATE.char_slots = STATE.char_slots || []).push(characterBundle(c, true));
   if(autoCoordsOnSecond()) flash('인물이 둘이 되어 위치 지정을 켜고 좌우로 벌렸습니다 (공홈과 같은 동작).');
     renderSlots(); tokens(); save(); }
   $('slotLib').value = '';
@@ -12064,6 +12610,9 @@ function castPresets(){
   STATE.cast_presets = Array.isArray(STATE.cast_presets) ? STATE.cast_presets : [];
   return STATE.cast_presets;
 }
+function castMode(state){
+  return state && state.cast_mode === 'together' ? 'together' : 'sequence';
+}
 function castPresetId(){
   const tail = (globalThis.crypto && crypto.randomUUID)
     ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -12106,7 +12655,24 @@ function renderSettings(){
       <div class="sec-body${SET_OPEN.has(st.name) ? '' : ' hidden'}" data-sb="${escA(st.name)}"></div>`;
     const b = sec.querySelector('.sec-body');
 
-    b.insertAdjacentHTML('beforeend', `<div class="field"><label>전용 캐스트 (각자 따로 전체 씬 생성 · 비우면 왼쪽 [캐릭터] 사용)</label>
+    b.insertAdjacentHTML('beforeend', `<div class="field"><label>전용 캐스트 (비우면 왼쪽 [캐릭터] 사용)</label>
+      <div class="filterbar">
+        <span class="hint">출연 자료</span>
+        <select data-castsource="${escA(st.name)}" style="width:auto;">
+          <option value="manual"${s.cast_source==='all_characters'?'':' selected'}>직접 캐스트</option>
+          <option value="all_characters"${s.cast_source==='all_characters'?' selected':''}>캐릭터 자료 전체</option>
+        </select>
+        <span class="hint">실행 방식</span>
+        <select data-castmode="${escA(st.name)}" style="width:auto;">
+          <option value="sequence"${castMode(s)==='sequence'?' selected':''}>각자 순회 — 한 명씩 전체 씬</option>
+          <option value="together"${castMode(s)==='together'?' selected':''}>함께 등장 — 한 장에 여러 명</option>
+        </select>
+        <span class="hint">${castMode(s)==='together'
+          ? '첫째=주인공 · 둘째=상대역 · 이후=추가 인물'
+          : (s.cast_source==='all_characters'
+            ? `캐릭터 자료 ${comparisonCharacterChoices().length}명 × 선택 씬`
+            : '인원수만큼 생성 벌이 늘어납니다')}</span>
+      </div>
       <div data-cast="${escA(st.name)}"></div>
       <div class="bar" style="margin:5px 0 0;"><button data-castadd="${escA(st.name)}">+ 직접 입력</button>
       <select data-castlib="${escA(st.name)}" style="flex:1;"><option value="">+ 라이브러리에서...</option></select></div>
@@ -12212,6 +12778,16 @@ function bindSettings(){
   }));
   h.querySelectorAll('[data-suse]').forEach(x => x.addEventListener('change', () => {
     stState(x.dataset.suse).use = x.checked; tokens(); save(); counts();
+  }));
+  h.querySelectorAll('[data-castmode]').forEach(select => select.addEventListener('change', () => {
+    stState(select.dataset.castmode).cast_mode =
+      select.value === 'together' ? 'together' : 'sequence';
+    save(); renderSettings(); tokens(); counts();
+  }));
+  h.querySelectorAll('[data-castsource]').forEach(select => select.addEventListener('change', () => {
+    stState(select.dataset.castsource).cast_source =
+      select.value === 'all_characters' ? 'all_characters' : 'manual';
+    save(); renderSettings(); tokens(); counts();
   }));
   h.querySelectorAll('[data-ssel]').forEach(x => x.addEventListener('change', () => {
     const s = stState(x.dataset.ssel), id = +x.dataset.id;
@@ -12322,14 +12898,18 @@ function bindSettings(){
   h.querySelectorAll('[data-optedit]').forEach(b => b.addEventListener('click', () => openOpts(b.dataset.optedit)));
   h.querySelectorAll('[data-cast]').forEach(el => renderCast(el.dataset.cast));
   h.querySelectorAll('[data-castadd]').forEach(b => b.addEventListener('click', () => {
-    stState(b.dataset.castadd).cast.push({name:'', prompt:'', negative:''});
+    stState(b.dataset.castadd).cast.push({name:'', prompt:'', outfit:'', negative:''});
     renderCast(b.dataset.castadd); tokens(); save();
   }));
   h.querySelectorAll('[data-castlib]').forEach(sel => {
-    (STATE.characters||[]).forEach(c => { const o = document.createElement('option'); o.value = c.id; o.textContent = c.name||'(무명)'; sel.appendChild(o); });
+    (STATE.characters||[]).forEach(c => {
+      const o = document.createElement('option'); o.value = c.id;
+      o.textContent = (c.name || '(무명)') + characterVariantLabel(c);
+      sel.appendChild(o);
+    });
     sel.addEventListener('change', () => {
       const c = (STATE.characters||[]).find(x => x.id === sel.value);
-      if(c){ stState(sel.dataset.castlib).cast.push({name:c.name||'', prompt:c.female||'', negative:c.negative||''});
+      if(c){ stState(sel.dataset.castlib).cast.push(characterBundle(c, false));
         renderCast(sel.dataset.castlib); tokens(); save(); }
       sel.value = '';
     });
@@ -12348,6 +12928,7 @@ function bindSettings(){
     const record = {
       id: same ? same.id : castPresetId(),
       name,
+      mode: castMode(stState(setting)),
       members: JSON.parse(JSON.stringify(members)),
     };
     if(same) presets[presets.indexOf(same)] = record; else presets.push(record);
@@ -12366,6 +12947,7 @@ function bindSettings(){
     const state = stState(setting);
     if(state.cast.length && !confirm('현재 전용 캐스트를 고른 조합으로 바꿀까요?')) return;
     state.cast = JSON.parse(JSON.stringify(preset.members || []));
+    state.cast_mode = preset.mode === 'together' ? 'together' : 'sequence';
     renderCast(setting); tokens(); save();
     msg.textContent = `"${preset.name}" ${state.cast.length}명을 불러왔습니다.`;
   }));
@@ -12394,9 +12976,28 @@ function counts(){
       const cuts = stg.size ? g.ids.filter((_, i) => stg.has(i + 1)).length : g.ids.length;
       im += cuts * (rep[g.id] || 1);
     });
+    if(castMode(s) === 'sequence'){
+      const castCount = s.cast_source === 'all_characters'
+        ? comparisonCharacterChoices().length : (s.cast || []).filter(c =>
+          [c.prompt,c.outfit].some(value => String(value || '').trim())).length;
+      if(castCount) im *= castCount;
+    }
     const el = document.querySelector(`[data-scnt="${CSS.escape(st.name)}"]`);
     if(el) el.textContent = s.selected.length ? `${s.selected.length}세트 · ${im}장` : '';
   });
+}
+function castResourceChoices(memberIndex, field, items, selected, title){
+  const chosen = new Set(Array.isArray(selected) ? selected.map(String) : []);
+  const available = (items || []).filter(item => item && item.id);
+  if(!available.length){
+    return `<div class="cast-resource"><b>${title}</b><span class="hint">먼저 생성 화면의 Vibe·Reference에 자료를 넣으세요.</span></div>`;
+  }
+  return `<div class="cast-resource"><b>${title}</b><div class="cast-resource-list">` +
+    available.map(item => `<label class="cast-resource-chip">
+      <input type="checkbox" data-cresource="${field}" data-ci="${memberIndex}"
+        value="${escA(item.id)}"${chosen.has(String(item.id)) ? ' checked' : ''}>
+      <span>${esc(item.name || item.id)}</span></label>`).join('') +
+    `</div></div>`;
 }
 function renderCast(name){
   const host = document.querySelector(`[data-cast="${CSS.escape(name)}"]`);
@@ -12404,15 +13005,55 @@ function renderCast(name){
   const s = stState(name);
   host.innerHTML = '';
   s.cast.forEach((c,i) => {
+    const position = c.position && typeof c.position === 'object' ? c.position : {};
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-cf="name" data-ci="${i}" placeholder="이름" value="${escA(c.name)}">
       <button class="danger" data-cdel="${i}">✕</button></div>
-      <textarea data-cf="prompt" data-ci="${i}" placeholder="girl, ...">${esc(c.prompt)}</textarea>
-      <input type="text" data-cf="negative" data-ci="${i}" placeholder="전용 네거티브" value="${escA(c.negative)}">`;
+      <textarea data-cf="prompt" data-ci="${i}" placeholder="외형·캐릭터 원문">${esc(c.prompt)}</textarea>
+      <input type="text" data-cf="outfit" data-ci="${i}" placeholder="착의·예술적 변형" value="${escA(c.outfit||'')}">
+      <input type="text" data-cf="negative" data-ci="${i}" placeholder="전용 네거티브" value="${escA(c.negative)}">
+      <details class="cast-advanced">
+        <summary>위치 · Vibe · Reference</summary>
+        <div class="cast-position">
+          <label>자유 좌표 X
+            <input type="number" data-cpos="x" data-ci="${i}" min="0" max="1" step="0.01"
+              value="${position.x == null ? '' : escA(position.x)}" placeholder="자동">
+          </label>
+          <label>자유 좌표 Y
+            <input type="number" data-cpos="y" data-ci="${i}" min="0" max="1" step="0.01"
+              value="${position.y == null ? '' : escA(position.y)}" placeholder="자동">
+          </label>
+          <span class="hint">비우면 인원수에 맞춰 자동 배치</span>
+        </div>
+        ${castResourceChoices(i, 'reference_ids', STATE.char_refs, c.reference_ids, '캐릭터 Reference')}
+        ${castResourceChoices(i, 'vibe_ids', STATE.vibes, c.vibe_ids, 'Vibe')}
+      </details>`;
     host.appendChild(el);
   });
   host.querySelectorAll('[data-cf]').forEach(el => el.addEventListener('input', () => {
     s.cast[+el.dataset.ci][el.dataset.cf] = el.value; tokens(); save();
+  }));
+  host.querySelectorAll('[data-cpos]').forEach(el => el.addEventListener('change', () => {
+    const member = s.cast[+el.dataset.ci];
+    const inputs = host.querySelectorAll(`[data-cpos][data-ci="${el.dataset.ci}"]`);
+    const next = {};
+    inputs.forEach(input => {
+      if(input.value !== ''){
+        const number = Number(input.value);
+        if(Number.isFinite(number)) next[input.dataset.cpos] = Math.max(0, Math.min(1, number));
+      }
+    });
+    if(next.x != null && next.y != null) member.position = next;
+    else delete member.position;
+    save();
+  }));
+  host.querySelectorAll('[data-cresource]').forEach(el => el.addEventListener('change', () => {
+    const index = +el.dataset.ci;
+    const field = el.dataset.cresource;
+    s.cast[index][field] = Array.from(host.querySelectorAll(
+      `[data-cresource="${field}"][data-ci="${index}"]:checked`
+    )).map(input => input.value);
+    save();
   }));
   host.querySelectorAll('[data-cdel]').forEach(b => b.addEventListener('click', () => {
     s.cast.splice(+b.dataset.cdel, 1); renderCast(name); tokens(); save();
@@ -12667,7 +13308,7 @@ if($('i2iDrop')){
 const EXP_CHUNK = 120;
 let EXP = {dir:'', files:[], dirs:[], total:0, loading:false,
   loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1,
-  folders:{}, ranks:{}, ratings:{}, tags:{}};
+  folders:{}, ranks:{}, ratings:{}, elo:{}, elo_matches:{}, tags:{}};
 function expListUrl(dir, offset=0){
   const q = new URLSearchParams({
     dir: dir ?? EXP.dir, limit: String(EXP_CHUNK), offset: String(offset)
@@ -12694,7 +13335,8 @@ async function expLoad(dir){
   EXP.dir = r.dir; EXP.files = r.files; EXP.dirs = r.dirs;
   EXP.total = Number.isFinite(r.total) ? r.total : r.files.length;
   EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav); EXP.ranks = r.ranks || {};
-  EXP.folders = r.folders || {}; EXP.ratings = r.ratings || {}; EXP.tags = r.tags || {};
+  EXP.folders = r.folders || {}; EXP.ratings = r.ratings || {};
+  EXP.elo = r.elo || {}; EXP.elo_matches = r.elo_matches || {}; EXP.tags = r.tags || {};
   $('expPath').textContent = 'output/' + (r.dir ? r.dir + '/' : '');
   /* 최상위에서는 위로 갈 곳이 없다 — 눌려도 아무 일 없으면 고장으로 보인다 */
   const up = $('expUp');
@@ -12765,7 +13407,8 @@ function expDraw(){
   const vis = expVisible();
   $('expCount').textContent = `${EXP.total}장`;
   $('expStat').textContent = `${vis.length}/${EXP.total}장 불러옴 · 선별 ${EXP.picked.size}`
-    + ` · 즐겨찾기 ${EXP.fav.size} · 평가 ${Object.keys(EXP.ratings||{}).length}`;
+    + ` · 즐겨찾기 ${EXP.fav.size} · 평가 ${Object.keys(EXP.ratings||{}).length}`
+    + ` · ELO ${Object.keys(EXP.elo||{}).length}`;
   $('expCmpN').textContent = EXP.cmp.size;
   /* 수천 장을 한 번에 그리면 초기 로딩·메모리가 터진다 (Custom 의 페이지 분할 참고).
      120장씩 그리고, '더 보기'가 화면에 가까워지면 자동으로 다음 묶음. */
@@ -12779,6 +13422,7 @@ function expChunk(){
   for(let i = EXP.shown; i < end; i++){
     const f = vis[i];
     const score = Number((EXP.ratings || {})[f.path] || 0);
+    const elo = Number((EXP.elo || {})[f.path] || 0);
     const tags = (EXP.tags || {})[f.path] || [];
     const el = document.createElement('div');
     el.style.cssText = 'position:relative;cursor:pointer;';
@@ -12788,9 +13432,9 @@ function expChunk(){
         border-radius:var(--radius);${EXP.cmp.has(f.path)?'outline:2px dashed var(--accent);outline-offset:1px;':''}">
       <div style="position:absolute;top:2px;right:3px;font-size:var(--fs-sm);text-shadow:0 0 3px #000;">
         ${EXP.fav.has(f.path)?'⭐':''}${EXP.picked.has(f.path)?'✔':''}</div>
-      ${((EXP.ranks||{})[f.path] || score) ? `<div style="position:absolute;top:2px;left:3px;font-size:var(--fs-2xs);
+      ${((EXP.ranks||{})[f.path] || score || elo) ? `<div style="position:absolute;top:2px;left:3px;font-size:var(--fs-2xs);
         background:#000a;color:#ffd76e;padding:1px 4px;border-radius:var(--radius-pill);">
-        ${(EXP.ranks||{})[f.path] ? `🏆${EXP.ranks[f.path]}` : ''}${score ? ` ${'★'.repeat(score)}` : ''}</div>` : ''}
+        ${(EXP.ranks||{})[f.path] ? `🏆${EXP.ranks[f.path]}` : ''}${score ? ` ${'★'.repeat(score)}` : ''}${elo ? ` ⚖${Math.round(elo)}` : ''}</div>` : ''}
       <div class="tag" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(f.name)}</div>
       ${tags.length ? `<div class="hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(tags.slice(0,3).join(' · '))}</div>` : ''}`;
     el.addEventListener('click', () => expOpen(i));
@@ -12897,12 +13541,87 @@ function cupPick(which){
   CUP.i += 2;
   cupDraw();
 }
+/* ── 블라인드 ELO ─────────────────────────────────────────────────────
+   파일명·기존 점수·출처를 가린 채 같은 후보군 안에서 반복 비교한다.
+   별점과 월드컵 순위는 다른 판단 축이므로 덮지 않고 ELO와 판수만 따로 누적한다. */
+let ELO = null;
+async function eloStart(){
+  const vis = await expEnsureAll();
+  if(vis.length < 2){
+    $('expStat').textContent = '블라인드 ELO는 그림이 2장 이상일 때 할 수 있습니다.';
+    return;
+  }
+  const pool = vis.map(file => file.path);
+  for(let i = pool.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  ELO = {pool, target:3, played:0, pair:null};
+  eloNext();
+}
+function eloNext(){
+  if(!ELO) return;
+  const ordered = [...ELO.pool].sort((a,b) => {
+    const diff = Number(EXP.elo_matches[a] || 0) - Number(EXP.elo_matches[b] || 0);
+    return diff || Math.random() - .5;
+  });
+  const least = Number(EXP.elo_matches[ordered[0]] || 0);
+  if(least >= ELO.target){
+    const el = $('eloBg'); if(el) el.remove();
+    $('expStat').textContent = `⚖ 블라인드 ELO 완료 — ${ELO.played}판 · 각 후보 누적 ${ELO.target}판 이상`;
+    ELO = null; expDraw(); return;
+  }
+  const a = ordered[0];
+  const aScore = Number(EXP.elo[a] || 1000);
+  const opponents = ordered.slice(1).sort((x,y) =>
+    Math.abs(Number(EXP.elo[x] || 1000) - aScore)
+      - Math.abs(Number(EXP.elo[y] || 1000) - aScore));
+  const b = opponents[0];
+  ELO.pair = [a,b];
+  let ov = $('eloBg');
+  if(!ov){
+    ov = document.createElement('div'); ov.id = 'eloBg';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:100;background:#000e;display:flex;'
+      + 'flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:14px;';
+    document.body.appendChild(ov);
+  }
+  ov.innerHTML = `<div style="color:#eee;font-size:var(--fs-sm);">
+      ⚖ 블라인드 ELO · ${ELO.played + 1}번째 판
+      <span style="opacity:.7;margin-left:10px;">←/→ 또는 클릭 · Space 무승부 · Esc 저장 후 종료</span></div>
+    <div style="display:flex;gap:12px;align-items:center;justify-content:center;max-height:78vh;">
+      <img data-elo="a" alt="후보 A" src="/setout?p=${encodeURIComponent(a)}"
+        style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
+      <img data-elo="b" alt="후보 B" src="/setout?p=${encodeURIComponent(b)}"
+        style="max-width:46vw;max-height:74vh;object-fit:contain;cursor:pointer;border:3px solid transparent;border-radius:var(--radius);">
+    </div><div style="color:#aaa;font-size:var(--fs-2xs);">A와 B 중 더 나은 결과만 고르세요. 이름과 기존 평가는 숨겨집니다.</div>`;
+  ov.querySelectorAll('[data-elo]').forEach(image => {
+    image.addEventListener('mouseenter', () => image.style.borderColor = 'var(--accent)');
+    image.addEventListener('mouseleave', () => image.style.borderColor = 'transparent');
+    image.addEventListener('click', () => eloPick(image.dataset.elo));
+  });
+}
+async function eloPick(which){
+  if(!ELO || !ELO.pair) return;
+  const [a,b] = ELO.pair;
+  const ra = Number(EXP.elo[a] || 1000), rb = Number(EXP.elo[b] || 1000);
+  const expectedA = 1 / (1 + Math.pow(10, (rb - ra) / 400));
+  const actualA = which === 'a' ? 1 : (which === 'b' ? 0 : .5);
+  const delta = 24 * (actualA - expectedA);
+  EXP.elo[a] = Math.round((ra + delta) * 10) / 10;
+  EXP.elo[b] = Math.round((rb - delta) * 10) / 10;
+  EXP.elo_matches[a] = Number(EXP.elo_matches[a] || 0) + 1;
+  EXP.elo_matches[b] = Number(EXP.elo_matches[b] || 0) + 1;
+  ELO.played++;
+  await picksSave();
+  eloNext();
+}
 async function picksSave(){
   await fetch('/api/picks_save', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       picked:[...EXP.picked], fav:[...EXP.fav],
       folders:EXP.folders || {}, ranks:EXP.ranks || {},
-      ratings:EXP.ratings || {}, tags:EXP.tags || {}
+      ratings:EXP.ratings || {}, elo:EXP.elo || {},
+      elo_matches:EXP.elo_matches || {}, tags:EXP.tags || {}
     })});
 }
 let EXP_RECIPE_UNDO = null;
@@ -13050,6 +13769,8 @@ function expOpen(i){
     document.body.appendChild(ov);
   }
   const score = Number((EXP.ratings || {})[f.path] || 0);
+  const elo = Number((EXP.elo || {})[f.path] || 0);
+  const eloMatches = Number((EXP.elo_matches || {})[f.path] || 0);
   const tags = (EXP.tags || {})[f.path] || [];
   ov.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt=""
       style="max-width:96vw;max-height:82vh;object-fit:contain;border-radius:var(--radius);">
@@ -13059,6 +13780,7 @@ function expOpen(i){
       <span class="tag">${EXP.picked.has(f.path)?'✔ 선별됨':'F = 선별'}</span>
       <span class="tag">${EXP.cmp.has(f.path)?'비교함에 있음':'C = 비교함'}</span>
       <span class="tag">${EXP.fav.has(f.path)?'⭐':'S = 즐겨찾기'}</span>
+      ${elo ? `<span class="tag">⚖ ELO ${Math.round(elo)} · ${eloMatches}판</span>` : ''}
       <select id="expRate" aria-label="이 그림 별점" style="width:auto;">
         <option value="0"${score===0?' selected':''}>별점 없음</option>
         ${[1,2,3,4,5].map(n => `<option value="${n}"${score===n?' selected':''}>${'★'.repeat(n)}</option>`).join('')}
@@ -13103,6 +13825,17 @@ function expOpen(i){
 }
 function expClose(){ const o = $('expViewer'); if(o) o.remove(); EXP.open = -1; }
 window.addEventListener('keydown', async e => {
+  if(ELO){
+    if(e.key === 'ArrowLeft'){ e.preventDefault(); eloPick('a'); return; }
+    if(e.key === 'ArrowRight'){ e.preventDefault(); eloPick('b'); return; }
+    if(e.key === ' '){ e.preventDefault(); eloPick('both'); return; }
+    if(e.key === 'Escape'){
+      e.preventDefault(); const el = $('eloBg'); if(el) el.remove();
+      $('expStat').textContent = `⚖ 블라인드 ELO 중단 — 이번 세션 ${ELO.played}판은 저장됨`;
+      ELO = null; expDraw(); return;
+    }
+    return;
+  }
   /* 월드컵이 열려 있으면 그쪽이 키를 먼저 먹는다 */
   if(CUP){
     if(e.key === 'ArrowLeft'){ e.preventDefault(); cupPick('a'); return; }
@@ -13159,6 +13892,7 @@ if($('expUp')){
   });
   $('expCmpClear').addEventListener('click', () => { EXP.cmp.clear(); expDraw(); });
   if($('expCup')) $('expCup').addEventListener('click', cupStart);
+  if($('expElo')) $('expElo').addEventListener('click', eloStart);
   if($('expApplyPicked')) $('expApplyPicked').addEventListener(
     'click', expApplyPickedRecipe);
   $('expCompare').addEventListener('click', () => {
@@ -14502,7 +15236,8 @@ async function manageLibraryKind(){
   }
   if(kind === '생성 기록'){
     STATE.ui = STATE.ui || {};
-    STATE.ui.library_work = 'compare';
+    STATE.ui.settings_work = 'compare';
+    setMode('settings');
     arrangeStudioWorkspace();
     await comparisonRunsLoad();
     $('compareCard').scrollIntoView({behavior:'smooth', block:'start'});
@@ -14557,16 +15292,31 @@ function renderCharCards(){
   const query = libraryNeedle(($('charFilter')||{}).value);
   const filtered = (STATE.characters||[]).filter(c => !query || libraryNeedle([
     c.name, c.female, c.clothed, c.negative, c.source,
+    (c.variant||{}).group, (c.variant||{}).name,
   ].join(' ')).includes(query));
   const shown = filtered.slice(0, CHAR_EDIT_LIMIT);
   shown.forEach(c => {
+    const variant = c.variant && typeof c.variant === 'object' ? c.variant : {};
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-xc="${c.id}" data-xf="name" value="${escA(c.name)}" placeholder="이름">
       <button data-xdup="${c.id}" title="이 캐릭터를 복사해 의상·변형만 바꿉니다">복제</button>
       <button class="danger" data-xdel="${c.id}">삭제</button></div>
       <textarea data-xc="${c.id}" data-xf="female" placeholder="girl, ...">${esc(c.female)}</textarea>
       <input type="text" data-xc="${c.id}" data-xf="clothed" placeholder="착의 (선택)" value="${escA(c.clothed)}" style="margin-top:4px;">
-      <input type="text" data-xc="${c.id}" data-xf="negative" placeholder="전용 네거티브" value="${escA(c.negative)}" style="margin-top:4px;">`;
+      <input type="text" data-xc="${c.id}" data-xf="negative" placeholder="전용 네거티브" value="${escA(c.negative)}" style="margin-top:4px;">
+      <details class="cast-advanced"${variant.group ? ' open' : ''}>
+        <summary>같은 캐릭터의 변형 묶음${variant.group ? ` · ${esc(variant.name || '기본 변형')}` : ''}</summary>
+        <div class="grid3" style="margin-top:7px;">
+          <div class="field"><label>묶음 ID</label>
+            <input type="text" data-xv="group" data-xci="${c.id}" value="${escA(variant.group||'')}" placeholder="비우면 독립 캐릭터"></div>
+          <div class="field"><label>변형 이름</label>
+            <input type="text" data-xv="name" data-xci="${c.id}" value="${escA(variant.name||'')}" placeholder="기본·교복·시대극 등"></div>
+          <label class="field"><span>전수 비교·fallback 후보</span>
+            <select data-xv="enabled" data-xci="${c.id}"><option value="on"${variant.enabled===false?'':' selected'}>사용</option>
+              <option value="off"${variant.enabled===false?' selected':''}>제외</option></select></label>
+        </div>
+        <p class="hint">같은 묶음에서 사용 가능한 변형이 하나도 없으면 첫 항목을 안전하게 사용합니다.</p>
+      </details>`;
     h.appendChild(el);
   });
   if(!shown.length){
@@ -14583,6 +15333,19 @@ function renderCharCards(){
     const c = (STATE.characters||[]).find(x => x.id === el.dataset.xc);
     if(c){ c[el.dataset.xf] = el.value; save(); }
   }));
+  h.querySelectorAll('[data-xv]').forEach(el => el.addEventListener('change', () => {
+    const c = (STATE.characters||[]).find(x => x.id === el.dataset.xci);
+    if(!c) return;
+    const variant = c.variant && typeof c.variant === 'object' ? c.variant : {};
+    if(el.dataset.xv === 'enabled') variant.enabled = el.value !== 'off';
+    else variant[el.dataset.xv] = el.value;
+    if(!String(variant.group || '').trim() && !String(variant.name || '').trim()){
+      delete c.variant;
+    }else{
+      c.variant = variant;
+    }
+    renderSlots(); save();
+  }));
   h.querySelectorAll('[data-xdup]').forEach(b => b.addEventListener('click', () => {
     const chars = STATE.characters || [];
     const at = chars.findIndex(x => x.id === b.dataset.xdup);
@@ -14596,6 +15359,17 @@ function renderCharCards(){
     while(names.has(name.toLocaleLowerCase())) name = `${root} ${serial++}`;
     cloned.id = genId();
     cloned.name = name;
+    const originalVariant = chars[at].variant && typeof chars[at].variant === 'object'
+      ? chars[at].variant : {};
+    const group = String(originalVariant.group || '').trim() || `variant-${chars[at].id || genId()}`;
+    chars[at].variant = Object.assign({}, originalVariant, {
+      group, name:String(originalVariant.name || '').trim() || '기본', enabled:originalVariant.enabled !== false
+    });
+    const siblings = chars.filter(item =>
+      String(((item.variant||{}).group)||'').trim() === group).length;
+    cloned.variant = Object.assign({}, cloned.variant || {}, {
+      group, name:`변형 ${siblings + 1}`, enabled:true
+    });
     chars.splice(at + 1, 0, cloned);
     renderLibrary(); renderSlots(); save();
     const input = document.querySelector(`[data-xc="${cloned.id}"][data-xf="name"]`);
@@ -14718,7 +15492,8 @@ function openLib(it){
     ${sourceUrl?`<a href="${escA(sourceUrl)}" target="_blank">원본 게시글 ↗</a>`:''}</div>`);
   $('libTake').addEventListener('click', () => {
     if(it.kind === '캐릭터'){
-      (STATE.char_slots = STATE.char_slots||[]).push({name:it.ref.name||'', prompt:it.ref.female||'', negative:it.ref.negative||''});
+      (STATE.char_slots = STATE.char_slots||[]).push(characterBundle(it.ref||{}, true));
+      autoCoordsOnSecond();
       renderSlots(); tokens(); save();
       $('modalFlash').textContent = '왼쪽 캐릭터 칸에 추가됨 ✓';
     } else {
@@ -15456,13 +16231,16 @@ async function inspectImages(files){
   flash(`${ok}개 추출 완료${fail ? `, ${fail}개는 생성 정보가 없었습니다` : ''}`);
   if(ok){
     if($('comboList')){ $('comboQ').value = ''; $('comboSrc').value = '내 이미지'; await loadCombos(false); }
-    /* 한 장이면 **읽은 내용을 보여 준 뒤** 넣고, 여러 장이면 마지막 것을 바로 넣는다.
+    /* 한 장이면 **읽은 내용을 보여 준 뒤** 넣고, 여러 장은 자료로만 수집한다.
        ⚠ 예전 주석은 "무엇을 가져올지 고르게 한다(SDStudio 의 항목별 적용)" 였는데
          **지금은 고르는 길이 없다.** 그림체는 베이스+네거티브+생성 설정이 한 덩어리라
          쪼개 넣으면 원래 그림이 재현되지 않아서다(`29cf044` 에서 없앴다).
          `openApplyPicker` 는 **읽기 전용 요약 + `통째로 적용` 단추 하나**뿐이다
          (실측: 항목별 체크박스 0개 · 단추 1개). 낡은 설명이 남아 있어 바로잡는다. */
-    if(last) (imgs.length === 1 ? openApplyPicker(last) : applyStyle(last));
+    if(last && imgs.length === 1) openApplyPicker(last);
+    if(imgs.length > 1){
+      flash(`${ok}개를 자료실에 정리했습니다${fail ? ` · ${fail}개 미인식` : ''} · 현재 생성 설정은 바꾸지 않았습니다.`);
+    }
   }
   return ok;
 }
@@ -16487,10 +17265,8 @@ $('modalSave').addEventListener('click', async () => {
         let used = false;
         if(($('bldUseNow') || {}).checked){
           const c = r.characters[r.characters.length - 1] || {};
-          (STATE.char_slots = STATE.char_slots || []).push({
-            name:c.name || name, prompt:c.female || composed, outfit:'',
-            negative:c.negative || negative, enabled:true
-          });
+          (STATE.char_slots = STATE.char_slots || []).push(characterBundle(
+            Object.assign({name, female:composed, negative}, c), true));
           autoCoordsOnSecond();
           used = true;
           save();
@@ -16891,6 +17667,7 @@ def normalize_cast_presets(value):
             raise ValueError("cast preset must be an object")
         preset_id = preset.get("id")
         name = preset.get("name")
+        mode = preset.get("mode", "sequence")
         members = preset.get("members")
         if (not isinstance(preset_id, str) or not preset_id
                 or len(preset_id) > 120
@@ -16901,26 +17678,59 @@ def normalize_cast_presets(value):
         folded_name = name.strip().casefold()
         if preset_id in seen_ids or folded_name in seen_names:
             raise ValueError("duplicate cast preset")
+        if mode not in ("sequence", "together"):
+            raise ValueError("invalid cast preset mode")
         if not isinstance(members, list) or not members or len(members) > 64:
             raise ValueError("cast preset must contain 1 to 64 members")
         clean_members = []
         for member in members:
             if not isinstance(member, dict):
                 raise ValueError("cast member must be an object")
-            if set(member) - {"name", "prompt", "negative"}:
+            required_text = ("name", "prompt", "negative")
+            optional_text = ("id", "outfit", "source_id")
+            list_fields = ("reference_ids", "vibe_ids")
+            object_fields = ("variant", "position")
+            allowed = set(required_text + optional_text + list_fields + object_fields)
+            if set(member) - allowed:
                 raise ValueError("unknown cast member fields")
             clean = {}
-            for field in ("name", "prompt", "negative"):
+            for field in required_text:
                 text = member.get(field, "")
                 if not isinstance(text, str):
                     raise ValueError("cast member fields must be strings")
                 clean[field] = text
+            for field in optional_text:
+                if field not in member:
+                    continue
+                text = member[field]
+                if not isinstance(text, str):
+                    raise ValueError("cast member fields must be strings")
+                clean[field] = text
+            for field in list_fields:
+                if field not in member:
+                    continue
+                items = member[field]
+                if not isinstance(items, list) or len(items) > 64:
+                    raise ValueError("cast member references must be lists")
+                if any(not isinstance(item, str) for item in items):
+                    raise ValueError("cast member reference ids must be strings")
+                clean[field] = list(items)
+            for field in object_fields:
+                if field not in member:
+                    continue
+                item = member[field]
+                if not isinstance(item, dict):
+                    raise ValueError("cast member variant and position must be objects")
+                clean[field] = copy.deepcopy(item)
             clean_members.append(clean)
-        result.append({
+        clean_preset = {
             "id": preset_id,
             "name": name.strip(),
             "members": clean_members,
-        })
+        }
+        if "mode" in preset:
+            clean_preset["mode"] = mode
+        result.append(clean_preset)
         seen_ids.add(preset_id)
         seen_names.add(folded_name)
     return result
@@ -17749,6 +18559,14 @@ class ConfigServer:
             "scene_presets": list_scene_presets(),
             "startup_recovery": STARTUP_RECOVERY_NOTICE,
         }
+
+    def snapshot_blueprint(self):
+        """현재 화면값의 파생 설계도. 토큰과 전체 사용자 자료는 포함하지 않는다."""
+        with self.config_lock:
+            return {
+                "ok": True,
+                "blueprint": generation_blueprint(self.cfg),
+            }
 
     def handle_generate_one(self):
         """① 설정만으로 단독 1장 생성 (세팅 무관 — NAI 기본 생성처럼)"""
@@ -18821,7 +19639,7 @@ class ConfigServer:
         if not self.cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요 (pst-... 형식)."}
         has_slot = any(slot_prompt(s).strip() for s in self.cfg.get("char_slots", []))
-        has_cast = any(strip_comment_lines(c.get("prompt") or "").strip()
+        has_cast = any(slot_prompt(c).strip()
                        for st in (self.cfg.get("setting_state") or {}).values()
                        for c in st.get("cast", []))
         if not (has_slot or has_cast):
@@ -18885,6 +19703,11 @@ class ConfigServer:
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
+                elif self.path.startswith("/api/blueprint"):
+                    try:
+                        self._json(server.snapshot_blueprint())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
                 elif self.path.startswith("/api/trash"):
@@ -19395,17 +20218,20 @@ class ConfigServer:
                         if not scene:
                             self._json({"ok": False, "error": f"{num}번 씬이 없습니다."}); return
                         cast = None
-                        for c in (setting_state(cfg, scene.get("_setting", "")).get("cast") or []):
-                            if strip_comment_lines(c.get("prompt") or "").strip():
-                                cast = {"name": c.get("name") or "전용 캐스트",
-                                        "female": c.get("prompt"), "negative": c.get("negative", "")}
-                                break
+                        scene_state = setting_state(cfg, scene.get("_setting", ""))
+                        cast_members = [
+                            c for c in setting_cast_members(cfg, scene_state)
+                            if slot_prompt(c).strip()
+                        ]
+                        if cast_members:
+                            used_members = (
+                                cast_members if scene_state.get("cast_mode") == "together"
+                                else cast_members[:1])
+                            cast = character_run_from_group(used_members)
                         if cast is None:
                             slots = [s for s in (cfg.get("char_slots") or [])
                                      if slot_prompt(s).strip()]
-                            cast = ({"name": slots[0].get("name") or "캐릭터 1",
-                                     "female": slot_prompt(slots[0]),
-                                     "negative": slots[0].get("negative", "")}
+                            cast = (character_run_from_group(slots)
                                     if slots else {"name": "(캐릭터 없음)", "female": "", "negative": ""})
                         base, fem, male, cneg, mneg, w, h = build_scene(acfg, cast, cfg, num)
                         _, scene_ref_override, scene_ref_names = \
@@ -19612,7 +20438,7 @@ class ConfigServer:
                             cur = load_picks()
                             for k in (
                                 "picked", "fav", "folders", "ranks",
-                                "ratings", "tags",
+                                "ratings", "elo", "elo_matches", "tags",
                             ):
                                 if k in d:
                                     cur[k] = d[k]
@@ -19643,6 +20469,12 @@ class ConfigServer:
                                     if k not in gone}
                                 picks["ratings"] = {
                                     k: v for k, v in picks.get("ratings", {}).items()
+                                    if k not in gone}
+                                picks["elo"] = {
+                                    k: v for k, v in picks.get("elo", {}).items()
+                                    if k not in gone}
+                                picks["elo_matches"] = {
+                                    k: v for k, v in picks.get("elo_matches", {}).items()
                                     if k not in gone}
                                 picks["tags"] = {
                                     k: v for k, v in picks.get("tags", {}).items()
@@ -20043,30 +20875,26 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
     for num in scene_nums:
         sc = acfg["scenes"][str(num)]
         sname = sc.get("_setting", "")
-        cast = [c for c in setting_state(cfg, sname).get("cast", [])
-                if strip_comment_lines(c.get("prompt") or "").strip()]
+        scene_setting_state = setting_state(cfg, sname)
+        cast = [c for c in setting_cast_members(cfg, scene_setting_state)
+                if slot_prompt(c).strip()]
         # 두 목록의 뜻이 다르다 (UI 문구 그대로):
         #   세팅 전용 캐스트 = "각자 따로 전체 씬 생성" → 인원수만큼 벌이 늘어난다
         #   ① 설정의 캐릭터 칸 = "한 그림에 함께 들어갈 인물" → 늘어나지 않는다.
         #     첫 칸이 주인공, 둘째 칸이 상대역이 된다 (단독 생성과 같은 규칙).
         if cast:
-            # 표시 이름이 같아도 각 캐스트는 별개 작업이다. index와 내용 fingerprint를 identity로 쓴다.
-            runs = [([c], f"{sname}\0cast\0{i}\0{c.get('id', '')}\0"
-                             f"{c.get('prompt', '')}\0{c.get('negative', '')}")
-                    for i, c in enumerate(cast)]
+            cast_mode = scene_setting_state.get("cast_mode")
+            if cast_mode == "together":
+                identity = "\0".join(slot_bundle_identity(c) for c in cast)
+                runs = [(cast, f"{sname}\0together\0{identity}")]
+            else:
+                # 표시 이름이 같아도 각 캐스트는 별개 작업이다. index와 내용 fingerprint를 identity로 쓴다.
+                runs = [([c], f"{sname}\0sequence\0{i}\0{slot_bundle_identity(c)}")
+                        for i, c in enumerate(cast)]
         else:
             runs = [(slots, None)] if slots else []
         for i, (group, identity) in enumerate(runs):
-            p = group[0]
-            partner = group[1] if len(group) > 1 else {}
-            char = {"name": p.get("name") or f"인물{i+1}", "female": slot_prompt(p),
-                    "negative": p.get("negative", ""),
-                    "male_prompt_base": slot_prompt(partner),
-                    "partner_negative": partner.get("negative", ""),
-                    # 셋째 칸부터는 '추가 인물' 로 그대로 보낸다 (세팅은 주인공+상대역
-                    # 2인 구조지만, 캐릭터 칸에 더 넣어 뒀으면 버리지 않는다)
-                    "extras": [{"prompt": slot_prompt(x), "negative": x.get("negative", "")}
-                               for x in group[2:]]}
+            char = character_run_from_group(group, i)
             cid = _safe_name(char["name"]).lower() or f"char{i+1}"
             if identity is not None:
                 digest = zlib.crc32(identity.encode("utf-8")) & 0xffffffff
@@ -20960,7 +21788,8 @@ def _run_generation(server):
             scene = acfg["scenes"][str(num)]
             # 씬에서 Reference를 따로 고른 경우에만 전역 활성 목록을 그 선택으로
             # 좁힌다. Vibe는 그대로 유지하고 캐릭터 Reference만 씬 범위를 따른다.
-            reference_cfg, _, _ = setting_reference_config(cfg, scene)
+            cast_cfg = character_resource_config(cfg, char)
+            reference_cfg, _, _ = setting_reference_config(cast_cfg, scene)
             params = runtime_generation_params(reference_cfg, token)
             char_label = char.get("name") or cid
             suffix = "" if copy == 1 else f"_{copy}벌"

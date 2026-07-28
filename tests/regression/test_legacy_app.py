@@ -235,8 +235,15 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('data-output="${output}"', page)
         self.assertIn("composeSelected('positive')", page)
         self.assertIn("composeSelected('negative')", page)
-        self.assertIn("negative:c.negative || negative", page)
+        self.assertIn("Object.assign({name, female:composed, negative}, c)", page)
         self.assertIn('id="bldUseNow" checked', page)
+        self.assertIn("function characterBundle(c, forSlot=true)", page)
+        self.assertIn("function characterVariantChoice(character)", page)
+        self.assertIn('data-xv="group"', page)
+        self.assertIn('data-xv="enabled"', page)
+        self.assertIn("outfit:c.clothed||c.outfit||''", page)
+        self.assertIn("characterBundle(it.ref||{}, true)", page)
+        self.assertIn("characterBundle(c, false)", page)
         self.assertIn("const hydrateSection = sec =>", page)
         self.assertIn("select._bldCandidates =", page)
         self.assertIn("if(body.classList.contains('hidden')) hydrateSection", page)
@@ -1279,6 +1286,29 @@ class RegressionTests(unittest.TestCase):
                 {"mode": "styles", "fixed_size": False}, cfg))
         self.assertEqual((no_lock["width"], no_lock["height"]), (1024, 1024))
 
+        variant_cfg = {
+            "characters": [
+                {"id": "base", "name": "Base", "female": "base",
+                 "variant": {"group": "hero", "name": "기본", "enabled": False}},
+                {"id": "dress", "name": "Dress", "female": "dress",
+                 "variant": {"group": "hero", "name": "드레스", "enabled": True}},
+                {"id": "solo", "name": "Solo", "female": "solo"},
+            ],
+        }
+        selected = APP.comparison_characters(variant_cfg)
+        self.assertEqual([item["id"] for item in selected], ["solo", "dress"])
+        variant_cfg["characters"][1]["variant"]["enabled"] = False
+        fallback = APP.comparison_characters(variant_cfg)
+        self.assertEqual([item["id"] for item in fallback], ["solo", "base"])
+        planned = APP.setting_cast_members(
+            variant_cfg, {"cast_source": "all_characters"})
+        self.assertEqual([item["id"] for item in planned], ["solo", "base"])
+        self.assertEqual(
+            APP.setting_cast_members(
+                variant_cfg, {"cast": [{"name": "manual"}]}),
+            [{"name": "manual"}],
+        )
+
     def test_comparison_keeps_coordinates_aligned_after_disabled_character(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["char_slots"] = [
@@ -1502,6 +1532,10 @@ class RegressionTests(unittest.TestCase):
         page = APP.render_page()
         for value in ("styles", "characters", "both"):
             self.assertIn(f'name="cmpMode" value="{value}"', page)
+        self.assertIn('id="cmpPlanAllChars"', page)
+        self.assertIn('id="cmpPlanManual"', page)
+        self.assertIn('data-castsource=', page)
+        self.assertIn("state.cast_source = 'all_characters'", page)
         self.assertIn('id="cmpFix" checked', page)
         self.assertIn("#cmpCustom.hidden{display:none;}", page)
         self.assertIn('id="cmpSameSeed" checked', page)
@@ -3025,20 +3059,33 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('.navcopy small', css)
         self.assertIn('.workspace-context', css)
         self.assertIn('--studio-rail: 196px', css)
+        self.assertIn("loadBlueprint()", page)
+        self.assertIn('id="blueprintPlan"', page)
+        self.assertIn('id="generateImportCard"', page)
+        self.assertIn("bindDropZone($('generateInspectDrop'), $('generateInspectFile'))", page)
+        self.assertEqual(page.count('id="mosaicCard"'), 1)
+        self.assertIn("mosaicHome.insertAdjacentElement('afterend', mosaicCard)", page)
+        self.assertEqual(page.count('id="studioManageNav"'), 1)
+        self.assertEqual(page.count('id="jobCenterCard"'), 1)
+        self.assertIn('data-manage-work="environment"', page)
+        self.assertIn('data-manage-work="jobs"', page)
+        self.assertIn("panel.dataset.managePanel !== manageWork", page)
+        self.assertIn("async function loadJobCenter()", page)
 
     def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
-        """비교 생성은 복제하지 않고 작업실/기존 화면 사이에서 같은 DOM을 옮겨야 한다."""
+        """비교 실험은 세팅 안에 두고 기존 화면에서도 같은 DOM 하나를 써야 한다."""
         page = APP.render_page()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
         ).read_text(encoding="utf-8")
         self.assertEqual(page.count('id="compareCard"'), 1)
-        for marker in ('id="compareClassicHome"', 'id="studioCompareHome"',
-                       'id="studioLibraryNav"', 'id="studioLibraryBrowse"'):
-            self.assertIn(marker, page)
-        self.assertIn("home.insertAdjacentElement('afterend', card)", page)
-        self.assertIn("STATE.ui.library_work = button.dataset.libraryWork", page)
-        self.assertIn("document.body.dataset.mode !== 'library'", page)
+        self.assertIn('id="compareClassicHome"', page)
+        self.assertIn('data-settings-work="compare"', page)
+        self.assertNotIn('id="studioCompareHome"', page)
+        self.assertNotIn('id="studioLibraryNav"', page)
+        self.assertIn("classicHome.insertAdjacentElement('afterend', card)", page)
+        self.assertIn("compare: card", page)
+        self.assertIn("STATE.ui.settings_work = 'compare'", page)
         self.assertIn("arrangeStudioWorkspace();", page)
         self.assertIn('.studio-subnav-actions button.on', css)
 
@@ -3057,6 +3104,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(page.count(marker), 1)
             self.assertIn(marker, settings_view)
         self.assertIn("STATE.ui.settings_work = next", page)
+        self.assertIn("settingsCard.classList.toggle('hidden', studio && key !== settingsWork)", page)
         self.assertIn("settingsCard.classList.toggle('hidden', studio && key !== settingsWork)", page)
         self.assertIn("settingsNav.classList.toggle('hidden', !studio)", page)
         self.assertIn("$('sbEmpty').classList.toggle('hidden', !!st)", page)
@@ -3681,6 +3729,24 @@ class RegressionTests(unittest.TestCase):
         ):
             self.assertEqual(len(sent[key]), 2, key)
 
+        cfg = {
+            "vibes": [
+                {"id": "v1", "name": "first", "enabled": True},
+                {"id": "v2", "name": "second", "enabled": False},
+            ],
+            "char_refs": [
+                {"id": "r1", "name": "first", "enabled": True},
+                {"id": "r2", "name": "second", "enabled": False},
+            ],
+        }
+        scoped = APP.character_resource_config(
+            cfg, {"vibe_ids": ["v2"], "reference_ids": ["r2"]})
+        self.assertEqual([item["id"] for item in scoped["vibes"]], ["v2"])
+        self.assertEqual([item["id"] for item in scoped["char_refs"]], ["r2"])
+        self.assertTrue(scoped["vibes"][0]["enabled"])
+        self.assertTrue(scoped["char_refs"][0]["enabled"])
+        self.assertEqual(APP.character_resource_config(cfg, {}), cfg)
+
     def test_metadata_cleaning_removes_png_text_and_alpha_lsb(self):
         source = io.BytesIO()
         image = Image.new("RGBA", (2, 2), (10, 20, 30, 255))
@@ -3954,7 +4020,8 @@ class RegressionTests(unittest.TestCase):
             "use": True,
             "selected": ["group"],
             "cast": [
-                {"name": "same", "prompt": "one", "negative": ""},
+                {"name": "same", "prompt": "one", "outfit": "red dress",
+                 "negative": "bad hands"},
                 {"name": "same", "prompt": "two", "negative": ""},
             ],
         }
@@ -3965,10 +4032,31 @@ class RegressionTests(unittest.TestCase):
             pending = APP.compute_pending(cfg, acfg, {}, set())
             self.assertEqual(len(pending), 2)
             self.assertNotEqual(pending[0][1], pending[1][1])
+            self.assertEqual(pending[0][0]["female"], "one, red dress")
+            self.assertEqual(pending[0][0]["negative"], "bad hands")
             done = {pending[0][1]: {(1, 1)}}
             remaining = APP.compute_pending(cfg, acfg, done, set())
             self.assertEqual([(x[1], x[2], x[3]) for x in remaining],
                              [(pending[1][1], 1, 1)])
+            changed = copy.deepcopy(state)
+            changed["cast"][0]["outfit"] = "blue dress"
+            with patch.object(APP, "setting_state", return_value=changed):
+                changed_pending = APP.compute_pending(cfg, acfg, {}, set())
+            self.assertNotEqual(changed_pending[0][1], pending[0][1])
+
+            together = copy.deepcopy(state)
+            together["cast_mode"] = "together"
+            together["cast"][0]["position"] = {"x": 0.2, "y": 0.3}
+            together["cast"][0]["reference_ids"] = ["ref-a"]
+            together["cast"][1]["vibe_ids"] = ["vibe-b"]
+            with patch.object(APP, "setting_state", return_value=together):
+                combined = APP.compute_pending(cfg, acfg, {}, set())
+            self.assertEqual(len(combined), 1)
+            self.assertEqual(combined[0][0]["female"], "one, red dress")
+            self.assertEqual(combined[0][0]["male_prompt_base"], "two")
+            self.assertEqual(combined[0][0]["centers"][0], {"x": 0.2, "y": 0.3})
+            self.assertEqual(combined[0][0]["reference_ids"], ["ref-a"])
+            self.assertEqual(combined[0][0]["vibe_ids"], ["vibe-b"])
 
     def test_token_preview_expands_fragments_without_advancing_counters(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
@@ -4139,6 +4227,13 @@ class RegressionTests(unittest.TestCase):
                     },
                     "ranks": {},
                     "ratings": {"a.webp": 9, "b.webp": 0, "bad.webp": "bad"},
+                    "elo": {
+                        "a.webp": 1042.25, "high.webp": 9999,
+                        "bad.webp": "not-a-number",
+                    },
+                    "elo_matches": {
+                        "a.webp": 4, "huge.webp": 9999999, "bad.webp": -1,
+                    },
                     "tags": {"a.webp": raw_tags, "empty.webp": ["", " "]},
                 })
                 loaded = APP.load_picks()
@@ -4150,6 +4245,10 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(
                 loaded["folders"]["x" * 40], ["c.webp", "d.webp"])
             self.assertEqual(loaded["ratings"], {"a.webp": 5})
+            self.assertEqual(
+                loaded["elo"], {"a.webp": 1042.2, "high.webp": 3000.0})
+            self.assertEqual(
+                loaded["elo_matches"], {"a.webp": 4, "huge.webp": 1000000})
             self.assertEqual(len(loaded["tags"]["a.webp"]), 12)
             self.assertTrue(all(
                 len(tag) <= 40 for tag in loaded["tags"]["a.webp"]))
@@ -4160,9 +4259,13 @@ class RegressionTests(unittest.TestCase):
         for element_id in (
             "expGroupFilter", "expGroupName", "expGroupSave",
             "expGroupDelete", "expRate", "expTagInput", "expTagSave",
+            "expElo",
         ):
             self.assertIn(f'id="{element_id}"', page)
         self.assertIn("ratings:EXP.ratings || {}", page)
+        self.assertIn("elo:EXP.elo || {}", page)
+        self.assertIn("elo_matches:EXP.elo_matches || {}", page)
+        self.assertIn("블라인드 ELO", page)
         self.assertIn("tags:EXP.tags || {}", page)
         self.assertIn("folders:EXP.folders || {}", page)
         self.assertIn("원본 파일은 이동하지 않습니다.", page)
@@ -4959,15 +5062,27 @@ class RegressionTests(unittest.TestCase):
         presets = [{
             "id": "cast-fixture-1",
             "name": "주역 둘",
+            "mode": "together",
             "members": [
-                {"name": "첫째", "prompt": long_prompt, "negative": "bad hands"},
+                {"id": "char-1", "name": "첫째", "prompt": long_prompt,
+                 "outfit": "red dress, artistic variation",
+                 "negative": "bad hands", "variant": {"group": "uniform"},
+                 "reference_ids": ["ref-1"], "vibe_ids": ["vibe-1"]},
                 {"name": "둘째", "prompt": "second whole prompt", "negative": ""},
             ],
         }]
         ok, used, fixed = APP.validate_config_value(
             "cast_presets", presets, [])
         self.assertTrue(ok)
+        self.assertEqual(used[0]["mode"], "together")
         self.assertEqual(used[0]["members"][0]["prompt"], long_prompt)
+        self.assertEqual(
+            used[0]["members"][0]["outfit"],
+            "red dress, artistic variation",
+        )
+        self.assertEqual(used[0]["members"][0]["reference_ids"], ["ref-1"])
+        self.assertEqual(used[0]["members"][0]["vibe_ids"], ["vibe-1"])
+        self.assertEqual(used[0]["members"][0]["variant"], {"group": "uniform"})
         self.assertEqual(fixed, {})
 
         for invalid in (
@@ -4989,7 +5104,8 @@ class RegressionTests(unittest.TestCase):
         page = APP.render_page()
         for marker in (
                 "cast_presets", "data-castpreset=", "data-castload=",
-                "data-castsave=", "data-castpresetdel=",
+                "data-castsave=", "data-castpresetdel=", "data-castmode=",
+                "data-cresource=", "data-cpos=", "함께 등장 — 한 장에 여러 명",
                 "캐릭터 조합만 저장하며 세팅·장면·생성 설정은 바꾸지 않습니다."):
             self.assertIn(marker, page)
 
