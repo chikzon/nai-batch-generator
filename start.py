@@ -6953,6 +6953,79 @@ def spread_centers(n):
     return out
 
 
+def normalize_scene_centers(value):
+    """씬 파일에 저장할 캐릭터 위치를 검증한다.
+
+    빈 목록은 '이 씬에서는 전역 위치 설정을 따른다'는 뜻이다. 좌표가 켜진
+    씬은 NAI가 받는 0..1 범위의 x/y 쌍만 보존하며, 잘못된 자료를 조용히
+    일부만 저장하지 않고 요청 전체를 거절한다.
+    """
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError("캐릭터 위치는 목록이어야 합니다.")
+    out = []
+    for i, center in enumerate(value[:MAX_CHARS]):
+        if not isinstance(center, dict):
+            raise ValueError(f"{i + 1}번 캐릭터 위치 형식이 잘못되었습니다.")
+        try:
+            x = float(center["x"])
+            y = float(center["y"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ValueError(f"{i + 1}번 캐릭터 위치는 x/y 숫자가 필요합니다.")
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"{i + 1}번 캐릭터 위치는 유한한 숫자여야 합니다.")
+        if not (0 <= x <= 1 and 0 <= y <= 1):
+            raise ValueError(f"{i + 1}번 캐릭터 위치는 0~1 범위여야 합니다.")
+        out.append({"x": round(x, 4), "y": round(y, 4)})
+    return out
+
+
+def setting_scene_people(scene, female, male, char_negative, male_negative,
+                         char, cfg):
+    """세팅 배치 한 장의 인물과 위치를 같은 순서로 만든다.
+
+    씬 전용 위치가 있으면 그것이 우선이고, 없으면 기존 전역 위치 설정을
+    따른다. 추가 인물까지 포함해 NAI 상한에서 함께 자르므로 프롬프트와
+    좌표의 인덱스가 어긋나지 않는다.
+    """
+    people = [{"prompt": female, "negative": char_negative}]
+    if male:
+        people.append({"prompt": male, "negative": male_negative})
+    extras = [e for e in (char.get("extras") or []) if isinstance(e, dict)]
+    for extra in extras:
+        prompt = strip_comment_lines(extra.get("prompt") or "")
+        if prompt.strip():
+            people.append({
+                "prompt": prompt,
+                "negative": strip_comment_lines(extra.get("negative") or ""),
+            })
+    people = people[:MAX_CHARS]
+
+    explicit = normalize_scene_centers(scene.get("char_centers"))
+    use_positions = bool(explicit) or bool(cfg.get("use_coords"))
+    if not use_positions:
+        return people, [], False
+
+    defaults = spread_centers(len(people))
+    if explicit:
+        centers = list(explicit)
+    else:
+        centers = normalize_scene_centers(cfg.get("char_centers") or [])
+    for i in range(len(centers), len(people)):
+        extra_index = i - (2 if male else 1)
+        extra_center = (
+            extras[extra_index].get("center")
+            if 0 <= extra_index < len(extras) else None
+        )
+        try:
+            center = normalize_scene_centers([extra_center])[0] if extra_center else defaults[i]
+        except ValueError:
+            center = defaults[i]
+        centers.append(center)
+    return people, centers[:len(people)], True
+
+
 def _i2i_fields(i2i, action, seed):
     """img2img · 인페인트 전용 필드. 일반 생성이면 아무것도 안 넣는다."""
     if action == "generate" or not i2i.get("image"):
@@ -15305,13 +15378,44 @@ $('bNorm').addEventListener('click', () => {
 /* ── 씬/옵션 편집 모달 ── */
 async function openScene(setName, ids){
   window._mm = 'scene';
+  window._sceneSetting = setName;
+  window._sceneUndo = null;
   const st = SETTINGS.find(s => s.name === setName) || {};
-  const r = await (await fetch('/api/scenes?ids=' + ids.join(','))).json();
+  const r = await (await fetch('/api/scenes?setting=' + encodeURIComponent(setName)
+    + '&ids=' + ids.join(','))).json();
   if(!r.ok || !r.scenes.length){ alert('불러오기 실패'); return; }
   $('modalTitle').textContent = `${setName} · ${r.scenes[0].name}${ids.length>1?` 외 ${ids.length}단계`:''}`;
   const f = (id,k,l,v) => `<div class="field"><label>${l}</label><textarea data-sid="${id}" data-sk="${k}" style="min-height:42px;">${esc(v||'')}</textarea></div>`;
+  const pos = s => {
+    const mode = s.mode || st.mode || '단독';
+    const count = mode === '단독' ? 1 : 2;
+    const saved = Array.isArray(s.char_centers) ? s.char_centers : [];
+    const defaults = count === 1
+      ? [{x:.5,y:.5}] : [{x:.3,y:.5},{x:.7,y:.5}];
+    const labels = mode === '남녀' ? ['여성','남성'] : ['주인공','상대역'];
+    const rows = Array.from({length:count}, (_, i) => {
+      const c = saved[i] || defaults[i];
+      return `<div class="filterbar" style="margin:4px 0 0;">
+        <b style="min-width:48px;">${labels[i]}</b>
+        <label class="hint">가로 <input type="number" data-scenter="${s.id}" data-ci="${i}"
+          data-axis="x" value="${Number(c.x).toFixed(2)}" min="0" max="1" step="0.05"
+          style="width:68px;"${saved.length?'':' disabled'}></label>
+        <label class="hint">세로 <input type="number" data-scenter="${s.id}" data-ci="${i}"
+          data-axis="y" value="${Number(c.y).toFixed(2)}" min="0" max="1" step="0.05"
+          style="width:68px;"${saved.length?'':' disabled'}></label>
+      </div>`;
+    }).join('');
+    return `<div class="field" style="border:1px solid var(--line);padding:10px;">
+      <label style="display:flex;align-items:center;gap:7px;color:var(--text);">
+        <input type="checkbox" data-posuse="${s.id}" style="width:16px;height:16px;flex:none;accent-color:var(--accent);"${saved.length?' checked':''}>
+        이 씬에서 캐릭터 위치를 따로 지정</label>
+      <div class="hint">끄면 기본 생성 위치를 그대로 쓰며, 켜면 이 씬에만 저장됩니다.</div>
+      ${rows}
+      <button type="button" data-posspread="${s.id}" style="margin-top:6px;"${saved.length?'':' disabled'}>
+        인물을 고르게 배치</button>
+    </div>`;
+  };
   $('modalBody').innerHTML = r.scenes.map(s => {
-    /* 씬 모드에는 있는데 세팅에서 못 고치던 것들 — 해상도 프리셋 · 씬 전용 네거티브 */
     const isPreset = RES_PRESETS.some(r => r.w === s.width && r.h === s.height);
     let x = `<div class="row"><div class="tag">#${s.id} · ${esc(s.name)}
       <button data-preview="${s.id}" style="float:right;">🔍 최종 프롬프트 보기</button></div>
@@ -15323,16 +15427,17 @@ async function openScene(setName, ids){
           <option value=""${isPreset?'':' selected'}>직접 입력…</option>
         </select>
         <input type="number" data-sid="${s.id}" data-sk="width" value="${s.width||832}"
-          min="64" max="2048" step="64" title="가로" style="width:58px;text-align:center;">
+          min="64" max="2048" step="64" title="가로" style="width:74px;text-align:center;">
         <input type="number" data-sid="${s.id}" data-sk="height" value="${s.height||1216}"
-          min="64" max="2048" step="64" title="세로" style="width:58px;text-align:center;">
+          min="64" max="2048" step="64" title="세로" style="width:74px;text-align:center;">
       </div>`;
     if(st.mode === '백합'){ x += f(s.id,'base_tags','장면 공통',s.base_tags) + f(s.id,'female_prompt','주인공 쪽',s.female_prompt) + f(s.id,'partner_prompt','상대역 쪽',s.partner_prompt); }
     else if(st.mode === '단독'){ x += f(s.id,'female_prompt','프롬프트',s.female_prompt); }
     else { x += f(s.id,'female_prompt','여성 쪽',s.female_prompt) + f(s.id,'male_prompt','남성 (장면)',s.male_prompt); }
     return x + f(s.id, 'negative', '이 씬 전용 네거티브 (선택 · 기본 네거티브 뒤에 붙습니다)', s.negative)
-             + `<div class="hint" id="pv-${s.id}"></div></div>`;
-  }).join('');
+             + pos(s) + `<div class="hint" id="pv-${s.id}"></div></div>`;
+  }).join('') + `<div class="bar"><button type="button" id="sceneUndo" disabled>↶ 방금 저장 되돌리기</button>
+    <span class="hint">세팅 파일은 저장할 때마다 마지막 정상본을 백업합니다.</span></div>`;
   $('modalBody').querySelectorAll('[data-preview]').forEach(b =>
     b.addEventListener('click', () => scenePreview(b.dataset.preview)));
   /* 해상도 프리셋 → 숫자칸 채우기 (저장은 숫자칸 값으로 나간다) */
@@ -15344,6 +15449,34 @@ async function openScene(setName, ids){
       box.querySelector('[data-sk="width"]').value = w;
       box.querySelector('[data-sk="height"]').value = h;
     }));
+  $('modalBody').querySelectorAll('[data-posuse]').forEach(box =>
+    box.addEventListener('change', () => {
+      const sid = box.dataset.posuse;
+      $('modalBody').querySelectorAll(`[data-scenter="${sid}"],[data-posspread="${sid}"]`)
+        .forEach(el => el.disabled = !box.checked);
+    }));
+  $('modalBody').querySelectorAll('[data-posspread]').forEach(btn =>
+    btn.addEventListener('click', () => {
+      const sid = btn.dataset.posspread;
+      const xs = $('modalBody').querySelectorAll(`[data-scenter="${sid}"][data-axis="x"]`);
+      const ys = $('modalBody').querySelectorAll(`[data-scenter="${sid}"][data-axis="y"]`);
+      const vals = xs.length === 1 ? [.5] : [.3,.7];
+      xs.forEach((el,i) => el.value = vals[i] ?? .5);
+      ys.forEach(el => el.value = .5);
+    }));
+  $('sceneUndo').addEventListener('click', async () => {
+    const last = window._sceneUndo;
+    if(!last) return;
+    const back = await (await fetch('/api/scene_save', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        setting:last.setting, updates:last.before, expect_revision:last.revision
+      })})).json();
+    if(!back.ok){ $('modalFlash').textContent = back.error || '되돌리기 실패'; return; }
+    $('modalFlash').textContent = '방금 저장한 내용을 되돌렸습니다.';
+    $('sceneUndo').disabled = true;
+    window._sceneUndo = null;
+    await openScene(setName, ids);
+  });
   $('modalFlash').textContent = ''; $('modalBg').style.display = 'flex';
 }
 
@@ -15361,9 +15494,13 @@ async function scenePreview(num){
   const box = (label, val, tok) => val ? `<div class="field" style="margin-top:6px;">
       <label>${label}${tok != null ? ` <span class="hint">${tok} 토큰</span>` : ''}</label>
       <textarea readonly style="min-height:44px;">${esc(val)}</textarea></div>` : '';
+  const posText = r.use_positions
+    ? (r.char_centers || []).map((c,i) => `${i+1}: (${Number(c.x).toFixed(2)}, ${Number(c.y).toFixed(2)})`).join(' · ')
+    : '자동 배치';
   host.innerHTML = `<div class="row" style="margin:8px 0 0;background:var(--paper2);">
     <div class="tag">실제 전송값 · ${esc(r.setting)}(${esc(r.mode)}) · 캐스트 ${esc(r.cast)}
       · ${r.width}×${r.height} · 시드 ${r.seed}</div>
+    <div class="hint">캐릭터 ${r.people}명 · 위치 ${esc(posText)}</div>
     ${box('베이스 (그림체 + 장소 + 시간대)', r.base, r.tokens.base)}
     ${box('캐릭터 1 (주인공 + 씬 + 표정아크)', r.female, r.tokens.female)}
     ${box('캐릭터 2 (상대역 + 옷단계 + 씬)', r.male, r.tokens.male)}
@@ -15456,14 +15593,32 @@ $('modalSave').addEventListener('click', async () => {
   }
   if(m === 'scene'){
     const u = {};
-    /* textarea 뿐 아니라 숫자칸(해상도)도 함께 모은다. `_res` 셀렉트는 보내지 않는다
-       (그건 숫자칸을 채우는 도우미일 뿐이다). */
+    /* 프롬프트·해상도와 씬 전용 위치를 한 요청으로 저장한다. */
     $('modalBody').querySelectorAll('[data-sid]').forEach(t => {
       if(t.dataset.sk === '_res') return;
       (u[t.dataset.sid] = u[t.dataset.sid]||{})[t.dataset.sk] = t.value;
     });
-    const r = await (await fetch('/api/scene_save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({updates:u})})).json();
-    $('modalFlash').textContent = r.ok ? `저장됨 ✓ ${r.updated}씬` : (r.error||'실패');
+    $('modalBody').querySelectorAll('[data-posuse]').forEach(box => {
+      const sid = box.dataset.posuse;
+      const centers = [];
+      if(box.checked){
+        $('modalBody').querySelectorAll(`[data-scenter="${sid}"]`).forEach(input => {
+          const i = Number(input.dataset.ci);
+          centers[i] = centers[i] || {};
+          centers[i][input.dataset.axis] = Number(input.value);
+        });
+      }
+      (u[sid] = u[sid] || {}).char_centers = centers;
+    });
+    const r = await (await fetch('/api/scene_save', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+        setting:window._sceneSetting, updates:u
+      })})).json();
+    if(r.ok){
+      window._sceneUndo = {setting:r.setting, before:r.before, revision:r.revision};
+      if($('sceneUndo')) $('sceneUndo').disabled = !r.fields;
+      $('modalFlash').textContent = `저장됨 ✓ ${r.updated}씬 · ${r.fields}항목`;
+    } else $('modalFlash').textContent = r.error || '실패';
     return;
   }
   if(m === 'style' || m === 'char'){
@@ -17488,41 +17643,82 @@ class ConfigServer:
 
     @serialized_setting_write
     def handle_scene_save(self, body):
-        """씬 내부 프롬프트 수정 → asset_config.json 에 저장 (생성 중이면 다음 장부터 반영)"""
+        """한 세팅의 씬 내부 값을 원자적으로 저장한다.
+
+        씬 번호는 다른 세팅에도 존재할 수 있으므로 이름으로 파일을 먼저
+        고정한다. expect_revision은 편집 뒤 다른 저장이 끼어든 상태에서
+        되돌리기가 새 내용을 덮는 것을 막는다.
+        """
         try:
             data = json.loads(body)
+            setting = str(data.get("setting") or "").strip()
+            if not setting:
+                return {"ok": False, "error": "수정할 세팅 이름이 없습니다."}
+            path = setting_path(setting)
+            if not path:
+                return {"ok": False, "error": f"'{setting}' 세팅을 찾을 수 없습니다."}
             updates = data.get("updates") or {}
-            # 씬 모드에 있는 것 중 세팅에서 못 고치던 것들도 열었다:
-            #   negative(씬 전용 네거티브) · width/height(해상도)
+            if not isinstance(updates, dict):
+                return {"ok": False, "error": "씬 수정 내용의 형식이 잘못되었습니다."}
             allowed = ("female_prompt", "male_prompt", "partner_prompt", "base_tags",
-                       "negative", "width", "height")
-            NUMS = ("width", "height")
-            n = 0
-            for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
-                try:
-                    pack = load_json_recover(p)
-                except Exception:
+                       "negative", "width", "height", "char_centers")
+            pack = load_json_recover(path)
+            raw_revision = json.dumps(
+                pack, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), default=str).encode("utf-8")
+            revision = hashlib.sha256(raw_revision).hexdigest()
+            expected = str(data.get("expect_revision") or "")
+            if expected and expected != revision:
+                return {"ok": False, "conflict": True,
+                        "error": "다른 저장이 먼저 반영되어 되돌리지 않았습니다. 다시 열어 확인해주세요."}
+
+            scenes = pack.get("씬") or {}
+            prepared = {}
+            before = {}
+            for sid, fields in updates.items():
+                sid = str(sid)
+                sc = scenes.get(sid)
+                if not isinstance(sc, dict) or not isinstance(fields, dict):
                     continue
-                scenes = pack.get("씬") or {}
-                changed = False
-                for sid, fields in updates.items():
-                    sc = scenes.get(str(sid))
-                    if not sc or not isinstance(fields, dict):
+                clean = {}
+                old = {}
+                for key in allowed:
+                    if key not in fields:
                         continue
-                    for k in allowed:
-                        if k in fields:
-                            v = fields[k]
-                            if k in NUMS:
-                                try:
-                                    v = normalize_resolution(v)
-                                except (TypeError, ValueError, OverflowError):
-                                    continue
-                            sc[k] = v
-                    changed = True
-                    n += 1
-                if changed:
-                    atomic_write_json(p, pack)
-            return {"ok": True, "updated": n}
+                    value = fields[key]
+                    if key in ("width", "height"):
+                        value = normalize_resolution(value)
+                    elif key == "char_centers":
+                        value = normalize_scene_centers(value)
+                    elif not isinstance(value, str):
+                        raise ValueError(f"{key} 값은 문자열이어야 합니다.")
+                    clean[key] = value
+                    if key == "char_centers":
+                        old[key] = normalize_scene_centers(sc.get(key))
+                    else:
+                        old[key] = sc.get(key, "" if key not in ("width", "height") else value)
+                if clean:
+                    prepared[sid] = clean
+                    before[sid] = old
+
+            changed_scenes = 0
+            changed_fields = 0
+            for sid, fields in prepared.items():
+                scene_changed = False
+                for key, value in fields.items():
+                    if scenes[sid].get(key, [] if key == "char_centers" else "") != value:
+                        scenes[sid][key] = value
+                        changed_fields += 1
+                        scene_changed = True
+                changed_scenes += int(scene_changed)
+            if changed_fields:
+                atomic_write_json(path, pack)
+            after_revision = hashlib.sha256(json.dumps(
+                pack, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+            return {"ok": True, "updated": changed_scenes, "fields": changed_fields,
+                    "setting": setting, "before": before,
+                    "revision": after_revision}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -17863,17 +18059,35 @@ class ConfigServer:
                     q = parse_qs(urlparse(self.path).query)
                     ids = [x for x in (q.get("ids", [""])[0]).split(",") if x.strip().isdigit()]
                     try:
-                        ac = load_asset_config(server.cfg)
+                        setting_name = (q.get("setting", [""])[0] or "").strip()
+                        if setting_name:
+                            path = setting_path(setting_name)
+                            if not path:
+                                raise ValueError(f"'{setting_name}' 세팅을 찾을 수 없습니다.")
+                            pack = load_json_recover(path)
+                            source_scenes = pack.get("씬") or {}
+                            mode = pack.get("방식", "단독")
+                        else:
+                            ac = load_asset_config(server.cfg)
+                            source_scenes = ac["scenes"]
+                            mode = ""
                         out = []
                         for i in ids:
-                            sc = ac["scenes"].get(i)
+                            sc = source_scenes.get(i)
                             if sc:
                                 out.append({"id": int(i), "name": sc.get("name", ""),
+                                            "setting": setting_name or sc.get("_setting", ""),
+                                            "mode": mode or sc.get("_mode", ""),
                                             "female_prompt": sc.get("female_prompt", ""),
                                             "male_prompt": sc.get("male_prompt", ""),
                                             "partner_prompt": sc.get("partner_prompt", ""),
                                             "base_tags": sc.get("base_tags", ""),
-                                            "pair": sc.get("pair", "")})
+                                            "pair": sc.get("pair", ""),
+                                            "negative": sc.get("negative", ""),
+                                            "width": sc.get("width", 832),
+                                            "height": sc.get("height", 1216),
+                                            "char_centers": normalize_scene_centers(
+                                                sc.get("char_centers"))})
                         self._json({"ok": True, "scenes": out})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
@@ -18050,6 +18264,9 @@ class ConfigServer:
                                      "negative": slots[0].get("negative", "")}
                                     if slots else {"name": "(캐릭터 없음)", "female": "", "negative": ""})
                         base, fem, male, cneg, mneg, w, h = build_scene(acfg, cast, cfg, num)
+                        preview_people, preview_centers, preview_use_positions = \
+                            setting_scene_people(
+                                scene, fem, male, cneg, mneg, cast, cfg)
                         seed = seed_for(cfg, load_state()["seeds"].get(
                             f"{int(cfg.get('seed', 1) or 1):02d}", 0), num)
                         self._json({"ok": True, "num": num, "name": scene.get("name", ""),
@@ -18067,6 +18284,9 @@ class ConfigServer:
                                         (scene.get("negative") or "").strip())),
                                     "char_negative": normalize_prompt(cneg),
                                     "male_negative": normalize_prompt(mneg),
+                                    "people": len(preview_people),
+                                    "use_positions": preview_use_positions,
+                                    "char_centers": preview_centers,
                                     "width": w, "height": h, "seed": seed,
                                     "tokens": {"base": nai_tokens(base),
                                                "female": nai_tokens(fem),
@@ -19616,17 +19836,20 @@ def _run_generation(server):
                 #   (씬 모드와 같은 규칙 — 세팅 씬도 이제 이 칸을 가진다)
                 scene_neg = (acfg["scenes"][str(num)].get("negative") or "").strip()
                 neg_now = _join_tags(negative, scene_neg) if scene_neg else negative
-                # 주인공 + 상대역 + (있으면) 추가 인물
-                people = [{"prompt": female, "negative": char_neg}]
-                if male:
-                    people.append({"prompt": male, "negative": male_neg})
-                people += char.get("extras") or []
+                # 주인공 + 상대역 + 추가 인물의 프롬프트와 위치를 같은 순서로
+                # 만든다. 씬 전용 위치가 있으면 전역 위치보다 우선한다.
+                people, centers, use_positions = setting_scene_people(
+                    scene, female, male, char_neg, male_neg, char, cfg)
+                scene_params = dict(params)
+                if use_positions:
+                    scene_params = with_centers(scene_params, centers)
+                    scene_params["use_coords"] = True
                 try:
                     img = call_nai_api(token, base_p, "", "", neg_now, w, h,
                                        chars=people,
                                        scale=scale, cfg_rescale=cfg_rescale,
                                        steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
-                                       seed=seed, variety=variety, params=params)
+                                       seed=seed, variety=variety, params=scene_params)
                 finally:
                     pace_complete()
                 saved_path = save_with_meta(

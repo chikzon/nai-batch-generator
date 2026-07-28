@@ -390,6 +390,105 @@ class RegressionTests(unittest.TestCase):
                 APP._COMBOS.clear()
                 APP._COMBOS.update(old_cache)
 
+    def test_setting_scene_edit_targets_one_file_and_can_undo_safely(self):
+        with tempfile.TemporaryDirectory() as td:
+            settings_dir = Path(td) / "세팅"
+            settings_dir.mkdir()
+            first = settings_dir / "첫째.json"
+            second = settings_dir / "둘째.json"
+            APP.atomic_write_json(first, {
+                "이름": "첫째", "방식": "남녀",
+                "씬": {"101": {
+                    "name": "첫 장면", "female_prompt": "old prompt",
+                    "negative": "old negative", "width": 832, "height": 1216,
+                }},
+            }, keep_backup=False)
+            APP.atomic_write_json(second, {
+                "이름": "둘째", "방식": "남녀",
+                "씬": {"101": {
+                    "name": "다른 장면", "female_prompt": "must stay",
+                    "negative": "must stay", "width": 1024, "height": 1024,
+                }},
+            }, keep_backup=False)
+            server = APP.ConfigServer(copy.deepcopy(APP.DEFAULT_CONFIG))
+            with patch.object(APP, "SETTINGS_DIR", settings_dir):
+                saved = server.handle_scene_save(json.dumps({
+                    "setting": "첫째",
+                    "updates": {"101": {
+                        "female_prompt": "new prompt",
+                        "negative": "new negative",
+                        "width": 999,
+                        "char_centers": [
+                            {"x": 0.25, "y": 0.5},
+                            {"x": 0.75, "y": 0.5},
+                        ],
+                    }},
+                }, ensure_ascii=False))
+                self.assertTrue(saved["ok"])
+                self.assertEqual(saved["updated"], 1)
+                self.assertEqual(saved["fields"], 4)
+                changed = APP.load_json_recover(first)["씬"]["101"]
+                untouched = APP.load_json_recover(second)["씬"]["101"]
+                self.assertEqual(changed["female_prompt"], "new prompt")
+                self.assertEqual(changed["width"], 960)
+                self.assertEqual(changed["char_centers"][1]["x"], 0.75)
+                self.assertEqual(untouched["female_prompt"], "must stay")
+                self.assertTrue(first.with_suffix(".json.bak").is_file())
+
+                undone = server.handle_scene_save(json.dumps({
+                    "setting": "첫째", "updates": saved["before"],
+                    "expect_revision": saved["revision"],
+                }, ensure_ascii=False))
+                self.assertTrue(undone["ok"])
+                restored = APP.load_json_recover(first)["씬"]["101"]
+                self.assertEqual(restored["female_prompt"], "old prompt")
+                self.assertEqual(restored["negative"], "old negative")
+                self.assertEqual(restored["width"], 832)
+                self.assertEqual(restored.get("char_centers"), [])
+
+                invalid = server.handle_scene_save(json.dumps({
+                    "setting": "첫째",
+                    "updates": {"101": {
+                        "female_prompt": "must not land",
+                        "char_centers": [{"x": 2, "y": 0.5}],
+                    }},
+                }, ensure_ascii=False))
+                self.assertFalse(invalid["ok"])
+                self.assertEqual(
+                    APP.load_json_recover(first)["씬"]["101"]["female_prompt"],
+                    "old prompt")
+
+    def test_setting_batch_people_keeps_scene_positions_aligned(self):
+        character = {
+            "extras": [{
+                "prompt": "third person", "negative": "third negative",
+                "center": {"x": 0.5, "y": 0.8},
+            }]
+        }
+        people, centers, used = APP.setting_scene_people(
+            {"char_centers": [{"x": 0.2, "y": 0.4}, {"x": 0.8, "y": 0.4}]},
+            "hero", "partner", "hero negative", "partner negative",
+            character, {"use_coords": False})
+        self.assertTrue(used)
+        self.assertEqual([p["prompt"] for p in people],
+                         ["hero", "partner", "third person"])
+        self.assertEqual(centers, [
+            {"x": 0.2, "y": 0.4},
+            {"x": 0.8, "y": 0.4},
+            {"x": 0.5, "y": 0.8},
+        ])
+
+        people, centers, used = APP.setting_scene_people(
+            {}, "hero", "", "negative", "", {}, {"use_coords": False})
+        self.assertFalse(used)
+        self.assertEqual(len(people), 1)
+        self.assertEqual(centers, [])
+
+        page = APP.render_page()
+        self.assertIn("data-posuse", page)
+        self.assertIn("setting:window._sceneSetting", page)
+        self.assertIn("expect_revision:last.revision", page)
+
     def test_concurrent_setting_edits_are_one_read_modify_write_transaction(self):
         """서로 다른 정상 저장 두 개가 겹쳐도 마지막 요청이 앞 변경을 지우면 안 된다."""
         with tempfile.TemporaryDirectory() as td:
