@@ -17,6 +17,7 @@
 import gzip
 import hashlib
 import base64
+import copy
 import functools
 import io
 import json
@@ -2275,6 +2276,142 @@ _COMBOS = {"loaded": False, "rows": []}
 _COMBOS_LOCK = threading.Lock()
 _STYLE_TX_LOCK = threading.RLock()
 
+# 그림체는 저장 위치나 입력 경로가 달라도 아래 생성 설정까지 포함한 한 묶음이다.
+# 수집 JSON의 NAI 메타 이름(scale/noise_schedule)과 사용자 그림체 파일의 화면 설정
+# 이름(cfg_scale/scheduler)을 같은 열쇠로 맞춘다.
+STYLE_BUNDLE_SETTING_KEYS = (
+    "model", "width", "height", "cfg_scale", "cfg_rescale", "steps",
+    "sampler", "scheduler", "variety", "uc_preset", "quality_toggle",
+    "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
+    "controlnet_strength", "prefer_brownian",
+    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
+)
+_STYLE_SETTING_ALIASES = {
+    "cfg_scale": ("cfg_scale", "scale"),
+    "scheduler": ("scheduler", "noise_schedule"),
+    "variety": ("variety", "variety_plus", "skip_cfg_above_sigma"),
+    "smea": ("smea", "sm"),
+    "smea_dyn": ("smea_dyn", "sm_dyn"),
+}
+_STYLE_INT_SETTINGS = {"width", "height", "steps", "uc_preset"}
+_STYLE_FLOAT_SETTINGS = {
+    "cfg_scale", "cfg_rescale", "uncond_scale", "controlnet_strength",
+}
+_STYLE_BOOL_SETTINGS = {
+    "variety", "quality_toggle", "smea", "smea_dyn",
+    "dynamic_thresholding", "prefer_brownian",
+    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
+}
+
+
+def _style_value(record, *names):
+    for name in names:
+        if record.get(name) is not None:
+            return record.get(name)
+    return None
+
+
+def canonical_style_settings(record):
+    """수집 메타·사용자 그림체·비교 레시피의 설정 이름을 한 규격으로 맞춘다."""
+    record = record if isinstance(record, dict) else {}
+    raw = (_style_value(record, "settings", "설정", "params") or {})
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key in STYLE_BUNDLE_SETTING_KEYS:
+        names = _STYLE_SETTING_ALIASES.get(key, (key,))
+        value = next((raw[name] for name in names
+                      if name in raw and raw[name] is not None), None)
+        if value is None:
+            continue
+        try:
+            if key in _STYLE_INT_SETTINGS:
+                value = int(value)
+            elif key in _STYLE_FLOAT_SETTINGS:
+                value = float(value)
+            elif key in _STYLE_BOOL_SETTINGS:
+                value = (value.strip().lower() in ("1", "true", "yes", "on")
+                         if isinstance(value, str) else bool(value))
+            elif key == "model":
+                value = model_id_from_metadata(
+                    value, str(value or "nai-diffusion-4-5-full"))
+            else:
+                value = str(value)
+        except (TypeError, ValueError, OverflowError):
+            value = str(value)
+        out[key] = value
+    return out
+
+
+def style_bundle_signature(record):
+    """그림체의 베이스+네거티브+생성 설정 불가분 묶음을 식별한다."""
+    record = record if isinstance(record, dict) else {}
+    prompt = _style_value(record, "base", "prompt", "프롬프트")
+    if prompt in (None, ""):
+        prompt = record.get("combo") or ""
+    negative = _style_value(record, "negative", "네거티브") or ""
+    settings = canonical_style_settings(record)
+    if not (str(prompt or "") or str(negative or "") or settings):
+        fallback = {
+            "artists": record.get("artists") or [],
+            "combo": record.get("combo") or "",
+            "seed": (record.get("params") or {}).get("seed")
+                if isinstance(record.get("params"), dict) else None,
+        }
+        return json.dumps(
+            {"legacy": fallback}, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str)
+    return json.dumps(
+        {"prompt": str(prompt or ""), "negative": str(negative or ""),
+         "settings": settings},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def character_bundle_signature(record):
+    """캐릭터를 세부 태그로 쪼개지 않고 전체 positive·negative로 식별한다."""
+    record = record if isinstance(record, dict) else {}
+    return json.dumps({
+        "prompt": str(_style_value(record, "female", "prompt", "외형") or ""),
+        "outfit": str(_style_value(record, "clothed", "outfit", "착의") or ""),
+        "negative": str(_style_value(record, "negative", "네거티브") or ""),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _style_row_digest(row):
+    return hashlib.sha256(json.dumps(
+        row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str).encode("utf-8")).hexdigest()
+
+
+def _merge_style_evidence(existing, incoming):
+    """같은 묶음의 새 이미지·출처만 더하고 기존 원문과 설정은 덮지 않는다."""
+    merged = copy.deepcopy(existing)
+    old_images = list(merged.get("images") or [])
+    for image in incoming.get("images") or []:
+        if image not in old_images:
+            old_images.append(image)
+    if old_images:
+        merged["images"] = old_images
+    evidence = list(merged.get("evidence") or [])
+    item = {
+        key: copy.deepcopy(incoming.get(key))
+        for key in ("title", "source", "url", "posted_at", "images")
+        if incoming.get(key) not in (None, "", [])
+    }
+    if item:
+        marker = json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            default=str)
+        known = {
+            json.dumps(x, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), default=str)
+            for x in evidence if isinstance(x, dict)
+        }
+        if marker not in known:
+            evidence.append(item)
+    if evidence:
+        merged["evidence"] = evidence
+    return merged
+
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
 _CNUM = r"-?(?:\d+\.\d*|\.\d+|\d+)"
@@ -2338,27 +2475,69 @@ def load_combos():
 
 
 @serialized_data_write(lambda: STYLE_FILE.parent.parent)
-def add_style(rec):
-    """새 그림체를 라이브러리에 넣고 파일에 저장 (이미지 추출 결과 등)."""
+def add_style(rec, import_info=None, return_detail=False):
+    """큰 그림체 묶음을 비파괴 임포트한다.
+
+    같은 묶음은 기존 레코드를 갈아치우지 않고 새 이미지·출처 근거만 더한다.
+    import_info가 있으면 단건 이미지도 자료팩처럼 독립적으로 되돌릴 판을 남긴다.
+    """
     with _STYLE_TX_LOCK:
         # 다른 실행본이 먼저 저장했을 수 있으므로 프로세스 잠금을 얻은 뒤 캐시가
         # 아니라 디스크 최신판에서 시작한다.
         forget_collection_caches()
         rows = list(load_combos())
-        key = " ".join(sorted((a or "").lower() for a in rec.get("artists", [])))
-        p = rec.get("params") or {}
+        wanted = style_bundle_signature(rec)
+        action, changed, before, row_key = "added", True, None, ""
         for i, r in enumerate(rows):
-            rp = r.get("params") or {}
-            if (" ".join(sorted((a or "").lower() for a in r.get("artists", []))) == key
-                    and rp.get("seed") == p.get("seed")):
-                rows[i] = rec                   # 같은 조합+시드면 갱신
-                break
+            if not isinstance(r, dict) or style_bundle_signature(r) != wanted:
+                continue
+            before = copy.deepcopy(r)
+            merged = _merge_style_evidence(r, rec)
+            changed = merged != r
+            if changed:
+                rows[i] = merged
+                action = "updated"
+            else:
+                action = "existing"
+            row_key, _ = _row_key(r, "id")
+            rec = rows[i]
+            break
         else:
+            rec = copy.deepcopy(rec)
+            if not rec.get("id"):
+                rec["id"] = "style-" + hashlib.sha256(
+                    wanted.encode("utf-8")).hexdigest()[:20]
+            row_key, _ = _row_key(rec, "id")
             rows.insert(0, rec)
-        STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(STYLE_FILE, rows, indent=None)
-        forget_collection_caches()
-        return len(rows)
+
+        if changed:
+            STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(STYLE_FILE, rows, indent=None)
+        batch_id = None
+        if changed and isinstance(import_info, dict):
+            batch = {
+                "kind": str(import_info.get("kind") or "import"),
+                "file": str(import_info.get("file") or "자료"),
+                "lists": {}, "files": copy.deepcopy(import_info.get("files") or {}),
+                "installed": [], "list_updates": [], "요약": "",
+            }
+            if before is None:
+                batch["lists"] = {"그림체.json": [row_key]}
+                batch["요약"] = "그림체: 새 묶음 1건"
+            else:
+                batch["list_updates"] = [{
+                    "stem": "그림체.json", "key": row_key,
+                    "before": before, "after_sha256": _style_row_digest(rec),
+                }]
+                batch["요약"] = "그림체: 같은 묶음에 새 근거를 더함"
+            batch_id = record_import_batch(batch)
+        if changed:
+            forget_collection_caches()
+        detail = {
+            "total": len(rows), "action": action, "changed": changed,
+            "id": rec.get("id"), "batch": batch_id,
+        }
+        return detail if return_detail else len(rows)
 
 
 # ── 그림체 정리 ────────────────────────────────────────────────────────────
@@ -3887,6 +4066,34 @@ def save_pack_log(rows):
     atomic_write_json(p, rows[-50:], indent=1)
 
 
+def record_import_batch(batch):
+    """입력 경로와 무관한 한 번의 임포트를 기존 장착·undo 장부에 남긴다."""
+    batch = copy.deepcopy(batch) if isinstance(batch, dict) else {}
+    changed = any(batch.get(key) for key in (
+        "lists", "files", "installed", "list_updates", "characters"))
+    if not changed:
+        return None
+    batch.setdefault("id", f"{int(time.time())}-{os.urandom(4).hex()}")
+    batch.setdefault("at", time.strftime("%Y-%m-%d %H:%M:%S"))
+    batch.setdefault("file", "자료")
+    batch.setdefault("kind", "datapack")
+    batch.setdefault("lists", {})
+    batch.setdefault("files", {})
+    batch.setdefault("installed", [])
+    batch.setdefault("list_updates", [])
+    batch.setdefault("characters", [])
+    batch.setdefault("새로", (
+        sum(len(v) for v in batch["lists"].values())
+        + sum(len(v) for v in batch["files"].values())
+        + len(batch["installed"])
+        + len(batch["characters"])
+    ))
+    rows = load_pack_log()
+    rows.append(batch)
+    save_pack_log(rows)
+    return batch["id"]
+
+
 DATAPACK_SCHEMA = "nais-datapack/v1"
 DATA_INDEX_SCHEMA = "nais-data-index/v1"
 
@@ -4275,6 +4482,7 @@ def import_datapack_bytes(data, filename="", overwrite=False):
 def pack_log_brief():
     """되돌리기 화면용 — 큰 id 목록은 빼고 요약만."""
     return [{"id": b.get("id"), "at": b.get("at"), "file": b.get("file"),
+             "kind": b.get("kind", "datapack"),
              "새로": b.get("새로", 0), "요약": b.get("요약", ""),
              "pack_id": (b.get("manifest") or {}).get("id", ""),
              "pack_name": (b.get("manifest") or {}).get("name", ""),
@@ -4284,8 +4492,10 @@ def pack_log_brief():
 
 
 @serialized_data_write(lambda: BASE_DIR)
-def undo_datapack(batch_id):
-    """가져온 것을 통째로 되돌린다 — **그때 새로 들어온 것만** 지운다.
+def undo_datapack(batch_id, cfg=None):
+    """어느 입력 경로든 한 번의 임포트를 되돌린다.
+
+    새로 들어온 것은 빼고, 같은 묶음에 근거만 추가한 경우에는 그 직전 행을 복원한다.
     원래 갖고 있던 자료는 건드리지 않는다(열쇠를 그때 기록해 뒀다)."""
     rows = load_pack_log()
     hit = next((b for b in rows if str(b.get("id")) == str(batch_id)), None)
@@ -4293,6 +4503,34 @@ def undo_datapack(batch_id):
         return {"ok": False, "error": "그 기록을 못 찾았습니다."}
     lists, dirs = _datapack_lists(), _datapack_dirs()
     said = []
+    for update in reversed(hit.get("list_updates") or []):
+        stem = str(update.get("stem") or "")
+        spot = lists.get(stem)
+        before = update.get("before")
+        if not spot or not isinstance(before, dict):
+            continue
+        path, key = spot
+        if not path.is_file():
+            continue
+        try:
+            current_rows = load_json_recover(path)
+            wanted_key = str(update.get("key") or "")
+            index = next((
+                i for i, item in enumerate(current_rows)
+                if isinstance(item, dict)
+                and _row_key(item, key)[0] == wanted_key
+            ), None)
+            if index is None:
+                said.append(f"{stem}: 바뀐 묶음을 찾지 못해 그대로 둠")
+                continue
+            if _style_row_digest(current_rows[index]) != update.get("after_sha256"):
+                said.append(f"{stem}: 가져온 뒤 수정되어 그대로 둠")
+                continue
+            current_rows[index] = before
+            atomic_write_json(path, current_rows, indent=None)
+            said.append(f"{stem}: 임포트 전 묶음으로 복구")
+        except Exception as e:
+            log.warning(f"임포트 목록 갱신 되돌리기 실패: {e}")
     for stem, keys in (hit.get("lists") or {}).items():
         spot = lists.get(stem)
         if not spot or not keys:
@@ -4353,6 +4591,32 @@ def undo_datapack(batch_id):
                 said.append(f"{rel.as_posix()}: 가져온 파일 뺌")
         except Exception as e:
             log.warning(f"자료팩 전체파일 되돌리기 실패: {e}")
+    changed_config = False
+    char_records = hit.get("characters") or []
+    if cfg is not None and char_records:
+        wanted = {
+            str(item.get("id")): str(item.get("after_signature") or "")
+            for item in char_records if isinstance(item, dict) and item.get("id")
+        }
+        removed_ids = set()
+        kept = []
+        for char in cfg.get("characters") or []:
+            cid = str(char.get("id") or "")
+            if cid not in wanted:
+                kept.append(char)
+                continue
+            if wanted[cid] and character_bundle_signature(char) != wanted[cid]:
+                kept.append(char)
+                said.append(f"캐릭터 {char.get('name') or cid}: 가져온 뒤 수정되어 그대로 둠")
+                continue
+            removed_ids.add(cid)
+        if removed_ids:
+            cfg["characters"] = kept
+            delete_char_files(cfg, removed_ids)
+            sync_chars_to_files(cfg)
+            save_config(cfg)
+            changed_config = True
+            said.append(f"캐릭터: {len(removed_ids)}건 뺌")
     # ⚠ **되돌린 그 판만** 뺀다. 예전에는 id 가 같은 것을 모두 걸러냈는데,
     #   이미 겹쳐 있는 옛 기록(위 참조)에서는 손대지도 않은 판의 기록까지 사라져
     #   그 자료를 **영영 되돌릴 수 없게** 됐다. 객체로 견주면 옛 기록도 한 번에 한 판씩
@@ -4360,7 +4624,7 @@ def undo_datapack(batch_id):
     save_pack_log([b for b in rows if b is not hit])
     forget_collection_caches()
     return {"ok": True, "report": said or ["되돌릴 것이 없었습니다"],
-            "log": pack_log_brief()}
+            "log": pack_log_brief(), "changed_config": changed_config}
 
 
 # ══ 내 자료 전체 백업 ═════════════════════════════════════════════════
@@ -4820,13 +5084,7 @@ COMPARE_MODE_LABELS = {
     "both": "그림체 × 캐릭터",
 }
 COMPARE_MAX_JOBS = 2_000_000
-COMPARE_RECIPE_SETTING_KEYS = (
-    "model", "width", "height", "cfg_scale", "cfg_rescale", "steps",
-    "sampler", "scheduler", "variety", "uc_preset", "quality_toggle",
-    "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
-    "controlnet_strength", "prefer_brownian",
-    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
-)
+COMPARE_RECIPE_SETTING_KEYS = STYLE_BUNDLE_SETTING_KEYS
 
 
 def _comparison_id(prefix, *parts):
@@ -4837,7 +5095,7 @@ def _comparison_id(prefix, *parts):
 
 def comparison_styles(spec=None):
     """수집 그림체와 사용자가 저장한 그림체 프리셋을 같은 실행 목록으로 합친다."""
-    out, seen = [], set()
+    out, seen, bundle_seen = [], set(), set()
     for i, raw in enumerate(load_combos()):
         if not isinstance(raw, dict):
             continue
@@ -4857,9 +5115,15 @@ def comparison_styles(spec=None):
                                  or f"그림체 {i + 1}").strip()
         item["_compare_kind"] = "수집"
         out.append(item)
+        bundle_seen.add(style_bundle_signature(item))
 
     for i, saved in enumerate(list_styles(spec or load_spec())):
         if not isinstance(saved, dict) or not (saved.get("prompt") or "").strip():
+            continue
+        bundle_signature = style_bundle_signature(saved)
+        # 같은 큰 묶음이 수집 JSON과 사용자 그림체 폴더 양쪽에 있어도 전수 비교에서
+        # 두 번 생성하지 않는다. 파일은 없애지 않고 수집 자료 쪽의 이미지·출처를 우선한다.
+        if bundle_signature in bundle_seen:
             continue
         settings = dict(saved.get("settings") or {})
         params = {
@@ -4891,6 +5155,7 @@ def comparison_styles(spec=None):
             "negative": saved.get("negative", ""),
             "params": params,
         })
+        bundle_seen.add(bundle_signature)
     return out
 
 
@@ -15862,7 +16127,9 @@ class ConfigServer:
                 params["quality_toggle"] = qt
                 params["quality_toggle_guessed"] = True
             rec = {
-                "id": f"file-{abs(hash(body[:4096])) % 10**10}",
+                # 파이썬 hash()는 프로세스마다 달라 같은 파일이 재실행 뒤 다른 id가 된다.
+                # 전체 원본 바이트의 SHA-256을 써 모든 임포트 경로에서 안정적으로 식별한다.
+                "id": f"file-{hashlib.sha256(body).hexdigest()[:20]}",
                 "title": Path(name).stem[:80], "source": "내 이미지",
                 "tab": "", "posted_at": "", "recommend": None, "views": None, "url": "",
                 "count": len(artists),
@@ -15884,6 +16151,8 @@ class ConfigServer:
                 "params": params, "images": [],
             }
             # 썸네일도 캐시에 넣어 목록에서 바로 보이게
+            thumb_created = False
+            key = ""
             try:
                 # local: 이름은 실제로 저장하는 WebP 바이트의 SHA-256이다.
                 # 원본 PNG의 SHA-1으로 이름을 만들면 같은 내용 해시라는 자료팩 규칙과
@@ -15898,11 +16167,24 @@ class ConfigServer:
                 out = IMG_CACHE / key
                 if not out.exists():
                     _atomic_write_bytes(out, thumb, keep_backup=False)
+                    thumb_created = True
                 rec["images"] = [f"local:{key}"]
             except Exception as e:
                 log.warning(f"추출 썸네일 실패: {e}")
-            total = add_style(rec) if save_flag in ("1", "true") else None
-            return {"ok": True, "style": rec, "saved": total}
+            saved = None
+            if save_flag in ("1", "true"):
+                files = ({"수집/이미지캐시": [key]}
+                         if thumb_created and key else {})
+                saved = add_style(
+                    rec,
+                    import_info={"kind": "image", "file": name, "files": files},
+                    return_detail=True,
+                )
+            return {
+                "ok": True, "style": rec,
+                "saved": saved.get("total") if saved else None,
+                "import": saved,
+            }
         except Exception as e:
             log.warning(f"메타데이터 추출 실패: {traceback.format_exc()}")
             return {"ok": False, "error": str(e)}
@@ -17121,10 +17403,15 @@ class ConfigServer:
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/pack_undo"):
-                    # 넣고 나서 아니다 싶으면 통째로 물린다 (그때 들어온 것만).
+                    # 이미지·자료팩·비교 승격 어느 경로든 그 판이 바꾼 것만 물린다.
                     try:
                         d = json.loads(body or b"{}")
-                        r = undo_datapack(d.get("id"))
+                        with server.config_lock:
+                            server.use_latest_config()
+                            r = undo_datapack(d.get("id"), server.cfg)
+                            if r.get("changed_config"):
+                                server.config_revision += 1
+                            r["revision"] = server.config_revision
                         if r.get("ok"):
                             self.spec = load_spec()
                             OPTIONS.clear()
@@ -17614,20 +17901,9 @@ def _unique_library_name(directory, requested, fallback, existing_names=()):
 
 
 def _style_signature(prompt, negative, settings):
-    clean_settings = {
-        key: value for key, value in (settings or {}).items()
-        if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
-    }
-    return json.dumps(
-        {
-            "prompt": str(prompt or ""),
-            "negative": str(negative or ""),
-            "settings": clean_settings,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return style_bundle_signature({
+        "prompt": prompt, "negative": negative, "settings": settings,
+    })
 
 
 @serialized_data_write(lambda: BASE_DIR)
@@ -17666,6 +17942,18 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
                 "names": [same.get("name") or "기존 그림체"],
                 "styles": styles, "changed_config": False,
             }
+        same_collected = next((
+            item for item in load_combos()
+            if isinstance(item, dict) and style_bundle_signature(item) == wanted
+        ), None)
+        if same_collected is not None:
+            return {
+                "ok": True, "kind": "style", "saved": 0, "existing": 1,
+                "names": [same_collected.get("title")
+                          or same_collected.get("id") or "기존 그림체"],
+                "styles": styles, "changed_config": False,
+                "existing_store": "수집/그림체.json",
+            }
         final_name = _unique_library_name(
             STYLE_DIR,
             name or recipe.get("style_name"),
@@ -17674,11 +17962,26 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
         )
         save_style_file(
             final_name, prompt=prompt, negative=negative, settings=settings)
+        batch_id = None
+        saved_path = STYLE_DIR / f"{_safe_name(final_name)}.json"
+        try:
+            rel_path = saved_path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
+        except (OSError, ValueError):
+            rel_path = ""
+        if rel_path and saved_path.is_file():
+            batch_id = record_import_batch({
+                "kind": "comparison", "file": restored["file"],
+                "installed": [{
+                    "path": rel_path,
+                    "sha256": hashlib.sha256(saved_path.read_bytes()).hexdigest(),
+                }],
+                "요약": "비교 결과: 그림체 묶음 1건 승격",
+            })
         return {
             "ok": True, "kind": "style", "saved": 1, "existing": 0,
             "names": [final_name],
             "styles": list_styles(spec or load_spec()),
-            "changed_config": False,
+            "changed_config": False, "batch": batch_id,
         }
     if kind != "characters":
         return {"ok": False, "error": "저장할 자료 종류가 올바르지 않습니다."}
@@ -17690,16 +17993,17 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
     if not slots:
         return {"ok": False, "error": "이 비교 결과에는 저장할 캐릭터가 없습니다."}
     characters = cfg.setdefault("characters", [])
-    names, saved, existing = [], 0, 0
+    names, saved, existing, saved_records = [], 0, 0, []
     for index, slot in enumerate(slots, 1):
         prompt = str(slot.get("prompt") or "")
         outfit = str(slot.get("outfit") or "")
         negative = str(slot.get("negative") or "")
+        wanted_character = character_bundle_signature({
+            "female": prompt, "clothed": outfit, "negative": negative,
+        })
         same = next((
             item for item in characters
-            if str(item.get("female") or "") == prompt
-            and str(item.get("clothed") or "") == outfit
-            and str(item.get("negative") or "") == negative
+            if character_bundle_signature(item) == wanted_character
         ), None)
         if same is not None:
             names.append(same.get("name") or f"기존 캐릭터 {index}")
@@ -17713,7 +18017,7 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
             f"비교 결과 캐릭터 {index}",
             (item.get("name") for item in characters),
         )
-        characters.append({
+        created = {
             "id": "".join(random.choices(
                 string.ascii_lowercase + string.digits, k=8)),
             "name": final_name,
@@ -17724,16 +18028,36 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
             "folder_id": None,
             "subfolder_id": None,
             "source": f"비교 결과: {restored['file']}",
-        })
+        }
+        characters.append(created)
+        saved_records.append(created)
         names.append(final_name)
         saved += 1
     if saved:
         sync_chars_to_files(cfg)
         save_config(cfg)
+    batch_id = None
+    try:
+        settings_inside = (
+            SETTINGS_FILE.resolve() == BASE_DIR.resolve()
+            or BASE_DIR.resolve() in SETTINGS_FILE.resolve().parents
+        )
+    except OSError:
+        settings_inside = False
+    if saved and settings_inside:
+        records = [{
+            "id": item.get("id"),
+            "after_signature": character_bundle_signature(item),
+        } for item in saved_records]
+        batch_id = record_import_batch({
+            "kind": "comparison", "file": restored["file"],
+            "characters": records,
+            "요약": f"비교 결과: 캐릭터 묶음 {len(records)}건 승격",
+        })
     return {
         "ok": True, "kind": "characters", "saved": saved, "existing": existing,
         "names": names, "characters": characters,
-        "changed_config": bool(saved),
+        "changed_config": bool(saved), "batch": batch_id,
     }
 
 

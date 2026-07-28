@@ -3964,6 +3964,160 @@ class RegressionTests(unittest.TestCase):
                     APP.STYLE_FILE.read_text(encoding="utf-8")), [])
                 self.assertEqual(APP.pack_log_brief(), [])
 
+    def test_style_bundle_signature_matches_metadata_and_saved_setting_names(self):
+        metadata = {
+            "base": "artist:a, cinematic light",
+            "negative": "lowres",
+            "params": {
+                "model": "nai-diffusion-4-5-full",
+                "width": "1024", "height": 1024, "scale": "6.5",
+                "cfg_rescale": 0.2, "steps": "28", "sampler": "k_euler",
+                "noise_schedule": "karras", "variety_plus": 1,
+                "sm": False, "sm_dyn": False,
+            },
+        }
+        saved = {
+            "prompt": "artist:a, cinematic light",
+            "negative": "lowres",
+            "settings": {
+                "model": "nai-diffusion-4-5-full",
+                "width": 1024, "height": 1024, "cfg_scale": 6.5,
+                "cfg_rescale": 0.2, "steps": 28, "sampler": "k_euler",
+                "scheduler": "karras", "variety": True,
+                "smea": False, "smea_dyn": False,
+            },
+        }
+        self.assertEqual(
+            APP.style_bundle_signature(metadata),
+            APP.style_bundle_signature(saved),
+        )
+
+    def test_single_style_import_merges_evidence_without_overwrite_and_undoes_each_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            style_file = base / "수집" / "그림체.json"
+            old_cache = copy.deepcopy(APP._COMBOS)
+            try:
+                with (
+                    patch.object(APP, "BASE_DIR", base),
+                    patch.object(APP, "STYLE_FILE", style_file),
+                    patch.object(APP, "COMBO_FILE", base / "수집" / "작가조합.json"),
+                    patch.object(APP, "IMG_CACHE", base / "수집" / "이미지캐시"),
+                ):
+                    APP._COMBOS.update({"loaded": False, "rows": []})
+                    first = APP.add_style({
+                        "id": "image-a", "title": "첫 이미지", "source": "내 이미지",
+                        "base": "artist:a, detail", "negative": "lowres",
+                        "params": {"scale": 6.5, "steps": 28,
+                                   "noise_schedule": "karras"},
+                        "images": ["local:a.webp"],
+                    }, import_info={"kind": "image", "file": "a.png"},
+                        return_detail=True)
+                    second = APP.add_style({
+                        "id": "image-b", "title": "둘째 이미지", "source": "공개 자료",
+                        "base": "artist:a, detail", "negative": "lowres",
+                        "params": {"cfg_scale": 6.5, "steps": 28,
+                                   "scheduler": "karras"},
+                        "images": ["local:b.webp"],
+                    }, import_info={"kind": "crawler", "file": "post-2"},
+                        return_detail=True)
+
+                    self.assertEqual((first["action"], second["action"]),
+                                     ("added", "updated"))
+                    rows = json.loads(style_file.read_text(encoding="utf-8"))
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["id"], "image-a")
+                    self.assertEqual(
+                        rows[0]["images"], ["local:a.webp", "local:b.webp"])
+                    self.assertEqual(rows[0]["base"], "artist:a, detail")
+                    self.assertEqual(rows[0]["params"]["scale"], 6.5)
+                    self.assertEqual(len(APP.pack_log_brief()), 2)
+
+                    restored = APP.undo_datapack(second["batch"])
+                    self.assertTrue(restored["ok"])
+                    rows = json.loads(style_file.read_text(encoding="utf-8"))
+                    self.assertEqual(rows[0]["images"], ["local:a.webp"])
+                    self.assertNotIn("evidence", rows[0])
+
+                    removed = APP.undo_datapack(first["batch"])
+                    self.assertTrue(removed["ok"])
+                    self.assertEqual(
+                        json.loads(style_file.read_text(encoding="utf-8")), [])
+            finally:
+                APP._COMBOS.clear()
+                APP._COMBOS.update(old_cache)
+
+    def test_comparison_list_deduplicates_same_bundle_across_two_style_stores(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            style_file = base / "수집" / "그림체.json"
+            style_dir = base / "그림체"
+            style_file.parent.mkdir(parents=True)
+            style_dir.mkdir()
+            style_file.write_text(json.dumps([{
+                "id": "collected", "title": "수집본",
+                "base": "same prompt", "negative": "same negative",
+                "params": {"scale": 6.0, "steps": 28},
+            }], ensure_ascii=False), encoding="utf-8")
+            (style_dir / "저장본.json").write_text(json.dumps({
+                "이름": "저장본", "프롬프트": "same prompt",
+                "네거티브": "same negative",
+                "설정": {"cfg_scale": 6.0, "steps": 28},
+            }, ensure_ascii=False), encoding="utf-8")
+            old_cache = copy.deepcopy(APP._COMBOS)
+            try:
+                with (
+                    patch.object(APP, "STYLE_FILE", style_file),
+                    patch.object(APP, "COMBO_FILE", base / "수집" / "작가조합.json"),
+                    patch.object(APP, "STYLE_DIR", style_dir),
+                ):
+                    APP._COMBOS.update({"loaded": False, "rows": []})
+                    styles = APP.comparison_styles({"그림체_그룹": []})
+                self.assertEqual(len(styles), 1)
+                self.assertEqual(styles[0]["_compare_kind"], "수집")
+            finally:
+                APP._COMBOS.clear()
+                APP._COMBOS.update(old_cache)
+
+    def test_promoted_character_import_batch_can_be_undone_without_touching_existing(self):
+        recipe = {
+            "char_slots": [{
+                "name": "신규", "prompt": "whole character",
+                "outfit": "whole outfit", "negative": "whole negative",
+            }],
+        }
+        restored = {
+            "ok": True, "file": "비교생성/run/result.webp", "recipe": recipe,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["characters"] = [{
+                "id": "keep", "name": "기존", "female": "existing",
+                "clothed": "", "negative": "", "enabled": True,
+            }]
+            with (
+                patch.object(APP, "BASE_DIR", base),
+                patch.object(APP, "SETTINGS_FILE", base / "설정.json"),
+                patch.object(APP, "CHAR_DIR", base / "캐릭터"),
+                patch.object(APP, "STYLE_FILE", base / "수집" / "그림체.json"),
+                patch.object(APP, "COMBO_FILE", base / "수집" / "작가조합.json"),
+                patch.object(APP, "IMG_CACHE", base / "수집" / "이미지캐시"),
+                patch.object(APP, "comparison_recipe_for_output",
+                             return_value=restored),
+            ):
+                promoted = APP.promote_comparison_recipe_assets(
+                    cfg, "ignored", "characters")
+                self.assertEqual(promoted["saved"], 1)
+                self.assertTrue(promoted["batch"])
+                self.assertEqual(len(cfg["characters"]), 2)
+
+                undone = APP.undo_datapack(promoted["batch"], cfg)
+                self.assertTrue(undone["ok"])
+                self.assertTrue(undone["changed_config"])
+                self.assertEqual([c["id"] for c in cfg["characters"]], ["keep"])
+                self.assertEqual(len(list((base / "캐릭터").glob("*.json"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
