@@ -60,6 +60,6 @@ Thumbs.db
 수집/작가조합.json
 
 # 빌드 산출물 (빌드.py)
-build/
+/build/
 dist/
 *.spec

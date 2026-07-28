@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_ROOT = ROOT / "contracts" / "chatbot-nai"
 V1 = CONTRACT_ROOT / "v1"
 SPEC = importlib.util.spec_from_file_location(
@@ -113,4 +113,3 @@ class ChatbotNaiContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -31,16 +31,22 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 # start.py가 유지보수 가능한 보조 모듈을 불러오므로, 파일 경로로 직접 로드하는
 # 이 시험도 일반 `python start.py`와 같은 모듈 검색 경로를 갖게 한다.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-SPEC = importlib.util.spec_from_file_location("nai_helper_under_test", ROOT / "start.py")
+SPEC = importlib.util.spec_from_file_location(
+    "nai_helper_under_test",
+    ROOT / "src" / "nai_studio" / "legacy_app.py",
+)
 assert SPEC and SPEC.loader
 APP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(APP)
-BUILD_SPEC = importlib.util.spec_from_file_location("nai_build_under_test", ROOT / "빌드.py")
+BUILD_SPEC = importlib.util.spec_from_file_location(
+    "nai_build_under_test",
+    ROOT / "tools" / "build" / "app.py",
+)
 assert BUILD_SPEC and BUILD_SPEC.loader
 BUILD = importlib.util.module_from_spec(BUILD_SPEC)
 BUILD_SPEC.loader.exec_module(BUILD)
@@ -795,7 +801,8 @@ class RegressionTests(unittest.TestCase):
                 """
             )
             command = [
-                sys.executable, "-c", script, str(ROOT / "start.py"),
+                sys.executable, "-c", script,
+                str(ROOT / "src" / "nai_studio" / "legacy_app.py"),
                 str(target),
             ]
             a = subprocess.Popen(
@@ -1075,7 +1082,10 @@ class RegressionTests(unittest.TestCase):
             self.assertNotIn(content_dir, BUILD.ASSET_DIRS)
         # UI 코드는 개인 자료가 아니라 프로그램 자산이다. 새 화면 CSS를 start.py에
         # 다시 쌓지 않고 exe 옆에 함께 둔다.
-        self.assertEqual(BUILD.ASSET_DIRS, ["ui"])
+        self.assertEqual(
+            BUILD.ASSET_DIRS,
+            ["src/nai_studio/web/static"],
+        )
         self.assertEqual(
             set(BUILD.DATA_PACK_ASSETS),
             {"후보사전.json", "규격.json", "옵션.json"},
@@ -2957,7 +2967,9 @@ class RegressionTests(unittest.TestCase):
                 server.httpd.server_close()
 
     def test_every_generation_path_builds_call_local_reference_params(self):
-        source = (ROOT / "start.py").read_text(encoding="utf-8")
+        source = (
+            ROOT / "src" / "nai_studio" / "legacy_app.py"
+        ).read_text(encoding="utf-8")
         self.assertEqual(source.count("runtime_generation_params("), 7)
         self.assertNotIn('raw.get("source_model")', source)
         self.assertNotIn("ensure_refs(", source)
@@ -2974,7 +2986,9 @@ class RegressionTests(unittest.TestCase):
     def test_studio_layout_is_default_and_classic_remains_compatible(self):
         """작업실을 기본으로 쓰되 설정 한 번으로 기존 호환 화면을 복원해야 한다."""
         page = APP.render_page()
-        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        css = (
+            ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
+        ).read_text(encoding="utf-8")
         self.assertIn('href="/ui/studio.css"', page)
         self.assertIn('id="layoutChips"', page)
         self.assertIn(
@@ -2998,7 +3012,9 @@ class RegressionTests(unittest.TestCase):
 
     def test_studio_workflow_has_context_and_descriptions_at_common_desktop_width(self):
         page = APP.render_page()
-        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        css = (
+            ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
+        ).read_text(encoding="utf-8")
         for marker in ('id="workspaceContext"', 'id="workspaceStep"',
                        'id="workspaceTitle"', 'id="workspaceDesc"'):
             self.assertEqual(page.count(marker), 1)
@@ -3013,7 +3029,9 @@ class RegressionTests(unittest.TestCase):
     def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
         """비교 생성은 복제하지 않고 작업실/기존 화면 사이에서 같은 DOM을 옮겨야 한다."""
         page = APP.render_page()
-        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        css = (
+            ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
+        ).read_text(encoding="utf-8")
         self.assertEqual(page.count('id="compareCard"'), 1)
         for marker in ('id="compareClassicHome"', 'id="studioCompareHome"',
                        'id="studioLibraryNav"', 'id="studioLibraryBrowse"'):
@@ -3027,7 +3045,9 @@ class RegressionTests(unittest.TestCase):
     def test_studio_settings_separates_existing_cards_and_classic_shows_all(self):
         """작업실은 세 작업을 나누되 기존 화면에서는 원래 카드가 모두 복원돼야 한다."""
         page = APP.render_page()
-        css = (ROOT / "ui" / "studio.css").read_text(encoding="utf-8")
+        css = (
+            ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
+        ).read_text(encoding="utf-8")
         settings_view = page[
             page.index('id="vSettings"'):page.index('id="vBuilder"')
         ]
@@ -4035,7 +4055,9 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(clock[0], before)
 
     def test_every_nai_generation_path_marks_completion(self):
-        source = (ROOT / "start.py").read_text(encoding="utf-8")
+        source = (
+            ROOT / "src" / "nai_studio" / "legacy_app.py"
+        ).read_text(encoding="utf-8")
         self.assertEqual(source.count("call_nai_api("), 7)  # definition + six callers
         self.assertEqual(source.count("pace_complete()"), 7)  # definition + six callers
         self.assertNotIn(

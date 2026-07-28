@@ -39,18 +39,18 @@ Release의 SHA-256을 확인한 뒤 실행하세요.
 
 첫 실행에서는 필요한 순서를 화면 안에서 안내합니다.
 
-![첫 실행 안내](docs/screenshots/first-run.png)
+![첫 실행 안내](docs/product/screenshots/first-run.png)
 
 기본자료팩을 넣으면 캐릭터를 단계별로 만들 수 있고, 전체 그림체·캐릭터 조합을 같은
 조건으로 비교하기 전에 실제 호출 수와 예상 비용을 확인합니다.
 
 | 캐릭터 빌더 | 비교 생성 계획 |
 | --- | --- |
-| ![캐릭터 빌더](docs/screenshots/character-builder.png) | ![비교 생성 계획](docs/screenshots/comparison-plan.png) |
+| ![캐릭터 빌더](docs/product/screenshots/character-builder.png) | ![비교 생성 계획](docs/product/screenshots/comparison-plan.png) |
 
 화면 구성, 테마, 강조색, 글씨 크기와 모서리는 `기타 → 화면·디자인`에서 바꿀 수 있습니다.
 
-![화면과 디자인 설정](docs/screenshots/appearance-settings.png)
+![화면과 디자인 설정](docs/product/screenshots/appearance-settings.png)
 
 ## 무엇을 할 수 있나
 
