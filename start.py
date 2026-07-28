@@ -6429,6 +6429,8 @@ def _build_std(acfg, char, scene, mode):
         base = f"{base}, {location}"
     if scene.get("base_tags"):
         base = _join_tags(base, scene.get("base_tags"))
+    if scene.get("relationship_tags"):
+        base = _join_tags(base, scene.get("relationship_tags"))
 
     cleaned_char = remove_prompt_tags(
         cleaned_char, scene.get("remove_char_tags", []))
@@ -6522,6 +6524,8 @@ def _build_yuri(acfg, char, scene):
     base = acfg["base"].get("yuri_base_prompt", "2girls, yuri")
     if scene.get("base_tags"):
         base = f"{base}, {scene['base_tags']}"
+    if scene.get("relationship_tags"):
+        base = _join_tags(base, scene.get("relationship_tags"))
     if scene.get("location"):
         base = f"{base}, {scene['location']}"
 
@@ -7003,6 +7007,65 @@ def normalize_scene_centers(value):
             raise ValueError(f"{i + 1}번 캐릭터 위치는 0~1 범위여야 합니다.")
         out.append({"x": round(x, 4), "y": round(y, 4)})
     return out
+
+
+def normalize_scene_reference_ids(value):
+    """씬의 캐릭터 순서에 맞춘 Reference id 목록을 검증한다.
+
+    빈 문자열은 해당 인물에 참조를 지정하지 않았다는 뜻이다. NAI 요청에는
+    캐릭터와 Reference를 강제로 묶는 별도 필드가 없으므로 순서·선택 근거만
+    보존하고, 실제 전송에서는 선택한 참조 목록으로 범위를 좁힌다.
+    """
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError("씬 캐릭터 레퍼런스는 목록이어야 합니다.")
+    out = []
+    for i, value in enumerate(value[:MAX_CHARS]):
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError(f"{i + 1}번 캐릭터 레퍼런스 id는 문자열이어야 합니다.")
+        value = value.strip()
+        if len(value) > 160:
+            raise ValueError(f"{i + 1}번 캐릭터 레퍼런스 id가 너무 깁니다.")
+        out.append(value)
+    return out
+
+
+def setting_reference_config(cfg, scene):
+    """씬 전용 Reference 선택을 현재 설정 위에 안전하게 얹는다.
+
+    `use_character_refs`가 꺼져 있으면 전역 활성 목록을 그대로 쓴다. 켜져 있으면
+    인물 순서대로 고른 id만 활성화한다. 같은 id를 여러 인물에 골라도 NAI에는 한 번만
+    보내며, 삭제되어 찾을 수 없는 id는 건너뛰고 이름 목록에는 근거를 남긴다.
+    """
+    if not scene.get("use_character_refs"):
+        active = [r.get("name") or r.get("id") or "무제"
+                  for r in (cfg.get("char_refs") or []) if r.get("enabled")]
+        return cfg, False, active
+    chosen = normalize_scene_reference_ids(scene.get("character_refs"))
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in (cfg.get("char_refs") or [])
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    scoped = dict(cfg)
+    selected, names, seen = [], [], set()
+    for rid in chosen:
+        if not rid:
+            names.append("참조 안 함")
+            continue
+        item = by_id.get(rid)
+        if item is None:
+            names.append(f"없어진 참조({rid})")
+            continue
+        names.append(item.get("name") or rid)
+        if rid not in seen:
+            selected.append(dict(item, enabled=True))
+            seen.add(rid)
+    scoped["char_refs"] = selected
+    return scoped, True, names
 
 
 def setting_scene_people(scene, female, male, char_negative, male_negative,
@@ -15529,7 +15592,21 @@ async function openScene(setName, ids){
   if(!r.ok || !r.scenes.length){ alert('불러오기 실패'); return; }
   $('modalTitle').textContent = `${setName} · ${r.scenes[0].name}${ids.length>1?` 외 ${ids.length}단계`:''}`;
   const f = (id,k,l,v) => `<div class="field"><label>${l}</label><textarea data-sid="${id}" data-sk="${k}" style="min-height:42px;">${esc(v||'')}</textarea></div>`;
-  const actor = (s, title, promptKey, removeKey, negativeKey, promptLabel) =>
+  const line = (id,k,l,v,placeholder='') => `<div class="field"><label>${l}</label>
+    <input type="text" data-sid="${id}" data-sk="${k}" value="${escA(v||'')}" placeholder="${escA(placeholder)}"></div>`;
+  const referenceSelect = (s, title, refIndex) => {
+    const selected = (s.character_refs || [])[refIndex] || '';
+    const known = (r.char_refs || []).some(ref => ref.id === selected);
+    const missing = selected && !known
+      ? `<option value="${escA(selected)}" selected>없어진 참조 · ${esc(selected)}</option>` : '';
+    return `<div class="field"><label>${title} Reference</label>
+      <select data-sref="${s.id}" data-ri="${refIndex}"${s.use_character_refs?'':' disabled'}>
+        <option value="">참조 안 함</option>${missing}
+        ${(r.char_refs || []).map(ref => `<option value="${escA(ref.id)}"${ref.id===selected?' selected':''}>
+          ${esc(ref.name)}</option>`).join('')}
+      </select></div>`;
+  };
+  const actor = (s, title, promptKey, removeKey, negativeKey, promptLabel, refIndex) =>
     `<div class="field" style="border-left:3px solid var(--accent);padding:8px 10px;background:var(--paper);">
       <b>${title}</b>
       ${f(s.id, promptKey, promptLabel, s[promptKey])}
@@ -15537,6 +15614,15 @@ async function openScene(setName, ids){
         ${f(s.id, removeKey, '이 캐릭터에서 제외할 태그 (쉼표)', s[removeKey])}
         ${f(s.id, negativeKey, '이 캐릭터에만 적용할 네거티브', s[negativeKey])}
       </div>
+      ${referenceSelect(s, title, refIndex)}
+    </div>`;
+  const refs = s => `<div class="field" style="border:1px solid var(--line);padding:10px;">
+      <label style="display:flex;align-items:center;gap:7px;color:var(--text);">
+        <input type="checkbox" data-refuse="${s.id}"
+          style="width:16px;height:16px;flex:none;accent-color:var(--accent);"${s.use_character_refs?' checked':''}>
+        이 씬에서 캐릭터 Reference를 따로 선택</label>
+      <div class="hint">끄면 생성 화면에서 켠 전체 Reference를 사용합니다. 켜면 아래 인물 순서의 선택만 보냅니다.
+      NAI API는 참조를 특정 인물에 강제로 묶지 않으므로 순서와 범위를 맞추는 방식입니다.</div>
     </div>`;
   const pos = s => {
     const mode = s.mode || st.mode || '단독';
@@ -15583,15 +15669,20 @@ async function openScene(setName, ids){
         <input type="number" data-sid="${s.id}" data-sk="height" value="${s.height||1216}"
           min="64" max="2048" step="64" title="세로" style="width:74px;text-align:center;">
       </div>`;
-    x += f(s.id, 'base_tags', '장면 공통·관계 태그 (모든 캐릭터 밖의 베이스에 붙습니다)', s.base_tags);
+    x += f(s.id, 'base_tags', '장면 공통 태그 (모든 캐릭터 밖의 베이스에 붙습니다)', s.base_tags);
+    x += `<div class="grid2">
+      ${line(s.id, 'relationship_name', '등장 관계 이름', s.relationship_name, '예: 연인 · 라이벌 · 가족')}
+      ${f(s.id, 'relationship_tags', '실제 관계 태그', s.relationship_tags)}
+    </div>`;
+    x += refs(s);
     if(st.mode === '백합'){
-      x += actor(s, '주인공', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
-      x += actor(s, '상대역', 'partner_prompt', 'remove_partner_tags', 'partner_negative', '이 장면에서 추가할 태그');
+      x += actor(s, '주인공', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그', 0);
+      x += actor(s, '상대역', 'partner_prompt', 'remove_partner_tags', 'partner_negative', '이 장면에서 추가할 태그', 1);
     } else if(st.mode === '단독'){
-      x += actor(s, '캐릭터', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
+      x += actor(s, '캐릭터', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그', 0);
     } else {
-      x += actor(s, '여성', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그');
-      x += actor(s, '남성', 'male_prompt', 'remove_male_tags', 'male_negative', '이 장면에서 추가할 태그');
+      x += actor(s, '여성', 'female_prompt', 'remove_char_tags', 'female_negative', '이 장면에서 추가할 태그', 0);
+      x += actor(s, '남성', 'male_prompt', 'remove_male_tags', 'male_negative', '이 장면에서 추가할 태그', 1);
     }
     return x + f(s.id, 'negative', '이 씬 전용 네거티브 (선택 · 기본 네거티브 뒤에 붙습니다)', s.negative)
              + pos(s) + `<div class="hint" id="pv-${s.id}"></div></div>`;
@@ -15612,6 +15703,12 @@ async function openScene(setName, ids){
     box.addEventListener('change', () => {
       const sid = box.dataset.posuse;
       $('modalBody').querySelectorAll(`[data-scenter="${sid}"],[data-posspread="${sid}"]`)
+        .forEach(el => el.disabled = !box.checked);
+    }));
+  $('modalBody').querySelectorAll('[data-refuse]').forEach(box =>
+    box.addEventListener('change', () => {
+      const sid = box.dataset.refuse;
+      $('modalBody').querySelectorAll(`[data-sref="${sid}"]`)
         .forEach(el => el.disabled = !box.checked);
     }));
   $('modalBody').querySelectorAll('[data-posspread]').forEach(btn =>
@@ -15656,11 +15753,16 @@ async function scenePreview(num){
   const posText = r.use_positions
     ? (r.char_centers || []).map((c,i) => `${i+1}: (${Number(c.x).toFixed(2)}, ${Number(c.y).toFixed(2)})`).join(' · ')
     : '자동 배치';
+  const refText = (r.reference_names || []).length
+    ? r.reference_names.join(' · ')
+    : (r.scene_reference_override ? '이 씬은 Reference 없음' : '전역 활성 Reference 없음');
   host.innerHTML = `<div class="row" style="margin:8px 0 0;background:var(--paper2);">
     <div class="tag">실제 전송값 · ${esc(r.setting)}(${esc(r.mode)}) · 캐스트 ${esc(r.cast)}
       · ${r.width}×${r.height} · 시드 ${r.seed}</div>
-    <div class="hint">캐릭터 ${r.people}명 · 위치 ${esc(posText)}</div>
-    ${box('베이스 (그림체 + 장소 + 시간대)', r.base, r.tokens.base)}
+    <div class="hint">캐릭터 ${r.people}명 · 위치 ${esc(posText)}
+      · 관계 ${esc(r.relationship_name || '미지정')}
+      · ${r.scene_reference_override ? '씬 전용 Reference' : '전역 Reference'} ${esc(refText)}</div>
+    ${box('베이스 (그림체 + 장소 + 시간대 + 관계)', r.base, r.tokens.base)}
     ${box('캐릭터 1 (주인공 + 씬 + 표정아크)', r.female, r.tokens.female)}
     ${box('캐릭터 2 (상대역 + 옷단계 + 씬)', r.male, r.tokens.male)}
     ${box('네거티브', r.negative)}
@@ -15768,6 +15870,16 @@ $('modalSave').addEventListener('click', async () => {
         });
       }
       (u[sid] = u[sid] || {}).char_centers = centers;
+    });
+    $('modalBody').querySelectorAll('[data-refuse]').forEach(box => {
+      const sid = box.dataset.refuse;
+      const refs = [];
+      $('modalBody').querySelectorAll(`[data-sref="${sid}"]`).forEach(select => {
+        refs[Number(select.dataset.ri)] = select.value;
+      });
+      const fields = (u[sid] = u[sid] || {});
+      fields.use_character_refs = box.checked;
+      fields.character_refs = refs;
     });
     const r = await (await fetch('/api/scene_save', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({
@@ -17822,11 +17934,18 @@ class ConfigServer:
             if not isinstance(updates, dict):
                 return {"ok": False, "error": "씬 수정 내용의 형식이 잘못되었습니다."}
             allowed = ("female_prompt", "male_prompt", "partner_prompt", "base_tags",
+                       "relationship_name", "relationship_tags",
                        "female_negative", "male_negative", "partner_negative",
                        "remove_char_tags", "remove_male_tags", "remove_partner_tags",
-                       "negative", "width", "height", "char_centers")
-            list_fields = ("remove_char_tags", "remove_male_tags",
-                           "remove_partner_tags")
+                       "negative", "width", "height", "char_centers",
+                       "use_character_refs", "character_refs")
+            tag_list_fields = ("remove_char_tags", "remove_male_tags",
+                               "remove_partner_tags")
+            valid_ref_ids = {
+                str(ref.get("id") or "")
+                for ref in (self.cfg.get("char_refs") or [])
+                if isinstance(ref, dict) and ref.get("id")
+            }
             pack = load_json_recover(path)
             raw_revision = json.dumps(
                 pack, ensure_ascii=False, sort_keys=True,
@@ -17855,7 +17974,16 @@ class ConfigServer:
                         value = normalize_resolution(value)
                     elif key == "char_centers":
                         value = normalize_scene_centers(value)
-                    elif key in list_fields:
+                    elif key == "character_refs":
+                        value = normalize_scene_reference_ids(value)
+                        unknown = [rid for rid in value if rid and rid not in valid_ref_ids]
+                        if unknown:
+                            raise ValueError(
+                                f"찾을 수 없는 캐릭터 레퍼런스입니다: {unknown[0]}")
+                    elif key == "use_character_refs":
+                        if not isinstance(value, bool):
+                            raise ValueError("씬 Reference 사용 여부는 true/false여야 합니다.")
+                    elif key in tag_list_fields:
                         if isinstance(value, str):
                             value = [x.strip() for x in re.split(r"[,\n]", value)
                                      if x.strip()]
@@ -17868,7 +17996,12 @@ class ConfigServer:
                     clean[key] = value
                     if key == "char_centers":
                         old[key] = normalize_scene_centers(sc.get(key))
-                    elif key in list_fields:
+                    elif key == "character_refs":
+                        old[key] = normalize_scene_reference_ids(
+                            sc.get("character_refs"))
+                    elif key == "use_character_refs":
+                        old[key] = bool(sc.get(key, False))
+                    elif key in tag_list_fields:
                         previous = sc.get(key) or []
                         old[key] = (
                             [x.strip() for x in re.split(r"[,\n]", previous) if x.strip()]
@@ -17886,7 +18019,11 @@ class ConfigServer:
             for sid, fields in prepared.items():
                 scene_changed = False
                 for key, value in fields.items():
-                    empty = [] if key == "char_centers" or key in list_fields else ""
+                    empty = (
+                        [] if key in ("char_centers", "character_refs")
+                        or key in tag_list_fields
+                        else False if key == "use_character_refs" else ""
+                    )
                     if scenes[sid].get(key, empty) != value:
                         scenes[sid][key] = value
                         changed_fields += 1
@@ -18263,6 +18400,9 @@ class ConfigServer:
                                             "male_prompt": sc.get("male_prompt", ""),
                                             "partner_prompt": sc.get("partner_prompt", ""),
                                             "base_tags": sc.get("base_tags", ""),
+                                            "relationship_name": sc.get(
+                                                "relationship_name", sc.get("pair", "")),
+                                            "relationship_tags": sc.get("relationship_tags", ""),
                                             "female_negative": sc.get("female_negative", ""),
                                             "male_negative": sc.get("male_negative", ""),
                                             "partner_negative": sc.get("partner_negative", ""),
@@ -18282,9 +18422,21 @@ class ConfigServer:
                                             "negative": sc.get("negative", ""),
                                             "width": sc.get("width", 832),
                                             "height": sc.get("height", 1216),
+                                            "use_character_refs": bool(
+                                                sc.get("use_character_refs", False)),
+                                            "character_refs": normalize_scene_reference_ids(
+                                                sc.get("character_refs")),
                                             "char_centers": normalize_scene_centers(
                                                 sc.get("char_centers"))})
-                        self._json({"ok": True, "scenes": out})
+                        self._json({
+                            "ok": True, "scenes": out,
+                            "char_refs": [
+                                {"id": str(ref.get("id") or ""),
+                                 "name": str(ref.get("name") or ref.get("id") or "무제")}
+                                for ref in (server.cfg.get("char_refs") or [])
+                                if isinstance(ref, dict) and ref.get("id")
+                            ],
+                        })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/status.json"):
@@ -18460,6 +18612,8 @@ class ConfigServer:
                                      "negative": slots[0].get("negative", "")}
                                     if slots else {"name": "(캐릭터 없음)", "female": "", "negative": ""})
                         base, fem, male, cneg, mneg, w, h = build_scene(acfg, cast, cfg, num)
+                        _, scene_ref_override, scene_ref_names = \
+                            setting_reference_config(cfg, scene)
                         preview_people, preview_centers, preview_use_positions = \
                             setting_scene_people(
                                 scene, fem, male, cneg, mneg, cast, cfg)
@@ -18469,6 +18623,8 @@ class ConfigServer:
                                     "setting": scene.get("_setting", ""),
                                     "mode": scene.get("_mode", ""),
                                     "cast": cast["name"],
+                                    "relationship_name": scene.get(
+                                        "relationship_name", scene.get("pair", "")),
                                     "base": normalize_prompt(base),
                                     "female": normalize_prompt(fem),
                                     "male": normalize_prompt(male),
@@ -18483,6 +18639,8 @@ class ConfigServer:
                                     "people": len(preview_people),
                                     "use_positions": preview_use_positions,
                                     "char_centers": preview_centers,
+                                    "scene_reference_override": scene_ref_override,
+                                    "reference_names": scene_ref_names,
                                     "width": w, "height": h, "seed": seed,
                                     "tokens": {"base": nai_tokens(base),
                                                "female": nai_tokens(fem),
@@ -19984,9 +20142,6 @@ def _run_generation(server):
         variety = cfg.get("variety", False)
         steps = int(cfg.get("steps", acfg["base"].get("steps", 28)))
         token = cfg["token"]
-        # 바이브는 한 번 인코딩하면 캐시되어 이 회차 내내 공짜로 재사용된다
-        params = runtime_generation_params(cfg, token)
-
         char, cid, num, copy = pending[0]
         total_now = completed + len(skip_set) + len(pending)
 
@@ -19995,6 +20150,10 @@ def _run_generation(server):
             out_dir.mkdir(parents=True, exist_ok=True)
 
             scene = acfg["scenes"][str(num)]
+            # 씬에서 Reference를 따로 고른 경우에만 전역 활성 목록을 그 선택으로
+            # 좁힌다. Vibe는 그대로 유지하고 캐릭터 Reference만 씬 범위를 따른다.
+            reference_cfg, _, _ = setting_reference_config(cfg, scene)
+            params = runtime_generation_params(reference_cfg, token)
             char_label = char.get("name") or cid
             suffix = "" if copy == 1 else f"_{copy}벌"
             fname = (f"{num:03d}_{scene['name'].replace(' ', '_').replace('/', '_')}"

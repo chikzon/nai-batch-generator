@@ -434,14 +434,23 @@ class RegressionTests(unittest.TestCase):
                     "negative": "must stay", "width": 1024, "height": 1024,
                 }},
             }, keep_backup=False)
-            server = APP.ConfigServer(copy.deepcopy(APP.DEFAULT_CONFIG))
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["char_refs"] = [{
+                "id": "ref-hero", "name": "주인공 참조", "enabled": False,
+                "ref_type": "character", "strength": 0.8, "fidelity": 0.7,
+            }]
+            server = APP.ConfigServer(cfg)
             with patch.object(APP, "SETTINGS_DIR", settings_dir):
                 saved = server.handle_scene_save(json.dumps({
                     "setting": "첫째",
                     "updates": {"101": {
                         "female_prompt": "new prompt",
                         "negative": "new negative",
+                        "relationship_name": "연인",
+                        "relationship_tags": "romantic couple, close relationship",
                         "width": 999,
+                        "use_character_refs": True,
+                        "character_refs": ["ref-hero", ""],
                         "char_centers": [
                             {"x": 0.25, "y": 0.5},
                             {"x": 0.75, "y": 0.5},
@@ -450,12 +459,15 @@ class RegressionTests(unittest.TestCase):
                 }, ensure_ascii=False))
                 self.assertTrue(saved["ok"])
                 self.assertEqual(saved["updated"], 1)
-                self.assertEqual(saved["fields"], 4)
+                self.assertEqual(saved["fields"], 8)
                 changed = APP.load_json_recover(first)["씬"]["101"]
                 untouched = APP.load_json_recover(second)["씬"]["101"]
                 self.assertEqual(changed["female_prompt"], "new prompt")
                 self.assertEqual(changed["width"], 960)
                 self.assertEqual(changed["char_centers"][1]["x"], 0.75)
+                self.assertEqual(changed["relationship_name"], "연인")
+                self.assertEqual(changed["character_refs"], ["ref-hero", ""])
+                self.assertTrue(changed["use_character_refs"])
                 self.assertEqual(untouched["female_prompt"], "must stay")
                 self.assertTrue(first.with_suffix(".json.bak").is_file())
 
@@ -469,15 +481,29 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(restored["negative"], "old negative")
                 self.assertEqual(restored["width"], 832)
                 self.assertEqual(restored.get("char_centers"), [])
+                self.assertEqual(restored.get("relationship_tags"), "")
+                self.assertEqual(restored.get("character_refs"), [])
+                self.assertFalse(restored.get("use_character_refs", False))
 
                 invalid = server.handle_scene_save(json.dumps({
                     "setting": "첫째",
                     "updates": {"101": {
                         "female_prompt": "must not land",
-                        "char_centers": [{"x": 2, "y": 0.5}],
+                        "character_refs": ["missing-reference"],
                     }},
                 }, ensure_ascii=False))
                 self.assertFalse(invalid["ok"])
+                self.assertEqual(
+                    APP.load_json_recover(first)["씬"]["101"]["female_prompt"],
+                    "old prompt")
+                invalid_position = server.handle_scene_save(json.dumps({
+                    "setting": "첫째",
+                    "updates": {"101": {
+                        "female_prompt": "must not land either",
+                        "char_centers": [{"x": 2, "y": 0.5}],
+                    }},
+                }, ensure_ascii=False))
+                self.assertFalse(invalid_position["ok"])
                 self.assertEqual(
                     APP.load_json_recover(first)["씬"]["101"]["female_prompt"],
                     "old prompt")
@@ -537,6 +563,8 @@ class RegressionTests(unittest.TestCase):
             "_setting": "시험", "_mode": "남녀", "_num": 101, "_stage": 0,
             "width": 832, "height": 1216,
             "base_tags": "holding hands, close relationship",
+            "relationship_name": "연인",
+            "relationship_tags": "romantic couple, intimate",
             "female_prompt": "smile", "male_prompt": "looking at viewer",
             "remove_char_tags": ["red hair"],
             "remove_male_tags": ["black hair"],
@@ -549,7 +577,10 @@ class RegressionTests(unittest.TestCase):
         }
         base, female, male, female_neg, male_neg, width, height = \
             APP._build_std(acfg, character, scene, "남녀")
-        self.assertEqual(base, "2people, style, holding hands, close relationship")
+        self.assertEqual(
+            base,
+            "2people, style, holding hands, close relationship, romantic couple, intimate",
+        )
         self.assertEqual(female, "1girl, blue eyes, smile")
         self.assertNotIn("black hair", male)
         self.assertIn("looking at viewer", male)
@@ -567,15 +598,41 @@ class RegressionTests(unittest.TestCase):
         base, female, partner, female_neg, partner_neg, _, _ = \
             APP._build_yuri(acfg, character, yuri)
         self.assertIn("holding hands, close relationship", base)
+        self.assertIn("romantic couple, intimate", base)
         self.assertNotIn("red hair", female)
         self.assertNotIn("brown hair", partner)
         self.assertIn("partner smile", partner)
         self.assertEqual(partner_neg, "partner bad anatomy, partner blur")
 
         page = APP.render_page()
-        self.assertIn("장면 공통·관계 태그", page)
+        self.assertIn("장면 공통 태그", page)
+        self.assertIn("등장 관계 이름", page)
+        self.assertIn("실제 관계 태그", page)
+        self.assertIn("data-refuse", page)
+        self.assertIn("data-sref", page)
         self.assertIn("remove_partner_tags", page)
         self.assertIn("female_negative", page)
+
+        refs_cfg = {
+            "char_refs": [
+                {"id": "second", "name": "둘째", "enabled": False},
+                {"id": "first", "name": "첫째", "enabled": True},
+            ]
+        }
+        scoped, override, names = APP.setting_reference_config(
+            refs_cfg,
+            {"use_character_refs": True,
+             "character_refs": ["first", "", "second", "first", "deleted"]},
+        )
+        self.assertTrue(override)
+        self.assertEqual([r["id"] for r in scoped["char_refs"]],
+                         ["first", "second"])
+        self.assertTrue(all(r["enabled"] for r in scoped["char_refs"]))
+        self.assertEqual(
+            names,
+            ["첫째", "참조 안 함", "둘째", "첫째", "없어진 참조(deleted)"],
+        )
+        self.assertFalse(refs_cfg["char_refs"][0]["enabled"])
 
     def test_concurrent_setting_edits_are_one_read_modify_write_transaction(self):
         """서로 다른 정상 저장 두 개가 겹쳐도 마지막 요청이 앞 변경을 지우면 안 된다."""
