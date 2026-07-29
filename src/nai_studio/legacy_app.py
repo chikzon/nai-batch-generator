@@ -97,11 +97,12 @@ from src.nai_studio.services.resource_bridge import (
     legacy_resource_import_plan,
 )
 from src.nai_studio.services.restoration_inputs import (
-    folder_inventory_queue,
+    folder_inventory_summary,
     image_batch_queue,
     image_inspect_queue,
     pack_import_queue,
     public_collection_queue,
+    public_collection_summary,
 )
 from src.nai_studio.services.variation_bridge import (
     character_asset_from_legacy_record,
@@ -4802,12 +4803,7 @@ def data_storage_status():
         try:
             loaded = load_json_recover(path)
             if isinstance(loaded, dict) and loaded.get("schema") == DATA_INDEX_SCHEMA:
-                queue = folder_inventory_queue(
-                    loaded.get("entries") or [],
-                    folder_label=PROFILE or "기본",
-                    status="indexed",
-                )
-                restoration = summarize_restore_queue(queue)
+                restoration = folder_inventory_summary(loaded)
                 index = {key: loaded.get(key) for key in (
                     "generated_at", "files", "bytes", "by_root", "fingerprint")}
         except Exception:
@@ -5104,6 +5100,7 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         "added": files,
         "report": report,
         "batch": batch.get("id"),
+        "archive_sha256": batch.get("archive_sha256"),
         "log": pack_log_brief(),
     }
     queue = pack_import_queue(result, filename=filename)
@@ -17225,7 +17222,8 @@ async function inspectImages(files){
     try{
       const batch = await (await fetch('/api/restoration_batch', {method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({items:restored, cursor:restored.length, status:'completed'})})).json();
+        body:JSON.stringify({items:restored, cursor:restored.length,
+          status:fail ? (ok ? 'partial' : 'failed') : 'completed'})})).json();
       if(batch.ok) window.LAST_RESTORATION_BATCH = batch.restoration_queue;
     }catch(e){
       console.warn('다중 이미지 복원 큐를 합치지 못했습니다.', e);
@@ -18935,8 +18933,7 @@ class PublicCollectionManager:
                 reverse=True,
             )
             data["can_retry_failed"] = bool(data["failed_items"])
-            queue = public_collection_queue(data)
-            data["restoration"] = summarize_restore_queue(queue)
+            data["restoration"] = public_collection_summary(data)
             return data
 
     def restoration_snapshot(self):
