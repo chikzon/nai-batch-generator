@@ -1,65 +1,52 @@
 # 기능 분류·구조 최적화 색인
 
-기준: `6b7b2bf` 이후 작업 트리. 이 문서는 완료 선언이 아니라 누락 방지 색인이다.
+기준: 현재 작업 트리. 저장 schema·사용자 자료 경로·HTTP endpoint·생성 payload를
+바꾸지 않고 기능 소유권과 조립 경계만 분리한 상태다.
 
 ## 전수 범위
 
-| 대상 | 실측 | 분류 상태 |
+| 대상 | 실측 | 분류·분리 상태 |
 |---|---:|---|
-| 제품 Python | 75파일 · 1,100개 함수·클래스 | 디렉터리·모듈 소유권으로 전부 배정 |
-| 50줄 이상 제품 정의 | 151개 | 별도 소유 모듈 81개, `legacy_app.py` 잔존 70개 |
+| 제품 Python | 105파일 · 44,074줄 · 1,500개 함수·클래스 | `domain`·`services`·`runtime`·`web/routes`·호환 조립으로 전부 배정 |
+| 50줄 이상 제품 정의 | 173개 | 기능 구현은 소유 모듈에 배정, `legacy_app.py`에는 큰 함수 0개 |
+| `legacy_app.py` | 6,647줄 · 390개 정의 | 50줄 이상은 551줄짜리 `ConfigServer` 클래스 1개뿐이며, 내부 32개 메서드는 모두 49줄 이하 |
 | HTTP | GET 40 · POST 74 | 생성·세팅·자료·빌더·관리·공통에 전부 배정, 누락·중복 0 |
 | 정적 DOM id | 518개 | 생성 216 · 세팅 80 · 자료 113 · 빌더 5 · 관리 78 · 공통 26 |
-| UI JavaScript | `studio-core.js` 공통 상태·helper + `studio.js` 8,488줄 | 첫 공통 경계 분리 완료, 기능별 파일 분리는 미완료 |
+| UI JavaScript | 8파일 · 8,533줄 | generation→settings→library→builder→admin→bootstrap 분리 완료, `studio.js`는 1줄 호환 shim |
 
-## 범주와 현재 소유권
+## 범주와 소유권
 
-| 범주 | 내부 기능 | 현재 주 소유 모듈 |
+| 범주 | 내부 기능 | 주 소유 모듈 |
 |---|---|---|
-| 생성 | 설계도, 모델·비용·토큰, 캐릭터·위치, payload, NAI 통신, 결과 저장, 단일·img2img·Director·비교 실행 | `domain/{blueprint,costs,model_presets,nai_payload,positioning,tokenization}.py`, `services/{generation_blueprint,generation_runtime,character_runtime,nai_client,result_store}.py`, generation/runtime route |
-| 세팅 | 옵션 축, 장면 프롬프트, 캐스트, 씬 미리보기, 상속, 순서·실험 계획 | `domain/{project_inheritance,sequence,experiment}.py`, `services/{setting_compiler,scene_catalog,scene_preview,experiment_bridge,experiment_execution_bridge}.py`, settings route |
-| 자료 | 이미지 증거·메타 복원, 공개자료, 자료팩, 백업, 평가·승격, 휴지통·출력 목록 | `collection/arca.py`, `domain/{evidence,image_metadata,knowledge,resources,restoration,evaluation}.py`, collection/catalog/recovery/evaluation 서비스·route |
-| 빌더 | 그림체·캐릭터·작가 조합, 프롬프트 조각, 태그 검증 | `services/{character_bench,character_runtime,fragment_workflow,prompt_bridge,variation_bridge}.py`, fragments/catalog route; 태그·작가 핵심 일부는 레거시 잔존 |
-| 관리 | HTTP 보안, 실행 상태·Job, 진단·로그, 백업·복구, UI·빌드 | `runtime/*.py`, `web/{http_server,page_template}.py`, 관리 route, `tools/build/*.py` |
-| 공통 기반 | 원자 저장, ID·fingerprint, 호환 bridge, 앱 조립 | `runtime/data_files.py`, `domain/blueprint.py`, `services/*_bridge.py`, `legacy_app.py` |
+| 생성 | 설계도, 모델·비용·토큰, 캐릭터·위치, payload, NAI 통신, 단일·img2img·Director·Reference·Vibe·비교 실행, 결과 저장 | `domain/{blueprint,costs,model_presets,nai_payload,positioning,tokenization}.py`, `services/{generation_blueprint,generation_runtime,generation_step,generation_retry,generation_commit,generation_execution,generation_handlers,image_tool_handlers,nai_client,result_store}.py` |
+| 세팅 | 옵션 축, 장면 프롬프트, 캐스트, 씬 미리보기, 상속, 순서·실험 계획, 저장·복제·undo | `domain/{project_inheritance,sequence,experiment}.py`, `services/{setting_compiler,setting_runtime,setting_assets,setting_people,scene_catalog,scene_preview,settings_handlers,experiment_bridge,experiment_execution_bridge}.py` |
+| 자료 | 이미지 증거·메타 복원, 공개자료, 자료팩, 백업, 평가·승격, 휴지통·출력 목록, 로컬 이미지 무결성 | `collection/arca.py`, `domain/{evidence,image_metadata,knowledge,resources,restoration,evaluation}.py`, `services/{public_collection,public_image_style,datapack_store,user_backup_store,metadata_candidate_store,local_image_integrity,library_catalog,output_lifecycle,evaluation_workflow}.py` |
+| 빌더 | 그림체·캐릭터·작가 조합, 프롬프트 조각, 태그 검증 | `services/{style_store,character_storage,character_bench,character_runtime,artist_workspace,fragment_workflow,prompt_bridge,variation_bridge,public_tag_search}.py`, catalog/fragments route |
+| 관리 | HTTP 보안, 실행 상태·Job, 진단·로그, 프로그램 자료 이전, 앱 기동·종료, UI·빌드 | `runtime/*.py`, `services/program_data_migration.py`, `web/{http_server,server_runtime,app_wiring,page_template}.py`, `tools/build/*.py` |
+| 공통 UI | 화면별 이벤트·상태·DOM 연결, 초기 bootstrap, 호환 로드 순서 | `web/static/studio-{generation,settings,library,builder,admin,bootstrap}.js`, `studio-core.js`, `studio.js` |
+| 공통 기반 | 원자 저장, ID·fingerprint, 기능별 Operations 조립, 기존 import·진입점 호환 | `runtime/data_files.py`, `domain/blueprint.py`, `services/*_bridge.py`, `legacy_app.py`, `start.py` |
 
-`domain`은 저장·HTTP를 모르고, `services`는 domain을 조립하며, `web/routes`는
-주입된 Operations만 호출한다. `legacy_app.py`는 아직 완전한 조립·호환 계층이 아니다.
+`domain`은 저장·HTTP를 모르고, `services`는 domain과 저장 경계를 조립하며,
+`web/routes`는 주입된 Operations만 호출한다. `legacy_app.py`는 기존 전역 이름과
+`ConfigServer` 호출 경로를 유지하는 조립·호환 계층이다.
 
-## `legacy_app.py`에 남은 큰 정의 70개
+## 완료한 구조 단계
 
-아래 이름은 50줄 이상 정의를 한 번씩만 배정한 목록이다.
+1. GET·POST route dispatch와 localhost 서버 수명 분리
+2. 생성 계산·재시도·저장·handler·이미지 도구·비교 worker 분리
+3. 세팅 계산·캐스트·씬 저장 handler 분리
+4. 자료팩·백업·휴지통·평가·메타데이터·이미지 무결성·공개자료 분리
+5. 그림체·캐릭터·작가·태그·조각·자료실 검색 분리
+6. 프로그램 자료 이전, 앱 조립·기동·종료 분리
+7. UI를 공통→생성→세팅→자료→빌더→관리→bootstrap 순서로 분리
+8. 남은 생성 Operations와 route 의존성 조립을 범주별 작은 함수로 분리
 
-| 범주 | 잔존 정의 |
-|---|---|
-| 생성 | `comparison_styles`, `normalize_comparison_selection`, `iter_selected_comparison_jobs`, `comparison_selected_plan`, `iter_character_setting_jobs`, `comparison_character_setting_plan`, `comparison_plan`, `comparison_signature`, `iter_comparison_jobs`, `comparison_job_recipe_snapshot`, `comparison_recipe_context`, `compute_pending`, `_comparison_progress_start`, `_rerun_selected_comparison`, `_run_comparison`, `_run_generation`, `handle_job_command`, `handle_generate_one`, `handle_i2i`, `handle_regen`, `handle_scene_run`, `handle_compare_run`, `handle_director`, 중첩 생성 `run` 4개 |
-| 세팅 | `migrate_legacy_selections`, `_migrate_legacy`, `import_char_files`, `sync_chars_to_files`, `handle_blueprint_project`, `handle_save`, `handle_scene_save` |
-| 자료 | `search_booru`, `add_style`, `search_combos`, `organize_library_items`, `search_library`, `_merge_list_json`, `_local_image_audit`, `normalize_local_image_refs`, `rollback_local_image_normalize`, `metadata_audit_candidate`, `metadata_audit_save_candidate`, `_validate_datapack_manifest`, `preview_datapack_bytes`, `import_datapack_bytes`, `undo_datapack`, `_backup_diff_plan`, `restore_user_backup`, `trash_output_files`, `restore_trash_batch`, `list_output`, `_style_record_from_public_image`, `handle_character_variation_save`, `comparison_runs`, `comparison_recipe_for_output`, `_result_promotion_records`, `promote_comparison_recipe_assets`, `handle_compare_promote`, `handle_inspect`, `handle_ref_add`, `handle_ref_save` |
-| 빌더 | `verify_tags`, `compose_artist_workspace` |
-| 관리 | `migrate_legacy_program_data`, `ConfigServer`, `ConfigServer.start`, `main` |
+## 남은 완료 판정
 
-## 이미 정리한 경계
+- 범주별 기존 회귀
+- 전체 무과금 회귀 한 번
+- localhost·정적 자산·JavaScript 구문
+- 현재 HEAD의 exe·자료팩·설치본 빌드 경계
+- 토큰·사용자 자료가 배포 산출물에 들어가지 않았는지 확인
 
-- route dispatch: GET·POST 전부 작은 route 모듈
-- 비용·토큰, 세팅 미리보기, 프롬프트 조각, 평가, 백업·자료팩 route workflow
-- 위치 방식·좌표 검증·자동 분산
-- 세팅 옵션 축·장면 프롬프트 compiler
-- 캐릭터 슬롯·Variant·Cast 실행 투영
-- 현재 설정의 단일 생성 설계도
-- NAI HTTP·오류·ZIP 응답
-- 결과 포맷·원자 저장·NAI 메타데이터
-- 숨은 UI의 지연 초기화와 출력 탐색기 observer 수명
-- UI 공통 상태·DOM helper의 `studio-core.js` 첫 분리와 로드·배포 순서 계약
-- 빌드 필수 정적 자산 검증
-
-## 남은 단계와 완료 판정
-
-1. 비교 planning을 한 서비스로 모으고 별도 `legacy_blueprint_from_config` 투영을 통합
-2. 단일·img2img·재생성·씬·비교·세팅 worker를 공통 실행 골격으로 이동
-3. 자료팩·백업·휴지통·평가 transaction 전체를 route workflow 아래 서비스로 이동
-4. 태그·작가·자료실 검색과 세팅 저장소를 범주 서비스로 이동
-5. `ConfigServer`를 상태·의존성 조립과 얇은 호환 메서드만 남도록 축소
-6. `studio.js`를 `core → generation → settings → library → builder → admin → bootstrap` 순으로 분리
-7. 범주별 기존 시험 후 마지막 전체 무과금 회귀·localhost·빌드 경계 검증
-
-70개 잔존 정의와 `studio.js` 분리가 남아 있으므로 구조 최적화는 **진행 중**이다.
+위 검증과 빌드가 끝나기 전에는 전체 완료로 판정하지 않는다.

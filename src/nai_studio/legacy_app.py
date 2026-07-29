@@ -3756,9 +3756,8 @@ def comparison_recipe_context(cfg, plan, styles, chars):
     return _comparison_planning.comparison_recipe_context(
         _comparison_operations(), cfg, plan, styles, chars)
 
-def _generation_execution_operations():
-    """세팅 생성의 계산·재시도·저장 의존성을 호출 시점에 연결한다."""
-    step = _generation_step.GenerationStepOperations(
+def _generation_step_operations():
+    return _generation_step.GenerationStepOperations(
         character_resource_config=globals()["character_resource_config"],
         setting_reference_config=globals()["setting_reference_config"],
         build_scene=globals()["build_scene"],
@@ -3768,7 +3767,10 @@ def _generation_execution_operations():
         with_position_mode=globals()["with_position_mode"],
         with_centers=globals()["with_centers"],
     )
-    retry = _generation_retry.GenerationRetryOperations(
+
+
+def _generation_retry_operations():
+    return _generation_retry.GenerationRetryOperations(
         pace_gate=globals()["pace_gate"],
         pace_complete=globals()["pace_complete"],
         call_nai_api=globals()["call_nai_api"],
@@ -3776,7 +3778,10 @@ def _generation_execution_operations():
         error=globals()["log"].error,
         critical=globals()["log"].critical,
     )
-    commit = _generation_commit.GenerationCommitOperations(
+
+
+def _generation_commit_operations():
+    return _generation_commit.GenerationCommitOperations(
         save_image=globals()["save_with_meta"],
         output_format=globals()["out_format"],
         output_clean_args=globals()["_ocargs"],
@@ -3791,10 +3796,14 @@ def _generation_execution_operations():
         save_state=globals()["save_state"],
         warning=globals()["log"].warning,
     )
+
+
+def _generation_execution_operations():
+    """세팅 생성의 계산·재시도·저장 의존성을 호출 시점에 연결한다."""
     return _generation_execution.GenerationExecutionOperations(
-        step=step,
-        retry=retry,
-        commit=commit,
+        step=_generation_step_operations(),
+        retry=_generation_retry_operations(),
+        commit=_generation_commit_operations(),
         load_state=globals()["load_state"],
         save_state=globals()["save_state"],
         fixed_seed=globals()["fixed_seed"],
@@ -3816,60 +3825,74 @@ def _generation_execution_operations():
     )
 
 
+def _generation_handler_run_bindings():
+    return {
+        "common_job_store": globals()["common_job_store"],
+        "make_job_command": globals()["make_job_command"],
+        "transition_job": globals()["transition_job"],
+        "activate_comparison_run": globals()["activate_comparison_run"],
+        "retry_job": globals()["retry_job"],
+        "reconcile_job": globals()["reconcile_job"],
+        "inherited_blueprint": globals()["inherited_blueprint"],
+        "single_generation_material": globals()[
+            "single_generation_legacy_material"],
+        "characters_resource_config": globals()["characters_resource_config"],
+        "start_daemon": lambda target: globals()["threading"].Thread(
+            target=target, daemon=True).start(),
+        "error": globals()["log"].error,
+        "warning": globals()["log"].warning,
+    }
+
+
+def _generation_handler_nai_bindings():
+    return {
+        "pace_gate": globals()["pace_gate"],
+        "runtime_generation_params": globals()["runtime_generation_params"],
+        "load_state": globals()["load_state"],
+        "call_nai_api": globals()["call_nai_api"],
+        "with_centers": globals()["with_centers"],
+        "pace_complete": globals()["pace_complete"],
+        "output_subdir": globals()["out_sub"],
+        "output_format": globals()["out_format"],
+        "output_clean_args": globals()["out_clean"],
+        "save_with_meta": globals()["save_with_meta"],
+        "output_root": globals()["out_root"],
+        "record_job_result": globals()["record_job_result"],
+        "bump_daily": globals()["bump_daily"],
+        "save_state": globals()["save_state"],
+        "daily_count": globals()["daily_count"],
+        "available_output_path": globals()["available_output_path"],
+    }
+
+
+def _generation_handler_image_bindings():
+    return {
+        "random_seed": globals()["random"].randint,
+        "reference_inset_canvas": globals()["reference_inset_canvas"],
+        "character_asset_from_record": globals()[
+            "character_asset_from_legacy_record"],
+        "variation_plan_material": globals()[
+            "variation_plan_to_legacy_payload_material"],
+        "slot_prompt": globals()["slot_prompt"],
+        "active_people": globals()["active_people"],
+        "now": lambda: globals()["datetime"].now(),
+        "extract_metadata": globals()["extract_nai_metadata"],
+        "model_id_from_metadata": globals()["model_id_from_metadata"],
+        "normalize_position_mode": globals()["normalize_position_mode"],
+        "scene_mode_pending": globals()["scene_mode_pending"],
+        "safe_name": globals()["_safe_name"],
+        "progress_record_path": globals()["progress_record_path"],
+        "join_tags": globals()["_join_tags"],
+        "seed_for": globals()["seed_for"],
+    }
+
+
 def _generation_handler_operations():
-    """생성 HTTP handler의 Job·NAI·저장 의존성을 호출 시점에 연결한다."""
+    """생성 HTTP handler의 의존성을 기능 묶음별로 늦게 연결한다."""
     return _generation_handlers.GenerationHandlerOperations(
-        common_job_store=globals()["common_job_store"],
-        make_job_command=globals()["make_job_command"],
-        transition_job=globals()["transition_job"],
-        activate_comparison_run=globals()["activate_comparison_run"],
-        retry_job=globals()["retry_job"],
-        reconcile_job=globals()["reconcile_job"],
-        inherited_blueprint=globals()["inherited_blueprint"],
-        single_generation_material=globals()[
-            "single_generation_legacy_material"
-        ],
-        characters_resource_config=globals()["characters_resource_config"],
-        pace_gate=globals()["pace_gate"],
-        runtime_generation_params=globals()["runtime_generation_params"],
-        load_state=globals()["load_state"],
-        call_nai_api=globals()["call_nai_api"],
-        with_centers=globals()["with_centers"],
-        pace_complete=globals()["pace_complete"],
-        output_subdir=globals()["out_sub"],
-        output_format=globals()["out_format"],
-        output_clean_args=globals()["out_clean"],
-        save_with_meta=globals()["save_with_meta"],
-        output_root=globals()["out_root"],
-        record_job_result=globals()["record_job_result"],
-        bump_daily=globals()["bump_daily"],
-        save_state=globals()["save_state"],
-        start_daemon=lambda target: globals()["threading"].Thread(
-            target=target, daemon=True
-        ).start(),
-        error=globals()["log"].error,
-        random_seed=globals()["random"].randint,
-        reference_inset_canvas=globals()["reference_inset_canvas"],
-        character_asset_from_record=globals()[
-            "character_asset_from_legacy_record"
-        ],
-        variation_plan_material=globals()[
-            "variation_plan_to_legacy_payload_material"
-        ],
-        slot_prompt=globals()["slot_prompt"],
-        active_people=globals()["active_people"],
-        now=lambda: globals()["datetime"].now(),
-        extract_metadata=globals()["extract_nai_metadata"],
-        model_id_from_metadata=globals()["model_id_from_metadata"],
-        normalize_position_mode=globals()["normalize_position_mode"],
-        scene_mode_pending=globals()["scene_mode_pending"],
-        daily_count=globals()["daily_count"],
-        safe_name=globals()["_safe_name"],
-        progress_record_path=globals()["progress_record_path"],
-        join_tags=globals()["_join_tags"],
-        seed_for=globals()["seed_for"],
-        available_output_path=globals()["available_output_path"],
-        warning=globals()["log"].warning,
+        **_generation_handler_run_bindings(),
+        **_generation_handler_nai_bindings(),
+        **_generation_handler_image_bindings(),
     )
 
 
@@ -4003,20 +4026,20 @@ def _comparison_handler_operations():
     )
 
 
-def _route_bindings():
-    """라우트 Operations의 전역 의존성을 monkeypatch 가능한 함수로 묶는다."""
-    def late_bound(name):
-        return lambda *args, **kwargs: globals()[name](*args, **kwargs)
+def _late_bound(name):
+    return lambda *args, **kwargs: globals()[name](*args, **kwargs)
 
+
+def _route_catalog_bindings():
     return {
-        "booru": late_bound("search_booru"),
-        "style_duplicates": late_bound("find_style_dupes"),
-        "library": late_bound("search_library"),
-        "combos": late_bound("search_combos"),
-        "recipes": late_bound("search_recipes"),
-        "prewarm": late_bound("prewarm_images"),
-        "autocomplete": late_bound("autocomplete_tags"),
-        "tags": late_bound("search_tags"),
+        "booru": _late_bound("search_booru"),
+        "style_duplicates": _late_bound("find_style_dupes"),
+        "library": _late_bound("search_library"),
+        "combos": _late_bound("search_combos"),
+        "recipes": _late_bound("search_recipes"),
+        "prewarm": _late_bound("prewarm_images"),
+        "autocomplete": _late_bound("autocomplete_tags"),
+        "tags": _late_bound("search_tags"),
         "scenes": lambda cfg, ids, setting: globals()["scene_catalog"](
             cfg,
             ids,
@@ -4028,24 +4051,29 @@ def _route_bindings():
             normalize_refs=globals()["normalize_scene_reference_ids"],
             normalize_centers=globals()["normalize_scene_centers"],
         ),
-        "comparison_catalog": late_bound("comparison_catalog"),
-        "comparison_runs": late_bound("comparison_runs"),
-        "comparison_progress": late_bound("comparison_progress_summary"),
+        "comparison_catalog": _late_bound("comparison_catalog"),
+        "comparison_runs": _late_bound("comparison_runs"),
+        "comparison_progress": _late_bound("comparison_progress_summary"),
+    }
+
+
+def _route_asset_bindings():
+    return {
         "vibe_dir": lambda: globals()["VIBE_DIR"],
         "mime": lambda: globals()["MIME"],
-        "output_preview": late_bound("output_file_for_preview"),
-        "output_list": late_bound("list_output"),
-        "setting_thumbs": late_bound("setting_thumbs"),
+        "output_preview": _late_bound("output_file_for_preview"),
+        "output_list": _late_bound("list_output"),
+        "setting_thumbs": _late_bound("setting_thumbs"),
         "resource_export": lambda cfg: globals()[
             "export_legacy_resources"
         ](
             cfg,
             file_index=globals()["resource_file_index"](cfg),
         ),
-        "backup_export": late_bound("export_user_backup"),
-        "fragments_export": late_bound("export_fragments_zip"),
-        "settings_export": late_bound("export_settings_zip"),
-        "cached_image": late_bound("fetch_cached_image"),
+        "backup_export": _late_bound("export_user_backup"),
+        "fragments_export": _late_bound("export_fragments_zip"),
+        "settings_export": _late_bound("export_settings_zip"),
+        "cached_image": _late_bound("fetch_cached_image"),
         "diagnostics": lambda limit, errors_only: globals()[
             "diagnostic_snapshot"
         ](
@@ -4053,15 +4081,20 @@ def _route_bindings():
             limit=limit,
             errors_only=errors_only,
         ),
-        "render_page": late_bound("render_page"),
+        "render_page": _late_bound("render_page"),
+    }
+
+
+def _route_recovery_bindings():
+    return {
         "metadata_audit": lambda offset, limit: globals()[
             "metadata_audit_status"
         ](
             found_offset=offset,
             found_limit=limit,
         ),
-        "folder_inventory": late_bound("folder_inventory_page"),
-        "trash": late_bound("list_trash_batches"),
+        "folder_inventory": _late_bound("folder_inventory_page"),
+        "trash": _late_bound("list_trash_batches"),
         "pack_log": lambda: {
             "ok": True,
             "log": globals()["pack_log_brief"](),
@@ -4072,37 +4105,43 @@ def _route_bindings():
         "public_collection": lambda: globals()[
             "PUBLIC_COLLECTION"
         ].snapshot(),
-        "data_storage": late_bound("data_storage_status"),
-        "image_origins": late_bound("image_origin_stats"),
-        "local_integrity": late_bound("local_image_integrity"),
-        "preview_backup": late_bound("preview_user_backup"),
-        "restore_backup": late_bound("restore_user_backup"),
-        "rollback_backup": late_bound("rollback_user_backup"),
+        "data_storage": _late_bound("data_storage_status"),
+        "image_origins": _late_bound("image_origin_stats"),
+        "local_integrity": _late_bound("local_image_integrity"),
+        "preview_backup": _late_bound("preview_user_backup"),
+        "restore_backup": _late_bound("restore_user_backup"),
+        "rollback_backup": _late_bound("rollback_user_backup"),
         "load_settings": lambda: globals()["load_settings_recover"](
             globals()["SETTINGS_FILE"]
         ),
         "default_config": lambda: globals()["DEFAULT_CONFIG"],
-        "migrate_selections": late_bound("migrate_legacy_selections"),
-        "migrate_slots": late_bound("migrate_char_slots"),
-        "load_spec": late_bound("load_spec"),
+        "migrate_selections": _late_bound("migrate_legacy_selections"),
+        "migrate_slots": _late_bound("migrate_char_slots"),
+        "load_spec": _late_bound("load_spec"),
         "options": lambda: globals()["OPTIONS"],
-        "load_options": late_bound("load_options"),
-        "normalize_local_images": late_bound(
+        "load_options": _late_bound("load_options"),
+        "normalize_local_images": _late_bound(
             "normalize_local_image_refs"
         ),
-        "rollback_local_images": late_bound(
+        "rollback_local_images": _late_bound(
             "rollback_local_image_normalize"
         ),
-        "rebuild_data_index": late_bound("rebuild_data_index"),
-        "metadata_control": late_bound("metadata_audit_control"),
-        "metadata_candidate": late_bound("metadata_audit_candidate"),
-        "metadata_save": late_bound("metadata_audit_save_candidate"),
-        "image_batch_queue": late_bound("image_batch_queue"),
-        "summarize_queue": late_bound("summarize_restore_queue"),
-        "preview_pack": late_bound("preview_datapack_bytes"),
-        "import_pack": late_bound("import_datapack_bytes"),
-        "pack_queue": late_bound("pack_import_queue"),
-        "forget_caches": late_bound("forget_collection_caches"),
+        "rebuild_data_index": _late_bound("rebuild_data_index"),
+        "metadata_control": _late_bound("metadata_audit_control"),
+        "metadata_candidate": _late_bound("metadata_audit_candidate"),
+        "metadata_save": _late_bound("metadata_audit_save_candidate"),
+        "image_batch_queue": _late_bound("image_batch_queue"),
+        "summarize_queue": _late_bound("summarize_restore_queue"),
+    }
+
+
+def _route_collection_bindings():
+    return {
+        "preview_pack": _late_bound("preview_datapack_bytes"),
+        "import_pack": _late_bound("import_datapack_bytes"),
+        "pack_queue": _late_bound("pack_import_queue"),
+        "summarize_queue": _late_bound("summarize_restore_queue"),
+        "forget_caches": _late_bound("forget_collection_caches"),
         "public_start": lambda payload: globals()[
             "PUBLIC_COLLECTION"
         ].start(payload),
@@ -4112,69 +4151,92 @@ def _route_bindings():
         "public_control": lambda action: globals()[
             "PUBLIC_COLLECTION"
         ].control(action),
-        "undo_pack": late_bound("undo_datapack"),
-        "import_settings": late_bound("import_settings_bytes"),
-        "verify_tags": late_bound("verify_tags"),
-        "organize_library": late_bound("organize_library_items"),
-        "delete_styles": late_bound("delete_styles"),
-        "restore_styles": late_bound("restore_styles"),
-        "artist_workspace": late_bound("artist_workspace_request"),
-        "load_ratings": late_bound("load_ratings"),
-        "rate_artist": late_bound("rate_artist"),
-        "apply_evaluation": late_bound("apply_evaluation_action"),
+        "undo_pack": _late_bound("undo_datapack"),
+        "import_settings": _late_bound("import_settings_bytes"),
+        "verify_tags": _late_bound("verify_tags"),
+        "organize_library": _late_bound("organize_library_items"),
+        "delete_styles": _late_bound("delete_styles"),
+        "restore_styles": _late_bound("restore_styles"),
+    }
+
+
+def _route_evaluation_fragment_bindings():
+    return {
+        "artist_workspace": _late_bound("artist_workspace_request"),
+        "load_ratings": _late_bound("load_ratings"),
+        "rate_artist": _late_bound("rate_artist"),
+        "apply_evaluation": _late_bound("apply_evaluation_action"),
         "picks_lock": globals()["_JSON_IO_LOCK"],
-        "load_picks": late_bound("load_picks"),
-        "save_picks": late_bound("save_picks"),
-        "trash_outputs": late_bound("trash_output_files"),
-        "restore_trash": late_bound("restore_trash_batch"),
-        "output_subdir": late_bound("out_sub"),
-        "atomic_write": late_bound("_atomic_write_bytes"),
-        "strip_and_save": late_bound("strip_and_save"),
+        "load_picks": _late_bound("load_picks"),
+        "save_picks": _late_bound("save_picks"),
+        "trash_outputs": _late_bound("trash_output_files"),
+        "restore_trash": _late_bound("restore_trash_batch"),
+        "output_subdir": _late_bound("out_sub"),
+        "atomic_write": _late_bound("_atomic_write_bytes"),
+        "strip_and_save": _late_bound("strip_and_save"),
         "fragment_dir": lambda: globals()["FRAG_DIR"],
-        "save_fragment": late_bound("save_fragment"),
-        "list_fragments": late_bound("list_fragments"),
-        "recoverable_remove": late_bound("recoverable_remove"),
-        "load_state": late_bound("load_state"),
-        "save_state": late_bound("save_state"),
-        "import_fragments": late_bound("import_fragments_bytes"),
-        "reroll_components": late_bound("reroll_legacy_components"),
-        "resolve_prompt": late_bound("resolve_legacy_prompt"),
-        "sequence_text": late_bound("legacy_sequence_text"),
-        "resolve_fragments": late_bound("resolve_fragments"),
+        "save_fragment": _late_bound("save_fragment"),
+        "list_fragments": _late_bound("list_fragments"),
+        "recoverable_remove": _late_bound("recoverable_remove"),
+        "load_state": _late_bound("load_state"),
+        "save_state": _late_bound("save_state"),
+        "import_fragments": _late_bound("import_fragments_bytes"),
+        "reroll_components": _late_bound("reroll_legacy_components"),
+        "resolve_prompt": _late_bound("resolve_legacy_prompt"),
+        "sequence_text": _late_bound("legacy_sequence_text"),
+        "resolve_fragments": _late_bound("resolve_fragments"),
         "random_factory": globals()["random"].Random,
-        "duplicate_scene_undo": late_bound(
+    }
+
+
+def _route_settings_runtime_bindings():
+    return {
+        "duplicate_scene_undo": _late_bound(
             "undo_duplicate_setting_scene"
         ),
-        "duplicate_scene": late_bound("duplicate_setting_scene"),
-        "load_asset_config": late_bound("load_asset_config"),
-        "setting_state": late_bound("setting_state"),
-        "cast_members": late_bound("setting_cast_members"),
-        "slot_prompt": late_bound("slot_prompt"),
-        "character_run": late_bound("character_run_from_group"),
-        "build_scene": late_bound("build_scene"),
-        "reference_config": late_bound("setting_reference_config"),
-        "scene_people": late_bound("setting_scene_people"),
-        "seed_for": late_bound("seed_for"),
-        "normalize_prompt": late_bound("normalize_prompt"),
-        "join_tags": late_bound("_join_tags"),
-        "token_count": late_bound("nai_tokens"),
-        "save_scenes": late_bound("save_scenes"),
-        "new_setting": late_bound("new_setting"),
-        "add_set": late_bound("setting_add_set"),
-        "save_meta": late_bound("setting_meta_save"),
-        "renumber": late_bound("setting_renumber"),
-        "delete_setting": late_bound("setting_delete"),
-        "duplicate_group": late_bound("duplicate_setting_group"),
+        "duplicate_scene": _late_bound("duplicate_setting_scene"),
+        "load_asset_config": _late_bound("load_asset_config"),
+        "setting_state": _late_bound("setting_state"),
+        "cast_members": _late_bound("setting_cast_members"),
+        "slot_prompt": _late_bound("slot_prompt"),
+        "character_run": _late_bound("character_run_from_group"),
+        "build_scene": _late_bound("build_scene"),
+        "reference_config": _late_bound("setting_reference_config"),
+        "scene_people": _late_bound("setting_scene_people"),
+        "seed_for": _late_bound("seed_for"),
+        "normalize_prompt": _late_bound("normalize_prompt"),
+        "join_tags": _late_bound("_join_tags"),
+        "token_count": _late_bound("nai_tokens"),
+        "save_scenes": _late_bound("save_scenes"),
+        "new_setting": _late_bound("new_setting"),
+        "add_set": _late_bound("setting_add_set"),
+        "save_meta": _late_bound("setting_meta_save"),
+        "renumber": _late_bound("setting_renumber"),
+        "delete_setting": _late_bound("setting_delete"),
+        "duplicate_group": _late_bound("duplicate_setting_group"),
         "log_warning": globals()["log"].warning,
-        "activate_comparison": late_bound("activate_comparison_run"),
-        "comparison_recipe": late_bound("comparison_recipe_for_output"),
-        "fetch_balance": late_bound("fetch_anlas_balance"),
-        "vibe_paths": late_bound("vibe_paths"),
-        "compute_pending": late_bound("compute_pending"),
-        "estimate_anlas": late_bound("anlas_estimate"),
-        "finalize_tokens": late_bound("finalized_token_texts"),
-        "tokens_exact": late_bound("tokens_exact"),
+        "activate_comparison": _late_bound("activate_comparison_run"),
+        "comparison_recipe": _late_bound("comparison_recipe_for_output"),
+        "fetch_balance": _late_bound("fetch_anlas_balance"),
+        "vibe_paths": _late_bound("vibe_paths"),
+        "compute_pending": _late_bound("compute_pending"),
+        "estimate_anlas": _late_bound("anlas_estimate"),
+        "finalize_tokens": _late_bound("finalized_token_texts"),
+        "tokens_exact": _late_bound("tokens_exact"),
     }
+
+
+def _route_bindings():
+    """라우트 Operations 의존성을 기능 범주별로 합친다."""
+    groups = (
+        _route_catalog_bindings(),
+        _route_asset_bindings(),
+        _route_recovery_bindings(),
+        _route_collection_bindings(),
+        _route_evaluation_fragment_bindings(),
+        _route_settings_runtime_bindings(),
+    )
+    return {key: value for group in groups for key, value in group.items()}
 
 
 # ═══════════════ 설정 로드/저장 ═══════════════
