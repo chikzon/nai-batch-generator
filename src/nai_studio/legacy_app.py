@@ -200,6 +200,7 @@ from src.nai_studio.services import (
     local_image_store as _local_image_store,
     metadata_candidate_store as _metadata_candidate_store,
     output_lifecycle as _output_lifecycle,
+    program_data_migration as _program_data_migration,
     public_style_import as _public_style_import,
     setting_runtime as _setting_runtime,
     settings_handlers as _settings_handlers,
@@ -423,83 +424,23 @@ _LEGACY_USER_DIRS = (
 
 
 def migrate_legacy_program_data(program_dir, data_dir):
-    """옛 설치본의 프로그램 옆 자료를 새 사용자 폴더로 **복사만** 한다.
-
-    원본은 지우지 않고, 대상에 다른 내용이 있으면 덮지 않는다. 중간에 종료돼도 다음
-    실행에서 없는 파일만 이어 복사할 수 있도록 완료 기록은 맨 마지막에 쓴다.
-    """
-    source, target = Path(program_dir).resolve(), Path(data_dir).resolve()
-    if source == target:
-        return {"status": "same", "copied": 0, "skipped": 0, "conflicts": 0}
-    receipt = target / "이전자료-복사기록.json"
-    old_receipt = {}
-    try:
-        old_receipt = json.loads(receipt.read_text(encoding="utf-8"))
-        if old_receipt.get("status") == "complete":
-            return old_receipt
-    except (OSError, json.JSONDecodeError):
-        pass
-    evidence = [source / name for name in _LEGACY_USER_FILES + _LEGACY_USER_DIRS]
-    if not any(path.exists() for path in evidence):
-        return {"status": "none", "copied": 0, "skipped": 0, "conflicts": 0}
-
-    # 사용자가 이미 새 위치에 자료를 만든 경우 두 저장소를 자동 병합하지 않는다.
-    destination_evidence = [
-        target / name for name in _LEGACY_USER_FILES + _LEGACY_USER_DIRS
-    ]
-    if (old_receipt.get("status") not in ("copying", "partial")
-            and any(path.exists() for path in destination_evidence)):
-        return {"status": "destination-not-empty", "copied": 0,
-                "skipped": 0, "conflicts": 0}
-
-    target.mkdir(parents=True, exist_ok=True)
-    result = {"schema": "nais-data-migration/v1", "status": "copying",
-              "source": str(source), "target": str(target),
-              "copied": 0, "skipped": 0, "conflicts": 0, "errors": []}
-
-    def save_receipt():
-        tmp = receipt.with_name(
-            f".{receipt.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
-        os.replace(tmp, receipt)
-
-    save_receipt()
-
-    def copy_one(src, dst):
-        if src.is_symlink():
-            result["skipped"] += 1
-            return
-        try:
-            if dst.exists():
-                if (dst.is_file() and src.is_file()
-                        and hashlib.sha256(dst.read_bytes()).digest()
-                        == hashlib.sha256(src.read_bytes()).digest()):
-                    result["skipped"] += 1
-                else:
-                    result["conflicts"] += 1
-                return
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            result["copied"] += 1
-        except OSError as e:
-            result["errors"].append(f"{src.name}: {e}")
-
-    for name in _LEGACY_USER_FILES:
-        src = source / name
-        if src.is_file():
-            copy_one(src, target / name)
-    for name in _LEGACY_USER_DIRS:
-        root = source / name
-        if not root.is_dir() or root.is_symlink():
-            continue
-        for src in sorted(root.rglob("*")):
-            if src.is_file():
-                copy_one(src, target / name / src.relative_to(root))
-    result["status"] = "complete" if not result["errors"] else "partial"
-    result["completed_at"] = datetime.now().isoformat(timespec="seconds")
-    save_receipt()
-    return result
+    paths = _program_data_migration.ProgramDataMigrationPaths(
+        program_dir=Path(program_dir),
+        data_dir=Path(data_dir),
+        user_files=globals()["_LEGACY_USER_FILES"],
+        user_dirs=globals()["_LEGACY_USER_DIRS"],
+    )
+    operations = _program_data_migration.ProgramDataMigrationOperations(
+        copy_file=globals()["shutil"].copy2,
+        replace_file=globals()["os"].replace,
+        process_id=globals()["os"].getpid,
+        thread_id=globals()["threading"].get_ident,
+        now=lambda: globals()["datetime"].now(),
+    )
+    return _program_data_migration.migrate_legacy_program_data(
+        paths,
+        operations,
+    )
 
 
 if getattr(sys, "frozen", False) and BASE_DIR.resolve() != PROGRAM_DIR.resolve():
