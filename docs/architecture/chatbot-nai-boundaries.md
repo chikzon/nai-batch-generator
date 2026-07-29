@@ -48,6 +48,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 생성·비교·이미지 도구 POST 라우트 | `web/routes/generation_post.py` |
 | 설계도·설정·비용·토큰 POST 라우트 | `web/routes/runtime_post.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
+| 세팅 옵션 축·장면별 인물 프롬프트 컴파일 | `services/setting_compiler.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
 

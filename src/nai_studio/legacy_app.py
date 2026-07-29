@@ -218,6 +218,22 @@ from src.nai_studio.services.restoration_inputs import (
     pack_import_queue,
 )
 from src.nai_studio.services.scene_catalog import scene_catalog
+from src.nai_studio.services.setting_compiler import (
+    AXIS_SHAPES,
+    AXIS_TARGETS,
+    LEGACY_AXES,
+    _build_std,
+    _build_yuri,
+    _guess_shape,
+    _join_tags,
+    _strip_subject_prefix,
+    apply_axes,
+    axis_specs,
+    build_scene,
+    clean_char_prompt,
+    remove_prompt_tags,
+    setting_state,
+)
 from src.nai_studio.services.result_promotion import (
     append_promotion_events,
     build_result_promotion,
@@ -7831,21 +7847,6 @@ def save_config(cfg):
     atomic_write_json(SETTINGS_FILE, clean)
 
 
-# ═══════════════ 프롬프트 조합 ═══════════════
-
-def clean_char_prompt(raw):
-    return ", ".join(
-        t.strip()
-        for t in (raw or "").replace("\n", ",").split(",")
-        if t.strip() and not t.strip().startswith("#")
-    )
-
-
-def setting_state(cfg, name):
-    """설정.json 에 저장되는 세팅별 선택 상태: {use, selected(그룹 id들), opts{옵션명: 선택값}}"""
-    return (cfg.get("setting_state") or {}).get(name, {})
-
-
 def load_asset_config(cfg):
     """세팅/ 폴더의 모든 세팅을 병합. 각 씬에 _setting(이름)/_mode(방식)를 부여하고,
     세팅별 옵션 선택값(setting_state)을 규격이 아는 의미대로 반영한다."""
@@ -7903,188 +7904,6 @@ def load_asset_config(cfg):
                 sc["location"] = loc
             acfg["scenes"][str(k)] = sc
     return acfg
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  옵션 축 — 세팅이 스스로 "이 축이 어디에 어떻게 붙는지" 말할 수 있게 한다.
-#    세팅 파일에 `옵션규격` 이 있으면 그것을 따르고, 없으면 **값 모양으로 추론**한다.
-#    (기존 세팅 3종은 규격이 없으므로 추론 경로로 예전과 똑같이 동작한다)
-#
-#    "옵션규격": { "장소테마": {"적용": "base",  "방식": "계열별"},
-#                 "시간대":   {"적용": "base",  "방식": "고정"},
-#                 "표정진행": {"적용": "여자",  "방식": "단계별"},
-#                 "말투":     {"적용": "네거티브", "방식": "고정"} }
-#
-#    적용: base | 여자 | 남자 | 네거티브       방식: 고정 | 계열별 | 단계별
-# ══════════════════════════════════════════════════════════════════════
-AXIS_TARGETS = ("base", "여자", "남자", "네거티브")
-AXIS_SHAPES = ("고정", "계열별", "단계별")
-# 이름만 보고 아는 것 (예전 세팅과 호환)
-LEGACY_AXES = {
-    "장소테마": ("base", "계열별"),
-    "시간대": ("base", "고정"),
-    "표정진행": ("여자", "단계별"),
-}
-
-
-def _guess_shape(items):
-    """항목 값의 모양으로 방식을 추론한다."""
-    for v in (items or {}).values():
-        if isinstance(v, list):
-            return "단계별"
-        if isinstance(v, dict):
-            return "계열별"
-        return "고정"
-    return "고정"
-
-
-def axis_specs(data):
-    """세팅 파일 → {축이름: (적용, 방식)}. 규격이 없으면 이름·모양으로 추론."""
-    declared = data.get("옵션규격") or {}
-    out = {}
-    for ax, items in (data.get("옵션") or {}).items():
-        d = declared.get(ax) or {}
-        target = d.get("적용")
-        shape = d.get("방식")
-        if target not in AXIS_TARGETS or shape not in AXIS_SHAPES:
-            lt, ls = LEGACY_AXES.get(ax, (None, None))
-            target = target if target in AXIS_TARGETS else (lt or "base")
-            shape = shape if shape in AXIS_SHAPES else (ls or _guess_shape(items))
-        out[ax] = (target, shape)
-    return out
-
-
-def apply_axes(specs, options, chosen, scene, target):
-    """이 씬에서 `target` 자리에 붙을 옵션 태그들을 이어 붙여 돌려준다."""
-    parts = []
-    for ax, (tgt, shape) in (specs or {}).items():
-        if tgt != target:
-            continue
-        pick = chosen.get(ax, "")
-        if not pick:
-            continue
-        val = (options.get(ax) or {}).get(pick)
-        if not val:
-            continue
-        if shape == "계열별" and isinstance(val, dict):
-            v = val.get(scene.get("category", ""))
-            if v:
-                parts.append(v)
-        elif shape == "단계별" and isinstance(val, (list, tuple)):
-            i = int(scene.get("_stage", 0))
-            if 0 <= i < len(val) and val[i]:
-                parts.append(val[i])
-        elif isinstance(val, str):
-            parts.append(val)
-    return ", ".join(x for x in parts if x)
-
-
-def _setting_ctx(acfg, scene):
-    return acfg.get("_settings", {}).get(scene.get("_setting", ""), {})
-
-
-def remove_prompt_tags(text, removals):
-    """쉼표 단위 프롬프트에서 사용자가 지정한 태그를 제외한다."""
-    if isinstance(removals, str):
-        removals = re.split(r"[,\n]", removals)
-    needles = [str(x).strip().lower() for x in (removals or []) if str(x).strip()]
-    if not needles:
-        return text
-    parts = [tag.strip() for tag in (text or "").split(",") if tag.strip()]
-    return ", ".join(
-        tag for tag in parts
-        if not any(needle in tag.lower() for needle in needles)
-    )
-
-
-def build_scene(acfg, char, cfg, scene_num):
-    """방식(남녀/백합/단독)에 따라 프롬프트 조립. 반환: (base, cap1, cap2, neg1, neg2, w, h)"""
-    scene = acfg["scenes"][str(scene_num)]
-    mode = scene.get("_mode", "단독")
-    if mode == "백합":
-        return _build_yuri(acfg, char, scene)
-    return _build_std(acfg, char, scene, mode)
-
-
-def _build_std(acfg, char, scene, mode):
-    kind = "표정" if mode == "단독" else "체위"
-    variant = "clothed" if mode == "단독" else "nude"
-    base = acfg["base"]["nsfw_base_prompt"] if variant == "nude" else acfg["base"]["base_prompt"]
-    ctx = _setting_ctx(acfg, scene)
-
-    raw_char = char.get("female", "")
-    cleaned_char = clean_char_prompt(raw_char)
-    char_negative = char.get("negative", "")
-
-    location = scene.get("location", "")
-    if location:
-        base = f"{base}, {location}"
-    if scene.get("base_tags"):
-        base = _join_tags(base, scene.get("base_tags"))
-    if scene.get("relationship_tags"):
-        base = _join_tags(base, scene.get("relationship_tags"))
-
-    cleaned_char = remove_prompt_tags(
-        cleaned_char, scene.get("remove_char_tags", []))
-    char_negative = _join_tags(
-        char_negative, scene.get("female_negative", ""))
-
-    female_scene = scene.get("female_prompt", "")
-    male_caption = scene.get("male_prompt", "")
-
-    female_caption = _join_tags(cleaned_char, female_scene)
-
-    scene_num = scene.get("_num", 0)
-    role = ctx.get("role", {})
-    opts_chosen = ctx.get("opts", {})
-
-    # 단계 = **묶음 안의 순서**. `(번호-1) % 5` 를 쓰면 5장 묶음에 갇힌다.
-    stage = int(scene.get("_stage", (scene_num - 1) % 5))
-    specs = ctx.get("specs") or {}
-    options = ctx.get("options", {})
-
-    # 여자 칸에 붙는 축 (표정진행 등)
-    add_f = apply_axes(specs, options, opts_chosen, scene, "여자")
-    if add_f:
-        female_caption = _join_tags(female_caption, add_f)
-
-    if mode == "남녀":
-        # 상대역(남자)은 세팅 파일의 것 — 씬 태그가 비어 있어도 항상 포함
-        # 캐릭터 칸/동시 캐스트의 둘째 인물이 있으면 세팅의 기본 상대역보다 우선한다.
-        partner_from_cast = char.get("male_prompt_base", "")
-        male_base = clean_char_prompt(partner_from_cast or role.get("외형", ""))
-        male_base = remove_prompt_tags(
-            male_base, scene.get("remove_male_tags", []))
-        wear_mode = opts_chosen.get("남자옷", "나체")
-        outfit = role.get("의상", "")
-        wear = ""
-        if partner_from_cast:
-            # 둘째 캐릭터의 착의는 slot_prompt에 이미 들어 있다. 세팅 기본 상대역 옷을
-            # 다시 붙이면 두 의상이 충돌하므로 캐스트 원문을 그대로 우선한다.
-            wear = ""
-        elif wear_mode == "착의":
-            wear = f"{outfit}, clothed male, clothed sex, open pants"
-        elif wear_mode == "탈의진행":
-            if stage <= 1:
-                wear = f"{outfit}, clothed male, clothed sex, open pants"
-            elif stage == 2:
-                wear = "topless male, open pants, clothed sex"
-        add_m = apply_axes(specs, options, opts_chosen, scene, "남자")
-        male_caption = ", ".join(x for x in (male_base, wear, male_caption, add_m) if x)
-        male_negative = _join_tags(
-            char.get("partner_negative", "") or role.get("네거티브", ""),
-            scene.get("male_negative", ""))
-    else:  # 단독
-        male_caption = apply_axes(specs, options, opts_chosen, scene, "남자")
-        male_negative = ""
-
-    # 네거티브에 붙는 축
-    add_n = apply_axes(specs, options, opts_chosen, scene, "네거티브")
-    if add_n:
-        char_negative = _join_tags(char_negative, add_n)
-
-    return (base, female_caption, male_caption, char_negative, male_negative,
-            scene["width"], scene["height"])
 
 
 def slot_prompt(sl):
@@ -8178,70 +7997,6 @@ def character_run_from_group(group, fallback_index=0, position_mode=None):
             for item in members for resource_id in (item.get("vibe_ids") or [])
             if resource_id)),
     }
-
-
-def _join_tags(*parts):
-    """빈 조각을 걸러서 콤마로 잇는다. 캐릭터 칸이 비었을 때
-    ', scene tags' 처럼 앞에 콤마만 남는 것을 막는다."""
-    return ", ".join(p.strip().strip(",").strip() for p in parts
-                     if p and p.strip().strip(",").strip())
-
-
-def _strip_subject_prefix(text):
-    """'1girl, 1boy, ' 등 인원수 프리픽스를 제거해 순수 화풍 태그만 남긴다."""
-    text = text or ""
-    for prefix in ("1girl, 1boy, ", "1girl,1boy,", "1girl, "):
-        if text.startswith(prefix):
-            return text[len(prefix):]
-    return text
-
-
-def _build_yuri(acfg, char, scene):
-    """백합 — 파트너는 세팅 파일의 상대역, 탈의단계는 세팅 옵션에서."""
-    ctx = _setting_ctx(acfg, scene)
-    role = ctx.get("role", {})
-    opts_chosen = ctx.get("opts", {})
-    undress_tags = ctx.get("options", {}).get("탈의단계", {})
-
-    base = acfg["base"].get("yuri_base_prompt", "2girls, yuri")
-    if scene.get("base_tags"):
-        base = f"{base}, {scene['base_tags']}"
-    if scene.get("relationship_tags"):
-        base = _join_tags(base, scene.get("relationship_tags"))
-    if scene.get("location"):
-        base = f"{base}, {scene['location']}"
-
-    u1, u2 = scene.get("undress1", 4), scene.get("undress2", 4)
-    if opts_chosen.get("옷진행", "진행") == "나체":
-        u1 = u2 = 4
-
-    def girl_text(nude_raw, clothed_raw, level):
-        raw = nude_raw if level >= 4 or not clothed_raw else clothed_raw
-        text = clean_char_prompt(raw)
-        extra = undress_tags.get(str(level), "")
-        return f"{text}, {extra}" if extra else text
-
-    female_text = remove_prompt_tags(
-        girl_text(char.get("female", ""), char.get("clothed", ""), u1),
-        scene.get("remove_char_tags", []))
-    partner_from_cast = char.get("male_prompt_base", "")
-    partner_text = remove_prompt_tags(
-        (clean_char_prompt(partner_from_cast) if partner_from_cast
-         else girl_text(role.get("외형", ""), role.get("착의", ""), u2)),
-        scene.get("remove_partner_tags", []))
-
-    female_scene = scene.get("female_prompt", "")
-    partner_scene = scene.get("partner_prompt", "")
-
-    female_caption = _join_tags(female_text, female_scene)
-    partner_caption = _join_tags(partner_text, partner_scene)
-
-    return (
-        base, female_caption, partner_caption,
-        _join_tags(char.get("negative", ""), scene.get("female_negative", "")),
-        _join_tags(char.get("partner_negative", "") or role.get("네거티브", ""),
-                   scene.get("partner_negative", "")),
-        scene["width"], scene["height"])
 
 
 # ═══════════════ NAI API ═══════════════
