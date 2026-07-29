@@ -198,6 +198,12 @@ from src.nai_studio.services.character_bench import (
     apply_character_variation_candidates,
     reference_inset_canvas,
 )
+from src.nai_studio.services.character_runtime import (
+    active_people,
+    character_run_from_group,
+    slot_bundle_identity,
+    slot_prompt,
+)
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
     reroll_legacy_components,
@@ -7906,99 +7912,6 @@ def load_asset_config(cfg):
     return acfg
 
 
-def slot_prompt(sl):
-    """캐릭터 칸의 전송값 = 외형 + 의상. 의상을 따로 두면 외형을 안 건드리고 갈아입힐 수 있다.
-    ⚠ 주석 제거를 **여기서** 한다 — 활성 판정(active_people)과 전송이 같은 값을 봐야
-    주석 전용 슬롯이 (people, centers) 짝을 어긋내지 못한다 (CQA-003)."""
-    if not isinstance(sl, dict):
-        return ""
-    effective = selected_variation_values(sl)
-    return _join_tags(strip_comment_lines(effective["prompt"]),
-                      strip_comment_lines(effective["outfit"]))
-
-
-def slot_bundle_identity(sl):
-    """재개·중복 판정용 캐릭터 묶음.
-
-    화면 표시 이름과 달리 생성 결과를 바꿀 수 있는 원문·참조·변형을 모두 포함한다.
-    사용자가 저장한 원문은 정규화하지 않고 JSON 직렬화만 안정적으로 수행한다.
-    """
-    if not isinstance(sl, dict):
-        return ""
-    effective = selected_variation_values(sl)
-    selected = effective["selected_variant"]
-    bundle = {
-        "id": sl.get("id", ""),
-        "prompt": effective["prompt"],
-        "outfit": effective["outfit"],
-        "negative": effective["negative"],
-        "variant": sl.get("variant") or {},
-        "variants": sl.get("variants") or [],
-        "selected_variant_id": effective["selected_variant_id"],
-        "reference_ids": (
-            selected.get("reference_ids")
-            if "reference_ids" in selected else sl.get("reference_ids")
-        ) or [],
-        "vibe_ids": (
-            selected.get("vibe_ids")
-            if "vibe_ids" in selected else sl.get("vibe_ids")
-        ) or [],
-        "position": sl.get("position") or {},
-    }
-    return json.dumps(
-        bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        default=str,
-    )
-
-
-def character_run_from_group(group, fallback_index=0, position_mode=None):
-    """캐릭터 슬롯/캐스트 여러 명을 한 장의 세팅 입력 구조로 바꾼다."""
-    members = [item for item in (group or [])
-               if isinstance(item, dict) and slot_prompt(item).strip()]
-    if not members:
-        return {}
-    primary = members[0]
-    partner = members[1] if len(members) > 1 else {}
-    primary_effective = selected_variation_values(primary)
-    partner_effective = selected_variation_values(partner)
-    names = [str(item.get("name") or "").strip() for item in members]
-    names = [name for name in names if name]
-    centers = []
-    for item in members:
-        center = item.get("position") or item.get("center")
-        if isinstance(center, dict) and center.get("x") is not None:
-            centers.append(copy.deepcopy(center))
-        else:
-            centers.append(None)
-    return {
-        "name": " + ".join(names) or f"인물{fallback_index + 1}",
-        "female": slot_prompt(primary),
-        "negative": primary_effective["negative"],
-        "male_prompt_base": slot_prompt(partner),
-        "partner_negative": partner_effective["negative"],
-        "extras": [
-            {
-                "prompt": slot_prompt(item),
-                "negative": selected_variation_values(item)["negative"],
-                "center": copy.deepcopy(item.get("position") or item.get("center")),
-            }
-            for item in members[2:]
-        ],
-        "centers": centers,
-        "position_mode": (
-            normalize_position_mode(position_mode, bool([c for c in centers if c]))
-            if position_mode not in (None, "") else ""),
-        "reference_ids": list(dict.fromkeys(
-            str(resource_id)
-            for item in members for resource_id in (item.get("reference_ids") or [])
-            if resource_id)),
-        "vibe_ids": list(dict.fromkeys(
-            str(resource_id)
-            for item in members for resource_id in (item.get("vibe_ids") or [])
-            if resource_id)),
-    }
-
-
 # ═══════════════ NAI API ═══════════════
 
 def _ref_fields(p):
@@ -8010,35 +7923,6 @@ def _variety_sigma_value(model, width, height, variety, p):
     """이전 단일 파일 호출부를 위한 호환 어댑터."""
     return variety_sigma_value(
         model, width, height, variety, p, warn=log.warning)
-
-
-def active_people(slots, centers=None, extra=None):
-    """캐릭터 칸에서 **켠 인물만** 골라 (people, centers) 로 돌려준다.
-    칸은 6명 넘게 둬도 되고, 보내는 것만 6명으로 자른다 (`enabled: False` 는 건너뜀).
-    좌표는 **칸 순서**로 저장돼 있으므로 켠 인물에 맞춰 같이 골라야 짝이 안 어긋난다."""
-    centers = centers or []
-    people, ctrs = [], []
-    for i, sl in enumerate(slots or []):
-        if not isinstance(sl, dict) or sl.get("enabled") is False:
-            continue
-        cap = slot_prompt(sl)
-        if not (cap or "").strip():
-            continue
-        effective = selected_variation_values(sl)
-        people.append({"prompt": cap, "negative": effective["negative"]})
-        c = centers[i] if i < len(centers) and isinstance(centers[i], dict) else None
-        ctrs.append(c or {"x": 0.5, "y": 0.5})
-    for e in (extra or []):
-        cap = strip_comment_lines(e.get("prompt") or "")   # 씬 인물 칸도 같은 규칙 (CQA-003)
-        if cap.strip():
-            people.append({"prompt": cap,
-                           "negative": strip_comment_lines(e.get("negative") or "")})
-            ctrs.append(e.get("center") or {"x": 0.5, "y": 0.5})
-    if len(people) > MAX_CHARS:
-        log.warning(f"켠 인물이 {len(people)}명입니다 — NAI 상한 {MAX_CHARS}명까지만 보냅니다 "
-                    f"(칸은 그대로 남습니다).")
-        people, ctrs = people[:MAX_CHARS], ctrs[:MAX_CHARS]
-    return people, ctrs
 
 
 BLUEPRINT_GENERATION_KEYS = (
