@@ -138,23 +138,11 @@ def _manifest_records(
     return by_path, issues
 
 
-def project_legacy_evaluations(
-    picks: Mapping[str, Any],
-    *,
-    comparison_manifests: Sequence[Mapping[str, Any]] = (),
-    result_records: Sequence[Mapping[str, Any]] = (),
-) -> dict:
-    """선별 장부·비교 manifest·결과 레코드를 경로별 공통 평가로 투영."""
-    source = _mapping(picks, "picks")
-    manifests = _rows(comparison_manifests, "comparison_manifests")
-    results = _rows(result_records, "result_records")
-    manifest_by_path, issues = _manifest_records(manifests)
-    result_by_path = {}
-    for record in results:
-        path = _path(record.get("path", record.get("file")))
-        if path:
-            result_by_path[path] = record
-
+def _evaluation_paths(
+    source: Mapping[str, Any],
+    result_by_path: Mapping[str, Any],
+    manifest_by_path: Mapping[str, Any],
+) -> list[str]:
     paths = []
     for key in ("picked", "fav"):
         paths.extend(_path(item) for item in (source.get(key) or []))
@@ -165,130 +153,144 @@ def project_legacy_evaluations(
         paths.extend(_path(item) for item in (source.get(key) or {}))
     for members in (source.get("folders") or {}).values():
         paths.extend(_path(item) for item in (members or []))
-    paths.extend(result_by_path)
-    paths.extend(manifest_by_path)
-    paths = list(dict.fromkeys(item for item in paths if item))
+    return list(dict.fromkeys(
+        item for item in [*paths, *result_by_path, *manifest_by_path] if item
+    ))
 
+
+def _rating_for_evaluation(
+    path: str,
+    source: Mapping[str, Any],
+    result: Mapping[str, Any],
+    manifest_record: Mapping[str, Any],
+    issues: list,
+) -> tuple[Any, list[dict]]:
+    entries = []
+    for value_source, value in (
+        ("picks.ratings", (source.get("ratings") or {}).get(path)),
+        ("result", result.get("rating")),
+        ("comparison-manifest", manifest_record.get("rating")),
+    ):
+        if value is not None:
+            entries.append({"source": value_source, "rating": deepcopy(value)})
+    values = list(dict.fromkeys(entry["rating"] for entry in entries))
+    if len(values) > 1:
+        issues.append({
+            "code": "rating-conflict", "path": path, "values": deepcopy(entries)
+        })
+    return (entries[0]["rating"] if entries else None), entries
+
+
+def _review_state_for_evaluation(
+    path: str,
+    source: Mapping[str, Any],
+    result: Mapping[str, Any],
+    manifest_record: Mapping[str, Any],
+    issues: list,
+) -> tuple[str, list[dict]]:
+    states = []
+    for state_source, state in (
+        ("picks.review_states", (source.get("review_states") or {}).get(path)),
+        ("result", result.get("review_state")),
+        ("comparison-manifest", manifest_record.get("review_state")),
+    ):
+        if state is None:
+            continue
+        if state not in REVIEW_STATES:
+            raise ValueError(f"invalid review state for {path}: {state}")
+        states.append({"source": state_source, "state": state})
+    values = list(dict.fromkeys(item["state"] for item in states))
+    if len(values) > 1:
+        issues.append({
+            "code": "review-state-conflict", "path": path,
+            "values": deepcopy(states),
+        })
+    return (max(values, key=_STATE_ORDER.get) if values else "candidate"), states
+
+
+def _project_evaluation(
+    path: str,
+    source: Mapping[str, Any],
+    result: Mapping[str, Any],
+    manifest_record: Mapping[str, Any],
+    folders: Mapping[str, set[str]],
+    picked: set[str],
+    favorites: set[str],
+    issues: list,
+) -> dict:
+    memos = _memo_entries(path, source, result, manifest_record)
+    tags = _union(
+        (source.get("tags") or {}).get(path) or [],
+        result.get("tags") or [], manifest_record.get("tags") or [],
+    )
+    boards = [name for name, members in folders.items() if path in members]
+    rating, rating_entries = _rating_for_evaluation(
+        path, source, result, manifest_record, issues
+    )
+    review_state, states = _review_state_for_evaluation(
+        path, source, result, manifest_record, issues
+    )
+    elo_map = source.get("elo") or {}
+    matches_map = source.get("elo_matches") or {}
+    return canonical_evaluation({
+        "subject": {"kind": "generation-result", "path": path},
+        "favorite": path in favorites, "rating": rating,
+        "memo": memos[0]["memo"] if memos else "",
+        "memo_entries": memos, "rating_entries": rating_entries,
+        "tags": tags, "review_state": review_state,
+        "review_state_entries": states,
+        "fixed_board": {"member": path in picked or bool(boards), "boards": boards},
+        "blind": {
+            "enabled": path in elo_map or path in matches_map,
+            "revealed": True, "matches": int(matches_map.get(path) or 0),
+        },
+        "elo": {
+            "rating": float(elo_map.get(path, 1000.0)),
+            "matches": int(matches_map.get(path) or 0), "wins": 0, "losses": 0,
+        },
+        "evidence_refs": _union(
+            result.get("evidence_refs") or [],
+            manifest_record.get("evidence_refs") or [],
+        ),
+        "result_refs": [f"result:{path}"],
+        "asset_refs": _union(
+            result.get("asset_refs") or [], manifest_record.get("asset_refs") or []
+        ),
+        "comparison_lineage": deepcopy(manifest_record.get("_lineage") or {}),
+        "result_record": deepcopy(result),
+        "legacy_rank": deepcopy((source.get("ranks") or {}).get(path)),
+    })
+
+
+def project_legacy_evaluations(
+    picks: Mapping[str, Any],
+    *,
+    comparison_manifests: Sequence[Mapping[str, Any]] = (),
+    result_records: Sequence[Mapping[str, Any]] = (),
+) -> dict:
+    """선별 장부·비교 manifest·결과 레코드를 경로별 공통 평가로 투영."""
+    source = _mapping(picks, "picks")
+    manifest_by_path, issues = _manifest_records(
+        _rows(comparison_manifests, "comparison_manifests")
+    )
+    result_by_path = {}
+    for record in _rows(result_records, "result_records"):
+        path = _path(record.get("path", record.get("file")))
+        if path:
+            result_by_path[path] = record
     picked = {_path(item) for item in (source.get("picked") or [])}
     favorites = {_path(item) for item in (source.get("fav") or [])}
     folders = {
         str(name): {_path(item) for item in (members or [])}
         for name, members in (source.get("folders") or {}).items()
     }
-    evaluations = []
-    for path in paths:
-        result = result_by_path.get(path, {})
-        manifest_record = manifest_by_path.get(path, {})
-        memos = _memo_entries(path, source, result, manifest_record)
-        tags = _union(
-            (source.get("tags") or {}).get(path) or [],
-            result.get("tags") or [],
-            manifest_record.get("tags") or [],
+    evaluations = [
+        _project_evaluation(
+            path, source, result_by_path.get(path, {}),
+            manifest_by_path.get(path, {}), folders, picked, favorites, issues,
         )
-        boards = [
-            name for name, members in folders.items() if path in members
-        ]
-
-        rating_entries = []
-        for value_source, value in (
-            ("picks.ratings", (source.get("ratings") or {}).get(path)),
-            ("result", result.get("rating")),
-            ("comparison-manifest", manifest_record.get("rating")),
-        ):
-            if value is not None:
-                rating_entries.append({
-                    "source": value_source,
-                    "rating": deepcopy(value),
-                })
-        rating_values = list(dict.fromkeys(
-            entry["rating"] for entry in rating_entries
-        ))
-        if len(rating_values) > 1:
-            issues.append({
-                "code": "rating-conflict",
-                "path": path,
-                "values": deepcopy(rating_entries),
-            })
-        rating = rating_entries[0]["rating"] if rating_entries else None
-
-        states = []
-        for state_source, state in (
-            (
-                "picks.review_states",
-                (source.get("review_states") or {}).get(path),
-            ),
-            ("result", result.get("review_state")),
-            ("comparison-manifest", manifest_record.get("review_state")),
-        ):
-            if state is None:
-                continue
-            if state not in REVIEW_STATES:
-                raise ValueError(f"invalid review state for {path}: {state}")
-            states.append({"source": state_source, "state": state})
-        state_values = list(dict.fromkeys(item["state"] for item in states))
-        if len(state_values) > 1:
-            issues.append({
-                "code": "review-state-conflict",
-                "path": path,
-                "values": deepcopy(states),
-            })
-        review_state = (
-            max(state_values, key=_STATE_ORDER.get)
-            if state_values else "candidate"
-        )
-
-        elo_map = source.get("elo") or {}
-        matches_map = source.get("elo_matches") or {}
-        blind_enabled = path in elo_map or path in matches_map
-        evidence_refs = _union(
-            result.get("evidence_refs") or [],
-            manifest_record.get("evidence_refs") or [],
-        )
-        asset_refs = _union(
-            result.get("asset_refs") or [],
-            manifest_record.get("asset_refs") or [],
-        )
-        evaluation = canonical_evaluation({
-            "subject": {
-                "kind": "generation-result",
-                "path": path,
-            },
-            "favorite": path in favorites,
-            "rating": rating,
-            "memo": memos[0]["memo"] if memos else "",
-            "memo_entries": memos,
-            "rating_entries": rating_entries,
-            "tags": tags,
-            "review_state": review_state,
-            "review_state_entries": states,
-            "fixed_board": {
-                "member": path in picked or bool(boards),
-                "boards": boards,
-            },
-            "blind": {
-                "enabled": blind_enabled,
-                "revealed": True,
-                "matches": int(matches_map.get(path) or 0),
-            },
-            "elo": {
-                # 기존 Blind ELO 화면의 신규 기본값은 1000이다.
-                "rating": float(elo_map.get(path, 1000.0)),
-                "matches": int(matches_map.get(path) or 0),
-                "wins": 0,
-                "losses": 0,
-            },
-            "evidence_refs": evidence_refs,
-            "result_refs": [f"result:{path}"],
-            "asset_refs": asset_refs,
-            "comparison_lineage": deepcopy(
-                manifest_record.get("_lineage") or {}
-            ),
-            "result_record": deepcopy(result),
-            "legacy_rank": deepcopy(
-                (source.get("ranks") or {}).get(path)
-            ),
-        })
-        evaluations.append(evaluation)
+        for path in _evaluation_paths(source, result_by_path, manifest_by_path)
+    ]
     return {"evaluations": evaluations, "issues": issues}
 
 
