@@ -63,7 +63,10 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
         # 다음 구조 추출 때 현재 baseline에 맞춰 함께 낮춘다.
         self.assertLessEqual(len(source.splitlines()), 13_460)
 
-        tree = ast.parse(source)
+        transport = (
+            ROOT / "src" / "nai_studio" / "web" / "server_runtime.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(transport)
         sizes = {
             node.name: node.end_lineno - node.lineno + 1
             for node in ast.walk(tree)

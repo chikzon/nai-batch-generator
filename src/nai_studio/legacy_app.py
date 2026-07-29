@@ -315,60 +315,15 @@ from src.nai_studio.services.variation_bridge import (
     variation_plan_to_legacy_payload_material,
 )
 from src.nai_studio.domain.variations import accept_variation
+from src.nai_studio.web import (
+    app_wiring as _app_wiring,
+    server_runtime as _server_runtime,
+)
 from src.nai_studio.web.http_server import (
     ConfigRequestHandler,
     start_http_server,
 )
 from src.nai_studio.web.page_template import PAGE_TEMPLATE
-from src.nai_studio.web.routes.assets import (
-    AssetGetOperations,
-    handle_asset_get,
-)
-from src.nai_studio.web.routes.catalog import (
-    CatalogGetOperations,
-    handle_catalog_get,
-)
-from src.nai_studio.web.routes.catalog_post import (
-    CatalogPostOperations,
-    handle_catalog_post,
-)
-from src.nai_studio.web.routes.collection_post import (
-    CollectionPostOperations,
-    handle_collection_post,
-)
-from src.nai_studio.web.routes.evaluation_post import (
-    EvaluationPostOperations,
-    handle_evaluation_post,
-)
-from src.nai_studio.web.routes.fragments_post import (
-    FragmentPostOperations,
-    handle_fragment_post,
-)
-from src.nai_studio.web.routes.generation import (
-    GenerationGetOperations,
-    handle_generation_get,
-)
-from src.nai_studio.web.routes.generation_post import (
-    GenerationPostOperations,
-    handle_generation_post,
-)
-from src.nai_studio.web.routes.recovery import (
-    RecoveryGetOperations,
-    handle_recovery_get,
-)
-from src.nai_studio.web.routes.recovery_post import (
-    RecoveryPostOperations,
-    handle_recovery_post,
-)
-from src.nai_studio.web.routes.settings_post import (
-    SettingsPostOperations,
-    handle_settings_post,
-)
-from src.nai_studio.web.routes.runtime import handle_runtime_get
-from src.nai_studio.web.routes.runtime_post import (
-    RuntimePostOperations,
-    handle_runtime_post,
-)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -4047,6 +4002,180 @@ def _comparison_handler_operations():
     )
 
 
+def _route_bindings():
+    """라우트 Operations의 전역 의존성을 monkeypatch 가능한 함수로 묶는다."""
+    def late_bound(name):
+        return lambda *args, **kwargs: globals()[name](*args, **kwargs)
+
+    return {
+        "booru": late_bound("search_booru"),
+        "style_duplicates": late_bound("find_style_dupes"),
+        "library": late_bound("search_library"),
+        "combos": late_bound("search_combos"),
+        "recipes": late_bound("search_recipes"),
+        "prewarm": late_bound("prewarm_images"),
+        "autocomplete": late_bound("autocomplete_tags"),
+        "tags": late_bound("search_tags"),
+        "scenes": lambda cfg, ids, setting: globals()["scene_catalog"](
+            cfg,
+            ids,
+            setting,
+            setting_path=globals()["setting_path"],
+            load_json=globals()["load_json_recover"],
+            load_asset_config=globals()["load_asset_config"],
+            content_revision=globals()["setting_content_revision"],
+            normalize_refs=globals()["normalize_scene_reference_ids"],
+            normalize_centers=globals()["normalize_scene_centers"],
+        ),
+        "comparison_catalog": late_bound("comparison_catalog"),
+        "comparison_runs": late_bound("comparison_runs"),
+        "comparison_progress": late_bound("comparison_progress_summary"),
+        "vibe_dir": lambda: globals()["VIBE_DIR"],
+        "mime": lambda: globals()["MIME"],
+        "output_preview": late_bound("output_file_for_preview"),
+        "output_list": late_bound("list_output"),
+        "setting_thumbs": late_bound("setting_thumbs"),
+        "resource_export": lambda cfg: globals()[
+            "export_legacy_resources"
+        ](
+            cfg,
+            file_index=globals()["resource_file_index"](cfg),
+        ),
+        "backup_export": late_bound("export_user_backup"),
+        "fragments_export": late_bound("export_fragments_zip"),
+        "settings_export": late_bound("export_settings_zip"),
+        "cached_image": late_bound("fetch_cached_image"),
+        "diagnostics": lambda limit, errors_only: globals()[
+            "diagnostic_snapshot"
+        ](
+            globals()["LOG_FILE"],
+            limit=limit,
+            errors_only=errors_only,
+        ),
+        "render_page": late_bound("render_page"),
+        "metadata_audit": lambda offset, limit: globals()[
+            "metadata_audit_status"
+        ](
+            found_offset=offset,
+            found_limit=limit,
+        ),
+        "folder_inventory": late_bound("folder_inventory_page"),
+        "trash": late_bound("list_trash_batches"),
+        "pack_log": lambda: {
+            "ok": True,
+            "log": globals()["pack_log_brief"](),
+        },
+        "public_restoration": lambda: globals()[
+            "PUBLIC_COLLECTION"
+        ].restoration_snapshot(),
+        "public_collection": lambda: globals()[
+            "PUBLIC_COLLECTION"
+        ].snapshot(),
+        "data_storage": late_bound("data_storage_status"),
+        "image_origins": late_bound("image_origin_stats"),
+        "local_integrity": late_bound("local_image_integrity"),
+        "preview_backup": late_bound("preview_user_backup"),
+        "restore_backup": late_bound("restore_user_backup"),
+        "rollback_backup": late_bound("rollback_user_backup"),
+        "load_settings": lambda: globals()["load_settings_recover"](
+            globals()["SETTINGS_FILE"]
+        ),
+        "default_config": lambda: globals()["DEFAULT_CONFIG"],
+        "migrate_selections": late_bound("migrate_legacy_selections"),
+        "migrate_slots": late_bound("migrate_char_slots"),
+        "load_spec": late_bound("load_spec"),
+        "options": lambda: globals()["OPTIONS"],
+        "load_options": late_bound("load_options"),
+        "normalize_local_images": late_bound(
+            "normalize_local_image_refs"
+        ),
+        "rollback_local_images": late_bound(
+            "rollback_local_image_normalize"
+        ),
+        "rebuild_data_index": late_bound("rebuild_data_index"),
+        "metadata_control": late_bound("metadata_audit_control"),
+        "metadata_candidate": late_bound("metadata_audit_candidate"),
+        "metadata_save": late_bound("metadata_audit_save_candidate"),
+        "image_batch_queue": late_bound("image_batch_queue"),
+        "summarize_queue": late_bound("summarize_restore_queue"),
+        "preview_pack": late_bound("preview_datapack_bytes"),
+        "import_pack": late_bound("import_datapack_bytes"),
+        "pack_queue": late_bound("pack_import_queue"),
+        "forget_caches": late_bound("forget_collection_caches"),
+        "public_start": lambda payload: globals()[
+            "PUBLIC_COLLECTION"
+        ].start(payload),
+        "public_retry": lambda payload: globals()[
+            "PUBLIC_COLLECTION"
+        ].retry_failed(payload),
+        "public_control": lambda action: globals()[
+            "PUBLIC_COLLECTION"
+        ].control(action),
+        "undo_pack": late_bound("undo_datapack"),
+        "import_settings": late_bound("import_settings_bytes"),
+        "verify_tags": late_bound("verify_tags"),
+        "organize_library": late_bound("organize_library_items"),
+        "delete_styles": late_bound("delete_styles"),
+        "restore_styles": late_bound("restore_styles"),
+        "artist_workspace": late_bound("artist_workspace_request"),
+        "load_ratings": late_bound("load_ratings"),
+        "rate_artist": late_bound("rate_artist"),
+        "apply_evaluation": late_bound("apply_evaluation_action"),
+        "picks_lock": globals()["_JSON_IO_LOCK"],
+        "load_picks": late_bound("load_picks"),
+        "save_picks": late_bound("save_picks"),
+        "trash_outputs": late_bound("trash_output_files"),
+        "restore_trash": late_bound("restore_trash_batch"),
+        "output_subdir": late_bound("out_sub"),
+        "atomic_write": late_bound("_atomic_write_bytes"),
+        "strip_and_save": late_bound("strip_and_save"),
+        "fragment_dir": lambda: globals()["FRAG_DIR"],
+        "save_fragment": late_bound("save_fragment"),
+        "list_fragments": late_bound("list_fragments"),
+        "recoverable_remove": late_bound("recoverable_remove"),
+        "load_state": late_bound("load_state"),
+        "save_state": late_bound("save_state"),
+        "import_fragments": late_bound("import_fragments_bytes"),
+        "reroll_components": late_bound("reroll_legacy_components"),
+        "resolve_prompt": late_bound("resolve_legacy_prompt"),
+        "sequence_text": late_bound("legacy_sequence_text"),
+        "resolve_fragments": late_bound("resolve_fragments"),
+        "random_factory": globals()["random"].Random,
+        "duplicate_scene_undo": late_bound(
+            "undo_duplicate_setting_scene"
+        ),
+        "duplicate_scene": late_bound("duplicate_setting_scene"),
+        "load_asset_config": late_bound("load_asset_config"),
+        "setting_state": late_bound("setting_state"),
+        "cast_members": late_bound("setting_cast_members"),
+        "slot_prompt": late_bound("slot_prompt"),
+        "character_run": late_bound("character_run_from_group"),
+        "build_scene": late_bound("build_scene"),
+        "reference_config": late_bound("setting_reference_config"),
+        "scene_people": late_bound("setting_scene_people"),
+        "seed_for": late_bound("seed_for"),
+        "normalize_prompt": late_bound("normalize_prompt"),
+        "join_tags": late_bound("_join_tags"),
+        "token_count": late_bound("nai_tokens"),
+        "save_scenes": late_bound("save_scenes"),
+        "new_setting": late_bound("new_setting"),
+        "add_set": late_bound("setting_add_set"),
+        "save_meta": late_bound("setting_meta_save"),
+        "renumber": late_bound("setting_renumber"),
+        "delete_setting": late_bound("setting_delete"),
+        "duplicate_group": late_bound("duplicate_setting_group"),
+        "log_warning": globals()["log"].warning,
+        "activate_comparison": late_bound("activate_comparison_run"),
+        "comparison_recipe": late_bound("comparison_recipe_for_output"),
+        "fetch_balance": late_bound("fetch_anlas_balance"),
+        "vibe_paths": late_bound("vibe_paths"),
+        "compute_pending": late_bound("compute_pending"),
+        "estimate_anlas": late_bound("anlas_estimate"),
+        "finalize_tokens": late_bound("finalized_token_texts"),
+        "tokens_exact": late_bound("tokens_exact"),
+    }
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -5871,254 +6000,24 @@ class ConfigServer:
         return {"ok": True}
 
     def start(self, open_browser=True):
-        server = self
-
-        def late_bound(name):
-            return lambda *args, **kwargs: globals()[name](*args, **kwargs)
-
-        catalog_get = CatalogGetOperations(
-            booru=lambda *args: search_booru(*args),
-            style_duplicates=lambda: find_style_dupes(),
-            library=lambda *args, **kwargs: search_library(*args, **kwargs),
-            combos=lambda *args, **kwargs: search_combos(*args, **kwargs),
-            recipes=lambda *args: search_recipes(*args),
-            prewarm=lambda *args, **kwargs: prewarm_images(*args, **kwargs),
-            autocomplete=lambda *args: autocomplete_tags(*args),
-            tags=lambda *args: search_tags(*args),
-            scenes=lambda cfg, ids, setting: scene_catalog(
-                cfg,
-                ids,
-                setting,
-                setting_path=setting_path,
-                load_json=load_json_recover,
-                load_asset_config=load_asset_config,
-                content_revision=setting_content_revision,
-                normalize_refs=normalize_scene_reference_ids,
-                normalize_centers=normalize_scene_centers,
-            ),
+        paths = _server_runtime.ServerRuntimePaths(
+            static_dir=globals()["UI_DIR"],
+            port_range=globals()["PREVIEW_PORT_RANGE"],
         )
-        generation_get = GenerationGetOperations(
-            comparison_catalog=lambda cfg, spec: comparison_catalog(cfg, spec),
-            comparison_runs=lambda cfg: comparison_runs(cfg),
-            comparison_progress=lambda cfg: comparison_progress_summary(cfg),
+        operations = _server_runtime.ServerRuntimeOperations(
+            build_operation_sets=_app_wiring.build_route_operation_sets,
+            request_handler=globals()["ConfigRequestHandler"],
+            start_http=globals()["start_http_server"],
+            browser_open=globals()["webbrowser"].open,
+            logger=globals()["log"],
         )
-        asset_get = AssetGetOperations(
-            vibe_dir=lambda: VIBE_DIR,
-            mime=lambda: MIME,
-            output_preview=lambda cfg, rel: output_file_for_preview(cfg, rel),
-            output_list=lambda *args, **kwargs: list_output(*args, **kwargs),
-            setting_thumbs=lambda name, cfg: setting_thumbs(name, cfg),
-            resource_export=lambda cfg: export_legacy_resources(
-                cfg, file_index=resource_file_index(cfg)
-            ),
-            backup_export=lambda cfg: export_user_backup(cfg),
-            fragments_export=lambda: export_fragments_zip(),
-            settings_export=lambda names: export_settings_zip(names),
-            cached_image=lambda url: fetch_cached_image(url),
-            diagnostics=lambda limit, errors_only: diagnostic_snapshot(
-                LOG_FILE, limit=limit, errors_only=errors_only
-            ),
-            render_page=lambda: render_page(),
-        )
-        recovery_get = RecoveryGetOperations(
-            metadata_audit=lambda offset, limit: metadata_audit_status(
-                found_offset=offset, found_limit=limit
-            ),
-            folder_inventory=lambda offset, limit: folder_inventory_page(
-                offset, limit
-            ),
-            trash=lambda cfg: list_trash_batches(cfg),
-            pack_log=lambda: {"ok": True, "log": pack_log_brief()},
-            public_restoration=lambda: PUBLIC_COLLECTION.restoration_snapshot(),
-            public_collection=lambda: PUBLIC_COLLECTION.snapshot(),
-            data_storage=lambda: data_storage_status(),
-            image_origins=lambda: image_origin_stats(),
-            local_integrity=lambda: local_image_integrity(),
-        )
-        recovery_post = RecoveryPostOperations(
-            preview_backup=late_bound("preview_user_backup"),
-            restore_backup=late_bound("restore_user_backup"),
-            rollback_backup=late_bound("rollback_user_backup"),
-            load_settings=lambda: load_settings_recover(SETTINGS_FILE),
-            default_config=lambda: DEFAULT_CONFIG,
-            migrate_selections=late_bound("migrate_legacy_selections"),
-            migrate_slots=late_bound("migrate_char_slots"),
-            load_spec=late_bound("load_spec"),
-            options=lambda: OPTIONS,
-            load_options=late_bound("load_options"),
-            normalize_local_images=late_bound("normalize_local_image_refs"),
-            rollback_local_images=late_bound("rollback_local_image_normalize"),
-            rebuild_data_index=late_bound("rebuild_data_index"),
-            metadata_control=late_bound("metadata_audit_control"),
-            metadata_candidate=late_bound("metadata_audit_candidate"),
-            metadata_save=late_bound("metadata_audit_save_candidate"),
-            image_batch_queue=late_bound("image_batch_queue"),
-            summarize_queue=late_bound("summarize_restore_queue"),
-        )
-        collection_post = CollectionPostOperations(
-            preview_pack=late_bound("preview_datapack_bytes"),
-            import_pack=late_bound("import_datapack_bytes"),
-            pack_queue=late_bound("pack_import_queue"),
-            summarize_queue=late_bound("summarize_restore_queue"),
-            forget_caches=late_bound("forget_collection_caches"),
-            load_spec=late_bound("load_spec"),
-            options=lambda: OPTIONS,
-            load_options=late_bound("load_options"),
-            public_start=lambda payload: PUBLIC_COLLECTION.start(payload),
-            public_retry=lambda payload: PUBLIC_COLLECTION.retry_failed(payload),
-            public_control=lambda action: PUBLIC_COLLECTION.control(action),
-            undo_pack=late_bound("undo_datapack"),
-            import_settings=late_bound("import_settings_bytes"),
-            resource_import=server.handle_resource_import,
-            reference_add=server.handle_ref_add,
-            reference_save=server.handle_ref_save,
-        )
-        catalog_post = CatalogPostOperations(
-            style_save=server.handle_style_save,
-            normalization_save=server.handle_norm_save,
-            verify_tags=late_bound("verify_tags"),
-            organize_library=late_bound("organize_library_items"),
-            delete_styles=late_bound("delete_styles"),
-            restore_styles=late_bound("restore_styles"),
-        )
-        evaluation_post = EvaluationPostOperations(
-            artist_workspace=late_bound("artist_workspace_request"),
-            load_ratings=late_bound("load_ratings"),
-            rate_artist=late_bound("rate_artist"),
-            apply_evaluation=late_bound("apply_evaluation_action"),
-            picks_lock=_JSON_IO_LOCK,
-            load_picks=late_bound("load_picks"),
-            save_picks=late_bound("save_picks"),
-            trash_outputs=late_bound("trash_output_files"),
-            restore_trash=late_bound("restore_trash_batch"),
-            output_subdir=late_bound("out_sub"),
-            atomic_write=late_bound("_atomic_write_bytes"),
-            strip_and_save=late_bound("strip_and_save"),
-        )
-        fragment_post = FragmentPostOperations(
-            fragment_dir=lambda: FRAG_DIR,
-            save_fragment=late_bound("save_fragment"),
-            list_fragments=late_bound("list_fragments"),
-            recoverable_remove=late_bound("recoverable_remove"),
-            load_state=late_bound("load_state"),
-            save_state=late_bound("save_state"),
-            import_fragments=late_bound("import_fragments_bytes"),
-            reroll_components=late_bound("reroll_legacy_components"),
-            resolve_prompt=late_bound("resolve_legacy_prompt"),
-            sequence_text=late_bound("legacy_sequence_text"),
-            resolve_fragments=late_bound("resolve_fragments"),
-            random_factory=random.Random,
-        )
-        settings_post = SettingsPostOperations(
-            duplicate_scene_undo=late_bound("undo_duplicate_setting_scene"),
-            duplicate_scene=late_bound("duplicate_setting_scene"),
-            scene_save=server.handle_scene_save,
-            option_item=server.handle_option_item,
-            role_save=server.handle_role_save,
-            sceneset_save=server.handle_sceneset_save,
-            load_asset_config=late_bound("load_asset_config"),
-            setting_state=late_bound("setting_state"),
-            cast_members=late_bound("setting_cast_members"),
-            slot_prompt=late_bound("slot_prompt"),
-            character_run=late_bound("character_run_from_group"),
-            build_scene=late_bound("build_scene"),
-            reference_config=late_bound("setting_reference_config"),
-            scene_people=late_bound("setting_scene_people"),
-            seed_for=late_bound("seed_for"),
-            load_state=late_bound("load_state"),
-            normalize_prompt=late_bound("normalize_prompt"),
-            join_tags=late_bound("_join_tags"),
-            token_count=late_bound("nai_tokens"),
-            save_scenes=late_bound("save_scenes"),
-            new_setting=late_bound("new_setting"),
-            add_set=late_bound("setting_add_set"),
-            save_meta=late_bound("setting_meta_save"),
-            renumber=late_bound("setting_renumber"),
-            delete_setting=late_bound("setting_delete"),
-            duplicate_group=late_bound("duplicate_setting_group"),
-            log_warning=log.warning,
-        )
-        generation_post = GenerationPostOperations(
-            activate_comparison=late_bound("activate_comparison_run"),
-            compare_rerun=server.handle_compare_rerun,
-            comparison_recipe=late_bound("comparison_recipe_for_output"),
-            compare_promote=server.handle_compare_promote,
-            compare_preview=server.handle_compare_preview,
-            compare_run=server.handle_compare_run,
-            start=server.handle_start,
-            generate_one=server.handle_generate_one,
-            request_stop=server.live.request_stop,
-            job_command=server.handle_job_command,
-            image_to_image=server.handle_i2i,
-            variation_save=server.handle_character_variation_save,
-            regenerate=server.handle_regen,
-            scene_run=server.handle_scene_run,
-            director=server.handle_director,
-            inspect_image=server.handle_inspect,
-        )
-        runtime_post = RuntimePostOperations(
-            blueprint_project=server.handle_blueprint_project,
-            save_config=server.handle_save,
-            fetch_balance=late_bound("fetch_anlas_balance"),
-            vibe_paths=late_bound("vibe_paths"),
-            load_asset_config=late_bound("load_asset_config"),
-            compute_pending=late_bound("compute_pending"),
-            estimate_anlas=late_bound("anlas_estimate"),
-            finalize_tokens=late_bound("finalized_token_texts"),
-            token_count=late_bound("nai_tokens"),
-            tokens_exact=late_bound("tokens_exact"),
-        )
-
-        class Handler(ConfigRequestHandler):
-
-            def do_GET(self):
-                if self._serve_static(UI_DIR):
-                    return
-                if handle_runtime_get(self, server):
-                    return
-                if handle_recovery_get(self, server, recovery_get):
-                    return
-                if handle_catalog_get(self, server, catalog_get):
-                    return
-                if handle_generation_get(self, server, generation_get):
-                    return
-                if handle_asset_get(self, server, asset_get):
-                    return
-                self.send_response(404)
-                self.end_headers()
-
-            def do_POST(self):
-                body = self._read_post_body()
-                if body is None:
-                    return
-                if handle_recovery_post(self, server, recovery_post, body):
-                    return
-                if handle_collection_post(self, server, collection_post, body):
-                    return
-                if handle_catalog_post(self, catalog_post, body):
-                    return
-                if handle_evaluation_post(self, server, evaluation_post, body):
-                    return
-                if handle_fragment_post(self, server, fragment_post, body):
-                    return
-                if handle_settings_post(self, server, settings_post, body):
-                    return
-                if handle_generation_post(self, server, generation_post, body):
-                    return
-                if handle_runtime_post(self, server, runtime_post, body):
-                    return
-                self.send_response(404)
-                self.end_headers()
-
-        self.httpd, self.url = start_http_server(
+        return _server_runtime.start_server_runtime(
             self,
-            Handler,
-            port_range=PREVIEW_PORT_RANGE,
+            _route_bindings(),
+            paths,
+            operations,
             open_browser=open_browser,
-            browser_open=webbrowser.open,
-            logger=log,
         )
-        return self.url
 
 
 def char_folder_id(char):
