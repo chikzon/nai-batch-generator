@@ -181,6 +181,7 @@ from src.nai_studio.services import (
     catalog_search as _catalog_search,
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
+    library_catalog as _library_catalog,
     output_lifecycle as _output_lifecycle,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
@@ -2130,442 +2131,99 @@ def style_rating(rec, ratings=None):
     }
 
 
-def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="",
-                  rating=""):
-    """그림체 검색. q=제목/작가/프롬프트, tab=NAI·R18_NAI, source=아카·도랑·내 이미지,
-    sort=recommend|views|newest|oldest|artists, seeded=1 이면 설정값 완비된 것만."""
-    rows = load_combos()
-    ratings = load_ratings()
-    q = (q or "").strip().casefold()
-    hit = rows
-    if q:
-        terms = [t for t in q.split() if t]
-        cached = (_COMBOS.get("search") or []) if rows is _COMBOS.get("rows") else []
-        if len(cached) != len(rows):
-            cached = [(
-                str(r.get("combo") or "") + " "
-                + str(r.get("title") or "") + " "
-                + str(r.get("source") or "") + " "
-                + str(r.get("rest") or "") + " "
-                + str(r.get("negative") or "")
-            ).casefold() for r in rows]
-        hit = [r for r, text in zip(rows, cached)
-               if all(term in text for term in terms)]
-    if tab and tab != "all":
-        hit = [r for r in hit if (r.get("tab") or "") == tab]
-    if source and source != "all":
-        hit = [r for r in hit if (r.get("source") or "") == source]
-    if seeded in ("1", "true", True):
-        hit = [r for r in hit if (r.get("params") or {}).get("seed")]
-    # 평가 필터 — fav(즐겨찾기만) · rated(별점 매긴 것만) · hideblock(차단 숨김)
-    rating_cache = {}
-
-    def rating_for(row):
-        key = id(row)
-        if key not in rating_cache:
-            rating_cache[key] = style_rating(row, ratings)
-        return rating_cache[key]
-
-    if rating:
-        if rating == "fav":
-            hit = [r for r in hit if rating_for(r)["fav"]]
-        elif rating == "rated":
-            hit = [r for r in hit if rating_for(r)["score"]]
-        elif rating == "hideblock":
-            hit = [r for r in hit if not rating_for(r)["block"]]
-    if sort in STYLE_SORTS and sort != "default":
-        rev = sort in {"newest"}
-        hit = sorted(hit, key=STYLE_SORTS[sort], reverse=rev)
-
-    def tally(key, default=""):
-        if rows is _COMBOS.get("rows"):
-            if key == "source" and _COMBOS.get("sources") is not None:
-                return dict(_COMBOS["sources"])
-            if key == "tab" and _COMBOS.get("tabs") is not None:
-                return dict(_COMBOS["tabs"])
-        out = {}
-        for r in rows:
-            v = r.get(key) or default
-            if v:
-                out[v] = out.get(v, 0) + 1
-        return out
-
-    page = hit[offset:offset + limit]
-    # 목록 카드가 실제로 쓰는 값만 보낸다. 원본에는 캐릭터 전체 프롬프트·rest·weights가
-    # 함께 있어 20~50개만 열어도 응답과 JSON 파싱이 불필요하게 커졌다. 그림체 적용에
-    # 필요한 베이스·네거티브·생성 설정은 그대로 보존하고, 썸네일도 첫 장만 보낸다.
-    card_fields = (
-        "id", "title", "source", "tab", "posted_at", "recommend", "views", "url",
-        "count", "combo", "artists", "base", "negative", "negative_full", "params",
-        "images",
-    )
-    items = []
-    for r in page:
-        item = {k: r[k] for k in card_fields if k in r}
-        if isinstance(item.get("images"), list):
-            item["images"] = item["images"][:1]
-        item["_rate"] = rating_for(r)
-        items.append(item)
-    seeded_total = (
-        int(_COMBOS.get("seeded") or 0)
-        if rows is _COMBOS.get("rows")
-        else sum(1 for r in rows if (r.get("params") or {}).get("seed"))
-    )
-    return {"total": len(rows), "matched": len(hit),
-            "sources": tally("source", "도랑"), "tabs": tally("tab"),
-            "seeded": seeded_total,
-            "items": items, "offset": offset}
-
-
 LIBRARY_REVIEW_FILE = BASE_DIR / "수집" / "자료정리.json"
 _LIBRARY_REVIEW_LOCK = threading.RLock()
 LIBRARY_REVIEW_STATUSES = {"pending", "reviewed", "hold"}
 
 
+def _library_catalog_paths():
+    return _library_catalog.LibraryCatalogPaths(
+        review_file=LIBRARY_REVIEW_FILE,
+        review_schema="nais-library-review/v1",
+        review_statuses=frozenset(LIBRARY_REVIEW_STATUSES),
+    )
+
+
+def _library_catalog_state():
+    return _library_catalog.LibraryCatalogState(
+        combo_cache=_COMBOS,
+        style_sorts=STYLE_SORTS,
+    )
+
+
+def _library_catalog_operations():
+    """현재 자료 공급자와 저장 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
+    return _library_catalog.LibraryCatalogOperations(
+        load_combos=load_combos,
+        load_ratings=load_ratings,
+        style_rating=style_rating,
+        list_settings=list_settings,
+        list_styles=list_styles,
+        load_recipes=load_recipes,
+        comparison_runs=comparison_runs,
+        load_json=load_json_recover,
+        atomic_write_json=atomic_write_json,
+        now=datetime.now,
+        review_lock=_LIBRARY_REVIEW_LOCK,
+        warning=log.warning,
+    )
+
+
+def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="",
+                  rating=""):
+    return _library_catalog.search_combos(
+        _library_catalog_state(),
+        _library_catalog_operations(),
+        q,
+        limit,
+        offset,
+        tab,
+        source,
+        sort,
+        seeded,
+        rating,
+    )
+
+
 def load_library_review(strict=False):
-    if not LIBRARY_REVIEW_FILE.is_file():
-        return {"schema": "nais-library-review/v1", "items": {}}
-    try:
-        data = load_json_recover(LIBRARY_REVIEW_FILE)
-        if not isinstance(data, dict) or not isinstance(data.get("items"), dict):
-            raise ValueError("자료 정리 장부 형식이 올바르지 않습니다.")
-        return data
-    except Exception as e:
-        log.warning(f"자료 정리 장부를 읽지 못했습니다: {e}")
-        # 보기 화면은 원본 자료를 계속 보여 주되, 쓰기에서는 손상된 장부를 빈 장부로
-        # 오인해 덮지 않는다. .bak도 못 살렸다면 사용자가 복구할 증거를 그대로 남긴다.
-        if strict:
-            raise ValueError(
-                "자료 정리 장부가 손상되어 저장을 멈췄습니다. "
-                "자료정리.json과 .bak을 확인하세요.") from e
-        return {"schema": "nais-library-review/v1", "items": {}}
+    return _library_catalog.load_library_review(
+        _library_catalog_paths(),
+        _library_catalog_operations(),
+        strict,
+    )
 
 
 def library_review_revision(data):
-    raw = json.dumps(
-        data or {}, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"), default=str).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    return _library_catalog.library_review_revision(data)
 
 
 def normalize_library_labels(value):
-    if isinstance(value, str):
-        value = re.split(r"[,\n]", value)
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError("자료 이름표는 문자열 또는 목록이어야 합니다.")
-    out = []
-    for label in value:
-        label = unicodedata.normalize("NFKC", str(label or "")).strip()
-        if not label:
-            continue
-        if len(label) > 40:
-            raise ValueError("자료 이름표는 40자 이하여야 합니다.")
-        if label not in out:
-            out.append(label)
-        if len(out) >= 20:
-            break
-    return out
+    return _library_catalog.normalize_library_labels(value)
 
 
 def organize_library_items(request):
-    """큰 묶음 원문을 건드리지 않고 검토 상태·이름표 장부만 원자 저장한다."""
-    if not isinstance(request, dict):
-        raise ValueError("자료 정리 요청 형식이 올바르지 않습니다.")
-    ids = request.get("ids") or []
-    if not isinstance(ids, list):
-        raise ValueError("정리할 자료 id는 목록이어야 합니다.")
-    ids = list(dict.fromkeys(str(value or "").strip() for value in ids))
-    ids = [value for value in ids if value]
-    if not ids:
-        raise ValueError("정리할 자료를 먼저 고르세요.")
-    if len(ids) > 500:
-        raise ValueError("한 번에 정리할 자료는 500개까지입니다.")
-    if any(len(value) > 240 or ":" not in value for value in ids):
-        raise ValueError("자료 id 형식이 올바르지 않습니다.")
-    action = str(request.get("action") or "apply")
-    with _LIBRARY_REVIEW_LOCK:
-        data = load_library_review(strict=True)
-        revision = library_review_revision(data)
-        expected = str(request.get("expect_revision") or "")
-        if expected and expected != revision:
-            return {
-                "ok": False, "conflict": True, "revision": revision,
-                "error": "다른 화면에서 자료 정리가 먼저 바뀌었습니다. 목록을 새로 불러와 다시 적용하세요.",
-            }
-        items = data.setdefault("items", {})
-        before = {item_id: copy.deepcopy(items.get(item_id)) for item_id in ids}
-        if action == "restore":
-            restore = request.get("records")
-            if not isinstance(restore, dict):
-                raise ValueError("되돌릴 자료 정리 기록이 없습니다.")
-            for item_id in ids:
-                old = restore.get(item_id)
-                if isinstance(old, dict):
-                    items[item_id] = copy.deepcopy(old)
-                else:
-                    items.pop(item_id, None)
-        elif action == "apply":
-            raw_status = request.get("status")
-            status = str(raw_status or "").strip()
-            if status and status not in LIBRARY_REVIEW_STATUSES:
-                raise ValueError("알 수 없는 검토 상태입니다.")
-            labels = normalize_library_labels(request.get("labels"))
-            label_mode = str(request.get("label_mode") or "add")
-            if label_mode not in {"add", "replace", "clear"}:
-                raise ValueError("알 수 없는 이름표 적용 방식입니다.")
-            for item_id in ids:
-                record = copy.deepcopy(items.get(item_id) or {})
-                if status:
-                    record["status"] = status
-                if label_mode == "clear":
-                    record["labels"] = []
-                elif label_mode == "replace":
-                    record["labels"] = labels
-                elif labels:
-                    record["labels"] = normalize_library_labels(
-                        list(record.get("labels") or []) + labels)
-                record["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                if (record.get("status", "pending") == "pending"
-                        and not record.get("labels")):
-                    items.pop(item_id, None)
-                else:
-                    items[item_id] = record
-        else:
-            raise ValueError("알 수 없는 자료 정리 동작입니다.")
-        data["schema"] = "nais-library-review/v1"
-        data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        atomic_write_json(LIBRARY_REVIEW_FILE, data)
-        return {
-            "ok": True, "changed": len(ids), "before": before,
-            "revision": library_review_revision(data),
-        }
+    return _library_catalog.organize_library_items(
+        _library_catalog_paths(),
+        _library_catalog_operations(),
+        request,
+    )
 
 
 def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
                    review="", label=""):
-    """입력 경로와 저장 위치가 다른 큰 묶음을 한 자료실 규격으로 검색한다.
-
-    전체 레코드는 서버 안에서만 검색하고 현재 페이지의 적용 필드만 보낸다. 수천 건의
-    긴 프롬프트·raw metadata를 브라우저 STATE에 복제하지 않아 자료 탭을 여는 비용이
-    자료 수에 비례해 폭증하지 않는다.
-    """
-    try:
-        limit = max(1, min(200, int(limit)))
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        limit, offset = 100, 0
-    rows = []
-    for char in (cfg or {}).get("characters", []):
-        if not isinstance(char, dict):
-            continue
-        name = str(char.get("name") or "(무명)")
-        character_images = []
-        for image_ref in [
-            char.get("representative"),
-            char.get("representative_image"),
-            *(char.get("images") if isinstance(char.get("images"), list) else []),
-            *(char.get("evidence_images")
-              if isinstance(char.get("evidence_images"), list) else []),
-            *(char.get("variation_images")
-              if isinstance(char.get("variation_images"), list) else []),
-        ]:
-            if isinstance(image_ref, str) and image_ref and image_ref not in character_images:
-                character_images.append(image_ref)
-        rows.append({
-            "id": "character:" + str(char.get("id") or name),
-            "kind": "캐릭터", "store": "character", "name": name,
-            "prompt": str(char.get("female") or ""),
-            "negative": str(char.get("negative") or ""),
-            "outfit": str(char.get("clothed") or ""),
-            "source": str(char.get("source") or "내 캐릭터"),
-            "groups": char.get("groups") if isinstance(char.get("groups"), dict) else {},
-            "images": character_images,
-            "evidence": copy.deepcopy(char.get("evidence"))
-            if "evidence" in char else None,
-            "ref": {
-                key: copy.deepcopy(char.get(key))
-                for key in (
-                    "id", "name", "female", "clothed", "negative", "groups",
-                    "source", "folder_id", "subfolder_id",
-                    "variant", "variants", "reference_ids", "vibe_ids",
-                    "selected_variant_id", "representative", "images",
-                    "evidence", "evidence_ids", "evidence_refs",
-                    "evidence_images", "variation_images",
-                ) if key in char
-            },
-        })
-    for index, style in enumerate(list_styles(spec or {})):
-        name = str(style.get("name") or f"그림체 {index + 1}")
-        rows.append({
-            "id": "preset:" + name, "kind": "그림체", "store": "preset",
-            "name": name, "prompt": str(style.get("prompt") or ""),
-            "negative": str(style.get("negative") or ""),
-            "source": "내 프리셋", "settings": copy.deepcopy(style.get("settings") or {}),
-            "images": [], "ref": copy.deepcopy(style),
-        })
-    card_fields = (
-        "id", "title", "source", "tab", "posted_at", "recommend", "views",
-        "url", "count", "combo", "artists", "base", "negative",
-        "negative_full", "params", "images",
+    return _library_catalog.search_library(
+        _library_catalog_paths(),
+        _library_catalog_operations(),
+        cfg,
+        spec,
+        q,
+        kind,
+        source,
+        limit,
+        offset,
+        review,
+        label,
     )
-    for index, style in enumerate(load_combos()):
-        if not isinstance(style, dict):
-            continue
-        compact = {key: copy.deepcopy(style[key]) for key in card_fields if key in style}
-        if isinstance(compact.get("images"), list):
-            compact["images"] = compact["images"][:1]
-        name = str(
-            style.get("title") or style.get("combo")
-            or f"수집 그림체 {index + 1}")
-        # 예전 자료에는 id가 없다. 목록 순번은 자료팩 병합 때 바뀌므로 검토 장부의
-        # 열쇠로 쓰면 안 된다. 실제 카드 내용으로 만든 지문은 재시작·재정렬 뒤에도 같다.
-        fallback_id = hashlib.sha256(json.dumps(
-            compact, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
-        rows.append({
-            "id": "collected:" + str(style.get("id") or fallback_id),
-            "kind": "그림체", "store": "collected", "name": name,
-            "prompt": str(style.get("base") or style.get("combo") or ""),
-            "negative": str(style.get("negative") or ""),
-            "source": str(style.get("source") or "수집 자료"),
-            "settings": copy.deepcopy(style.get("params") or {}),
-            "images": list(style.get("images") or [])[:1],
-            "ref": compact,
-        })
-    for index, recipe in enumerate(load_recipes()):
-        if not isinstance(recipe, dict):
-            continue
-        compact = {
-            key: copy.deepcopy(recipe[key])
-            for key in (
-                "id", "title", "axis", "concept", "concept_ko", "domain",
-                "tags", "positive", "negative", "url", "images",
-            ) if key in recipe
-        }
-        if isinstance(compact.get("images"), list):
-            compact["images"] = compact["images"][:2]
-        fallback_id = hashlib.sha256(json.dumps(
-            compact, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:20]
-        rows.append({
-            "id": "recipe:" + str(recipe.get("id") or fallback_id),
-            "kind": "레시피", "store": "recipe",
-            "name": str(recipe.get("title") or recipe.get("concept_ko")
-                        or f"레시피 {index + 1}"),
-            "prompt": str(recipe.get("positive") or ""),
-            "negative": str(recipe.get("negative") or ""),
-            "source": "공유 레시피",
-            "images": list(recipe.get("images") or [])[:1],
-            "ref": compact,
-        })
-    for setting in list_settings():
-        data = setting.get("data") if isinstance(setting.get("data"), dict) else {}
-        scenes = data.get("씬") if isinstance(data.get("씬"), dict) else {}
-        scene_names = [
-            str(scene.get("name") or scene.get("이름") or "")
-            for scene in scenes.values() if isinstance(scene, dict)
-        ]
-        rows.append({
-            "id": "setting:" + str(setting.get("file") or setting.get("name")),
-            "kind": "세팅", "store": "setting",
-            "name": str(setting.get("name") or "(이름 없는 세팅)"),
-            "prompt": ", ".join(scene_names),
-            "negative": str(data.get("네거티브") or ""),
-            "source": "내 세팅",
-            "meta": {
-                "mode": str(setting.get("mode") or "단독"),
-                "scenes": len(scenes),
-                "stages": list(data.get("단계명") or []),
-                "options": list((data.get("옵션") or {}).keys())
-                if isinstance(data.get("옵션"), dict) else [],
-            },
-            "ref": {
-                "name": str(setting.get("name") or ""),
-                "file": str(setting.get("file") or ""),
-            },
-        })
-    for run in comparison_runs(cfg, limit=200).get("runs", []):
-        if not isinstance(run, dict):
-            continue
-        status = str(run.get("status") or "상태 미확인")
-        completed = int(run.get("completed") or 0)
-        total = int(run.get("total") or completed)
-        rows.append({
-            "id": "generation:" + str(run.get("folder") or run.get("name")),
-            "kind": "생성 기록", "store": "generation",
-            "name": str(run.get("mode_label") or run.get("name") or "비교 생성"),
-            "prompt": f"{status} · {completed}/{total}장",
-            "negative": "", "source": "비교 생성",
-            "meta": {
-                "status": status, "completed": completed, "total": total,
-                "updated_at": str(run.get("updated_at") or ""),
-                "resumable": bool(run.get("resumable")),
-            },
-            "ref": copy.deepcopy(run),
-        })
-
-    review_data = load_library_review()
-    review_items = review_data.get("items") or {}
-    review_counts = {"pending": 0, "reviewed": 0, "hold": 0}
-    all_labels = {}
-    for row in rows:
-        record = review_items.get(row["id"])
-        if not isinstance(record, dict):
-            record = {}
-        status = str(record.get("status") or "pending")
-        if status not in LIBRARY_REVIEW_STATUSES:
-            status = "pending"
-        try:
-            labels = normalize_library_labels(record.get("labels"))
-        except ValueError:
-            # 한 항목의 낡거나 손상된 이름표 때문에 수천 건 자료실 전체를 막지 않는다.
-            labels = []
-        row["review_status"] = status
-        row["labels"] = labels
-        review_counts[status] += 1
-        for value in labels:
-            all_labels[value] = all_labels.get(value, 0) + 1
-
-    all_sources = {}
-    all_kinds = {}
-    for row in rows:
-        all_sources[row["source"]] = all_sources.get(row["source"], 0) + 1
-        all_kinds[row["kind"]] = all_kinds.get(row["kind"], 0) + 1
-    terms = [
-        part for part in re.split(
-            r"\s+", unicodedata.normalize("NFKC", str(q or "")).strip().casefold())
-        if part
-    ]
-    matched = []
-    for row in rows:
-        if kind and kind not in {"all", row["kind"]}:
-            continue
-        if source and source not in {"all", row["source"]}:
-            continue
-        if review and review not in {"all", row["review_status"]}:
-            continue
-        if label and label not in row["labels"]:
-            continue
-        if terms:
-            haystack = unicodedata.normalize("NFKC", " ".join([
-                row.get("name", ""), row.get("prompt", ""), row.get("negative", ""),
-                row.get("outfit", ""), row.get("source", ""),
-                " ".join(row.get("labels") or []), row.get("review_status", ""),
-                json.dumps(row.get("meta") or {}, ensure_ascii=False),
-            ])).casefold()
-            if not all(term in haystack for term in terms):
-                continue
-        matched.append(row)
-    page = matched[offset:offset + limit]
-    return {
-        "ok": True, "total": len(rows), "matched": len(matched),
-        "offset": offset, "items": page, "sources": all_sources,
-        "kinds": all_kinds, "review_counts": review_counts,
-        "labels": all_labels, "revision": library_review_revision(review_data),
-    }
-
 
 # ══ 캐릭터 빌더 후보사전 (슬롯별 후보 태그 — 후보사전.json 에서 자유롭게 확장) ══
 BUILDER_FILE = BASE_DIR / "후보사전.json"
