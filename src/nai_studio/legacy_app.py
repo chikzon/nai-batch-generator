@@ -185,6 +185,7 @@ from src.nai_studio.services import (
     character_storage as _character_storage,
     collection_handlers as _collection_handlers,
     comparison_execution as _comparison_execution,
+    comparison_handlers as _comparison_handlers,
     comparison_planning as _comparison_planning,
     comparison_promotion as _comparison_promotion,
     comparison_runtime as _comparison_runtime,
@@ -4080,6 +4081,31 @@ def _settings_handler_operations():
     )
 
 
+def _comparison_handler_operations():
+    """비교 실행·승격의 기존 계획·계보·worker 의존성을 연결한다."""
+    return _comparison_handlers.ComparisonHandlerOperations(
+        result_promotion_records=globals()["_result_promotion_records"],
+        legacy_lineage_unavailable=globals()[
+            "LegacyPromotionLineageUnavailable"
+        ],
+        promote_assets=globals()["promote_comparison_recipe_assets"],
+        append_promotion_ledger=globals()[
+            "_append_result_promotion_ledger"
+        ],
+        redact_diagnostic_text=globals()["redact_diagnostic_text"],
+        comparison_plan=globals()["comparison_plan"],
+        inherited_blueprint=globals()["inherited_blueprint"],
+        comparison_characters=globals()["comparison_characters"],
+        comparison_sources=globals()["comparison_sources"],
+        run_comparison=globals()["_run_comparison"],
+        start_daemon=lambda target: globals()["threading"].Thread(
+            target=target,
+            daemon=True,
+        ).start(),
+        error=globals()["log"].error,
+    )
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -5665,67 +5691,11 @@ class ConfigServer:
 
     @serialized_data_write(lambda: BASE_DIR)
     def handle_compare_promote(self, body):
-        """비교 결과의 서버 원문을 기존 그림체/캐릭터 자료 형식으로 명시적으로 저장."""
-        try:
-            data = json.loads(body or b"{}")
-            with self.config_lock:
-                self.use_latest_config()
-                promotions = None
-                try:
-                    promotions = _result_promotion_records(
-                        self.cfg,
-                        data.get("path"),
-                        data.get("kind"),
-                        name=data.get("name"),
-                    )
-                except LegacyPromotionLineageUnavailable:
-                    # 구형 비교 결과는 실행 식별자가 없을 수 있다. 자산 저장은 호환
-                    # 경로로 허용하되 계보를 꾸며 내지 않고 미확인으로 명시한다.
-                    pass
-                result = promote_comparison_recipe_assets(
-                    self.cfg,
-                    data.get("path"),
-                    data.get("kind"),
-                    name=data.get("name"),
-                    spec=self.spec,
-                )
-                if result.get("changed_config"):
-                    self.config_revision += 1
-                result["revision"] = self.config_revision
-                if result.get("ok") and promotions is not None:
-                    try:
-                        # 이름 충돌 시 실제 저장된 이름으로 엄격 레코드를 다시 만든다.
-                        promotions = _result_promotion_records(
-                            self.cfg,
-                            data.get("path"),
-                            data.get("kind"),
-                            name=data.get("name"),
-                            resolved_names=list(result.get("names") or []),
-                        )
-                        result["lineage"] = _append_result_promotion_ledger(
-                            promotions)
-                        result["lineage"]["verified"] = all(
-                            item.get("lineage", {})
-                            .get("execution", {})
-                            .get("manifest_verified") is True
-                            for item in promotions
-                        )
-                    except Exception as error:
-                        result["lineage"] = {
-                            "error": redact_diagnostic_text(error),
-                            "verified": False,
-                        }
-                elif result.get("ok"):
-                    result["lineage"] = {
-                        "verified": False,
-                        "warning": (
-                            "자산은 저장했지만 이 구형 결과에는 엄격한 실행 계보가 "
-                            "없어 승격 장부에는 넣지 않았습니다."
-                        ),
-                    }
-                return result
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _comparison_handlers.handle_compare_promote(
+            self,
+            {"body": body},
+            _comparison_handler_operations(),
+        )
 
     def handle_compare_preview(self, body):
         """자료 비교 생성의 실제 장수·비용 범위를 계산한다. 생성이나 저장은 하지 않는다."""
@@ -5739,77 +5709,11 @@ class ConfigServer:
             return {"ok": False, "errors": [str(e)], "error": str(e)}
 
     def handle_compare_run(self, body):
-        """그림체 전체·캐릭터 전체·직교 조합을 같은 조건으로 한 장씩 생성한다."""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        try:
-            data = json.loads(body or b"{}")
-        except Exception as e:
-            return {"ok": False, "error": f"잘못된 요청입니다: {e}"}
-        # 계획·설계도·worker가 같은 클릭 시점 사본을 사용한다. 실행권을 잡는 사이
-        # 자동 저장이 들어와도 계획은 옛 값, 실제 호출은 새 값으로 갈라지지 않는다.
-        with self.config_lock:
-            run_cfg = copy.deepcopy(self.cfg)
-        if not run_cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-        opus = None
-        if self.anlas_balance_cache is not None:
-            opus = bool(self.anlas_balance_cache.get("opus"))
-        plan = comparison_plan(run_cfg, data, self.spec, opus=opus)
-        if not plan["ok"] or not plan["count"]:
-            return {"ok": False, "error": " ".join(plan.get("errors") or [])
-                    or "생성할 항목이 없습니다."}
-        try:
-            confirmed_count = int(data.get("confirmed_count"))
-        except (TypeError, ValueError):
-            confirmed_count = -1
-        if not data.get("confirmed") or confirmed_count != plan["count"]:
-            return {"ok": False, "error":
-                    f"실행 직전 장수 확인이 필요합니다. 현재 계획은 {plan['count']:,}장입니다.",
-                    "plan": plan}
-        tok = self.live.try_claim(
-            "자료 비교 생성",
-            "library",
-            blueprint=inherited_blueprint(
-                run_cfg,
-                source={"kind": "comparison-plan"},
-                experiment={
-                    **copy.deepcopy(plan.get("options") or {}),
-                    "selection": copy.deepcopy(
-                        plan.get("selection")
-                        or (plan.get("options") or {}).get("selection")
-                        or {}),
-                },
-            ),
-            payload_identity={
-                "kind": "comparison",
-                "count": plan["count"],
-                "mode": (plan.get("options") or {}).get("mode"),
-            },
+        return _comparison_handlers.handle_compare_run(
+            self,
+            {"body": body},
+            _comparison_handler_operations(),
         )
-        if tok is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-
-        if plan["options"].get("mode") == "character_setting":
-            styles, chars = [], comparison_characters(run_cfg)
-        else:
-            styles, chars = comparison_sources(run_cfg, self.spec)
-
-        def run():
-            try:
-                _run_comparison(self, run_cfg, plan, styles, chars)
-            except Exception as e:
-                log.error(f"자료 비교 생성 실패: {e}")
-                log.error(traceback.format_exc())
-                self.live.update(
-                    status_text=f"자료 비교 생성 실패: {e}",
-                    failed=max(1, self.live.failed), last_error=str(e),
-                    can_retry=True, phase="failed")
-            finally:
-                self.live.release(tok)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {"ok": True, "plan": plan}
 
     def handle_compare_rerun(self, body):
         """선택 실험 결과 한 장의 canonical 셀만 같은 seed로 다시 실행한다."""
