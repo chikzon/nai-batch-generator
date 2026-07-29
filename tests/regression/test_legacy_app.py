@@ -1278,6 +1278,23 @@ class RegressionTests(unittest.TestCase):
             ["src/nai_studio/web/static"],
         )
         self.assertEqual(
+            set(BUILD.REQUIRED_STATIC_ASSETS),
+            {
+                "src/nai_studio/web/static/base.css",
+                "src/nai_studio/web/static/studio.css",
+                "src/nai_studio/web/static/studio.js",
+            },
+        )
+        with tempfile.TemporaryDirectory() as td:
+            empty_program = Path(td)
+            with self.assertRaises(SystemExit):
+                BUILD.verify_program_assets(empty_program)
+            for relative in BUILD.REQUIRED_STATIC_ASSETS:
+                path = empty_program / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture", encoding="utf-8")
+            BUILD.verify_program_assets(empty_program)
+        self.assertEqual(
             set(BUILD.DATA_PACK_ASSETS),
             {"후보사전.json", "규격.json", "옵션.json"},
         )
@@ -3739,13 +3756,21 @@ class RegressionTests(unittest.TestCase):
                 target.write_bytes(b"fixture")
                 return target
 
+            def fake_copy_assets(target):
+                for relative in BUILD.REQUIRED_STATIC_ASSETS:
+                    path = target / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture", encoding="utf-8")
+                return (list(BUILD.REQUIRED_STATIC_ASSETS), [])
+
             with (
                 patch.object(BUILD, "HERE", root),
                 patch.object(BUILD, "make_icon", return_value=None),
                 patch.object(BUILD, "make_version_file",
                              return_value=root / "build" / "version.txt"),
                 patch.object(BUILD, "build_exe", return_value=exe),
-                patch.object(BUILD, "copy_assets", return_value=([], [])),
+                patch.object(BUILD, "copy_assets",
+                             side_effect=fake_copy_assets),
                 patch.object(BUILD, "build_data_pack",
                              side_effect=fake_data_pack),
                 patch.object(BUILD.sys, "argv", ["빌드.py"]),

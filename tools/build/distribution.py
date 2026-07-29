@@ -186,7 +186,9 @@ def verify(dst: Path):
     required_files = (
         "start.py", "실행.bat", "requirements.txt", "README.md", "CREDITS.md",
         "LICENSE", "THIRD_PARTY_NOTICES.md", "t5_tokenizer.json",
+        "src/nai_studio/web/static/base.css",
         "src/nai_studio/web/static/studio.css",
+        "src/nai_studio/web/static/studio.js",
         "태그/danbooru_e621_merged.csv",
     )
     for rel in required_files:

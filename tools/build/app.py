@@ -55,6 +55,11 @@ ASSETS = [
 # HTML 안에 다시 CSS를 쌓지 않고 화면 구성 자산을 프로그램과 함께 둔다.
 # 개인 자료가 아니라 실행에 필요한 코드 자산이므로 exe 옆에 반드시 복사한다.
 ASSET_DIRS: list[str] = ["src/nai_studio/web/static"]
+REQUIRED_STATIC_ASSETS: tuple[str, ...] = (
+    "src/nai_studio/web/static/base.css",
+    "src/nai_studio/web/static/studio.css",
+    "src/nai_studio/web/static/studio.js",
+)
 
 # 사용자가 원할 때 자료 탭으로 넣는 **별도 공개 기본 자료팩**.
 # 개인 `세팅/`은 여기서 자동으로 읽지 않는다. 개발자 PC에서 빌드한 공개 팩에 개인 세팅이
@@ -241,6 +246,20 @@ def copy_assets(app_dir: Path) -> tuple[list[str], list[str]]:
     return put, miss
 
 
+def verify_program_assets(app_dir: Path) -> None:
+    """외부 정적 자산은 exe에 내장되지 않으므로 복사 결과가 하나라도 없으면 빌드를 막는다."""
+    missing = [
+        name
+        for name in REQUIRED_STATIC_ASSETS
+        if not (app_dir / name).is_file()
+        or (app_dir / name).stat().st_size == 0
+    ]
+    if missing:
+        raise SystemExit(
+            "필수 UI 자산이 빌드에 없습니다: " + ", ".join(missing)
+        )
+
+
 def build_data_pack(out_dir: Path, src_root: Path | None = None) -> Path:
     """기본 후보·태그를 본체와 섞지 않고 검증 가능한 ZIP 하나로 만든다.
 
@@ -397,6 +416,7 @@ def main() -> int:
     print(f"  넣음 {len(put)}개: {', '.join(put)}")
     if miss:
         print(f"  없어서 건너뜀 {len(miss)}개: {', '.join(miss)}")
+    verify_program_assets(app_dir)
 
     total = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file())
     print(f"\n✔ exe: {exe}")
