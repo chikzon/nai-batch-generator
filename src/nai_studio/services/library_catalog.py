@@ -52,45 +52,38 @@ class LibraryCatalogOperations:
     warning: Callable[..., Any]
 
 
-def search_combos(
+def _combo_texts(
+    rows: list[dict],
     state: LibraryCatalogState,
-    operations: LibraryCatalogOperations,
-    query: str = "",
-    limit: int = 40,
-    offset: int = 0,
-    tab: str = "",
-    source: str = "",
-    sort: str = "",
-    seeded: Any = "",
-    rating: str = "",
-) -> dict[str, Any]:
-    """그림체 묶음을 검색·필터·정렬하고 카드에 필요한 필드만 반환한다."""
-    rows = operations.load_combos()
-    ratings = operations.load_ratings()
+) -> list[str]:
+    cached = (
+        (state.combo_cache.get("search") or [])
+        if rows is state.combo_cache.get("rows") else []
+    )
+    if len(cached) == len(rows):
+        return cached
+    return [
+        " ".join(str(row.get(key) or "") for key in (
+            "combo", "title", "source", "rest", "negative"
+        )).casefold()
+        for row in rows
+    ]
+
+
+def _filter_combos(
+    rows: list[dict],
+    state: LibraryCatalogState,
+    *,
+    query: str,
+    tab: str,
+    source: str,
+    seeded: Any,
+) -> list[dict]:
     query = (query or "").strip().casefold()
     matched = rows
     if query:
         terms = [term for term in query.split() if term]
-        cached = (
-            (state.combo_cache.get("search") or [])
-            if rows is state.combo_cache.get("rows")
-            else []
-        )
-        if len(cached) != len(rows):
-            cached = [
-                (
-                    str(row.get("combo") or "")
-                    + " "
-                    + str(row.get("title") or "")
-                    + " "
-                    + str(row.get("source") or "")
-                    + " "
-                    + str(row.get("rest") or "")
-                    + " "
-                    + str(row.get("negative") or "")
-                ).casefold()
-                for row in rows
-            ]
+        cached = _combo_texts(rows, state)
         matched = [
             row
             for row, text in zip(rows, cached)
@@ -114,60 +107,63 @@ def search_combos(
             for row in matched
             if (row.get("params") or {}).get("seed")
         ]
+    return matched
 
-    rating_cache: dict[int, dict] = {}
+
+def _rating_accessor(
+    operations: LibraryCatalogOperations,
+    ratings: dict,
+) -> Callable[[dict], dict]:
+    cache: dict[int, dict] = {}
 
     def rating_for(row: dict) -> dict:
         key = id(row)
-        if key not in rating_cache:
-            rating_cache[key] = operations.style_rating(row, ratings)
-        return rating_cache[key]
+        if key not in cache:
+            cache[key] = operations.style_rating(row, ratings)
+        return cache[key]
 
+    return rating_for
+
+
+def _filter_combo_ratings(
+    matched: list[dict],
+    rating: str,
+    rating_for: Callable[[dict], dict],
+) -> list[dict]:
     if rating:
         if rating == "fav":
-            matched = [
-                row for row in matched if rating_for(row)["fav"]
-            ]
+            return [row for row in matched if rating_for(row)["fav"]]
         elif rating == "rated":
-            matched = [
-                row for row in matched if rating_for(row)["score"]
-            ]
+            return [row for row in matched if rating_for(row)["score"]]
         elif rating == "hideblock":
-            matched = [
-                row
-                for row in matched
-                if not rating_for(row)["block"]
-            ]
-    if (
-        sort in state.style_sorts
-        and sort != "default"
-    ):
-        matched = sorted(
-            matched,
-            key=state.style_sorts[sort],
-            reverse=sort in {"newest"},
+            return [row for row in matched if not rating_for(row)["block"]]
+    return matched
+
+
+def _combo_tally(
+    rows: list[dict],
+    state: LibraryCatalogState,
+    key: str,
+    default: str = "",
+) -> dict[str, int]:
+    if rows is state.combo_cache.get("rows"):
+        cached = state.combo_cache.get(
+            "sources" if key == "source" else "tabs" if key == "tab" else ""
         )
+        if cached is not None:
+            return dict(cached)
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = row.get(key) or default
+        if value:
+            counts[value] = counts.get(value, 0) + 1
+    return counts
 
-    def tally(key: str, default: str = "") -> dict[str, int]:
-        if rows is state.combo_cache.get("rows"):
-            if (
-                key == "source"
-                and state.combo_cache.get("sources") is not None
-            ):
-                return dict(state.combo_cache["sources"])
-            if (
-                key == "tab"
-                and state.combo_cache.get("tabs") is not None
-            ):
-                return dict(state.combo_cache["tabs"])
-        counts: dict[str, int] = {}
-        for row in rows:
-            value = row.get(key) or default
-            if value:
-                counts[value] = counts.get(value, 0) + 1
-        return counts
 
-    page = matched[offset:offset + limit]
+def _combo_cards(
+    page: list[dict],
+    rating_for: Callable[[dict], dict],
+) -> list[dict]:
     card_fields = (
         "id",
         "title",
@@ -195,6 +191,35 @@ def search_combos(
             item["images"] = item["images"][:1]
         item["_rate"] = rating_for(row)
         items.append(item)
+    return items
+
+
+def search_combos(
+    state: LibraryCatalogState,
+    operations: LibraryCatalogOperations,
+    query: str = "",
+    limit: int = 40,
+    offset: int = 0,
+    tab: str = "",
+    source: str = "",
+    sort: str = "",
+    seeded: Any = "",
+    rating: str = "",
+) -> dict[str, Any]:
+    """그림체 묶음을 검색·필터·정렬하고 카드에 필요한 필드만 반환한다."""
+    rows = operations.load_combos()
+    rating_for = _rating_accessor(operations, operations.load_ratings())
+    matched = _filter_combos(
+        rows, state, query=query, tab=tab, source=source, seeded=seeded
+    )
+    matched = _filter_combo_ratings(matched, rating, rating_for)
+    if sort in state.style_sorts and sort != "default":
+        matched = sorted(
+            matched,
+            key=state.style_sorts[sort],
+            reverse=sort == "newest",
+        )
+    items = _combo_cards(matched[offset:offset + limit], rating_for)
     seeded_total = (
         int(state.combo_cache.get("seeded") or 0)
         if rows is state.combo_cache.get("rows")
@@ -207,8 +232,8 @@ def search_combos(
     return {
         "total": len(rows),
         "matched": len(matched),
-        "sources": tally("source", "도랑"),
-        "tabs": tally("tab"),
+        "sources": _combo_tally(rows, state, "source", "도랑"),
+        "tabs": _combo_tally(rows, state, "tab"),
         "seeded": seeded_total,
         "items": items,
         "offset": offset,
