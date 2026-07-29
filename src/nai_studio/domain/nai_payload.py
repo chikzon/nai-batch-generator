@@ -190,6 +190,142 @@ def image_to_image_fields(
     return {key: value for key, value in out.items() if value is not None}
 
 
+def _prepared_payload_params(
+    params: Mapping[str, Any],
+    info: Callable[[str], None] | None,
+) -> tuple[dict[str, Any], str]:
+    prepared = dict(params or {})
+    model = prepared.get("model") or "nai-diffusion-4-5-full"
+    if is_v4_model(model):
+        for key, (_, neutral) in V3_ONLY.items():
+            if prepared.get(key) not in (None, neutral) and info is not None:
+                info(
+                    f"{key} 은(는) V3 전용이라 이 모델에서는 무시합니다 "
+                    f"(중립값 {neutral})"
+                )
+            prepared[key] = neutral
+    return prepared, model
+
+
+def _payload_people(
+    people: Sequence[tuple[str, str]],
+    centers: Sequence[Mapping[str, Any]],
+    use_coords: bool,
+) -> tuple[list, list, list, Callable[[int], dict[str, float]]]:
+    def center(index: int) -> dict[str, float]:
+        if not use_coords:
+            return {"x": 0.5, "y": 0.5}
+        item = (
+            centers[index]
+            if index < len(centers) and isinstance(centers[index], Mapping)
+            else {}
+        )
+        return {
+            "x": float(item.get("x", 0.5)),
+            "y": float(item.get("y", 0.5)),
+        }
+
+    limited = list(people[:MAX_CHARACTERS])
+    positive = [
+        {"char_caption": prompt, "centers": [center(index)]}
+        for index, (prompt, _) in enumerate(limited)
+    ]
+    negative = [
+        {"char_caption": value, "centers": [center(index)]}
+        for index, (_, value) in enumerate(limited)
+    ]
+    return limited, positive, negative, center
+
+
+def _payload_model_action(
+    model: str,
+    prepared: Mapping[str, Any],
+) -> tuple[str, str, Mapping[str, Any]]:
+    image_to_image = prepared.get("_i2i") or {}
+    action = "generate"
+    if image_to_image.get("image"):
+        action = "infill" if image_to_image.get("mask") else "img2img"
+        if action == "infill" and not model.endswith("-inpainting"):
+            model += "-inpainting"
+    return model, action, image_to_image
+
+
+def _payload_parameters(
+    *,
+    prepared: Mapping[str, Any],
+    model: str,
+    action: str,
+    image_to_image: Mapping[str, Any],
+    base_prompt: str,
+    negative_prompt: str,
+    limited_people: list[tuple[str, str]],
+    positive_captions: list,
+    negative_captions: list,
+    center: Callable[[int], dict[str, float]],
+    use_coords: bool,
+    width: int,
+    height: int,
+    scale: float,
+    cfg_rescale: float,
+    steps: int,
+    sampler: str,
+    scheduler: str,
+    uc_preset: int,
+    seed: int,
+    variety: bool,
+    warn: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    return {
+        "width": width, "height": height, "n_samples": 1, "steps": steps,
+        "scale": scale, "uncond_scale": float(prepared.get("uncond_scale", 0.0)),
+        "cfg_rescale": cfg_rescale, "sampler": sampler,
+        "noise_schedule": scheduler, "seed": seed,
+        "negative_prompt": negative_prompt, "params_version": 3,
+        "legacy": False, "image_format": "png", "version": 1,
+        "legacy_v3_extend": bool(prepared.get("legacy_v3_extend", False)),
+        "add_original_image": True,
+        "prefer_brownian": bool(prepared.get("prefer_brownian", True)),
+        "deliberate_euler_ancestral_bug": bool(
+            prepared.get("deliberate_euler_ancestral_bug", False)),
+        "dynamic_thresholding": bool(prepared.get("dynamic_thresholding", False)),
+        "dynamic_thresholding_percentile": 0.999,
+        "dynamic_thresholding_mimic_scale": 10.0,
+        "sm": bool(prepared.get("smea", False)),
+        "sm_dyn": bool(prepared.get("smea_dyn", False)),
+        "skip_cfg_above_sigma": variety_sigma_value(
+            model, width, height, variety, prepared, warn=warn),
+        "skip_cfg_below_sigma": 0.0, "ucPreset": uc_preset,
+        "use_coords": use_coords,
+        "cfg_sched_eligibility": "enable_for_post_summer_samplers",
+        "explike_fine_detail": False, "minimize_sigma_inf": False,
+        "uncond_per_vibe": True, "wonky_vibe_correlation": True,
+        "controlnet_strength": float(prepared.get("controlnet_strength", 1)),
+        "controlnet_model": None, "lora_unet_weights": None,
+        "lora_clip_weights": None,
+        "reference_information_extracted_multiple": [],
+        "reference_strength_multiple": [],
+        "normalize_reference_strength_multiple": True,
+        **reference_fields(prepared),
+        **image_to_image_fields(image_to_image, action, seed),
+        "characterPrompts": [
+            {"prompt": prompt, "uc": negative, "center": center(index), "enabled": True}
+            for index, (prompt, negative) in enumerate(limited_people)
+        ],
+        "v4_prompt": {
+            "caption": {"base_caption": base_prompt, "char_captions": positive_captions},
+            "use_coords": use_coords, "use_order": True, "legacy_uc": False,
+        },
+        "v4_negative_prompt": {
+            "caption": {
+                "base_caption": negative_prompt,
+                "char_captions": negative_captions,
+            },
+            "use_coords": use_coords, "use_order": False, "legacy_uc": False,
+        },
+        "request_type": "PromptGenerateRequest",
+    }
+
+
 def build_nai_payload(
     *,
     base_prompt: str,
@@ -214,129 +350,26 @@ def build_nai_payload(
     반환의 두 번째 값은 실제 모델·action·좌표 사용 여부다. 전송 계층이 응답
     메타데이터를 기록할 때 같은 결정을 재계산하지 않도록 함께 돌려준다.
     """
-    prepared = dict(params or {})
-    model = prepared.get("model") or "nai-diffusion-4-5-full"
-    if is_v4_model(model):
-        for key, (_, neutral) in V3_ONLY.items():
-            if prepared.get(key) not in (None, neutral) and info is not None:
-                info(
-                    f"{key} 은(는) V3 전용이라 이 모델에서는 무시합니다 "
-                    f"(중립값 {neutral})"
-                )
-            prepared[key] = neutral
-
+    prepared, model = _prepared_payload_params(params, info)
     position_mode = normalize_position_mode(
         prepared.get("position_mode"), prepared.get("use_coords", False))
     use_coords = position_mode_uses_coords(
         position_mode, prepared.get("use_coords", False))
     centers = prepared.get("char_centers") or []
-
-    def center(index: int) -> list[dict[str, float]]:
-        if not use_coords:
-            return [{"x": 0.5, "y": 0.5}]
-        item = (
-            centers[index]
-            if index < len(centers) and isinstance(centers[index], dict)
-            else {}
-        )
-        return [{
-            "x": float(item.get("x", 0.5)),
-            "y": float(item.get("y", 0.5)),
-        }]
-
-    limited_people = list(people[:MAX_CHARACTERS])
-    char_captions = [
-        {"char_caption": prompt, "centers": center(index)}
-        for index, (prompt, _) in enumerate(limited_people)
-    ]
-    negative_char_captions = [
-        {"char_caption": negative, "centers": center(index)}
-        for index, (_, negative) in enumerate(limited_people)
-    ]
-
-    image_to_image = prepared.get("_i2i") or {}
-    action = "generate"
-    if image_to_image.get("image"):
-        action = "infill" if image_to_image.get("mask") else "img2img"
-        if action == "infill" and not model.endswith("-inpainting"):
-            model += "-inpainting"
-
-    parameters = {
-        "width": width,
-        "height": height,
-        "n_samples": 1,
-        "steps": steps,
-        "scale": scale,
-        "uncond_scale": float(prepared.get("uncond_scale", 0.0)),
-        "cfg_rescale": cfg_rescale,
-        "sampler": sampler,
-        "noise_schedule": scheduler,
-        "seed": seed,
-        "negative_prompt": negative_prompt,
-        "params_version": 3,
-        "legacy": False,
-        "image_format": "png",
-        "version": 1,
-        "legacy_v3_extend": bool(prepared.get("legacy_v3_extend", False)),
-        "add_original_image": True,
-        "prefer_brownian": bool(prepared.get("prefer_brownian", True)),
-        "deliberate_euler_ancestral_bug": bool(
-            prepared.get("deliberate_euler_ancestral_bug", False)),
-        "dynamic_thresholding": bool(
-            prepared.get("dynamic_thresholding", False)),
-        "dynamic_thresholding_percentile": 0.999,
-        "dynamic_thresholding_mimic_scale": 10.0,
-        "sm": bool(prepared.get("smea", False)),
-        "sm_dyn": bool(prepared.get("smea_dyn", False)),
-        "skip_cfg_above_sigma": variety_sigma_value(
-            model, width, height, variety, prepared, warn=warn),
-        "skip_cfg_below_sigma": 0.0,
-        "ucPreset": uc_preset,
-        "use_coords": use_coords,
-        "cfg_sched_eligibility": "enable_for_post_summer_samplers",
-        "explike_fine_detail": False,
-        "minimize_sigma_inf": False,
-        "uncond_per_vibe": True,
-        "wonky_vibe_correlation": True,
-        "controlnet_strength": float(
-            prepared.get("controlnet_strength", 1)),
-        "controlnet_model": None,
-        "lora_unet_weights": None,
-        "lora_clip_weights": None,
-        "reference_information_extracted_multiple": [],
-        "reference_strength_multiple": [],
-        "normalize_reference_strength_multiple": True,
-        **reference_fields(prepared),
-        **image_to_image_fields(image_to_image, action, seed),
-        "characterPrompts": [
-            {
-                "prompt": prompt,
-                "uc": negative,
-                "center": center(index)[0],
-                "enabled": True,
-            }
-            for index, (prompt, negative) in enumerate(limited_people)
-        ],
-        "v4_prompt": {
-            "caption": {
-                "base_caption": base_prompt,
-                "char_captions": char_captions,
-            },
-            "use_coords": use_coords,
-            "use_order": True,
-            "legacy_uc": False,
-        },
-        "v4_negative_prompt": {
-            "caption": {
-                "base_caption": negative_prompt,
-                "char_captions": negative_char_captions,
-            },
-            "use_coords": use_coords,
-            "use_order": False,
-            "legacy_uc": False,
-        },
-        "request_type": "PromptGenerateRequest",
-    }
+    limited, positive, negative, center = _payload_people(
+        people, centers, use_coords
+    )
+    model, action, image_to_image = _payload_model_action(model, prepared)
+    parameters = _payload_parameters(
+        prepared=prepared, model=model, action=action,
+        image_to_image=image_to_image, base_prompt=base_prompt,
+        negative_prompt=negative_prompt, limited_people=limited,
+        positive_captions=positive, negative_captions=negative,
+        center=center, use_coords=use_coords, width=width, height=height,
+        scale=scale, cfg_rescale=cfg_rescale, steps=steps, sampler=sampler,
+        scheduler=scheduler, uc_preset=uc_preset, seed=seed,
+        variety=variety, warn=warn,
+    )
     return {
         "input": base_prompt,
         "model": model,
