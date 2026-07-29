@@ -247,6 +247,10 @@ from src.nai_studio.web.routes.recovery import (
     RecoveryGetOperations,
     handle_recovery_get,
 )
+from src.nai_studio.web.routes.recovery_post import (
+    RecoveryPostOperations,
+    handle_recovery_post,
+)
 from src.nai_studio.web.routes.runtime import handle_runtime_get
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -12742,6 +12746,26 @@ class ConfigServer:
             image_origins=lambda: image_origin_stats(),
             local_integrity=lambda: local_image_integrity(),
         )
+        recovery_post = RecoveryPostOperations(
+            preview_backup=preview_user_backup,
+            restore_backup=restore_user_backup,
+            rollback_backup=rollback_user_backup,
+            load_settings=lambda: load_json_recover(SETTINGS_FILE),
+            default_config=DEFAULT_CONFIG,
+            migrate_selections=migrate_legacy_selections,
+            migrate_slots=migrate_char_slots,
+            load_spec=load_spec,
+            options=OPTIONS,
+            load_options=load_options,
+            normalize_local_images=normalize_local_image_refs,
+            rollback_local_images=rollback_local_image_normalize,
+            rebuild_data_index=rebuild_data_index,
+            metadata_control=metadata_audit_control,
+            metadata_candidate=metadata_audit_candidate,
+            metadata_save=metadata_audit_save_candidate,
+            image_batch_queue=image_batch_queue,
+            summarize_queue=summarize_restore_queue,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12765,131 +12789,9 @@ class ConfigServer:
                 body = self._read_post_body()
                 if body is None:
                     return
-                if self.path.startswith("/api/backup_preview"):
-                    try:
-                        result = preview_user_backup(body)
-                        if result.get("ok"):
-                            server.backup_preview_blob = bytes(body)
-                            server.backup_preview_sha256 = str(result.get("sha256") or "")
-                        self._json(result)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/backup_restore"):
-                    try:
-                        content_type = self.headers.get("Content-Type", "")
-                        if "application/json" in content_type:
-                            request = json.loads(body or b"{}")
-                            expected_sha = str(request.get("sha256") or "")
-                            if (not server.backup_preview_blob
-                                    or expected_sha != server.backup_preview_sha256):
-                                result = {
-                                    "ok": False,
-                                    "error": "검사한 백업 원문이 메모리에 없습니다. 다시 검사해 주세요.",
-                                }
-                            else:
-                                result = restore_user_backup(
-                                    server.backup_preview_blob,
-                                    expected_sha,
-                                    selected=request.get("selected") or [],
-                                    expected_diff=str(
-                                        request.get("diff_fingerprint") or ""),
-                                )
-                        else:
-                            # 구형 화면·API 호환: ZIP 본문을 보내면 전체 복원한다.
-                            result = restore_user_backup(
-                                body, self.headers.get("X-Backup-SHA256", ""))
-                        if result.get("ok"):
-                            server.backup_preview_blob = None
-                            server.backup_preview_sha256 = ""
-                            fresh = load_json_recover(SETTINGS_FILE)
-                            merged = dict(DEFAULT_CONFIG)
-                            merged.update(fresh if isinstance(fresh, dict) else {})
-                            migrate_legacy_selections(merged)
-                            migrate_char_slots(merged)
-                            server.cfg.clear()
-                            server.cfg.update(merged)
-                            server.spec = load_spec()
-                            OPTIONS.clear()
-                            OPTIONS.update(load_options())
-                            server.config_revision += 1
-                        self._json(result)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/backup_rollback"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        result = rollback_user_backup(data.get("id"))
-                        if result.get("ok"):
-                            fresh = load_json_recover(SETTINGS_FILE)
-                            merged = dict(DEFAULT_CONFIG)
-                            merged.update(fresh if isinstance(fresh, dict) else {})
-                            migrate_legacy_selections(merged)
-                            migrate_char_slots(merged)
-                            server.cfg.clear()
-                            server.cfg.update(merged)
-                            server.spec = load_spec()
-                            OPTIONS.clear()
-                            OPTIONS.update(load_options())
-                            server.config_revision += 1
-                        self._json(result)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/local_image_normalize"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(normalize_local_image_refs(
-                            data.get("fingerprint", "")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/local_image_rollback"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(rollback_local_image_normalize(
-                            data.get("id", "")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/data_index_rebuild"):
-                    try:
-                        index = rebuild_data_index()
-                        self._json({
-                            "ok": True,
-                            "files": index["files"],
-                            "bytes": index["bytes"],
-                            "fingerprint": index["fingerprint"],
-                        })
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/metadata_audit_control"):
-                    try:
-                        self._json(metadata_audit_control(body))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/metadata_audit_candidate"):
-                    try:
-                        self._json(metadata_audit_candidate(body))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/metadata_audit_save"):
-                    try:
-                        self._json(metadata_audit_save_candidate(body))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/restoration_batch"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        queue = image_batch_queue(
-                            data.get("items") or [],
-                            cursor=data.get("cursor"),
-                            status=data.get("status") or "completed",
-                        )
-                        self._json({
-                            "ok": True,
-                            "restoration": summarize_restore_queue(queue),
-                            "restoration_queue": queue,
-                        })
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/blueprint_project"):
+                if handle_recovery_post(self, server, recovery_post, body):
+                    return
+                if self.path.startswith("/api/blueprint_project"):
                     try:
                         self._json(server.handle_blueprint_project(body))
                     except Exception as e:
