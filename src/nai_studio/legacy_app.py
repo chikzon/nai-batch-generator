@@ -38,7 +38,6 @@ import zipfile
 import zlib
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
@@ -218,7 +217,6 @@ from src.nai_studio.services.result_promotion import (
     build_result_promotion,
     new_promotion_ledger,
 )
-from src.nai_studio.web.page_template import PAGE_TEMPLATE
 from src.nai_studio.services.variation_bridge import (
     approved_proposal_to_legacy_candidates,
     character_asset_from_legacy_record,
@@ -226,6 +224,11 @@ from src.nai_studio.services.variation_bridge import (
     variation_plan_to_legacy_payload_material,
 )
 from src.nai_studio.domain.variations import accept_variation
+from src.nai_studio.web.http_server import (
+    ConfigRequestHandler,
+    start_http_server,
+)
+from src.nai_studio.web.page_template import PAGE_TEMPLATE
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -12662,57 +12665,12 @@ class ConfigServer:
     def start(self, open_browser=True):
         server = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def _json(self, obj, status=200):
-                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _trusted_post(self):
-                """브라우저의 다른 사이트가 127.0.0.1 API를 대신 누르지 못하게 한다."""
-                from urllib.parse import urlparse
-                allowed = {"127.0.0.1", "localhost", "::1"}
-                try:
-                    host = urlparse("http://" + (self.headers.get("Host") or ""))
-                    if host.hostname not in allowed or host.port != self.server.server_port:
-                        return False
-                    origin = self.headers.get("Origin")
-                    if origin:
-                        src = urlparse(origin)
-                        if (src.scheme != "http" or src.hostname not in allowed
-                                or src.port != self.server.server_port):
-                            return False
-                    fetch_site = (self.headers.get("Sec-Fetch-Site") or "").lower()
-                    if fetch_site and fetch_site != "same-origin":
-                        return False
-                    return True
-                except (TypeError, ValueError):
-                    return False
+        class Handler(ConfigRequestHandler):
 
             def do_GET(self):
-                if self.path == "/ui/studio.css":
-                    # 프로그램 UI 자산만 고정 경로로 제공한다. 사용자 경로를 받지 않아
-                    # 정적 파일 제공 때문에 경로 탈출 표면이 늘어나지 않는다.
-                    f = UI_DIR / "studio.css"
-                    if not f.is_file():
-                        self.send_response(404); self.end_headers(); return
-                    data = f.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/css; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                elif self.path.startswith("/api/blueprint"):
+                if self._serve_static(UI_DIR):
+                    return
+                if self.path.startswith("/api/blueprint"):
                     try:
                         self._json(server.snapshot_blueprint())
                     except Exception as e:
@@ -13133,19 +13091,9 @@ class ConfigServer:
                     self.send_response(404); self.end_headers()
 
             def do_POST(self):
-                if not self._trusted_post():
-                    self._json({"ok": False, "error": "허용되지 않은 요청 출처입니다."}, status=403)
+                body = self._read_post_body()
+                if body is None:
                     return
-                try:
-                    length = int(self.headers.get("Content-Length", 0))
-                except (TypeError, ValueError):
-                    self._json({"ok": False, "error": "잘못된 Content-Length입니다."}, status=400)
-                    return
-                # 이미지 업로드를 허용하되 무제한 메모리 할당은 막는다.
-                if length < 0 or length > 128 * 1024 * 1024:
-                    self._json({"ok": False, "error": "요청 본문이 너무 큽니다."}, status=413)
-                    return
-                body = self.rfile.read(length) if length else b""
                 if self.path.startswith("/api/backup_preview"):
                     try:
                         result = preview_user_backup(body)
@@ -13996,29 +13944,15 @@ class ConfigServer:
                 else:
                     self.send_response(404); self.end_headers()
 
-        # ⚠ 윈도우에서는 `allow_reuse_address`(HTTPServer 기본 켬) 때문에
-        #   **이미 듣고 있는 포트에도 두 번째 바인딩이 성공한다.** 그러면 두 인스턴스가
-        #   같은 포트를 잡은 셈이 되어 뒤에 뜬 쪽이 응답을 못 한다.
-        #   프로필을 나눠 계정 2개를 나란히 돌리려면 이걸 꼭 꺼야 한다.
-        class ExclusiveServer(ThreadingHTTPServer):
-            allow_reuse_address = False
-
-        for port in PREVIEW_PORT_RANGE:
-            try:
-                self.httpd = ExclusiveServer(("127.0.0.1", port), Handler)
-            except OSError:
-                continue
-            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-            self.url = f"http://127.0.0.1:{port}/"
-            log.info(f"🖼  설정 / 실시간 미리보기: {self.url}")
-            if open_browser:
-                try:
-                    webbrowser.open(self.url)
-                except Exception:
-                    pass
-            return self.url
-        log.error("서버용 포트를 찾지 못했습니다 (8787~8796 모두 사용 중).")
-        return None
+        self.httpd, self.url = start_http_server(
+            self,
+            Handler,
+            port_range=PREVIEW_PORT_RANGE,
+            open_browser=open_browser,
+            browser_open=webbrowser.open,
+            logger=log,
+        )
+        return self.url
 
 
 def char_folder_id(char):

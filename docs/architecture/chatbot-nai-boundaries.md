@@ -31,6 +31,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 사용자 자료 잠금·원자 저장·손상 복구 | `runtime/data_files.py` |
 | 실행권·중지·진행률·미리보기 상태 | `runtime/live_state.py` |
 | 정적 HTML·JavaScript 화면 | `web/page_template.py` |
+| localhost HTTP 보안·본문 제한·정적 응답·포트 기동 | `web/http_server.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 

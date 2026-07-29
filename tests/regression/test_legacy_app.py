@@ -971,6 +971,14 @@ class RegressionTests(unittest.TestCase):
         try:
             self.assertTrue(url.startswith("http://127.0.0.1:"))
             opened.assert_not_called()
+            with urllib.request.urlopen(url, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"<!DOCTYPE html>", response.read(100))
+            with urllib.request.urlopen(url + "ui/studio.css", timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.headers.get_content_type(), "text/css"
+                )
         finally:
             if server.httpd:
                 server.httpd.shutdown()
