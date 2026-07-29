@@ -59,9 +59,25 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
     def test_transport_and_template_do_not_grow_back_into_monoliths(self):
         source_path = ROOT / "src" / "nai_studio" / "legacy_app.py"
         source = source_path.read_text(encoding="utf-8")
-        # 이미 밖으로 옮긴 책임이 다시 들어오는 것만 막는 감소 전용 상한이다.
-        # 다음 구조 추출 때 현재 baseline에 맞춰 함께 낮춘다.
-        self.assertLessEqual(len(source.splitlines()), 5_420)
+        # 공개 레거시 경로는 기능을 소유하지 않고 호환 표면만 가리킨다.
+        self.assertLessEqual(len(source.splitlines()), 400)
+        public_tree = ast.parse(source)
+        self.assertFalse(any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            for node in public_tree.body
+        ))
+        self.assertEqual(
+            legacy_app.__name__,
+            "src.nai_studio.compat.legacy_surface",
+        )
+
+        compatibility_path = (
+            ROOT / "src" / "nai_studio" / "compat" / "legacy_surface.py"
+        )
+        compatibility = compatibility_path.read_text(encoding="utf-8")
+        # 기존 monkeypatch·전역 이름 계약을 한 번에 없애지 못하므로 현재 상한을
+        # 동결한다. 새 기능은 이 표면에도 추가하지 않는다.
+        self.assertLessEqual(len(compatibility.splitlines()), 5_500)
 
         transport = (
             ROOT / "src" / "nai_studio" / "web" / "server_runtime.py"

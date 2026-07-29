@@ -19,12 +19,13 @@
 | runtime | 원자 파일 I/O, 상태·Job, 로그·진단, 프로그램 진입 | `src/nai_studio/runtime/` |
 | web/routes | GET·POST 경로 해석과 응답 변환 | `src/nai_studio/web/routes/` |
 | web | localhost transport, 앱 조립, HTML renderer, 정적 UI | `src/nai_studio/web/` |
-| compatibility | 기존 전역 이름·`ConfigServer`·진입점 | `src/nai_studio/legacy_app.py`, `start.py` |
+| compatibility | 기존 전역 이름·`ConfigServer`·진입점 | `src/nai_studio/compat/legacy_surface.py`, `src/nai_studio/legacy_app.py`, `start.py` |
 
-`legacy_app.py`의 실제 기능·저장 본문은 각 소유 서비스로 이동했다. 현재 남은 것은
-기존 monkeypatch·import·HTTP 호출을 깨지 않기 위한 Operations 조립과 호환 facade다.
-`ConfigServer`를 더 잘게 나누는 것은 공개 호출 계약 변화 없이 실질 이득이 생기는
-후속 작업으로 남기며, 이번 구조 완료를 막는 기능 누락은 아니다.
+`legacy_app.py`는 기존 import와 직접 실행 경로만 보존하는 40줄 미만의 진입점이다.
+기존 monkeypatch·전역 이름·`ConfigServer` 계약은 `compat/legacy_surface.py`가 받으며,
+실제 기능·저장 본문은 각 소유 서비스에 있다. 런타임 의존성은 `ApplicationContext`로
+옮기기 시작했지만 호환 표면의 다수 Operations 조립은 아직 기존 전역 이름을 조회한다.
+따라서 공개 진입점 축소는 완료됐지만 호환 의존성 전환 전체가 끝났다는 뜻은 아니다.
 
 ## 파일 연결 계약
 

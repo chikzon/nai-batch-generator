@@ -7,17 +7,19 @@
 
 | 대상 | 실측 | 결과 |
 |---|---:|---|
-| 제품 Python (`src/nai_studio`) | 117파일 · 48,230줄 · 1,788개 함수·클래스 | domain·services·runtime·web/routes·호환 조립으로 전부 배정 |
-| 50줄 이상 제품 정의 | 187개 | 소유 모듈 안에서 책임 확인 |
+| 제품 Python (`src/nai_studio`) | 120파일 · 48,566줄 · 1,814개 함수·클래스 | domain·services·runtime·web/routes·호환 조립으로 전부 배정 |
+| 50줄 이상 제품 정의 | 189개 | 소유 모듈 안에서 책임 확인 |
 | 150줄 이상 제품 함수 | 0개 | 마지막 자료팩 import·undo까지 단계 분리 |
-| `legacy_app.py` | 5,395줄 · 408개 정의 | 기능·저장 본문 0개, 호환 facade와 Operations 조립만 유지 |
+| `legacy_app.py` | 38줄 · 정의 0개 | 기존 import·직접 실행을 호환 표면으로 연결 |
+| `compat/legacy_surface.py` | 5,455줄 · 409개 정의 | 기존 monkeypatch·전역 이름·`ConfigServer`·Operations 조립 유지 |
 | HTTP | 기능 GET 37 · 정적 GET 10 · POST 74 | 생성·세팅·자료·빌더·관리·공통으로 전부 배정 |
 | 정적 DOM id | 518개 | 생성 216 · 세팅 80 · 자료 113 · 빌더 5 · 관리 78 · 공통 26 |
 | UI JavaScript | 8파일 · 8,533줄 | 기능별 6파일+core+1줄 호환 shim |
 
-`ConfigServer`는 327줄짜리 호환 facade다. 내부 handler는 route 모듈로 위임한다.
-레거시에 남은 35줄 이상 함수 8개는 Operations·route 의존성 조립 또는 기존 호출
-signature를 유지하는 adapter이며 기능·저장 알고리즘이 아니다.
+`ConfigServer`는 호환 facade이며 내부 handler는 route 모듈로 위임한다. 호환 표면의
+긴 함수는 Operations·route 의존성 조립 또는 기존 호출 signature를 유지하는 adapter다.
+`ApplicationContext`가 경로·설정·저장·서비스 의존성을 명시적으로 등록하기 시작했지만
+현재 실제 전환은 출력 경로 결정부터 시작한 상태다.
 
 ## 범주별 기능과 소유권
 
@@ -29,7 +31,7 @@ signature를 유지하는 adapter이며 기능·저장 알고리즘이 아니다
 | 빌더 | 그림체, 캐릭터, 작가 조합·평가, 프롬프트 조각, 태그 색인·검증, 규격화 저장 | `services/{artist_rating_store,artist_workspace,builder_handlers,catalog_search,character_bench,character_runtime,character_storage,fragment_workflow,prompt_bridge,style_store,tag_catalog}` |
 | 관리 | 설정·상태, Job·계보, 평가·승격, 비교 계획·실행·재개·결과, 진단·로그, 프로그램 자료 이전, 앱 기동·종료, 빌드 | `domain/evaluation` · `services/{comparison_execution,comparison_handlers,comparison_planning,comparison_promotion,comparison_runtime,config_validation,evaluation_bridge,evaluation_workflow,job_bridge,management_state,program_data_migration,result_promotion}` · `runtime/*` · `tools/build/*` |
 | 공통 UI | 페이지 renderer, localhost 보안·서버 수명, route dispatch, 화면별 상태·이벤트·bootstrap | `web/{app_wiring,http_server,page_renderer,page_template,server_runtime}` · `web/routes/*` · `web/static/studio-{generation,settings,library,builder,admin,bootstrap}.js` · `studio-core.js` · `studio.js` |
-| 호환·연결 | 기존 import·전역 이름·`ConfigServer`·`start.py` 유지, 기능별 Operations 주입 | `services/legacy_bridge.py` · `legacy_app.py` · `start.py` |
+| 호환·연결 | 기존 import·전역 이름·`ConfigServer`·`start.py` 유지, 기능별 Operations 주입 | `services/legacy_bridge.py` · `runtime/application_context.py` · `compat/legacy_surface.py` · `legacy_app.py` · `start.py` |
 
 ## 내부 최적화 단계
 
@@ -42,7 +44,7 @@ signature를 유지하는 adapter이며 기능·저장 알고리즘이 아니다
 7. 비교 계획·signature·recipe·실행·결과·승격 단계 분리
 8. 관리 상태·Job·진단·기동·빌드와 공통 page renderer 분리
 9. 인라인 UI를 core→generation→settings→library→builder→admin→bootstrap으로 분리
-10. 레거시 기능·저장 본문 제거와 감소 전용 5,420줄 상한 고정
+10. 레거시 기능·저장 본문 제거, 공개 진입점 40줄 미만 축소, 호환 표면과 명시적 의존성 조립 분리
 
 ## 검증 결과
 
@@ -57,6 +59,6 @@ signature를 유지하는 adapter이며 기능·저장 알고리즘이 아니다
 
 ## 완료 범위
 
-완료는 이번 작업인 **기능 분류·책임 분리·내부 대형 함수 축소·호환 검증·현재 빌드**를
-뜻한다. 비교 앱에서 조사된 후속 새 기능, 모바일 앱화, 별도 UI 2차 재설계까지
-완료했다는 뜻은 아니다.
+완료는 **기능 분류·서비스 책임 분리·내부 대형 함수 축소·공개 레거시 진입점 축소**를
+뜻한다. 호환 표면의 모든 전역 의존성을 `ApplicationContext`로 옮긴 것, 비교 앱에서
+조사된 후속 새 기능, 모바일 앱화까지 완료했다는 뜻은 아니다.

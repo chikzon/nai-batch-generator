@@ -15,9 +15,9 @@ NovelAI 이미지 생성부터 자료 정리, 그림체·캐릭터 제작, 장�
 | [`v1.1.0` Release](https://github.com/chikzon/nai-batch-generator/releases/tag/v1.1.0) | 일반 사용자용 안정판 | 설치본·포터블·기본자료팩·SHA-256 목록 공개 |
 | `main` | 다음 안정판을 준비하는 개발 소스 | `v1.1.0` 이후 변경을 포함하며 Release 실행본과 동작이 다를 수 있음 |
 
-아래 스크린샷과 다운로드 파일명은 **`v1.1.0` 안정판 기준**입니다. `main`의 소스를
-직접 실행하는 경우 최신 변경을 먼저 사용하게 되지만, 그것이 새 Release가 게시됐다는
-뜻은 아닙니다.
+다운로드 파일명은 **`v1.1.0` 안정판 기준**이고, 아래 화면은 **현재 `main` 개발본**을
+빈 사용자 데이터 폴더에서 실행해 촬영했습니다. `main`의 최신 화면이 보인다고 해서
+새 Release가 게시됐다는 뜻은 아닙니다.
 
 ## 다운로드와 첫 실행
 
@@ -48,26 +48,30 @@ Persistent API Token은 계정 열쇠입니다. 공개 화면이나 다른 사�
 
 ## 화면
 
-### 첫 실행
+동일한 1600×1000 화면 크기와 빈 사용자 데이터로 촬영했습니다. 개인 토큰·자료·생성
+이미지는 들어 있지 않습니다.
 
-빈 데이터 폴더에서 본체와 선택 자료팩의 차이, 토큰 입력과 첫 생성 순서를 안내합니다.
+### 생성과 세팅
 
-![첫 실행 안내](docs/product/screenshots/first-run.png)
-
-### 빌더와 비교 실험
-
-캐릭터를 후보 단계로 조립하고, 그림체·캐릭터 자료를 같은 조건으로 비교하기 전에
-장수와 예상 비용을 확인합니다.
-
-| 캐릭터 빌더 | 비교 생성 계획 |
+| 첫 실행·생성 | 세팅 작업실 |
 | --- | --- |
-| ![캐릭터 빌더](docs/product/screenshots/character-builder.png) | ![비교 생성 계획](docs/product/screenshots/comparison-plan.png) |
+| ![현재 생성 화면](docs/product/screenshots/current-generation.png) | ![현재 세팅 화면](docs/product/screenshots/current-settings.png) |
 
-### 화면과 디자인
+### 자료와 빌더
 
-테마, 강조색, 글씨 크기, 모서리와 화면 밀도를 `관리 → 화면·디자인`에서 조절합니다.
+| 통합 자료실 | 캐릭터 빌더 |
+| --- | --- |
+| ![현재 통합 자료실](docs/product/screenshots/current-library.png) | ![현재 캐릭터 빌더](docs/product/screenshots/current-builder.png) |
 
-![화면과 디자인 설정](docs/product/screenshots/appearance-settings.png)
+### 비교와 관리
+
+| 비교 실험 | 작업·진단 |
+| --- | --- |
+| ![현재 비교 실험](docs/product/screenshots/current-comparison.png) | ![현재 관리 화면](docs/product/screenshots/current-management.png) |
+
+테마, 강조색, 글씨 크기, 모서리와 화면 구성을 `관리 → 계정·화면`에서 조절합니다.
+
+![현재 화면과 디자인 설정](docs/product/screenshots/current-appearance.png)
 
 ## 현재 구현 기능
 
