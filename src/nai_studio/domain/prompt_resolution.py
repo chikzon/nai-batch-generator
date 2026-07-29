@@ -250,6 +250,76 @@ class _Resolver:
             raise PromptOutputLimitError(
                 f"해석 결과가 {MAX_OUTPUT_LENGTH:,}자를 넘습니다. 원문을 자르지 않았습니다.")
 
+    def _resolve_choice_component(
+        self,
+        *,
+        kind: str,
+        path: str,
+        source_kind: str,
+        source_name: str,
+        start: int,
+        end: int,
+        expression: str,
+        choices: Sequence[str],
+        depth: int,
+        fragment_stack: tuple[str, ...],
+        parent_id: str,
+        output_start: int,
+        fragment_name: str = "",
+    ) -> tuple[str, list[dict]]:
+        """조각과 인라인 선택이 공유하는 freeze·재귀·계보 기록을 한 번 수행한다."""
+        component_id = _component_id(
+            kind, path, source_kind, source_name, start, end, expression
+        )
+        chosen_index, choice, was_frozen = self._pick(
+            component_id, expression, choices
+        )
+        child = self.expand(
+            choice,
+            source_kind=kind,
+            source_name=fragment_name or component_id,
+            path=f"{path}/{component_id}/choice-{chosen_index}",
+            depth=depth + 1,
+            fragment_stack=(
+                fragment_stack + (fragment_name,)
+                if fragment_name else fragment_stack
+            ),
+            parent_id=component_id,
+        )
+        source = {"kind": source_kind, "name": source_name}
+        record = {
+            "id": component_id,
+            "kind": kind,
+            "source": source,
+            "range": {"start": start, "end": end},
+            "expression": expression,
+            "choice": {
+                "index": chosen_index,
+                "value": choice,
+                "frozen": was_frozen,
+            },
+            "output_range": {
+                "start": output_start,
+                "end": output_start + len(child.text),
+            },
+            "depth": depth,
+            "parent_id": parent_id,
+        }
+        if fragment_name:
+            record["fragment"] = fragment_name
+        self.trace.append({
+            "component_id": component_id,
+            "kind": kind,
+            "source": deepcopy(source),
+            "range": deepcopy(record["range"]),
+            "choice_index": chosen_index,
+            "choice": choice,
+            "output_range": deepcopy(record["output_range"]),
+            "depth": depth,
+            "frozen": was_frozen,
+        })
+        return child.text, [record, *self._shift(child.components, output_start)]
+
     def expand(
         self,
         text: str,
@@ -292,59 +362,17 @@ class _Resolver:
                             chain = " → ".join(fragment_stack + (name,))
                             raise CyclicFragmentError(f"조각 순환 참조: {chain}")
                         choices = self.fragments[name]
-                        component_id = _component_id(
-                            "fragment", path, source_kind, source_name,
-                            index, closing + 1, expression)
-                        chosen_index, choice, was_frozen = self._pick(
-                            component_id, expression, choices)
-                        child = self.expand(
-                            choice,
-                            source_kind="fragment",
-                            source_name=name,
-                            path=f"{path}/{component_id}/choice-{chosen_index}",
-                            depth=depth + 1,
-                            fragment_stack=fragment_stack + (name,),
-                            parent_id=component_id,
+                        child_text, child_components = self._resolve_choice_component(
+                            kind="fragment", path=path,
+                            source_kind=source_kind, source_name=source_name,
+                            start=index, end=closing + 1,
+                            expression=expression, choices=choices,
+                            depth=depth, fragment_stack=fragment_stack,
+                            parent_id=parent_id, output_start=output_length,
+                            fragment_name=name,
                         )
-                        start_out = output_length
-                        append_literal(child.text)
-                        end_out = output_length
-                        source = {
-                            "kind": source_kind,
-                            "name": source_name,
-                        }
-                        record = {
-                            "id": component_id,
-                            "kind": "fragment",
-                            "source": source,
-                            "range": {"start": index, "end": closing + 1},
-                            "expression": expression,
-                            "fragment": name,
-                            "choice": {
-                                "index": chosen_index,
-                                "value": choice,
-                                "frozen": was_frozen,
-                            },
-                            "output_range": {
-                                "start": start_out,
-                                "end": end_out,
-                            },
-                            "depth": depth,
-                            "parent_id": parent_id,
-                        }
-                        components.append(record)
-                        components.extend(self._shift(child.components, start_out))
-                        self.trace.append({
-                            "component_id": component_id,
-                            "kind": "fragment",
-                            "source": deepcopy(source),
-                            "range": deepcopy(record["range"]),
-                            "choice_index": chosen_index,
-                            "choice": choice,
-                            "output_range": deepcopy(record["output_range"]),
-                            "depth": depth,
-                            "frozen": was_frozen,
-                        })
+                        append_literal(child_text)
+                        components.extend(child_components)
                         index = closing + 1
                         continue
 
@@ -354,58 +382,16 @@ class _Resolver:
                     expression = text[index:closing + 1]
                     choices = _split_inline(text[index + 1:closing])
                     if choices is not None:
-                        component_id = _component_id(
-                            "inline", path, source_kind, source_name,
-                            index, closing + 1, expression)
-                        chosen_index, choice, was_frozen = self._pick(
-                            component_id, expression, choices)
-                        child = self.expand(
-                            choice,
-                            source_kind="inline",
-                            source_name=component_id,
-                            path=f"{path}/{component_id}/choice-{chosen_index}",
-                            depth=depth + 1,
-                            fragment_stack=fragment_stack,
-                            parent_id=component_id,
+                        child_text, child_components = self._resolve_choice_component(
+                            kind="inline", path=path,
+                            source_kind=source_kind, source_name=source_name,
+                            start=index, end=closing + 1,
+                            expression=expression, choices=choices,
+                            depth=depth, fragment_stack=fragment_stack,
+                            parent_id=parent_id, output_start=output_length,
                         )
-                        start_out = output_length
-                        append_literal(child.text)
-                        end_out = output_length
-                        source = {
-                            "kind": source_kind,
-                            "name": source_name,
-                        }
-                        record = {
-                            "id": component_id,
-                            "kind": "inline",
-                            "source": source,
-                            "range": {"start": index, "end": closing + 1},
-                            "expression": expression,
-                            "choice": {
-                                "index": chosen_index,
-                                "value": choice,
-                                "frozen": was_frozen,
-                            },
-                            "output_range": {
-                                "start": start_out,
-                                "end": end_out,
-                            },
-                            "depth": depth,
-                            "parent_id": parent_id,
-                        }
-                        components.append(record)
-                        components.extend(self._shift(child.components, start_out))
-                        self.trace.append({
-                            "component_id": component_id,
-                            "kind": "inline",
-                            "source": deepcopy(source),
-                            "range": deepcopy(record["range"]),
-                            "choice_index": chosen_index,
-                            "choice": choice,
-                            "output_range": deepcopy(record["output_range"]),
-                            "depth": depth,
-                            "frozen": was_frozen,
-                        })
+                        append_literal(child_text)
+                        components.extend(child_components)
                         index = closing + 1
                         continue
 
