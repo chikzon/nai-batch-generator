@@ -1,7 +1,7 @@
 # Claude push 인계
 
-최신 로컬 `main`은 Outpaint 실제 NAI 검증과 사용자 백업 선택 복원까지 끝난
-기준점이다.
+최신 로컬 `main`은 Outpaint 실제 NAI 검증, 사용자 백업 선택 복원, 자료팩 자산별
+충돌 선택까지 끝난 기준점이다.
 사용자가 현재 기준점을 먼저 공개하라고 명시하지 않는 한 **아직 push하지 않는다.**
 다음 작업은 `NEXT_TASK.md` 한 건씩 진행한다.
 
@@ -27,6 +27,9 @@
 - 전체 사용자 백업을 그림체·캐릭터·설정·프로필의 JSON 항목까지 나눠 현재값과
   들어오는 값으로 비교. 아무것도 미리 덮지 않고 사용자가 고른 조각만 적용하며,
   미리보기 뒤 자료가 바뀌면 적용을 거부하고 기존 복원 기록으로 전체 되돌리기
+- 자료팩은 쓰기 전 manifest·현재 상태를 검사하고 그림체·레시피·캐릭터의
+  ID/이름 충돌만 80개씩 표시. 신규 자산은 자동 추가하고 선택한 충돌만 교체하며,
+  교체 전 행·파일을 기존 자료팩 Undo 장부로 복원
 
 대표 커밋:
 
@@ -53,6 +56,8 @@
 - 소스 서버 HTTP 왕복: 선택 복원 미리보기에서 충돌 1건 검출, 0개 선택 적용 시
   변경 0건. 실제 임시 파일 시험은 한 JSON 항목만 교체·되돌리기·미리보기 후
   외부 변경 충돌 거부까지 통과
+- 임시 소스 서버 자료팩 왕복: 충돌 1건 선택 교체 + 신규 1건 자동 추가 후
+  자료팩 해제로 기존 1건만 정확히 복원
 - 앱 내 브라우저 연결은 로컬 자산 경로 오류로 실패했으나 설치된 Playwright로 실제
   Chromium 조작과 최신 1600·390 스크린샷 촬영을 완료
 
@@ -66,9 +71,9 @@
 SHA-256:
 
 ```text
-f67e113e32bb37da99e2b57a4e16ace457ac5570bae162eb2a6a2d457d7c3a92  NAI-batch-generator-1.0.0-portable-win-x64.zip
-498ccf6d15991581e428dadd7b42cc8c644851e119ccc687e9ed07e625dd4f33  NAI-batch-generator-1.0.0-datapack.zip
-c8db5843cdd7c608dcf6fdd5de2b369f6b5f59771838bc487e1a51c404a04574  NAI-batch-generator-1.0.0-setup.exe
+9e5b9e8d5efc0648ab9b25d8c9d5666ea0356409d4f544fc5201afb0212b7b3d  NAI-batch-generator-1.0.0-portable-win-x64.zip
+3de3280aa7c5e9ffed055567e61f1a4153266726c88767c96b1b13df1b5b536a  NAI-batch-generator-1.0.0-datapack.zip
+9f17aafe8341da0366ce46455335b4483f2b5e2b427237b8a825ce83e2c85b36  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일

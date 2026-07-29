@@ -3709,6 +3709,14 @@ class RegressionTests(unittest.TestCase):
                                 "씬": {"1": {"name": "시험"}}},
                                ensure_ascii=False),
                 )
+                archive.writestr(
+                    "캐릭터/시험.json",
+                    json.dumps({
+                        "id": "char-test", "이름": "시험",
+                        "외형": "whole prompt", "착의": "whole outfit",
+                        "네거티브": "whole negative",
+                    }, ensure_ascii=False),
+                )
                 archive.writestr("태그/시험.csv", "tag,0,1,\n")
 
             with (
@@ -3717,23 +3725,24 @@ class RegressionTests(unittest.TestCase):
                 patch.object(APP, "SPEC_FILE", root / "규격.json"),
                 patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
                 patch.object(APP, "SETTINGS_DIR", root / "세팅"),
+                patch.object(APP, "CHAR_DIR", root / "캐릭터"),
                 patch.object(APP, "TAG_DIR", root / "태그"),
                 patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
             ):
                 result = APP.import_datapack_bytes(
                     payload.getvalue(), "기본자료팩.zip")
                 self.assertTrue(result["ok"])
-                self.assertEqual(result["added"], 5)
+                self.assertEqual(result["added"], 6)
                 for rel in (
                     "후보사전.json", "규격.json", "옵션.json",
-                    "세팅/시험.json", "태그/시험.csv",
+                    "세팅/시험.json", "캐릭터/시험.json", "태그/시험.csv",
                 ):
                     self.assertTrue((root / rel).exists(), rel)
                 undone = APP.undo_datapack(result["batch"])
                 self.assertTrue(undone["ok"])
                 for rel in (
                     "후보사전.json", "규격.json", "옵션.json",
-                    "세팅/시험.json", "태그/시험.csv",
+                    "세팅/시험.json", "캐릭터/시험.json", "태그/시험.csv",
                 ):
                     self.assertFalse((root / rel).exists(), rel)
 
@@ -3873,6 +3882,7 @@ class RegressionTests(unittest.TestCase):
                 patch.object(APP, "SPEC_FILE", root / "규격.json"),
                 patch.object(APP, "OPTIONS_FILE", root / "옵션.json"),
                 patch.object(APP, "SETTINGS_DIR", root / "세팅"),
+                patch.object(APP, "CHAR_DIR", root / "캐릭터"),
                 patch.object(APP, "TAG_DIR", root / "태그"),
                 patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
             ):
@@ -3892,6 +3902,177 @@ class RegressionTests(unittest.TestCase):
                         encoding="utf-8")),
                     old,
                 )
+
+                style_file = root / "수집" / "그림체.json"
+                style_file.parent.mkdir(exist_ok=True)
+                current_rows = [
+                    {"id": "choose", "base": "current chosen"},
+                    {"id": "keep", "base": "current kept"},
+                ]
+                incoming_rows = [
+                    {"id": "choose", "base": "incoming chosen"},
+                    {"id": "keep", "base": "incoming not selected"},
+                    {"id": "new", "base": "new item"},
+                ]
+                style_file.write_text(
+                    json.dumps(current_rows, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                with patch.object(APP, "STYLE_FILE", style_file):
+                    raw = json.dumps(
+                        incoming_rows, ensure_ascii=False).encode("utf-8")
+                    preview = APP.preview_datapack_bytes(raw, "그림체.json")
+                    self.assertEqual(preview["conflict_count"], 2)
+                    chosen = next(
+                        item["id"] for item in preview["conflicts"]
+                        if item["key"] == "choose")
+                    selected = APP.import_datapack_bytes(
+                        raw,
+                        "그림체.json",
+                        selected_conflicts=[chosen],
+                        expected_diff=preview["diff_fingerprint"],
+                    )
+                    self.assertTrue(selected["ok"], selected)
+                    installed = {
+                        item["id"]: item for item in json.loads(
+                            style_file.read_text(encoding="utf-8"))
+                    }
+                    self.assertEqual(
+                        installed["choose"]["base"], "incoming chosen")
+                    self.assertEqual(
+                        installed["keep"]["base"], "current kept")
+                    self.assertEqual(installed["new"]["base"], "new item")
+
+                    undone = APP.undo_datapack(selected["batch"])
+                    self.assertTrue(undone["ok"], undone)
+                    self.assertEqual(
+                        json.loads(style_file.read_text(encoding="utf-8")),
+                        current_rows,
+                    )
+
+                    replace_only_raw = json.dumps(
+                        incoming_rows[:2], ensure_ascii=False).encode("utf-8")
+                    replace_preview = APP.preview_datapack_bytes(
+                        replace_only_raw, "그림체.json")
+                    replace_choice = next(
+                        item["id"] for item in replace_preview["conflicts"]
+                        if item["key"] == "choose")
+                    replace_only = APP.import_datapack_bytes(
+                        replace_only_raw,
+                        "그림체.json",
+                        selected_conflicts=[replace_choice],
+                        expected_diff=replace_preview["diff_fingerprint"],
+                    )
+                    self.assertTrue(replace_only["batch"])
+                    self.assertEqual(
+                        APP.load_pack_log()[-1]["list_updates"][0]["key"],
+                        "choose",
+                    )
+                    self.assertTrue(
+                        APP.undo_datapack(replace_only["batch"])["ok"])
+
+                    no_id_current = [{"title": "이름만 있는 그림체", "base": "current"}]
+                    no_id_incoming = [{"title": "이름만 있는 그림체", "base": "incoming"}]
+                    style_file.write_text(
+                        json.dumps(no_id_current, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    no_id_raw = json.dumps(
+                        no_id_incoming, ensure_ascii=False).encode("utf-8")
+                    no_id_preview = APP.preview_datapack_bytes(
+                        no_id_raw, "그림체.json")
+                    self.assertEqual(
+                        no_id_preview["conflicts"][0]["key"],
+                        "title=이름만 있는 그림체",
+                    )
+                    no_id_result = APP.import_datapack_bytes(
+                        no_id_raw,
+                        "그림체.json",
+                        selected_conflicts=[
+                            no_id_preview["conflicts"][0]["id"]],
+                        expected_diff=no_id_preview["diff_fingerprint"],
+                    )
+                    self.assertEqual(
+                        json.loads(style_file.read_text(encoding="utf-8")),
+                        no_id_incoming,
+                    )
+                    self.assertTrue(
+                        APP.undo_datapack(no_id_result["batch"])["ok"])
+                    style_file.write_text(
+                        json.dumps(current_rows, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                    char_file = root / "캐릭터" / "기존.json"
+                    char_file.parent.mkdir()
+                    current_char = {
+                        "id": "a", "이름": "기존", "외형": "current prompt",
+                        "착의": "current outfit", "네거티브": "current negative",
+                    }
+                    incoming_char = {
+                        "id": "a", "이름": "새 이름", "외형": "incoming prompt",
+                        "착의": "incoming outfit", "네거티브": "incoming negative",
+                    }
+                    char_file.write_text(
+                        json.dumps(current_char, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    char_pack = io.BytesIO()
+                    with zipfile.ZipFile(char_pack, "w") as archive:
+                        archive.writestr(
+                            "캐릭터/새이름.json",
+                            json.dumps(incoming_char, ensure_ascii=False),
+                        )
+                    char_raw = char_pack.getvalue()
+                    char_preview = APP.preview_datapack_bytes(
+                        char_raw, "characters.zip")
+                    self.assertEqual(char_preview["conflict_count"], 1)
+                    char_result = APP.import_datapack_bytes(
+                        char_raw,
+                        "characters.zip",
+                        selected_conflicts=[
+                            char_preview["conflicts"][0]["id"]],
+                        expected_diff=char_preview["diff_fingerprint"],
+                    )
+                    self.assertTrue(char_result["ok"], char_result)
+                    self.assertEqual(
+                        json.loads(char_file.read_text(encoding="utf-8")),
+                        incoming_char,
+                    )
+                    self.assertFalse(
+                        (root / "캐릭터" / "새이름.json").exists())
+                    self.assertTrue(
+                        APP.undo_datapack(char_result["batch"])["ok"])
+                    self.assertEqual(
+                        json.loads(char_file.read_text(encoding="utf-8")),
+                        current_char,
+                    )
+
+                    stale = APP.preview_datapack_bytes(raw, "그림체.json")
+                    style_file.write_text(json.dumps([
+                        {"id": "choose", "base": "edited after preview"},
+                        current_rows[1],
+                    ], ensure_ascii=False), encoding="utf-8")
+                    rejected = APP.import_datapack_bytes(
+                        raw,
+                        "그림체.json",
+                        selected_conflicts=[stale["conflicts"][0]["id"]],
+                        expected_diff=stale["diff_fingerprint"],
+                    )
+                    self.assertFalse(rejected["ok"])
+                    self.assertTrue(rejected["conflict"])
+                    self.assertIn(
+                        "edited after preview",
+                        style_file.read_text(encoding="utf-8"),
+                    )
+
+        page = APP.PAGE_TEMPLATE
+        self.assertNotIn('id="packOver"', page)
+        for marker in (
+            'id="packDiff"', 'id="packSelectAll"', 'id="packSelectNone"',
+            'id="packDiffList"', 'id="packApply"', "/api/pack_preview",
+        ):
+            self.assertIn(marker, page)
 
     def test_active_people_keep_slot_coordinate_pairs(self):
         slots = [

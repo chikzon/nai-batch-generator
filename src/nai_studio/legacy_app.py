@@ -4221,7 +4221,7 @@ def _pack_rel(name):
         return None                      # 경로 탈출·드라이브 지정 차단
     # 팩이 한 겹 더 감싸여 있어도(자료팩/수집/…) 알아보게 앞을 훑는다
     for i, p in enumerate(parts):
-        if p in ("수집", "태그", "세팅"):
+        if p in ("수집", "태그", "세팅", "캐릭터"):
             return "/".join(parts[i:])
     return "/".join(parts)
 
@@ -4281,7 +4281,19 @@ def _row_key(x, key):
     return "가져옴-" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12], True
 
 
-def _merge_list_json(path, incoming, key, overwrite=False):
+def _datapack_match_key(item, primary):
+    """자료팩 충돌 판정은 id/tag를 우선하고, 없을 때만 사람이 보는 이름을 쓴다."""
+    value = item.get(primary)
+    if value not in (None, ""):
+        return str(value)
+    for field in ("id", "이름", "name", "title", "tag"):
+        value = item.get(field)
+        if value not in (None, ""):
+            return f"{field}={value}"
+    return _row_key(item, primary)[0]
+
+
+def _merge_list_json(path, incoming, key, overwrite=False, replace_keys=None):
     """열쇠 기준으로 합친다 → 무슨 일이 있었는지 세어서 돌려준다.
 
     ⚠ **'못 넣음' 을 '이미 있음' 으로 뭉뚱그리지 않는다.** 예전엔 열쇠 없는 항목이
@@ -4291,7 +4303,9 @@ def _merge_list_json(path, incoming, key, overwrite=False):
     if path.exists():
         try:
             got = load_json_recover(path)
-            old = got if isinstance(got, list) else []
+            if not isinstance(got, list):
+                raise ValueError(f"{path.name}이 목록이 아니라 가져오기를 중단했습니다.")
+            old = got
         except Exception:
             # 주 파일과 백업을 둘 다 못 읽으면 빈 목록으로 덮어쓰지 않는다.
             # 사용자가 가진 자료 전체를 "새 파일"로 오인해 날리는 것보다 가져오기를
@@ -4300,36 +4314,47 @@ def _merge_list_json(path, incoming, key, overwrite=False):
     idx = {}
     for i, x in enumerate(old):
         if isinstance(x, dict):
-            kk, _ = _row_key(x, key)
+            kk = _datapack_match_key(x, key)
             idx.setdefault(kk, i)
     n = {"새로": 0, "같음": 0, "다름": 0, "열쇠없음": 0, "항목아님": 0, "덮어씀": 0}
-    added_keys = []
+    added_keys, updates = [], []
+    replace_keys = set(map(str, replace_keys or ()))
     for x in incoming:
         if not isinstance(x, dict):
             n["항목아님"] += 1
             continue
-        kk, made = _row_key(x, key)
+        raw_key, made = _row_key(x, key)
+        kk = _datapack_match_key(x, key)
+        made = made and kk.startswith("가져옴-")
         if made:
             n["열쇠없음"] += 1           # 버리진 않는다 — 내용 열쇠로 넣는다
         if kk in idx:
             same = old[idx[kk]] == x
             if same:
                 n["같음"] += 1
-            elif overwrite:
+            elif overwrite or kk in replace_keys:
+                before = copy.deepcopy(old[idx[kk]])
                 old[idx[kk]] = x
                 n["덮어씀"] += 1
+                updates.append({
+                    "key": kk,
+                    "match_key": True,
+                    "before": before,
+                    "after_sha256": _style_row_digest(x),
+                })
             else:
                 n["다름"] += 1           # 기존 것을 지킨다. 몇 건인지는 알려 준다
             continue
         idx[kk] = len(old)
         old.append(x)
-        added_keys.append(kk)
+        # 신규 제거 장부는 옛 undo와 호환되는 원래 _row_key를 계속 쓴다.
+        added_keys.append(raw_key)
         n["새로"] += 1
     added = n["새로"] + n["덮어씀"]
     if added:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(path, old, indent=None)
-    return n, added_keys
+    return n, added_keys, updates
 
 
 def _say_counts(n):
@@ -5278,7 +5303,9 @@ def _validate_datapack_manifest(archive):
         is_data = (
             stem in known_lists
             or stem in known_whole
-            or rel.startswith(("세팅/", "태그/", "수집/이미지캐시/"))
+            or rel.startswith((
+                "세팅/", "캐릭터/", "태그/", "수집/이미지캐시/",
+            ))
         )
         if is_data and rel not in declared:
             raise ValueError(f"manifest에 기록되지 않은 자료가 들어 있습니다: {rel}")
@@ -5291,8 +5318,177 @@ def _validate_datapack_manifest(archive):
     }
 
 
+def _datapack_conflict_id(archive_sha, logical, key, current, incoming):
+    current_sha = _style_row_digest(current)
+    incoming_sha = _style_row_digest(incoming)
+    value = f"{archive_sha}\0{logical}\0{key}\0{current_sha}\0{incoming_sha}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest(), current_sha, incoming_sha
+
+
+def _datapack_character_destination(raw, fallback):
+    """캐릭터 파일명보다 안정적인 id가 같으면 현재 파일을 갱신 대상으로 쓴다."""
+    try:
+        incoming = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return fallback
+    cid = str(incoming.get("id") or "") if isinstance(incoming, dict) else ""
+    if not cid or not CHAR_DIR.is_dir():
+        return fallback
+    for path in CHAR_DIR.rglob("*.json"):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        if isinstance(current, dict) and str(current.get("id") or "") == cid:
+            return path
+    return fallback
+
+
+def preview_datapack_bytes(data, filename=""):
+    """자료를 쓰기 전에 같은 열쇠·다른 내용만 자산 단위로 찾는다."""
+    lists, whole = _datapack_lists(), _datapack_whole_files()
+    archive_sha = hashlib.sha256(data).hexdigest()
+    conflicts, recognized = [], 0
+
+    def add_conflict(logical, key, current, incoming, kind):
+        conflict_id, current_sha, incoming_sha = _datapack_conflict_id(
+            archive_sha, logical, key, current, incoming)
+        conflicts.append({
+            "id": conflict_id,
+            "logical": logical,
+            "key": str(key),
+            "kind": kind,
+            "current": copy.deepcopy(current),
+            "incoming": copy.deepcopy(incoming),
+            "current_sha256": current_sha,
+            "incoming_sha256": incoming_sha,
+        })
+
+    def inspect_list(stem, raw, renamed=None):
+        nonlocal recognized
+        spot = lists.get(stem)
+        if not spot:
+            return False
+        recognized += 1
+        dest, key = spot
+        rows, _how = _read_rows(raw)
+        if rows is None:
+            return True
+        if renamed:
+            rows = _rewrite_local_image_refs(rows, renamed)
+        current = []
+        if dest.is_file():
+            try:
+                got = json.loads(dest.read_text(encoding="utf-8-sig"))
+            except Exception as e:
+                raise ValueError(
+                    f"{dest.name}을 읽지 못해 자료팩을 비교할 수 없습니다: {e}"
+                ) from e
+            if not isinstance(got, list):
+                raise ValueError(f"{dest.name}이 목록이 아니라 자료팩을 비교할 수 없습니다.")
+            current = got
+        by_key = {}
+        for item in current:
+            if isinstance(item, dict):
+                item_key = _datapack_match_key(item, key)
+                by_key.setdefault(item_key, item)
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            item_key = _datapack_match_key(item, key)
+            before = by_key.get(item_key, _BACKUP_MISSING)
+            if before is not _BACKUP_MISSING and before != item:
+                add_conflict(stem, item_key, before, item, "목록 자산")
+        return True
+
+    def inspect_whole(logical, raw, dest, kind):
+        nonlocal recognized
+        recognized += 1
+        try:
+            incoming = json.loads(raw.decode("utf-8-sig"))
+        except Exception:
+            return
+        if not isinstance(incoming, dict) or not dest.is_file():
+            return
+        try:
+            current = json.loads(dest.read_text(encoding="utf-8-sig"))
+        except Exception as e:
+            raise ValueError(
+                f"{dest.name}을 읽지 못해 자료팩을 비교할 수 없습니다: {e}"
+            ) from e
+        if current != incoming:
+            add_conflict(logical, logical, current, incoming, kind)
+
+    if data[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            manifest = _validate_datapack_manifest(archive)
+            renamed = {}
+            for name in archive.namelist():
+                if name.endswith("/"):
+                    continue
+                rel = _pack_rel(name)
+                if rel and rel.startswith("수집/이미지캐시/"):
+                    stem = Path(rel).name
+                    if Path(stem).suffix.lower() in _datapack_dirs()[
+                            "수집/이미지캐시"][1]:
+                        renamed[stem] = _content_image_name(stem, archive.read(name))
+            for name in archive.namelist():
+                if name.endswith("/"):
+                    continue
+                rel = _pack_rel(name)
+                if not rel:
+                    continue
+                stem = Path(rel).name
+                raw = archive.read(name)
+                if stem in lists:
+                    inspect_list(stem, raw, renamed)
+                elif stem in whole and not rel.startswith("세팅/"):
+                    inspect_whole(stem, raw, whole[stem], "기본 자료")
+                elif rel.startswith("세팅/") and stem.lower().endswith(".json"):
+                    inspect_whole(rel, raw, SETTINGS_DIR / stem, "세팅")
+                elif rel.startswith("캐릭터/") and stem.lower().endswith(".json"):
+                    inspect_whole(
+                        rel,
+                        raw,
+                        _datapack_character_destination(
+                            raw, CHAR_DIR / Path(rel).relative_to("캐릭터")),
+                        "캐릭터",
+                    )
+            pack_name = (
+                (manifest or {}).get("name")
+                or (manifest or {}).get("id")
+                or Path(filename).name
+                or "자료팩"
+            )
+    else:
+        stem = Path(filename).name
+        if stem in lists:
+            inspect_list(stem, data)
+        elif stem in whole:
+            inspect_whole(stem, data, whole[stem], "기본 자료")
+        else:
+            return {"ok": False, "error": f"'{stem}' 은(는) 자료팩이 아닙니다."}
+        pack_name = stem
+
+    if not recognized:
+        return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
+    conflicts.sort(key=lambda item: (item["logical"], item["key"]))
+    fingerprint = hashlib.sha256(
+        "\n".join(item["id"] for item in conflicts).encode("ascii")
+    ).hexdigest()
+    return {
+        "ok": True,
+        "name": pack_name,
+        "sha256": archive_sha,
+        "diff_fingerprint": fingerprint,
+        "conflicts": conflicts,
+        "conflict_count": len(conflicts),
+    }
+
+
 @serialized_data_write(lambda: BASE_DIR)
-def import_datapack_bytes(data, filename="", overwrite=False):
+def import_datapack_bytes(data, filename="", overwrite=False,
+                          selected_conflicts=None, expected_diff=""):
     """자료팩 ZIP 이든 낱개 JSON 이든 받아 자료 종류별 제자리에 넣는다.
 
     무엇이 들어왔는지 `수집/가져온기록.json` 에 남겨 **통째로 되돌릴 수 있게** 한다.
@@ -5300,6 +5496,32 @@ def import_datapack_bytes(data, filename="", overwrite=False):
     import io
     import zipfile
     lists, dirs, whole = _datapack_lists(), _datapack_dirs(), _datapack_whole_files()
+    selected_list_keys, selected_whole = {}, set()
+    if selected_conflicts is not None:
+        preview = preview_datapack_bytes(data, filename)
+        if not preview.get("ok"):
+            return preview
+        if expected_diff and expected_diff != preview["diff_fingerprint"]:
+            return {
+                "ok": False,
+                "conflict": True,
+                "error": "검사 뒤 현재 자료가 바뀌었습니다. 자료팩을 다시 검사해 주세요.",
+            }
+        by_id = {item["id"]: item for item in preview["conflicts"]}
+        wanted_ids = set(map(str, selected_conflicts))
+        if wanted_ids - set(by_id):
+            return {
+                "ok": False,
+                "conflict": True,
+                "error": "검사 뒤 충돌 항목이 바뀌었습니다. 자료팩을 다시 검사해 주세요.",
+            }
+        for item_id in wanted_ids:
+            item = by_id[item_id]
+            if item["kind"] == "목록 자산":
+                selected_list_keys.setdefault(item["logical"], set()).add(
+                    item["key"])
+            else:
+                selected_whole.add(item["logical"])
     report, files = [], 0
     batch_id = f"{int(time.time())}-{os.urandom(4).hex()}"
     batch = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -5333,7 +5555,7 @@ def import_datapack_bytes(data, filename="", overwrite=False):
             if same:
                 report.append(f"{label}: 이미 같은 자료가 있음")
                 return True
-            if not overwrite:
+            if not overwrite and label not in selected_whole:
                 report.append(f"{label}: 기존 자료가 달라 그대로 둠")
                 return True
             backup = BASE_DIR / "수집" / "가져온백업" / batch_id / rel
@@ -5365,10 +5587,21 @@ def import_datapack_bytes(data, filename="", overwrite=False):
             return True
         if local_image_renames:
             rows = _rewrite_local_image_refs(rows, local_image_renames)
-        n, keys = _merge_list_json(dest, rows, key, overwrite)
+        n, keys, updates = _merge_list_json(
+            dest,
+            rows,
+            key,
+            overwrite,
+            replace_keys=selected_list_keys.get(stem),
+        )
         report.append(f"{stem}: {_say_counts(n)}" + (f" ({how})" if how else ""))
         if keys:
             batch["lists"][stem] = keys
+        for update in updates:
+            batch.setdefault("list_updates", []).append({
+                "stem": stem,
+                **update,
+            })
         files += n["새로"] + n["덮어씀"]
         return True
 
@@ -5414,7 +5647,16 @@ def import_datapack_bytes(data, filename="", overwrite=False):
                     take_whole(stem, z.read(n), whole[stem])
                     continue
                 if rel.startswith("세팅/") and stem.lower().endswith(".json"):
-                    take_whole(f"세팅/{stem}", z.read(n), SETTINGS_DIR / stem)
+                    take_whole(rel, z.read(n), SETTINGS_DIR / stem)
+                    continue
+                if rel.startswith("캐릭터/") and stem.lower().endswith(".json"):
+                    raw = z.read(n)
+                    take_whole(
+                        rel,
+                        raw,
+                        _datapack_character_destination(
+                            raw, CHAR_DIR / Path(rel).relative_to("캐릭터")),
+                    )
                     continue
                 for d, (root, exts) in dirs.items():
                     if rel.startswith(d + "/") and stem.lower().endswith(exts):
@@ -5466,7 +5708,8 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
     # 알아본 자료가 있으면 성공이다. 같은 팩을 다시 넣어 **전부 중복이어도 실패가 아니다**
     # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
-    if batch["lists"] or batch["files"] or batch["installed"]:
+    if (batch["lists"] or batch["files"] or batch["installed"]
+            or batch.get("list_updates")):
         rows = load_pack_log()
         # ⚠ 판 id 는 **초 단위 시간만으로 지으면 안 된다.** 화면의 `sendPack` 은 여러 파일을
         #   반복문으로 잇달아 넣으므로 두 파일을 함께 끌어다 놓으면 **같은 초**에 들어가
@@ -5539,7 +5782,11 @@ def undo_datapack(batch_id, cfg=None):
             index = next((
                 i for i, item in enumerate(current_rows)
                 if isinstance(item, dict)
-                and _row_key(item, key)[0] == wanted_key
+                and (
+                    _datapack_match_key(item, key)
+                    if update.get("match_key")
+                    else _row_key(item, key)[0]
+                ) == wanted_key
             ), None)
             if index is None:
                 said.append(f"{stem}: 바뀐 묶음을 찾지 못해 그대로 둠")
@@ -12163,11 +12410,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           여기에 <b>자료팩.zip</b> 을 끌어다 놓거나 눌러서 고르세요
         </div>
         <input type="file" id="packFile" accept=".zip,.json" multiple style="display:none;">
-        <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;">
-          <input type="checkbox" id="packOver" style="width:auto;flex:none;margin:0;">
-          <span>같은 이름이면 <b>새 것으로 바꾸기</b> (기본은 갖고 있던 것을 지킵니다)</span>
-        </label>
         <div id="packMsg" class="hint" style="margin-top:8px;"></div>
+        <div id="packDiff" class="hidden" style="margin-top:8px;">
+          <div class="bar" style="margin-bottom:7px;">
+            <button type="button" id="packSelectAll">들어오는 자산 전부 선택</button>
+            <button type="button" id="packSelectNone">현재 자산 전부 유지</button>
+            <span class="n" id="packSelectedCount">0개 선택</span>
+          </div>
+          <div id="packDiffList" class="items"
+            style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:7px;"></div>
+          <button type="button" id="packDiffMore" class="hidden"
+            style="width:100%;margin-top:7px;">더 보기</button>
+          <div class="bar" style="margin-top:8px;">
+            <button type="button" id="packApply" class="primary">선택대로 넣기</button>
+            <button type="button" id="packCancel">이 자료팩 건너뛰기</button>
+          </div>
+        </div>
         <div id="packLog" style="margin-top:10px;"></div>
         <div class="bar" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
           align-items:flex-start;">
@@ -17898,27 +18156,130 @@ if($('publicCollectStart')){
   PUBLIC_COLLECT_TIMER = setInterval(loadPublicCollection, 2000);
 }
 
+let PACK_FILES = [], PACK_ACTIVE = null, PACK_CHANGES = [], PACK_SHOW = 0,
+  PACK_SHA = '', PACK_DIFF = '', PACK_LINES = [], PACK_LOG = null;
+function packValue(value){
+  let text;
+  try{ text = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+  catch(e){ text = String(value); }
+  return `<pre style="max-height:190px;overflow:auto;white-space:pre-wrap;
+    word-break:break-word;margin:4px 0 0;">${esc(text)}</pre>`;
+}
+function packSelected(){
+  return PACK_CHANGES.filter(change => change.selected).map(change => change.id);
+}
+function packSelectionPaint(){
+  $('packSelectedCount').textContent =
+    `${packSelected().length.toLocaleString()}개 선택 / 충돌 ${PACK_CHANGES.length.toLocaleString()}개`;
+}
+function packDiffPaint(reset=false){
+  if(reset){ PACK_SHOW = 0; $('packDiffList').innerHTML = ''; }
+  const start = PACK_SHOW, end = Math.min(PACK_CHANGES.length, start + 80);
+  for(let i=start; i<end; i++){
+    const change = PACK_CHANGES[i];
+    const card = document.createElement('label');
+    card.className = 'row';
+    card.style.cssText = 'display:block;margin:0;cursor:pointer;';
+    card.innerHTML = `<div class="bar">
+      <input type="checkbox" data-pack-change="${escA(change.id)}"
+        style="width:auto;flex:none;" ${change.selected?'checked':''}>
+      <b>${esc(change.logical)}</b><span class="tag">${esc(change.kind)}</span></div>
+      <div class="hint">열쇠 ${esc(change.key)}</div>
+      <details><summary>현재 자산</summary>${packValue(change.current)}</details>
+      <details><summary>들어오는 자산</summary>${packValue(change.incoming)}</details>`;
+    card.querySelector('input').addEventListener('change', event => {
+      change.selected = event.target.checked; packSelectionPaint();
+    });
+    $('packDiffList').appendChild(card);
+  }
+  PACK_SHOW = end;
+  $('packDiffMore').classList.toggle('hidden', end >= PACK_CHANGES.length);
+  $('packDiffMore').textContent =
+    `더 보기 (${Math.max(0,PACK_CHANGES.length-end).toLocaleString()}개 남음)`;
+  packSelectionPaint();
+}
+function packFinishMessage(){
+  $('packMsg').innerHTML = PACK_LINES.map(esc).join('<br>') || '들어온 것 없음';
+  if(PACK_LOG) renderPackLog(PACK_LOG);
+}
+async function applyCurrentPack(selected){
+  if(!PACK_ACTIVE) return;
+  $('packApply').disabled = true;
+  $('packCancel').disabled = true;
+  $('packMsg').textContent =
+    `${PACK_ACTIVE.name} — 새 항목과 고른 충돌만 넣는 중입니다.`;
+  let r;
+  try{
+    r = await (await fetch('/api/pack_import', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sha256:PACK_SHA,diff_fingerprint:PACK_DIFF,selected})})).json();
+  }catch(e){ r = {ok:false,error:String(e)}; }
+  if(r.error) PACK_LINES.push(PACK_ACTIVE.name + ': ' + r.error);
+  else (r.report||[]).forEach(line => PACK_LINES.push(line));
+  if(r.log) PACK_LOG = r.log;
+  PACK_ACTIVE = null; PACK_CHANGES = []; PACK_SHA = ''; PACK_DIFF = '';
+  $('packDiff').classList.add('hidden');
+  $('packApply').disabled = false;
+  $('packCancel').disabled = false;
+  await nextPack();
+}
+async function nextPack(){
+  if(PACK_ACTIVE) return;
+  const file = PACK_FILES.shift();
+  if(!file){
+    packFinishMessage();
+    await reloadConfig();
+    return;
+  }
+  PACK_ACTIVE = file;
+  $('packMsg').textContent = `${file.name} 검사 중... (아직 아무 자료도 바꾸지 않습니다)`;
+  let r;
+  try{
+    r = await (await fetch('/api/pack_preview', {method:'POST',
+      headers:{'X-Filename':encodeURIComponent(file.name)},body:file})).json();
+  }catch(e){ r = {ok:false,error:String(e)}; }
+  if(!r.ok){
+    PACK_LINES.push(file.name + ': ' + (r.error || '검사 실패'));
+    PACK_ACTIVE = null;
+    await nextPack();
+    return;
+  }
+  PACK_SHA = r.sha256 || '';
+  PACK_DIFF = r.diff_fingerprint || '';
+  PACK_CHANGES = (r.conflicts || []).map(change =>
+    Object.assign({selected:false},change));
+  if(!PACK_CHANGES.length){
+    await applyCurrentPack([]);
+    return;
+  }
+  $('packMsg').textContent =
+    `${file.name} — 새 항목은 안전하게 추가됩니다. 충돌 ${PACK_CHANGES.length.toLocaleString()}개만 고르세요.`;
+  $('packDiff').classList.remove('hidden');
+  packDiffPaint(true);
+}
 async function sendPack(files){
   if(!files.length) return;
-  const lines = [];
-  let log = null;
-  const over = $('packOver') && $('packOver').checked ? '?overwrite=1' : '';
-  for(const f of files){
-    $('packMsg').textContent = f.name + ' 넣는 중... (큰 팩은 시간이 걸립니다)';
-    let r;
-    try{
-      r = await (await fetch('/api/pack_import' + over, {method:'POST',
-        headers:{'X-Filename': encodeURIComponent(f.name)}, body: f})).json();
-    }catch(e){ r = {ok:false, error:String(e)}; }
-    if(r.error) lines.push(f.name + ': ' + r.error);
-    else (r.report || []).forEach(x => lines.push(x));
-    if(r.log) log = r.log;
-  }
-  $('packMsg').innerHTML = lines.map(esc).join('<br>') || '들어온 것 없음';
-  if(log) renderPackLog(log);
-  await reloadConfig();
+  PACK_FILES.push(...files);
+  if(!PACK_ACTIVE) await nextPack();
 }
 if($('packDrop')){
+  $('packSelectAll').addEventListener('click', () => {
+    PACK_CHANGES.forEach(change => { change.selected = true; });
+    packDiffPaint(true);
+  });
+  $('packSelectNone').addEventListener('click', () => {
+    PACK_CHANGES.forEach(change => { change.selected = false; });
+    packDiffPaint(true);
+  });
+  $('packDiffMore').addEventListener('click', () => packDiffPaint(false));
+  $('packApply').addEventListener('click', () => applyCurrentPack(packSelected()));
+  $('packCancel').addEventListener('click', async () => {
+    if(PACK_ACTIVE) PACK_LINES.push(PACK_ACTIVE.name + ': 사용자가 건너뜀');
+    fetch('/api/pack_preview_cancel', {method:'POST',body:'{}'}).catch(()=>{});
+    PACK_ACTIVE = null; PACK_CHANGES = []; PACK_SHA = ''; PACK_DIFF = '';
+    $('packDiff').classList.add('hidden');
+    await nextPack();
+  });
   $('packDrop').addEventListener('click', () => $('packFile').click());
   $('packFile').addEventListener('change', async () => {
     const fs = [...$('packFile').files]; $('packFile').value = '';
@@ -21902,6 +22263,9 @@ class ConfigServer:
         # 선택 복원 요청은 SHA와 diff 지문이 모두 맞을 때만 이 바이트를 사용한다.
         self.backup_preview_blob = None
         self.backup_preview_sha256 = ""
+        self.pack_preview_blob = None
+        self.pack_preview_sha256 = ""
+        self.pack_preview_filename = ""
 
     def latest_config_from_disk(self):
         """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
@@ -24832,18 +25196,69 @@ class ConfigServer:
                         self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/pack_preview_cancel"):
+                    server.pack_preview_blob = None
+                    server.pack_preview_sha256 = ""
+                    server.pack_preview_filename = ""
+                    self._json({"ok": True})
+                elif self.path.startswith("/api/pack_preview"):
+                    from urllib.parse import unquote
+                    try:
+                        filename = unquote(
+                            self.headers.get("X-Filename", ""))
+                        result = preview_datapack_bytes(body, filename)
+                        if result.get("ok"):
+                            server.pack_preview_blob = bytes(body)
+                            server.pack_preview_sha256 = str(
+                                result.get("sha256") or "")
+                            server.pack_preview_filename = filename
+                        else:
+                            server.pack_preview_blob = None
+                            server.pack_preview_sha256 = ""
+                            server.pack_preview_filename = ""
+                        self._json(result)
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/pack_import"):
                     # 자료팩(수집물)은 배포본에 넣지 않는다. 따로 받아 여기서 합친다.
                     from urllib.parse import unquote
                     try:
-                        r = import_datapack_bytes(
-                            body, unquote(self.headers.get("X-Filename", "")),
-                            overwrite="overwrite=1" in self.path)
+                        if "application/json" in self.headers.get(
+                                "Content-Type", ""):
+                            request = json.loads(body or b"{}")
+                            expected_sha = str(request.get("sha256") or "")
+                            if (not server.pack_preview_blob
+                                    or expected_sha != server.pack_preview_sha256):
+                                r = {
+                                    "ok": False,
+                                    "error": "검사한 자료팩 원문이 메모리에 없습니다. 다시 골라 주세요.",
+                                }
+                            else:
+                                r = import_datapack_bytes(
+                                    server.pack_preview_blob,
+                                    server.pack_preview_filename,
+                                    selected_conflicts=request.get(
+                                        "selected") or [],
+                                    expected_diff=str(
+                                        request.get("diff_fingerprint") or ""),
+                                )
+                        else:
+                            # 구형 화면·API 호환: 원문 POST는 기존처럼 신규만 합친다.
+                            r = import_datapack_bytes(
+                                body,
+                                unquote(self.headers.get("X-Filename", "")),
+                                overwrite="overwrite=1" in self.path,
+                            )
                         if "restoration_queue" not in r:
                             queue = pack_import_queue(
                                 {
                                     **r,
-                                    "archive_sha256": hashlib.sha256(body).hexdigest(),
+                                    "archive_sha256": (
+                                        server.pack_preview_sha256
+                                        if "application/json" in self.headers.get(
+                                            "Content-Type", "")
+                                        else hashlib.sha256(body).hexdigest()
+                                    ),
                                 },
                                 filename=unquote(
                                     self.headers.get("X-Filename", "")
@@ -24852,6 +25267,9 @@ class ConfigServer:
                             r["restoration"] = summarize_restore_queue(queue)
                             r["restoration_queue"] = queue
                         if r.get("ok"):
+                            server.pack_preview_blob = None
+                            server.pack_preview_sha256 = ""
+                            server.pack_preview_filename = ""
                             # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
                             # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
                             forget_collection_caches()
