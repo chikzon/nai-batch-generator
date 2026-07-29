@@ -139,6 +139,225 @@ def booru_throttle(
         state.booru_last[0] = operations.clock()
 
 
+def _normalize_booru_tags(
+    site: str,
+    tags: str,
+    credentials: Callable[[str], tuple[str, str]],
+) -> tuple[str, str]:
+    parts = [
+        re.sub(r"^artists?:", "", tag, flags=re.I).replace(" ", "_")
+        for tag in (tags or "").split()
+        if tag
+    ]
+    note = ""
+    if site == "danbooru" and len(parts) > 2:
+        cap = 6 if all(credentials("danbooru")) else 2
+        if len(parts) > cap:
+            note = (
+                f"단부루는 태그 {cap}개까지만 검색됩니다 — "
+                f"앞 {cap}개만 씁니다: {' '.join(parts[:cap])}"
+                + (
+                    ""
+                    if cap > 2
+                    else (
+                        " (관리 → API 에 단부루 계정을 넣으면 "
+                        "6개까지)"
+                    )
+                )
+            )
+            parts = parts[:cap]
+    return " ".join(parts)[:200], note
+
+
+def _booru_request_options(
+    config: dict[str, Any],
+    site: str,
+    tags: str,
+    page: int,
+    limit: int,
+    credentials: Callable[[str], tuple[str, str]],
+    user_agent: str,
+) -> tuple[dict, dict, tuple[str, str] | None, dict | None]:
+    headers = {"User-Agent": user_agent}
+    params = (
+        {"tags": tags, "limit": limit, "pid": max(0, page - 1)}
+        if site == "gelbooru"
+        else {"tags": tags, "limit": limit, "page": page}
+    )
+    auth = None
+    user, key = credentials(site)
+    if user and key:
+        if config.get("auth") == "gel":
+            params["user_id"], params["api_key"] = user, key
+        else:
+            auth = (user, key)
+    elif site == "gelbooru":
+        return headers, params, auth, {
+            "ok": False,
+            "error": (
+                "겔부루는 API 키가 있어야 검색됩니다. "
+                "관리 → API 의 '부루 계정' 에 user_id 와 api_key 를 "
+                "넣어 주세요."
+            ),
+        }
+    return headers, params, auth, None
+
+
+def _booru_urls(config: dict[str, Any], site: str) -> list[str]:
+    if site != "danbooru":
+        return [config["url"]]
+    return [
+        config["url"].replace(DANBOORU_MIRRORS[0], host)
+        for host in DANBOORU_MIRRORS
+    ]
+
+
+def _request_booru_response(
+    operations: CatalogSearchOperations,
+    config: dict[str, Any],
+    site: str,
+    headers: dict,
+    params: dict,
+    auth: tuple[str, str] | None,
+    throttle: Callable[[float], Any],
+) -> tuple[Any | None, str, Exception | None]:
+    urls = _booru_urls(config, site)
+    response, used, last_error = None, urls[0], None
+    for url in urls:
+        for attempt in range(2 if len(urls) > 1 else 3):
+            throttle()
+            try:
+                response = operations.request_get(
+                    url,
+                    timeout=25,
+                    headers=headers,
+                    params=params,
+                    auth=auth,
+                )
+                used = url
+                break
+            except operations.request_errors as error:
+                last_error, response = error, None
+                operations.sleep(1.0 * (attempt + 1))
+        if response is not None:
+            break
+    return response, used, last_error
+
+
+def _booru_http_error(
+    config: dict[str, Any],
+    site: str,
+    response: Any,
+) -> dict | None:
+    if response.status_code == 429:
+        message = f"{config['name']} 요청 제한(429) — 잠시 뒤 다시 해 보세요."
+    elif response.status_code == 451:
+        message = f"{config['name']} 은 이 지역에서 막혀 있습니다 (451)."
+    elif response.status_code in (401, 403):
+        message = (
+            f"{config['name']} 인증 실패({response.status_code}) "
+            "— 관리 → API 의 '부루 계정' 을 확인해 주세요. "
+            f"{BOORU_AUTH_HELP.get(site, '')}"
+        )
+    elif response.status_code == 422 and "TagLimit" in response.text:
+        message = (
+            f"{config['name']} 태그 개수 제한(422) — 계정 등급이 "
+            "낮으면 태그 2개까지만 됩니다. 태그를 줄여 보세요."
+        )
+    elif response.status_code != 200:
+        message = (
+            f"{config['name']} HTTP {response.status_code}: "
+            f"{response.text[:100]}"
+        )
+    else:
+        return None
+    return {"ok": False, "error": message}
+
+
+def _booru_posts(response: Any, config: dict[str, Any]) -> list:
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise ValueError(
+            f"{config['name']} 이 JSON 을 주지 않았습니다 "
+            "(API 키가 필요할 수 있음). 단부루로 검색해 보세요."
+        ) from error
+    posts = (
+        data.get("post", [])
+        if isinstance(data, dict) and "post" in data
+        else data
+    )
+    if isinstance(posts, dict):
+        posts = posts.get("posts", [])
+    return posts
+
+
+def _booru_page_base(
+    config: dict[str, Any],
+    site: str,
+    used: str,
+) -> str:
+    page_base = config["page"]
+    if site == "danbooru":
+        used_host = used.split("/")[2]
+        if used_host != DANBOORU_MIRRORS[0]:
+            page_base = page_base.replace(
+                DANBOORU_MIRRORS[0],
+                used_host,
+            )
+    return page_base
+
+
+def _booru_item(
+    site: str,
+    post: dict[str, Any],
+    page_base: str,
+) -> dict[str, Any] | None:
+    if site == "e621":
+        file_info = post.get("file") or {}
+        preview_info = post.get("preview") or {}
+        tag_text = " ".join(sum(
+            (
+                (post.get("tags") or {}).get(group) or []
+                for group in (
+                    "artist",
+                    "character",
+                    "copyright",
+                    "general",
+                    "species",
+                )
+            ),
+        ))
+        thumb = preview_info.get("url")
+        full = file_info.get("url")
+    elif site == "gelbooru":
+        tag_text = post.get("tags") or ""
+        thumb = post.get("preview_url")
+        full = post.get("file_url")
+    else:
+        tag_text = post.get("tag_string") or ""
+        thumb = post.get("preview_file_url") or post.get("large_file_url")
+        full = post.get("file_url") or post.get("large_file_url")
+    if not thumb:
+        return None
+    return {
+        "id": post.get("id"),
+        "tags": tag_text,
+        "artist": (post.get("tag_string_artist") or "").strip(),
+        "character": (post.get("tag_string_character") or "").strip(),
+        "copyright": (post.get("tag_string_copyright") or "").strip(),
+        "thumb": thumb,
+        "full": full,
+        "rating": post.get("rating", ""),
+        "score": post.get("score", 0),
+        "url": (
+            f"{page_base}/{post.get('id')}"
+            if site != "gelbooru"
+            else f"{page_base}&id={post.get('id')}"
+        ),
+    }
+
+
 def search_booru(
     paths: CatalogSearchPaths,
     state: CatalogSearchState,
@@ -159,88 +378,32 @@ def search_booru(
     throttle_call = throttle or (
         lambda gap=1.0: booru_throttle(state, operations, gap)
     )
-    parts = [
-        re.sub(r"^artists?:", "", tag, flags=re.I).replace(" ", "_")
-        for tag in (tags or "").split()
-        if tag
-    ]
-    note = ""
-    if site == "danbooru" and len(parts) > 2:
-        cap = 6 if all(credential_lookup("danbooru")) else 2
-        if len(parts) > cap:
-            note = (
-                f"단부루는 태그 {cap}개까지만 검색됩니다 — "
-                f"앞 {cap}개만 씁니다: {' '.join(parts[:cap])}"
-                + (
-                    ""
-                    if cap > 2
-                    else (
-                        " (관리 → API 에 단부루 계정을 넣으면 "
-                        "6개까지)"
-                    )
-                )
-            )
-            parts = parts[:cap]
-    tags = " ".join(parts)[:200]
-    headers = {"User-Agent": operations.user_agent}
-    params = (
-        {
-            "tags": tags,
-            "limit": limit,
-            "pid": max(0, page - 1),
-        }
-        if site == "gelbooru"
-        else {"tags": tags, "limit": limit, "page": page}
+    tags, note = _normalize_booru_tags(
+        site,
+        tags,
+        credential_lookup,
     )
-    auth = None
-    user, key = credential_lookup(site)
-    if user and key:
-        if config.get("auth") == "gel":
-            params["user_id"], params["api_key"] = user, key
-        else:
-            auth = (user, key)
-    elif site == "gelbooru":
-        return {
-            "ok": False,
-            "error": (
-                "겔부루는 API 키가 있어야 검색됩니다. "
-                "관리 → API 의 '부루 계정' 에 user_id 와 api_key 를 "
-                "넣어 주세요."
-            ),
-        }
+    headers, params, auth, credential_error = _booru_request_options(
+        config,
+        site,
+        tags,
+        page,
+        limit,
+        credential_lookup,
+        operations.user_agent,
+    )
+    if credential_error is not None:
+        return credential_error
     try:
-        urls = [config["url"]]
-        if site == "danbooru":
-            urls = [
-                config["url"].replace(DANBOORU_MIRRORS[0], host)
-                for host in DANBOORU_MIRRORS
-            ]
-        response, used, last_error = None, urls[0], None
-        for url_index, url in enumerate(urls):
-            for attempt in range(2 if len(urls) > 1 else 3):
-                throttle_call()
-                try:
-                    response = operations.request_get(
-                        url,
-                        timeout=25,
-                        headers=headers,
-                        params=params,
-                        auth=auth,
-                    )
-                    used = url
-                    break
-                except operations.request_errors as error:
-                    last_error, response = error, None
-                    operations.sleep(1.0 * (attempt + 1))
-            if response is not None:
-                if url_index > 0:
-                    host = used.split("/")[2]
-                    note = (
-                        (note + " · " if note else "")
-                        + f"본 도메인이 막혀 미러({host})로 검색했습니다"
-                    )
-                    operations.log_info(f"단부루 미러 사용: {host}")
-                break
+        response, used, last_error = _request_booru_response(
+            operations,
+            config,
+            site,
+            headers,
+            params,
+            auth,
+            throttle_call,
+        )
         if response is None:
             operations.log_warning(
                 f"{site} 검색 연결 실패: {last_error}"
@@ -258,142 +421,36 @@ def search_booru(
                     f"해 보세요.{extra}"
                 ),
             }
-        if response.status_code == 429:
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} 요청 제한(429) — "
-                    "잠시 뒤 다시 해 보세요."
-                ),
-            }
-        if response.status_code == 451:
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} 은 이 지역에서 막혀 있습니다 "
-                    "(451)."
-                ),
-            }
-        if response.status_code in (401, 403):
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} 인증 실패({response.status_code}) "
-                    "— 관리 → API 의 '부루 계정' 을 확인해 주세요. "
-                    f"{BOORU_AUTH_HELP.get(site, '')}"
-                ),
-            }
-        if (
-            response.status_code == 422
-            and "TagLimit" in response.text
-        ):
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} 태그 개수 제한(422) — 계정 "
-                    "등급이 낮으면 태그 2개까지만 됩니다. 태그를 줄여 "
-                    "보세요."
-                ),
-            }
-        if response.status_code != 200:
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} HTTP {response.status_code}: "
-                    f"{response.text[:100]}"
-                ),
-            }
+        http_error = _booru_http_error(config, site, response)
+        if http_error is not None:
+            return http_error
         try:
-            data = response.json()
-        except ValueError:
-            return {
-                "ok": False,
-                "error": (
-                    f"{config['name']} 이 JSON 을 주지 않았습니다 "
-                    "(API 키가 필요할 수 있음). 단부루로 검색해 보세요."
-                ),
-            }
-        posts = (
-            data.get("post", [])
-            if isinstance(data, dict) and "post" in data
-            else data
-        )
-        if isinstance(posts, dict):
-            posts = posts.get("posts", [])
+            posts = _booru_posts(response, config)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
     except Exception as error:
         return {
             "ok": False,
             "error": f"{config['name']} 검색 실패: {error}",
         }
 
-    page_base = config["page"]
-    if site == "danbooru":
-        used_host = used.split("/")[2]
-        if used_host != DANBOORU_MIRRORS[0]:
-            page_base = page_base.replace(
-                DANBOORU_MIRRORS[0],
-                used_host,
-            )
-
-    items: list[dict[str, Any]] = []
-    for post in posts or []:
-        if site == "e621":
-            file_info = post.get("file") or {}
-            preview_info = post.get("preview") or {}
-            tag_text = " ".join(
-                sum(
-                    (
-                        (post.get("tags") or {}).get(group) or []
-                        for group in (
-                            "artist",
-                            "character",
-                            "copyright",
-                            "general",
-                            "species",
-                        )
-                    ),
-                )
-            )
-            thumb = preview_info.get("url")
-            full = file_info.get("url")
-        elif site == "gelbooru":
-            tag_text = post.get("tags") or ""
-            thumb = post.get("preview_url")
-            full = post.get("file_url")
-        else:
-            tag_text = post.get("tag_string") or ""
-            thumb = (
-                post.get("preview_file_url")
-                or post.get("large_file_url")
-            )
-            full = (
-                post.get("file_url")
-                or post.get("large_file_url")
-            )
-        if not thumb:
-            continue
-        items.append({
-            "id": post.get("id"),
-            "tags": tag_text,
-            "artist": (
-                post.get("tag_string_artist") or ""
-            ).strip(),
-            "character": (
-                post.get("tag_string_character") or ""
-            ).strip(),
-            "copyright": (
-                post.get("tag_string_copyright") or ""
-            ).strip(),
-            "thumb": thumb,
-            "full": full,
-            "rating": post.get("rating", ""),
-            "score": post.get("score", 0),
-            "url": (
-                f"{page_base}/{post.get('id')}"
-                if site != "gelbooru"
-                else f"{page_base}&id={post.get('id')}"
-            ),
-        })
+    urls = _booru_urls(config, site)
+    if site == "danbooru" and used != urls[0]:
+        host = used.split("/")[2]
+        note = (
+            (note + " · " if note else "")
+            + f"본 도메인이 막혀 미러({host})로 검색했습니다"
+        )
+        operations.log_info(f"단부루 미러 사용: {host}")
+    page_base = _booru_page_base(config, site, used)
+    items = [
+        item
+        for item in (
+            _booru_item(site, post, page_base)
+            for post in (posts or [])
+        )
+        if item is not None
+    ]
     return {
         "ok": True,
         "site": site,
@@ -520,6 +577,204 @@ def tags_json(
     return caller("tags.json", params)
 
 
+def _normalize_verification_tags(
+    text: str,
+) -> tuple[dict[str, str], list[str]]:
+    seen: dict[str, str] = {}
+    order: list[str] = []
+    semicolon_tag = "\x00NAI_SEMICOLON_BAR\x00"
+    prepared = (text or "").replace(";|", semicolon_tag)
+    parts = (
+        prepared.replace(chr(10), ",")
+        .replace(";", ",")
+        .replace(semicolon_tag, ";|")
+        .split(",")
+    )
+    for chunk in parts:
+        normalized = tagv_norm(chunk)
+        if not normalized or normalized in seen:
+            continue
+        seen[normalized] = chunk.strip()
+        order.append(normalized)
+    return seen, order
+
+
+def _refresh_tag_cache(
+    state: CatalogSearchState,
+    order: list[str],
+    fetch_tags: Callable[[dict[str, Any]], list[dict[str, Any]]],
+) -> str | None:
+    todo = [
+        tag
+        for tag in order
+        if tag not in NAI_RENAMED_TAGS
+        and tag not in state.tag_cache
+    ]
+    for index in range(0, len(todo), 40):
+        batch = todo[index:index + 40]
+        try:
+            found_rows = fetch_tags({
+                "search[name_space]": " ".join(batch),
+                "limit": 200,
+            })
+        except RuntimeError as error:
+            return str(error)
+        found = {
+            str(item.get("name")): (
+                int(item.get("post_count") or 0),
+                bool(item.get("is_deprecated")),
+            )
+            for item in found_rows
+        }
+        for tag in batch:
+            state.tag_cache[tag] = found.get(tag)
+    return None
+
+
+def _missing_verification_tags(
+    state: CatalogSearchState,
+    order: list[str],
+) -> list[str]:
+    return [
+        tag
+        for tag in order
+        if tag not in NAI_RENAMED_TAGS
+        if (
+            state.tag_cache.get(tag, (1, False)) is None
+            or state.tag_cache.get(tag, (1, False))[0] == 0
+        )
+    ]
+
+
+def _load_tag_aliases(
+    missing: list[str],
+    fetch_at: Callable[[str, dict[str, Any]], list[dict[str, Any]]],
+) -> dict[str, tuple[str, str]]:
+    aliases: dict[str, tuple[str, str]] = {}
+    for index in range(0, len(missing), 30):
+        batch = missing[index:index + 30]
+        try:
+            rows = fetch_at(
+                "tag_aliases.json",
+                {
+                    "search[antecedent_name_space]": " ".join(batch),
+                    "limit": 200,
+                },
+            )
+        except RuntimeError:
+            break
+        for item in rows:
+            antecedent = str(item.get("antecedent_name"))
+            consequent = str(item.get("consequent_name"))
+            current = aliases.get(antecedent)
+            if current is None or (
+                item.get("status") == "active"
+                and current[1] != "active"
+            ):
+                aliases[antecedent] = (
+                    consequent,
+                    str(item.get("status") or ""),
+                )
+    return aliases
+
+
+def _ghost_suggestions(
+    tag: str,
+    fetch_tags: Callable[[dict[str, Any]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    try:
+        suggestions = fetch_tags({
+            "search[name_matches]": f"*{tag}*",
+            "search[order]": "count",
+            "limit": 5,
+        })
+        return [
+            {
+                "name": str(suggestion.get("name")),
+                "count": int(suggestion.get("post_count") or 0),
+            }
+            for suggestion in suggestions
+            if suggestion.get("name")
+            and str(suggestion.get("name")) != tag
+            and int(suggestion.get("post_count") or 0) > 0
+        ]
+    except RuntimeError:
+        return []
+
+
+def _verification_item(
+    state: CatalogSearchState,
+    seen: dict[str, str],
+    aliases: dict[str, tuple[str, str]],
+    tag: str,
+    low: int,
+    fetch_tags: Callable[[dict[str, Any]], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if tag in NAI_RENAMED_TAGS:
+        return {
+            "raw": seen[tag],
+            "tag": tag,
+            "count": None,
+            "status": "nai_renamed",
+            "alias_to": NAI_RENAMED_TAGS[tag],
+        }
+    if tag not in state.tag_cache:
+        return {
+            "raw": seen[tag],
+            "tag": tag,
+            "count": None,
+            "status": "unknown",
+        }
+    record = state.tag_cache[tag]
+    count, deprecated = (0, False) if record is None else record
+    if count >= low:
+        status = "ok"
+    elif count > 0:
+        status = "low"
+    elif tag in aliases:
+        consequent, alias_status = aliases[tag]
+        return {
+            "raw": seen[tag],
+            "tag": tag,
+            "count": 0,
+            "status": "alias",
+            "alias_to": consequent,
+            "alias_status": alias_status,
+        }
+    elif deprecated:
+        status = "old"
+    else:
+        status = "ghost"
+    item: dict[str, Any] = {
+        "raw": seen[tag],
+        "tag": tag,
+        "count": count,
+        "status": status,
+    }
+    if deprecated:
+        item["deprecated"] = True
+    if status == "ghost":
+        item["suggest"] = _ghost_suggestions(tag, fetch_tags)
+    return item
+
+
+def _verification_summary(items: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        status: sum(
+            1 for item in items if item["status"] == status
+        )
+        for status in (
+            "ok",
+            "low",
+            "old",
+            "alias",
+            "nai_renamed",
+            "ghost",
+            "unknown",
+        )
+    }
+
+
 def verify_tags(
     state: CatalogSearchState,
     operations: CatalogSearchOperations,
@@ -547,175 +802,26 @@ def verify_tags(
             params,
         )
     )
-    seen: dict[str, str] = {}
-    order: list[str] = []
-    semicolon_tag = "\x00NAI_SEMICOLON_BAR\x00"
-    prepared = (text or "").replace(";|", semicolon_tag)
-    parts = (
-        prepared.replace(chr(10), ",")
-        .replace(";", ",")
-        .replace(semicolon_tag, ";|")
-        .split(",")
-    )
-    for chunk in parts:
-        normalized = tagv_norm(chunk)
-        if not normalized or normalized in seen:
-            continue
-        seen[normalized] = chunk.strip()
-        order.append(normalized)
-
-    result: list[dict[str, Any]] = []
-    error_message = None
-    todo = [
-        tag
-        for tag in order
-        if tag not in NAI_RENAMED_TAGS
-        and tag not in state.tag_cache
-    ]
-    for index in range(0, len(todo), 40):
-        batch = todo[index:index + 40]
-        try:
-            found_rows = tag_fetch({
-                "search[name_space]": " ".join(batch),
-                "limit": 200,
-            })
-            found = {
-                str(item.get("name")): (
-                    int(item.get("post_count") or 0),
-                    bool(item.get("is_deprecated")),
-                )
-                for item in found_rows
-            }
-            for tag in batch:
-                state.tag_cache[tag] = found.get(tag)
-        except RuntimeError as error:
-            error_message = str(error)
-            break
-
-    missing = [
-        tag
-        for tag in order
-        if tag not in NAI_RENAMED_TAGS
-        if (
-            state.tag_cache.get(tag, (1, False)) is None
-            or state.tag_cache.get(tag, (1, False))[0] == 0
+    seen, order = _normalize_verification_tags(text)
+    error_message = _refresh_tag_cache(state, order, tag_fetch)
+    missing = _missing_verification_tags(state, order)
+    aliases = _load_tag_aliases(missing, endpoint_fetch)
+    result = [
+        _verification_item(
+            state,
+            seen,
+            aliases,
+            tag,
+            low,
+            tag_fetch,
         )
+        for tag in order
     ]
-    aliases: dict[str, tuple[str, str]] = {}
-    for index in range(0, len(missing), 30):
-        batch = missing[index:index + 30]
-        try:
-            rows = endpoint_fetch(
-                "tag_aliases.json",
-                {
-                    "search[antecedent_name_space]": " ".join(batch),
-                    "limit": 200,
-                },
-            )
-            for item in rows:
-                antecedent = str(item.get("antecedent_name"))
-                consequent = str(item.get("consequent_name"))
-                current = aliases.get(antecedent)
-                if current is None or (
-                    item.get("status") == "active"
-                    and current[1] != "active"
-                ):
-                    aliases[antecedent] = (
-                        consequent,
-                        str(item.get("status") or ""),
-                    )
-        except RuntimeError:
-            break
-
-    for tag in order:
-        if tag in NAI_RENAMED_TAGS:
-            result.append({
-                "raw": seen[tag],
-                "tag": tag,
-                "count": None,
-                "status": "nai_renamed",
-                "alias_to": NAI_RENAMED_TAGS[tag],
-            })
-            continue
-        if tag not in state.tag_cache:
-            result.append({
-                "raw": seen[tag],
-                "tag": tag,
-                "count": None,
-                "status": "unknown",
-            })
-            continue
-        record = state.tag_cache[tag]
-        count, deprecated = (
-            (0, False) if record is None else record
-        )
-        if count >= low:
-            status = "ok"
-        elif count > 0:
-            status = "low"
-        elif tag in aliases:
-            consequent, alias_status = aliases[tag]
-            result.append({
-                "raw": seen[tag],
-                "tag": tag,
-                "count": 0,
-                "status": "alias",
-                "alias_to": consequent,
-                "alias_status": alias_status,
-            })
-            continue
-        elif deprecated:
-            status = "old"
-        else:
-            status = "ghost"
-        item: dict[str, Any] = {
-            "raw": seen[tag],
-            "tag": tag,
-            "count": count,
-            "status": status,
-        }
-        if deprecated:
-            item["deprecated"] = True
-        if status == "ghost":
-            try:
-                suggestions = tag_fetch({
-                    "search[name_matches]": f"*{tag}*",
-                    "search[order]": "count",
-                    "limit": 5,
-                })
-                item["suggest"] = [
-                    {
-                        "name": str(suggestion.get("name")),
-                        "count": int(
-                            suggestion.get("post_count") or 0
-                        ),
-                    }
-                    for suggestion in suggestions
-                    if suggestion.get("name")
-                    and str(suggestion.get("name")) != tag
-                    and int(suggestion.get("post_count") or 0) > 0
-                ]
-            except RuntimeError:
-                item["suggest"] = []
-        result.append(item)
     return {
         "ok": True,
         "items": result,
         "error": error_message,
-        "summary": {
-            status: sum(
-                1 for item in result if item["status"] == status
-            )
-            for status in (
-                "ok",
-                "low",
-                "old",
-                "alias",
-                "nai_renamed",
-                "ghost",
-                "unknown",
-            )
-        },
+        "summary": _verification_summary(result),
     }
 
 
