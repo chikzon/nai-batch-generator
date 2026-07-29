@@ -62,6 +62,21 @@ from src.nai_studio.domain.project_inheritance import (
     resolve_inheritance,
 )
 from src.nai_studio.domain.experiment import canonical_experiment_rule
+from src.nai_studio.domain.model_presets import (
+    MODELS,
+    QUALITY_SUFFIX,
+    QUALITY_SUFFIX_TEXT,
+    UC_PRESETS,
+    UC_PRESET_TEXT,
+    merge_quality_suffix,
+    merge_uc_preset,
+    model_id_from_metadata,
+    quality_suffix_text,
+    restore_quality_prompt,
+    split_quality_suffix,
+    split_uc_preset,
+    uc_preset_text,
+)
 from src.nai_studio.domain.positioning import (
     normalize_position_mode,
     position_mode_uses_coords,
@@ -8927,67 +8942,6 @@ def seed_for(cfg, base_seed, index):
 SAMPLERS = ["k_euler_ancestral", "k_euler", "k_dpmpp_2s_ancestral",
             "k_dpmpp_2m", "k_dpmpp_2m_sde", "k_dpmpp_sde"]
 NOISE_SCHEDULES = ["karras", "native", "exponential", "polyexponential"]
-MODELS = [
-    ("nai-diffusion-4-5-full", "V4.5 Full (기본)"),
-    ("nai-diffusion-4-5-curated", "V4.5 Curated"),
-    ("nai-diffusion-4-full", "V4 Full"),
-    ("nai-diffusion-4-curated-preview", "V4 Curated"),
-    ("nai-diffusion-3", "V3 (Anime)"),
-    ("nai-diffusion-furry-3", "V3 Furry"),
-]
-UC_PRESETS = [(0, "Heavy"), (1, "Light"), (3, "Human Focus"), (4, "None")]
-
-
-def model_id_from_metadata(value, fallback="nai-diffusion-4-5-full"):
-    """NAI PNG의 표시명/Source 문자열을 실제 API 모델 ID로 바꾼다.
-
-    Source 끝의 8자리 빌드 해시는 모델 버전이 아니므로 버전 토큰만 판정한다.
-    알 수 없는 구형/타사 모델은 사용자가 고른 지원 모델로 안전하게 되돌린다.
-    """
-    supported = {model_id for model_id, _label in MODELS}
-    fallback = fallback if fallback in supported else "nai-diffusion-4-5-full"
-    text = str(value or "").strip()
-    if text in supported:
-        return text
-    low = text.casefold()
-    curated = "curated" in low
-    if re.search(r"\bv?4(?:[._ -]?5)\b", low):
-        return "nai-diffusion-4-5-curated" if curated else "nai-diffusion-4-5-full"
-    if "furry" in low and re.search(r"\bv?3\b", low):
-        return "nai-diffusion-furry-3"
-    if re.search(r"\bv?4\b", low):
-        return "nai-diffusion-4-curated-preview" if curated else "nai-diffusion-4-full"
-    if re.search(r"\bv?3\b", low) or low.startswith("stable diffusion xl"):
-        return "nai-diffusion-3"
-    return fallback
-
-
-# ══ 모델별 퀄리티 태그·UC 프리셋의 실제 문구 ═══════════════════════════
-# NovelAI 공식 문서(2026-07-27 확인):
-#   https://docs.novelai.net/en/image/qualitytags/
-#   https://docs.novelai.net/en/image/undesiredcontent/
-QUALITY_SUFFIX_TEXT = {
-    "nai-diffusion-4-5-full":
-        "very aesthetic, masterpiece, no text",
-    "nai-diffusion-4-5-curated":
-        "masterpiece, no text, -0.8::feet::, rating:general",
-    "nai-diffusion-4-full":
-        "no text, best quality, very aesthetic, absurdres",
-    "nai-diffusion-4-curated-preview":
-        "rating:general, amazing quality, very aesthetic, absurdres",
-    "nai-diffusion-3":
-        "best quality, amazing quality, very aesthetic, absurdres",
-    "nai-diffusion-furry-3":
-        "{best quality}, {amazing quality}",
-}
-# 기존 테스트·외부 호출 호환용 이름. 실제 조립은 quality_suffix_text(model)을 쓴다.
-QUALITY_SUFFIX = ", " + QUALITY_SUFFIX_TEXT["nai-diffusion-4-5-full"]
-
-
-def quality_suffix_text(model):
-    return QUALITY_SUFFIX_TEXT.get(str(model or ""), "")
-
-
 def annotate_nai_comment(
     comment,
     quality_toggle,
@@ -9015,163 +8969,6 @@ def annotate_nai_comment(
         return comment
 
 
-def merge_quality_suffix(prompt, model):
-    text = quality_suffix_text(model)
-    raw = str(prompt or "").rstrip().rstrip(",")
-    if not text or raw.endswith(text):
-        return raw
-    return f"{raw}, {text}" if raw else text
-
-
-def split_quality_suffix(prompt, model=None):
-    """끝에 붙은 공식 퀄리티 태그를 떼어 (사용자 프롬프트, 켜짐)으로."""
-    raw = str(prompt or "").strip().rstrip(",")
-    candidates = []
-    if model and quality_suffix_text(model):
-        candidates.append(quality_suffix_text(model))
-    else:
-        candidates.extend(QUALITY_SUFFIX_TEXT.values())
-    # 이전 배포본이 넣던 잘못된 location 포함 문구도 가져오기 때만 떼어낸다.
-    candidates.extend([
-        "location, very aesthetic, masterpiece, no text",
-        "location, masterpiece, no text, -0.8::feet::, rating:general",
-    ])
-    for text in sorted(set(candidates), key=len, reverse=True):
-        if raw == text:
-            return "", True
-        if raw.endswith(", " + text):
-            return raw[:-(len(text) + 2)].rstrip().rstrip(","), True
-        if raw.startswith(text + ", "):
-            return raw[len(text) + 2:].lstrip().lstrip(","), True
-        marker = ", " + text + ", "
-        if marker in raw:
-            left, right = raw.split(marker, 1)
-            joined = ", ".join(x for x in (left.rstrip(" ,"), right.lstrip(" ,")) if x)
-            return joined, True
-    return raw, False
-
-
-def restore_quality_prompt(prompt, model, params):
-    """명시된 메타데이터 상태를 우선하고, 없는 구형 파일만 문구로 추정한다."""
-    if "quality_toggle" in params:
-        enabled = bool(params["quality_toggle"])
-        if not enabled:
-            return str(prompt or "").strip().rstrip(","), False
-        base, _ = split_quality_suffix(prompt, model)
-        return base, True
-    return split_quality_suffix(prompt, model)
-
-
-# ⚠ NAI 는 요청의 `ucPreset` 숫자를 **그림에 반영하지 않는다.** 실측(2026-07):
-#     같은 시드로 ucPreset 0 과 4 를 보냈을 때 픽셀 차이 0.00/255
-#     같은 시드로 프리셋 문구를 네거티브에 직접 합쳤을 때 차이 58.65/255
-#   즉 `ucPreset` 은 화면 상태를 적어 두는 값일 뿐이고, **문구를 합치는 것은
-#   클라이언트 몫**이다. 숫자만 보내면 프리셋은 아무 일도 하지 않는다.
-# `nsfw` 는 사용자 UC일 수 있지만 프리셋 자체에는 없다. 자동으로 끼워 넣지 않는다.
-_V45_FULL_HEAVY = ("lowres, artistic error, film grain, scan artifacts, worst quality, "
-                   "bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, "
-                   "halftone, screentone, multiple views, logo, too many watermarks, negative space, "
-                   "blank page")
-UC_PRESET_TEXT = {
-    "nai-diffusion-4-5-full": {
-        0: _V45_FULL_HEAVY,
-        1: ("lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, "
-            "multiple views, very displeasing, too many watermarks, negative space, blank page"),
-        3: _V45_FULL_HEAVY + ", @_@, mismatched pupils, glowing eyes, bad anatomy",
-        4: "",
-    },
-    "nai-diffusion-4-5-curated": {
-        0: ("blurry, lowres, upscaled, artistic error, film grain, scan artifacts, worst quality, "
-            "bad quality, jpeg artifacts, very displeasing, chromatic aberration, halftone, "
-            "multiple views, logo, too many watermarks, negative space, blank page"),
-        1: ("blurry, lowres, upscaled, artistic error, scan artifacts, jpeg artifacts, logo, "
-            "too many watermarks, negative space, blank page"),
-        3: ("blurry, lowres, upscaled, artistic error, film grain, scan artifacts, bad anatomy, "
-            "bad hands, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic "
-            "aberration, halftone, multiple views, logo, too many watermarks, @_@, mismatched "
-            "pupils, glowing eyes, negative space, blank page"),
-        4: "",
-    },
-    "nai-diffusion-4-full": {
-        0: ("blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, "
-            "jpeg artifacts, very displeasing, chromatic aberration, multiple views, logo, "
-            "too many watermarks"),
-        1: "blurry, lowres, error, worst quality, bad quality, jpeg artifacts, very displeasing",
-        4: "",
-    },
-    "nai-diffusion-4-curated-preview": {
-        0: ("blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, "
-            "jpeg artifacts, very displeasing, chromatic aberration, logo, dated, signature, "
-            "multiple views, gigantic breasts"),
-        1: ("blurry, lowres, error, worst quality, bad quality, jpeg artifacts, very displeasing, "
-            "logo, dated, signature"),
-        4: "",
-    },
-    "nai-diffusion-3": {
-        0: ("lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad "
-            "quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra "
-            "digits, artistic error, username, scan, [abstract],"),
-        1: "lowres, jpeg artifacts, worst quality, watermark, blurry, very displeasing,",
-        3: ("lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad "
-            "quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra "
-            "digits, artistic error, username, scan, [abstract], bad anatomy, bad hands, @_@, "
-            "mismatched pupils, heart-shaped pupils, glowing eyes,"),
-        4: "",
-    },
-    "nai-diffusion-furry-3": {
-        0: ("{{worst quality}}, [displeasing], {unusual pupils}, guide lines, {{unfinished}}, "
-            "{bad}, url, artist name, {{tall image}}, mosaic, {sketch page}, comic panel, impact "
-            "(font), [dated], {logo}, ych, {what}, {where is your god now}, {distorted text}, "
-            "repeated text, {floating head}, {1994}, {widescreen}, absolutely everyone, sequence, "
-            "{compression artifacts}, hard translated, {cropped}, {commissioner name}, unknown "
-            "text, high contrast,"),
-        1: ("{worst quality}, guide lines, unfinished, bad, url, tall image, widescreen, "
-            "compression artifacts, unknown text,"),
-        4: "",
-    },
-}
-
-
-def uc_preset_text(model, preset):
-    """이 모델에서 이 프리셋의 문구. 모르는 모델이면 빈 문자열."""
-    return UC_PRESET_TEXT.get(str(model or ""), {}).get(
-        int(preset or 0), ""
-    ).strip().rstrip(",")
-
-
-def merge_uc_preset(negative, model, preset):
-    """프리셋 문구를 네거티브 앞에 붙인다. 이미 붙어 있으면 그대로 둔다."""
-    txt = uc_preset_text(model, preset)
-    if not txt:
-        return negative or ""
-    neg = (negative or "").strip()
-    if neg == txt or txt in neg:
-        return neg
-    return f"{txt}, {neg}" if neg else txt
-
-
-def split_uc_preset(negative, model=None):
-    """네거티브 앞에 붙은 프리셋 문구를 떼어 (프리셋번호, 사용자부분) 으로.
-
-    그림에서 설정을 읽어 올 때 쓴다. 떼지 않으면 다시 생성할 때 문구가 **두 번**
-    붙는다. 가장 긴 것부터 맞춰 본다 (3 번은 0 번을 포함하므로)."""
-    neg = (negative or "").strip()
-    table = UC_PRESET_TEXT.get(str(model or ""), {})
-    candidates = list(table.items()) if table else [
-        item for preset_table in UC_PRESET_TEXT.values() for item in preset_table.items()
-    ]
-    candidates = [(num, txt.strip().rstrip(",")) for num, txt in candidates]
-    for num, txt in sorted(candidates, key=lambda kv: -len(kv[1])):
-        if not txt:
-            continue
-        at = neg.find(txt)
-        if at < 0:
-            continue
-        before = neg[:at].strip().strip(",").strip()
-        after = neg[at + len(txt):].strip().strip(",").strip()
-        user = ", ".join(part for part in (before, after) if part)
-        return num, user
-    return None, neg
 RESOLUTIONS = [(832, 1216, "세로"), (1216, 832, "가로"), (1024, 1024, "정사각"),
                (1024, 1536, "세로 대형"), (1536, 1024, "가로 대형"),
                (1472, 1472, "정사각 대형"), (1920, 1088, "와이드"), (1088, 1920, "세로 와이드"),
