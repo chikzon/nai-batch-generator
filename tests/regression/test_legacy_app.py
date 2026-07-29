@@ -2181,6 +2181,96 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(recovered["status"], "interrupted")
             self.assertTrue(recovered["can_resume"])
 
+    def test_finish_job_record_keeps_started_durable_identity_results_and_lineage(self):
+        class MemoryStore:
+            def __init__(self, value):
+                self.value = copy.deepcopy(value)
+
+            def get(self, _job_id):
+                return copy.deepcopy(self.value)
+
+            def save(self, value):
+                self.value = copy.deepcopy(value)
+                return copy.deepcopy(value)
+
+        for legacy_status, expected_phase in (
+                ("completed", "completed"),
+                ("failed", "failed"),
+                ("stopped", "paused")):
+            with self.subTest(status=legacy_status), tempfile.TemporaryDirectory() as td:
+                job_id = f"job-finish-{legacy_status}"
+                durable = APP.new_job(
+                    "setting",
+                    blueprint_fingerprint="a" * 64,
+                    payload_hash="b" * 64,
+                    request_id=f"request-start-{legacy_status}",
+                    job_id=job_id,
+                    metadata={"started_snapshot": True},
+                )
+                durable = APP.transition_job(durable, "preparing")
+                durable["results"] = [{
+                    "id": "result-start",
+                    "artifact": "output/result.webp",
+                    "content_hash": "c" * 64,
+                    "source_result_ids": ["evidence-before"],
+                }]
+                durable["lineage"] = {
+                    "source_job_ids": ["source-job-before"],
+                    "source_result_ids": ["evidence-before"],
+                    "result_ids": ["result-start"],
+                }
+                store = MemoryStore(durable)
+                ledger_file = Path(td) / "작업대기열.json"
+                APP.atomic_write_json(ledger_file, {
+                    "schema": "nais-job-ledger/v1",
+                    "jobs": [{
+                        "id": job_id,
+                        "operation": "세팅 배치 생성",
+                        "kind": "settings",
+                        "status": "running",
+                        "created_at": "2026-07-29T00:00:00",
+                        "updated_at": "2026-07-29T00:00:00",
+                        "completed": 0,
+                        "failed": 0,
+                        "can_resume": False,
+                    }],
+                })
+                with (
+                    patch.object(APP, "JOB_LEDGER_FILE", ledger_file),
+                    patch.object(APP, "common_job_store",
+                                 return_value=store),
+                ):
+                    APP.finish_job_record(
+                        job_id,
+                        status=legacy_status,
+                        completed=2,
+                        failed=1,
+                        can_resume=legacy_status != "completed",
+                        message="legacy progress only",
+                    )
+                    legacy = APP.load_job_ledger()["jobs"][0]
+
+                finished = store.value
+                self.assertEqual(finished["phase"], expected_phase)
+                self.assertEqual(
+                    finished["blueprint_fingerprint"], "a" * 64)
+                self.assertEqual(finished["payload_hash"], "b" * 64)
+                self.assertEqual(
+                    finished["request_id"],
+                    f"request-start-{legacy_status}")
+                self.assertEqual(finished["results"], durable["results"])
+                self.assertEqual(finished["lineage"], durable["lineage"])
+                self.assertEqual(
+                    finished["metadata"], {"started_snapshot": True})
+                self.assertEqual(
+                    (finished["progress"]["completed"],
+                     finished["progress"]["failed"]),
+                    (2, 1),
+                )
+                self.assertEqual(legacy["status"], legacy_status)
+                self.assertEqual(
+                    (legacy["completed"], legacy["failed"]), (2, 1))
+
     def test_live_state_eta_uses_only_work_completed_in_this_run(self):
         live = APP.LiveState()
         with patch.object(APP.time, "time", return_value=100.0):
@@ -5774,6 +5864,19 @@ class RegressionTests(unittest.TestCase):
                 "female": "character whole positive",
                 "clothed": "character whole outfit",
                 "negative": "character whole negative",
+                "variant": {"group": "uniform", "name": "winter"},
+                "variants": [{
+                    "id": "summer", "name": "summer",
+                    "clothed": "summer outfit",
+                }],
+                "reference_ids": ["ref-character-one"],
+                "vibe_ids": ["vibe-character-one"],
+                "images": ["local:character-proof.webp"],
+                "evidence": [{
+                    "id": "evidence:character:one",
+                    "image": "local:character-proof.webp",
+                }],
+                "evidence_refs": ["evidence:character:one"],
             }]}
             old_cache = copy.deepcopy(APP._COMBOS)
             try:
@@ -5833,6 +5936,27 @@ class RegressionTests(unittest.TestCase):
                     self.assertEqual(
                         character["items"][0]["ref"]["negative"],
                         "character whole negative")
+                    character_ref = character["items"][0]["ref"]
+                    self.assertEqual(
+                        character_ref["variant"],
+                        {"group": "uniform", "name": "winter"})
+                    self.assertEqual(
+                        character_ref["variants"][0]["id"], "summer")
+                    self.assertEqual(
+                        character_ref["reference_ids"],
+                        ["ref-character-one"])
+                    self.assertEqual(
+                        character_ref["vibe_ids"],
+                        ["vibe-character-one"])
+                    self.assertEqual(
+                        character["items"][0]["images"],
+                        ["local:character-proof.webp"])
+                    self.assertEqual(
+                        character_ref["evidence"][0]["id"],
+                        "evidence:character:one")
+                    self.assertEqual(
+                        character_ref["evidence_refs"],
+                        ["evidence:character:one"])
 
                     recipe = APP.search_library(
                         cfg, {"그림체_그룹": []}, q="recipe", kind="레시피")

@@ -64,6 +64,7 @@ from src.nai_studio.runtime import (
     reconcile_job,
     retry_job,
     transition_job,
+    update_progress,
 )
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
@@ -3220,6 +3221,8 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
         if not isinstance(char, dict):
             continue
         name = str(char.get("name") or "(무명)")
+        character_images = copy.deepcopy(
+            char.get("images") if isinstance(char.get("images"), list) else [])
         rows.append({
             "id": "character:" + str(char.get("id") or name),
             "kind": "캐릭터", "store": "character", "name": name,
@@ -3228,11 +3231,16 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
             "outfit": str(char.get("clothed") or ""),
             "source": str(char.get("source") or "내 캐릭터"),
             "groups": char.get("groups") if isinstance(char.get("groups"), dict) else {},
+            "images": character_images,
+            "evidence": copy.deepcopy(char.get("evidence"))
+            if "evidence" in char else None,
             "ref": {
                 key: copy.deepcopy(char.get(key))
                 for key in (
                     "id", "name", "female", "clothed", "negative", "groups",
                     "source", "folder_id", "subfolder_id",
+                    "variant", "variants", "reference_ids", "vibe_ids",
+                    "images", "evidence", "evidence_ids", "evidence_refs",
                 ) if key in char
             },
         })
@@ -13728,6 +13736,7 @@ function characterBundle(c, forSlot=true){
     id:c.id||'', name:c.name||'', prompt:c.female||c.prompt||'',
     outfit:c.clothed||c.outfit||'', negative:c.negative||'',
     variant:JSON.parse(JSON.stringify(c.variant||{})),
+    variants:JSON.parse(JSON.stringify(c.variants||[])),
     reference_ids:JSON.parse(JSON.stringify(c.reference_ids||[])),
     vibe_ids:JSON.parse(JSON.stringify(c.vibe_ids||[]))
   };
@@ -20051,6 +20060,48 @@ def start_job_record(operation, kind, *, blueprint=None, payload_identity=None):
         return record["id"]
 
 
+def _finish_durable_job(existing, projected):
+    """legacy 진행 관찰값만 합치고 시작 때 확정한 durable identity는 보존한다."""
+    if not isinstance(existing, dict):
+        return projected
+    if (
+        existing.get("phase") == "cancelled"
+        and projected.get("phase") != "cancelled"
+    ):
+        return existing
+    target = str(projected.get("phase") or "")
+    progress = copy.deepcopy(projected.get("progress") or {})
+    if target == "completed":
+        merged = reconcile_job(
+            existing,
+            {
+                "progress": progress,
+                "confirmed_complete": True,
+                "artifacts_intact": True,
+            },
+            now=str(projected.get("updated_at") or ""),
+        )
+    else:
+        merged = update_progress(
+            existing,
+            completed=progress.get("completed"),
+            failed=progress.get("failed"),
+            total=progress.get("total"),
+            message=progress.get("message"),
+            now=str(projected.get("updated_at") or ""),
+        )
+        if target in ("paused", "failed", "cancelled"):
+            if merged.get("phase") != target:
+                merged = transition_job(
+                    merged,
+                    target,
+                    error=(copy.deepcopy(projected.get("error"))
+                           if target == "failed" else None),
+                    now=str(projected.get("updated_at") or ""),
+                )
+    return merged
+
+
 def finish_job_record(job_id, *, status, completed=0, failed=0,
                       can_resume=False, message=""):
     if not job_id:
@@ -20073,14 +20124,8 @@ def finish_job_record(job_id, *, status, completed=0, failed=0,
                 existing = common_job_store().get(job_id)
             except Exception:
                 existing = None
-            # 사용자가 명시적으로 취소한 작업을 뒤늦게 끝난 legacy worker의
-            # stopped/partial 관찰값이 paused로 되돌리면 안 된다.
-            if not (
-                isinstance(existing, dict)
-                and existing.get("phase") == "cancelled"
-                and projected.get("phase") != "cancelled"
-            ):
-                common_job_store().save(projected)
+            common_job_store().save(
+                _finish_durable_job(existing, projected))
             break
         _save_job_ledger(data)
 
