@@ -41,9 +41,9 @@
 SHA-256:
 
 ```text
-84b48292870dea3e4a1963325befaa5eeca0891ef711d30ad8ef1208e08735cc  NAI-batch-generator-1.0.0-portable-win-x64.zip
-ee49f2b09a0c6b81202480c6167ef1b1ff14852d07f8ef57607b6686bfec8467  NAI-batch-generator-1.0.0-datapack.zip
-d13cd4c42a3ccc484a3fc0882e839cf01fca926ec8e4bd49422b479d4c5cd416  NAI-batch-generator-1.0.0-setup.exe
+37d2bdb32f87253947e7e48bd820cc451d4789c36381f25e2a7cd39f55cb4699  NAI-batch-generator-1.0.0-portable-win-x64.zip
+6533054f44d5858d62977f59322de393e5cea10723356f9a92d359dc8a63283e  NAI-batch-generator-1.0.0-datapack.zip
+e39c0823232d713d9a23c2892526455540d474b9678a9729b325bf3dde24f20c  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일
