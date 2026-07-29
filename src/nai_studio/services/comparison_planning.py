@@ -1187,60 +1187,20 @@ def comparison_character_setting_plan(
     return result
 
 
-def comparison_plan(
-    operations: ComparisonPlanningOperations,
+def _comparison_base_counts(
     cfg: dict,
-    raw: dict,
-    spec: dict | None = None,
-    opus: bool | None = None,
-    *,
-    selected_job_values: Any = None,
-    character_setting_job_values: Any = None,
-) -> dict:
-    """실행 전에 장수와 과금 범위를 계산한다. API 호출은 하지 않는다."""
-    options = normalize_comparison_options(raw, cfg)
-    mode = options["mode"]
-    if mode == "character_setting":
-        styles, chars = [], comparison_characters(cfg)
-    else:
-        styles, chars = comparison_sources(operations, cfg, spec)
-    if mode == "selected":
-        return comparison_selected_plan(
-            operations,
-            cfg,
-            options,
-            styles,
-            chars,
-            comparison_settings(cfg),
-            opus=opus,
-            job_values=selected_job_values,
-        )
-    if mode == "character_setting":
-        return comparison_character_setting_plan(
-            operations,
-            cfg,
-            options,
-            chars,
-            opus=opus,
-            job_values=character_setting_job_values,
-        )
-    current_slots = [
-        slot
-        for slot in (cfg.get("char_slots") or [])
-        if slot_prompt(slot).strip()
-        and slot.get("enabled") is not False
-    ]
+    mode: str,
+    options: dict,
+    styles: list[dict],
+    chars: list[dict],
+) -> tuple[int, int, int, list[str]]:
     combinations = (
-        len(styles)
-        if mode == "styles"
-        else len(chars)
-        if mode == "characters"
+        len(styles) if mode == "styles"
+        else len(chars) if mode == "characters"
         else len(styles) * len(chars)
     )
     total = combinations * options["seed_count"]
-    count = (
-        min(total, options["limit"]) if options["limit"] else total
-    )
+    count = min(total, options["limit"]) if options["limit"] else total
     errors = []
     if mode in ("styles", "both") and not styles:
         errors.append(
@@ -1254,56 +1214,121 @@ def comparison_plan(
         errors.append(
             f"한 계획은 최대 {COMPARE_MAX_JOBS:,}장까지 만들 수 있습니다."
         )
+    return combinations, total, count, errors
 
+
+def _comparison_costs(
+    cfg: dict,
+    mode: str,
+    options: dict,
+    styles: list[dict],
+    chars: list[dict],
+    count: int,
+) -> tuple[int, int, int]:
     refs = (
-        sum(
-            1
-            for reference in cfg.get("char_refs", [])
-            if reference.get("enabled")
-        )
-        if options["include_refs"]
-        else 0
+        sum(1 for reference in cfg.get("char_refs", []) if reference.get("enabled"))
+        if options["include_refs"] else 0
     )
     paid_total = opus_total = eligible = 0
     remain = count
 
-    def add_cost(job_cfg: dict, multiplier: int) -> None:
+    def add(job_cfg: dict, multiplier: int) -> None:
         nonlocal paid_total, opus_total, eligible, remain
         number = max(0, min(int(multiplier), remain))
         if not number:
             return
-        paid = anlas_estimate(
-            job_cfg, 1, opus=False, char_refs=refs
-        )
-        free = anlas_estimate(
-            job_cfg, 1, opus=True, char_refs=refs
-        )
+        paid = anlas_estimate(job_cfg, 1, opus=False, char_refs=refs)
+        free = anlas_estimate(job_cfg, 1, opus=True, char_refs=refs)
         paid_total += paid["per_image"] * number
         opus_total += free["per_image"] * number
-        if free["free_eligible"]:
-            eligible += number
+        eligible += number if free["free_eligible"] else 0
         remain -= number
 
     if mode == "characters":
-        used = comparison_style_config(cfg, None, options)
-        add_cost(used, count)
-    elif mode == "styles":
-        for style in styles:
-            if remain <= 0:
-                break
-            add_cost(
-                comparison_style_config(cfg, style, options),
-                options["seed_count"],
-            )
+        add(comparison_style_config(cfg, None, options), count)
     else:
+        multiplier = (
+            options["seed_count"]
+            if mode == "styles"
+            else len(chars) * options["seed_count"]
+        )
         for style in styles:
             if remain <= 0:
                 break
-            add_cost(
-                comparison_style_config(cfg, style, options),
-                len(chars) * options["seed_count"],
-            )
+            add(comparison_style_config(cfg, style, options), multiplier)
+    return paid_total, opus_total, eligible
 
+
+def _attach_experiment(
+    cfg: dict,
+    result: dict,
+    styles: list[dict],
+    chars: list[dict],
+) -> None:
+    """실행 전 계획에 공통 실험 셀 식별자를 붙이되 실패는 진단으로만 남긴다."""
+    try:
+        experiment = expand_legacy_experiment_cells(
+            cfg, result, styles=styles, characters=chars
+        )
+        result["experiment"] = {
+            "schema": experiment.get("schema"),
+            "id": experiment.get("id"),
+            "mode": experiment.get("legacy_mode"),
+            "total": experiment.get("total", 0),
+            "pending": experiment.get("pending", 0),
+            "completed": experiment.get("completed", 0),
+            "cell_ids": [
+                {"id": cell.get("id"), "resume_key": cell.get("legacy_resume_key")}
+                for cell in (experiment.get("cells") or [])[:10]
+            ],
+        }
+    except Exception as error:
+        result["experiment"] = {
+            "ok": False,
+            "error": redact_diagnostic_text(error),
+        }
+
+
+def comparison_plan(
+    operations: ComparisonPlanningOperations,
+    cfg: dict,
+    raw: dict,
+    spec: dict | None = None,
+    opus: bool | None = None,
+    *,
+    selected_job_values: Any = None,
+    character_setting_job_values: Any = None,
+) -> dict:
+    """실행 전에 장수와 과금 범위를 계산한다. API 호출은 하지 않는다."""
+    options = normalize_comparison_options(raw, cfg)
+    mode = options["mode"]
+    styles, chars = (
+        ([], comparison_characters(cfg))
+        if mode == "character_setting"
+        else comparison_sources(operations, cfg, spec)
+    )
+    if mode == "selected":
+        return comparison_selected_plan(
+            operations, cfg, options, styles, chars, comparison_settings(cfg),
+            opus=opus, job_values=selected_job_values,
+        )
+    if mode == "character_setting":
+        return comparison_character_setting_plan(
+            operations, cfg, options, chars, opus=opus,
+            job_values=character_setting_job_values,
+        )
+    current_slots = [
+        slot
+        for slot in (cfg.get("char_slots") or [])
+        if slot_prompt(slot).strip()
+        and slot.get("enabled") is not False
+    ]
+    combinations, total, count, errors = _comparison_base_counts(
+        cfg, mode, options, styles, chars
+    )
+    paid_total, opus_total, eligible = _comparison_costs(
+        cfg, mode, options, styles, chars, count
+    )
     expected = None
     if opus is True:
         expected = opus_total
@@ -1334,30 +1359,7 @@ def comparison_plan(
             item["_compare_name"] for item in chars[:3]
         ],
     }
-    try:
-        experiment = expand_legacy_experiment_cells(
-            cfg, result, styles=styles, characters=chars
-        )
-        result["experiment"] = {
-            "schema": experiment.get("schema"),
-            "id": experiment.get("id"),
-            "mode": experiment.get("legacy_mode"),
-            "total": experiment.get("total", 0),
-            "pending": experiment.get("pending", 0),
-            "completed": experiment.get("completed", 0),
-            "cell_ids": [
-                {
-                    "id": cell.get("id"),
-                    "resume_key": cell.get("legacy_resume_key"),
-                }
-                for cell in (experiment.get("cells") or [])[:10]
-            ],
-        }
-    except Exception as error:
-        result["experiment"] = {
-            "ok": False,
-            "error": redact_diagnostic_text(error),
-        }
+    _attach_experiment(cfg, result, styles, chars)
     return result
 
 
