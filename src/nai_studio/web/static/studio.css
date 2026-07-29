@@ -12,6 +12,198 @@
   --studio-shadow: 0 1px 2px rgba(15, 23, 42, .05);
 }
 
+.position-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.position-mode-picker {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.position-mode-picker button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: calc(var(--radius) - 2px);
+  background: transparent;
+  box-shadow: none;
+}
+
+.position-mode-picker button.on {
+  color: #fff;
+  background: var(--accent);
+}
+
+.poscoords,
+.poscoords label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.poscoords.hidden,
+.cast-poscoords.hidden {
+  display: none;
+}
+
+.cast-position-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper2);
+}
+
+.cast-posgrid {
+  display: grid;
+  grid-template-columns: repeat(5, 22px);
+  grid-template-rows: repeat(5, 22px);
+  gap: 3px;
+}
+
+.cast-poscell {
+  width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: var(--line);
+}
+
+.cast-poscell:hover {
+  background: var(--accent-dim);
+}
+
+.cast-poscell:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.cast-poscell.on {
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+@media (max-width: 640px) {
+  .posgrid,
+  .cast-posgrid {
+    grid-template-columns: repeat(5, 32px);
+    grid-template-rows: repeat(5, 32px);
+  }
+
+  .poscell,
+  .cast-poscell {
+    width: 32px;
+    min-height: 32px;
+  }
+}
+
+.cast-poscoords {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.output-settings {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper2);
+}
+
+.output-settings > summary {
+  padding: 9px 11px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.output-settings[open] {
+  padding: 0 10px 10px;
+}
+
+.output-settings[open] > summary {
+  margin-inline: -10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.result-tool-switcher {
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px auto 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.result-tool-switcher > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  margin-right: auto;
+}
+
+.result-tool-switcher small {
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.result-tool-switcher button {
+  min-height: 32px;
+  padding: 5px 9px;
+  white-space: nowrap;
+}
+
+.result-tool-switcher button.on {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.compact-import > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 700;
+  list-style-position: outside;
+}
+
+.compact-import > summary .n {
+  padding: 3px 7px;
+  border-radius: 3px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: var(--fs-2xs);
+}
+
+.compact-import > summary .count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+}
+
+.compact-import[open] > summary {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
 :root[data-layout="studio"] body {
   background: var(--bg);
 }
@@ -196,6 +388,10 @@
   background: var(--paper);
   color: var(--accent);
   box-shadow: 0 3px 10px rgba(15, 23, 42, .08);
+}
+
+:root[data-layout="studio"] .tools.jumps {
+  display: none;
 }
 
 @media (min-width: 1280px) {
@@ -427,7 +623,7 @@
     padding: 12px 16px;
   }
 
-:root[data-layout="studio"] .genrow {
+  :root[data-layout="studio"] .genrow {
     padding-inline: 16px;
   }
 }

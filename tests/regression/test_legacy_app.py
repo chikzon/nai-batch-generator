@@ -624,6 +624,20 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(len(people), 1)
         self.assertEqual(centers, [])
 
+        stored_scene = {
+            "char_centers": [{"x": 0.2, "y": 0.4}, {"x": 0.8, "y": 0.4}],
+        }
+        people, centers, used = APP.setting_scene_people(
+            stored_scene, "hero", "partner", "hero negative", "partner negative",
+            {"position_mode": "ai"}, {"use_coords": True})
+        self.assertFalse(used)
+        self.assertEqual(centers, [])
+        people, centers, used = APP.setting_scene_people(
+            stored_scene, "hero", "partner", "hero negative", "partner negative",
+            {"position_mode": "grid"}, {"use_coords": False})
+        self.assertTrue(used)
+        self.assertEqual(centers, stored_scene["char_centers"])
+
         page = APP.render_page()
         self.assertIn("data-posuse", page)
         self.assertIn("setting:window._sceneSetting", page)
@@ -2081,6 +2095,8 @@ class RegressionTests(unittest.TestCase):
             state = {"seeds": {}, "progress": {}, "daily": {}, "total_generated": 0}
             server = APP.ConfigServer(cfg)
             calls = []
+            result_links = []
+            ancestors = []
 
             def fake_generate(_token, base, _female, _male, negative, width, height, **kw):
                 calls.append({
@@ -2095,6 +2111,14 @@ class RegressionTests(unittest.TestCase):
                     server.live.stop_req = True
                 return image
 
+            def capture_result(job_id, path, **kwargs):
+                result_links.append({
+                    "job_id": job_id,
+                    "path": Path(path).name,
+                    **kwargs,
+                })
+                return {"id": kwargs.get("result_id")}
+
             progress_file = root / "비교생성-진행.json"
             with (
                 patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file),
@@ -2103,13 +2127,20 @@ class RegressionTests(unittest.TestCase):
                 patch.object(APP, "pace_gate", return_value=(True, "")),
                 patch.object(APP, "pace_complete", return_value=None),
                 patch.object(APP, "call_nai_api", side_effect=fake_generate),
+                patch.object(APP, "record_job_result",
+                             side_effect=capture_result),
+                patch.object(APP, "link_job_ancestor",
+                             side_effect=lambda current, previous:
+                             ancestors.append((current, previous))),
             ):
+                server.live.job_id = "job-first"
                 APP._run_comparison(server, cfg, plan, styles, chars)
                 first = json.loads(progress_file.read_text(encoding="utf-8"))
                 self.assertEqual(first["status"], "stopped")
                 self.assertEqual(len(first["completed"]), 1)
 
                 server.live.stop_req = False
+                server.live.job_id = "job-second"
                 APP._run_comparison(server, cfg, plan, styles, chars)
                 final = json.loads(progress_file.read_text(encoding="utf-8"))
                 first_record = min(
@@ -2118,10 +2149,29 @@ class RegressionTests(unittest.TestCase):
                 )
                 restored = APP.comparison_recipe_for_output(
                     cfg, first_record["file"])
+                tampered = APP.output_file_for_preview(
+                    cfg, first_record["file"])
+                tampered.write_bytes(b"replaced result")
+                server.live.job_id = "job-third"
+                APP._run_comparison(server, cfg, plan, styles, chars)
+                repaired = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
 
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 5)
             self.assertEqual(final["status"], "complete")
             self.assertEqual(len(final["completed"]), 4)
+            self.assertEqual(final["job_id"], "job-second")
+            self.assertEqual(
+                final["attempt_job_ids"], ["job-first", "job-second"])
+            self.assertEqual(ancestors, [
+                ("job-second", "job-first"),
+                ("job-third", "job-second"),
+            ])
+            self.assertEqual(
+                len([item for item in result_links
+                     if item["job_id"] == "job-second"]),
+                4,
+            )
             self.assertEqual(calls[0]["seed"], calls[2]["seed"])
             self.assertEqual(calls[1]["seed"], calls[3]["seed"])
             self.assertNotEqual(calls[0]["seed"], calls[1]["seed"])
@@ -2130,11 +2180,14 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(
                 [x["chars"][0]["prompt"] for x in calls],
                 ["character a, red dress", "character a, red dress",
-                 "character b", "character b"])
+                 "character b", "character b",
+                 "character a, red dress"])
             self.assertTrue(all(x["base"] == "style base" for x in calls))
             self.assertTrue(all(x["negative"] == "style negative" for x in calls))
             self.assertTrue(all(x["scale"] == 6.5 for x in calls))
-            self.assertEqual(len(list((root / "output").rglob("*.webp"))), 4)
+            self.assertEqual(len(repaired["completed"]), 4)
+            self.assertEqual(
+                len(list((root / "output").rglob("*.webp"))), 5)
             self.assertEqual(len(list((root / "output").rglob("manifest.json"))), 1)
             recipe = restored["recipe"]
             self.assertEqual(recipe["base_prompt"], "style base")
@@ -2270,7 +2323,10 @@ class RegressionTests(unittest.TestCase):
 
     def test_shared_live_state_tracks_owner_stop_retry_and_outcome(self):
         live = APP.LiveState()
-        token = live.try_claim("자료 비교 생성", "library")
+        blueprint = {"source": {"kind": "frozen-at-start"}}
+        token = live.try_claim(
+            "자료 비교 생성", "library", blueprint=blueprint)
+        blueprint["source"]["kind"] = "mutated-after-start"
         self.assertIsNotNone(token)
         self.assertIsNone(live.try_claim("겹친 생성", "preview"))
         running = live.snapshot()
@@ -2278,6 +2334,8 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(running["operation"], "자료 비교 생성")
         self.assertEqual(running["phase"], "running")
         self.assertEqual(running["retry_mode"], "library")
+        self.assertEqual(
+            live.frozen_blueprint()["source"]["kind"], "frozen-at-start")
 
         live.note_retry("HTTP 500")
         live.update(
@@ -2355,19 +2413,15 @@ class RegressionTests(unittest.TestCase):
                     metadata={"started_snapshot": True},
                 )
                 durable = APP.transition_job(durable, "preparing")
-                durable["results"] = [{
-                    "id": "result-start",
-                    "artifact": "output/result.webp",
-                    "content_hash": "c" * 64,
-                    "source_result_ids": ["evidence-before"],
-                }]
                 durable["lineage"] = {
                     "source_job_ids": ["source-job-before"],
                     "source_result_ids": ["evidence-before"],
-                    "result_ids": ["result-start"],
+                    "result_ids": [],
                 }
                 store = MemoryStore(durable)
                 ledger_file = Path(td) / "작업대기열.json"
+                result_file = Path(td) / "result.webp"
+                result_file.write_bytes(b"verified result bytes")
                 APP.atomic_write_json(ledger_file, {
                     "schema": "nais-job-ledger/v1",
                     "jobs": [{
@@ -2387,6 +2441,13 @@ class RegressionTests(unittest.TestCase):
                     patch.object(APP, "common_job_store",
                                  return_value=store),
                 ):
+                    recorded = APP.record_job_result(
+                        job_id,
+                        result_file,
+                        artifact="output/result.webp",
+                        source_result_ids=["evidence-before"],
+                    )
+                    started_durable = copy.deepcopy(store.value)
                     APP.finish_job_record(
                         job_id,
                         status=legacy_status,
@@ -2405,8 +2466,13 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(
                     finished["request_id"],
                     f"request-start-{legacy_status}")
-                self.assertEqual(finished["results"], durable["results"])
-                self.assertEqual(finished["lineage"], durable["lineage"])
+                self.assertEqual(finished["results"], started_durable["results"])
+                self.assertEqual(finished["lineage"], started_durable["lineage"])
+                self.assertEqual(recorded["artifact"], "output/result.webp")
+                self.assertEqual(
+                    recorded["content_hash"],
+                    hashlib.sha256(b"verified result bytes").hexdigest(),
+                )
                 self.assertEqual(
                     finished["metadata"], {"started_snapshot": True})
                 self.assertEqual(
@@ -2417,6 +2483,29 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(legacy["status"], legacy_status)
                 self.assertEqual(
                     (legacy["completed"], legacy["failed"]), (2, 1))
+
+        missing = APP.new_job(
+            "single",
+            blueprint_fingerprint="e" * 64,
+            payload_hash="f" * 64,
+            request_id="request-without-file",
+            job_id="job-without-file",
+        )
+        missing = APP.transition_job(missing, "preparing")
+        projected = APP.from_legacy_job_record({
+            "id": "job-without-file",
+            "operation": "단독 생성",
+            "kind": "preview",
+            "status": "completed",
+            "created_at": "2026-07-29T00:00:00",
+            "updated_at": "2026-07-29T00:00:01",
+            "completed": 1,
+            "failed": 0,
+        })
+        not_complete = APP._finish_durable_job(missing, projected)
+        self.assertEqual(not_complete["phase"], "paused")
+        self.assertEqual(
+            not_complete["error"]["code"], "artifact-missing")
 
     def test_live_state_eta_uses_only_work_completed_in_this_run(self):
         live = APP.LiveState()
@@ -3539,6 +3628,11 @@ class RegressionTests(unittest.TestCase):
                     result["restoration_queue"]["items"][0]["content_hash"],
                     manifest["content_sha256"],
                 )
+                self.assertEqual(
+                    result["restoration_queue"]["items"][0]["raw_metadata"][
+                        "lists"]["그림체.json"],
+                    ["verified"],
+                )
 
     def test_data_index_is_rebuildable_and_excludes_remote_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3786,9 +3880,25 @@ class RegressionTests(unittest.TestCase):
             4,
             request_id="nai-request-test",
             payload_hash="a" * 64,
+            blueprint_fingerprint="b" * 64,
         ))
         self.assertEqual(traced["requestId"], "nai-request-test")
         self.assertEqual(traced["payloadHash"], "a" * 64)
+        self.assertEqual(traced["blueprintFingerprint"], "b" * 64)
+
+        traced_image = Image.new("RGB", (2, 2), "white")
+        traced_image.nai_comment = original
+        traced_image.nai_request_id = "nai-request-saved"
+        traced_image.nai_payload_hash = "c" * 64
+        traced_image.nai_blueprint_fingerprint = "d" * 64
+        with tempfile.TemporaryDirectory() as td:
+            traced_path = APP.save_with_meta(
+                traced_image, Path(td) / "traced.png", fmt="png")
+            with Image.open(traced_path) as reopened:
+                saved_trace = json.loads(reopened.info["Comment"])
+        self.assertEqual(saved_trace["requestId"], "nai-request-saved")
+        self.assertEqual(saved_trace["payloadHash"], "c" * 64)
+        self.assertEqual(saved_trace["blueprintFingerprint"], "d" * 64)
 
         image = Image.new("RGB", (2, 2), "white")
         metadata = PngInfo()
@@ -4168,9 +4278,13 @@ class RegressionTests(unittest.TestCase):
             "metadataAuditStatus",
             "metadataAuditFound",
             "metadataAuditMore",
+            "dataInventoryShow",
+            "dataInventoryStatus",
         ):
             self.assertIn(f'id="{element_id}"', page)
         self.assertIn("loadMetadataAudit(METADATA_AUDIT_OFFSET, true)", page)
+        self.assertIn("/api/metadata_audit_save", page)
+        self.assertIn("자료실 후보로 저장", page)
         self.assertIsNone(APP._nai_json_metadata({
             "title": "그림체",
             "base": "artist one",
@@ -4183,6 +4297,73 @@ class RegressionTests(unittest.TestCase):
             "seed": 123,
             "steps": 28,
         }))
+        raw = json.dumps({
+            "source": "NovelAI Diffusion V4.5",
+            "v4_prompt": {"caption": {
+                "base_caption": (
+                    r"artist one, pst-ne-secret-value, "
+                    r"C:\Users\private\source.png"),
+            }},
+            "seed": 123,
+            "steps": 28,
+            "token": "pst-ne-secret-value",
+            "home_path": r"C:\Users\private\source.png",
+        }).encode("utf-8")
+
+        class AuditFixture:
+            def read_verified(self, _path, _digest):
+                return raw
+
+        digest = hashlib.sha256(raw).hexdigest()
+        body = json.dumps({
+            "path": "수집/fixture.json",
+            "sha256": digest,
+        }).encode("utf-8")
+        captured = {}
+
+        def save_fixture(record, **_kwargs):
+            captured.update(copy.deepcopy(record))
+            return {
+                "action": "added", "total": 1, "batch": "batch-1",
+                "changed": True, "id": record["id"],
+            }
+
+        with patch.object(APP, "metadata_audit_adapter",
+                          return_value=AuditFixture()):
+            preview = APP.metadata_audit_candidate(body)
+            self.assertNotIn("metadata_raw", preview["candidate"])
+            with patch.object(APP, "add_style", side_effect=save_fixture):
+                saved = APP.metadata_audit_save_candidate(body)
+        self.assertNotIn(
+            "pst-ne-secret-value",
+            json.dumps({"saved": saved, "record": captured},
+                       ensure_ascii=False),
+        )
+        self.assertNotIn(
+            r"C:\Users\private",
+            json.dumps({"saved": saved, "record": captured},
+                       ensure_ascii=False),
+        )
+        self.assertNotIn("style", saved)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            index_path = root / "수집" / "자료색인.json"
+            index_path.parent.mkdir(parents=True)
+            APP.atomic_write_json(index_path, {
+                "schema": APP.DATA_INDEX_SCHEMA,
+                "files": 1,
+                "entries": [{
+                    "path": r"C:\Users\private\pst-ne-secret-value.png",
+                    "size": 12,
+                    "sha256": "a" * 64,
+                }],
+            })
+            with patch.object(APP, "BASE_DIR", root):
+                page_result = APP.folder_inventory_page(0, 20)
+        encoded_page = json.dumps(page_result, ensure_ascii=False)
+        self.assertNotIn("pst-ne-secret-value", encoded_page)
+        self.assertNotIn(r"C:\Users\private", encoded_page)
 
     def test_studio_layout_is_default_and_classic_remains_compatible(self):
         """작업실을 기본으로 쓰되 설정 한 번으로 기존 호환 화면을 복원해야 한다."""
@@ -4789,6 +4970,36 @@ class RegressionTests(unittest.TestCase):
             )
             APP.call_nai_api(
                 "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1,
+                params={
+                    **base,
+                    "use_coords": True,
+                    "position_mode": "ai",
+                },
+                chars=people,
+            )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1,
+                params={
+                    **base,
+                    "use_coords": False,
+                    "position_mode": "grid",
+                },
+                chars=people,
+            )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1,
+                params={
+                    **base,
+                    "use_coords": False,
+                    "position_mode": "coordinate",
+                },
+                chars=people,
+            )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
                 seed=10,
                 params={
                     **base,
@@ -4812,11 +5023,22 @@ class RegressionTests(unittest.TestCase):
             [item["center"] for item in payloads[0]["parameters"]["characterPrompts"]],
             neutral,
         )
+        self.assertEqual(centers(payloads[2], "v4_prompt"), neutral)
+        self.assertEqual(centers(payloads[2], "v4_negative_prompt"), neutral)
+        self.assertEqual(
+            [item["center"] for item in payloads[2]["parameters"]["characterPrompts"]],
+            neutral,
+        )
         self.assertEqual(centers(payloads[1], "v4_prompt"), chosen)
         self.assertEqual(centers(payloads[1], "v4_negative_prompt"), chosen)
+        self.assertEqual(centers(payloads[3], "v4_prompt"), chosen)
+        self.assertEqual(centers(payloads[3], "v4_negative_prompt"), chosen)
+        self.assertEqual(centers(payloads[4], "v4_prompt"), chosen)
+        self.assertEqual(centers(payloads[4], "v4_negative_prompt"), chosen)
         parameters = payloads[1]["parameters"]
         self.assertEqual(parameters["image_format"], "png")
         self.assertTrue(parameters["normalize_reference_strength_multiple"])
+        self.assertNotIn("position_mode", parameters)
         self.assertEqual(
             parameters["characterPrompts"],
             [
@@ -4826,9 +5048,22 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertNotIn("extra_noise_seed", parameters)
         self.assertNotIn("color_correct", parameters)
-        i2i_parameters = payloads[2]["parameters"]
+        i2i_parameters = payloads[5]["parameters"]
         self.assertEqual(i2i_parameters["extra_noise_seed"], 9)
         self.assertFalse(i2i_parameters["color_correct"])
+
+    def test_director_respects_the_same_serial_nai_execution_lock(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg["token"] = "pst-fixture"
+        server = APP.ConfigServer(cfg)
+        server.live.running = True
+        with patch.object(
+                APP, "call_director",
+                side_effect=AssertionError("overlapping NAI call")):
+            result = server.handle_director(
+                b"fixture-image", "lineart", filename="fixture.png")
+        self.assertFalse(result["ok"])
+        self.assertIn("다른 NAI 작업", result["error"])
 
     def test_vibe_and_character_references_reach_actual_payload_in_aligned_arrays(self):
         png = io.BytesIO()
@@ -5013,7 +5248,10 @@ class RegressionTests(unittest.TestCase):
             {
                 "prompt": "appearance, outfit",
                 "negative": "character negative",
-                "position": {"x": 0.13, "y": 0.87, "enabled": False},
+                "position": {
+                    "x": 0.13, "y": 0.87,
+                    "mode": "ai", "enabled": False,
+                },
             },
         )
         self.assertEqual(snapshot["knowledge_assets"][0]["kind"], "style")
@@ -5340,6 +5578,146 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(APP.progress_record_valid(record, cfg, changed_fingerprint))
             image.unlink()
             self.assertFalse(APP.progress_record_valid(record, cfg, fingerprint))
+
+    def test_scene_run_skips_verified_cells_and_recreates_missing_result(self):
+        class InlineThread:
+            def __init__(self, target, daemon=True):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update({
+                "token": "pst-fixture",
+                "out_dir": td,
+                "base_prompt": "scene base",
+                "char_slots": [{
+                    "name": "hero", "prompt": "whole character",
+                    "negative": "whole negative", "enabled": True,
+                }],
+                "pace": {"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            })
+            scene = {
+                "id": "scene-one",
+                "name": "장면 하나",
+                "prompt": "outdoors",
+                "negative": "",
+                "width": 64,
+                "height": 64,
+            }
+            state = {
+                "seeds": {"01": 123},
+                "progress": {},
+                "daily": {},
+                "total_generated": 0,
+            }
+            calls = []
+            ledger_calls = []
+
+            def fake_generate(*_args, **kwargs):
+                calls.append(kwargs.get("seed"))
+                image = Image.new("RGB", (64, 64), "white")
+                image.nai_seed = kwargs.get("seed")
+                image.nai_comment = json.dumps({
+                    "prompt": "scene base, outdoors",
+                    "seed": kwargs.get("seed"),
+                })
+                return image
+
+            def capture_result(*args, **kwargs):
+                ledger_calls.append((args, kwargs))
+                if len(ledger_calls) == 1:
+                    raise OSError("fixture ledger unavailable")
+                return {"id": kwargs.get("result_id")}
+
+            common = (
+                patch.object(APP, "scene_mode_pending",
+                             return_value=[(scene, 1)]),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "runtime_generation_params",
+                             return_value={}),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api",
+                             side_effect=fake_generate),
+                patch.object(APP, "record_job_result",
+                             side_effect=capture_result),
+                patch.object(APP.threading, "Thread", InlineThread),
+            )
+            with common[0], common[1], common[2], common[3], common[4], \
+                    common[5], common[6], common[7], common[8]:
+                first_server = APP.ConfigServer(cfg)
+                self.assertTrue(first_server.handle_scene_run()["ok"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(first_server.live.phase, "partial")
+                second_server = APP.ConfigServer(cfg)
+                self.assertTrue(second_server.handle_scene_run()["ok"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(second_server.live.phase, "completed")
+                record = next(iter(next(
+                    iter(state["scene_progress"].values())).values()))
+                result = APP.progress_record_path(record, cfg)
+                self.assertTrue(result.is_file())
+                result.unlink()
+                self.assertTrue(APP.ConfigServer(cfg).handle_scene_run()["ok"])
+                self.assertEqual(len(calls), 2)
+
+    def test_settings_resume_backfills_verified_result_without_paid_network(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update({
+                "token": "pst-fixture",
+                "out_dir": td,
+                "seed": 1,
+                "characters": [{"id": "hero", "name": "Hero",
+                                "female": "whole character",
+                                "enabled": True}],
+            })
+            char = {"name": "Hero", "female": "whole character"}
+            acfg = {"base": {}, "scenes": {}}
+            context = APP.generation_context_fingerprint(cfg, acfg)
+            fingerprint = APP.generation_task_fingerprint(
+                context, char, "hero-id", 1, 1)
+            result = Path(td) / "nsfw_seed" / "seed_01" / "hero" / "one.webp"
+            result.parent.mkdir(parents=True)
+            result.write_bytes(b"verified existing result")
+            record = APP.make_progress_record(cfg, 1, 1, result, fingerprint)
+            state = {
+                "seeds": {"01": 123},
+                "progress": {"01": {"hero-id": [record]}},
+                "daily": {},
+                "total_generated": 0,
+            }
+            server = APP.ConfigServer(cfg)
+            server.live.job_id = "job-resume"
+            linked = []
+
+            def pending(_cfg, _acfg, done, _skip):
+                return [] if done else [(char, "hero-id", 1, 1)]
+
+            with (
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "load_asset_config", return_value=acfg),
+                patch.object(APP, "compute_pending", side_effect=pending),
+                patch.object(APP, "record_job_result",
+                             side_effect=lambda *args, **kwargs:
+                             linked.append((args, kwargs))),
+                patch.object(APP, "call_nai_api",
+                             side_effect=AssertionError("paid call")),
+            ):
+                APP._run_generation(server, cfg)
+
+            self.assertEqual(len(linked), 1)
+            self.assertEqual(linked[0][0][0], "job-resume")
+            self.assertTrue(
+                linked[0][1]["result_id"].startswith("result-setting-"))
+            self.assertEqual(server.live.completed, 1)
+            self.assertEqual(server.live.eta_base_completed, 1)
+            self.assertEqual(server.live.total, 1)
 
     def test_pace_gate_uses_completion_time_and_honors_cancel(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
@@ -6431,6 +6809,7 @@ class RegressionTests(unittest.TestCase):
             "id": "cast-fixture-1",
             "name": "주역 둘",
             "mode": "together",
+            "position_mode": "grid",
             "members": [
                 {"id": "char-1", "name": "첫째", "prompt": long_prompt,
                  "outfit": "red dress, artistic variation",
@@ -6443,6 +6822,7 @@ class RegressionTests(unittest.TestCase):
             "cast_presets", presets, [])
         self.assertTrue(ok)
         self.assertEqual(used[0]["mode"], "together")
+        self.assertEqual(used[0]["position_mode"], "grid")
         self.assertEqual(used[0]["members"][0]["prompt"], long_prompt)
         self.assertEqual(
             used[0]["members"][0]["outfit"],
@@ -6463,6 +6843,9 @@ class RegressionTests(unittest.TestCase):
                 {"name": "", "prompt": "", "negative": ""}]}],
             [{"id": "unknown", "name": "미지", "members": [
                 {"name": "", "prompt": "", "negative": "", "extra": True}]}],
+            [{"id": "bad-position", "name": "위치", "position_mode": "fixed",
+              "members": [
+                {"name": "", "prompt": "", "negative": ""}]}],
         ):
             ok, used, _ = APP.validate_config_value(
                 "cast_presets", invalid, presets)

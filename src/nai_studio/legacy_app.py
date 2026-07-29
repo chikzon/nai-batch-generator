@@ -55,9 +55,14 @@ from src.nai_studio.domain.blueprint import (
     summarize_blueprint,
 )
 from src.nai_studio.domain.experiment import canonical_experiment_rule
+from src.nai_studio.domain.positioning import (
+    normalize_position_mode,
+    position_mode_uses_coords,
+)
 from src.nai_studio.domain.restoration import summarize_restore_queue
 from src.nai_studio.runtime import (
     JobStore,
+    add_result,
     fingerprint_payload,
     from_legacy_job_record,
     new_job,
@@ -109,6 +114,7 @@ from src.nai_studio.services.resource_bridge import (
     legacy_resource_import_plan,
 )
 from src.nai_studio.services.restoration_inputs import (
+    folder_inventory_queue,
     folder_inventory_summary,
     image_batch_queue,
     image_inspect_queue,
@@ -731,6 +737,9 @@ DEFAULT_CONFIG = {
     "prefer_brownian": True,
     "deliberate_euler_ancestral_bug": False,
     "use_coords": False,
+    # ""는 구형 설정 호환 상태다. 읽을 때 use_coords로 파생하고 사용자가 세 모드 중
+    # 하나를 직접 고른 뒤에만 ai/grid/coordinate를 저장한다.
+    "position_mode": "",
     "legacy_v3_extend": False,
     "characters": [],        # 라이브러리(DB): [{id, name, female, clothed, negative, ...}]
     "character_folders": [],  # [{id, name, parent_id}]
@@ -1320,6 +1329,13 @@ def extract_nai_metadata(data, content_type=""):
             pass
     if values.get("qualityToggle") is not None:
         params["quality_toggle"] = bool(values["qualityToggle"])
+    v4 = values.get("v4_prompt") if isinstance(values.get("v4_prompt"), dict) else {}
+    if v4.get("use_coords") is not None:
+        params["use_coords"] = bool(v4.get("use_coords"))
+        # NAI 메타에는 위치판/연속 좌표 UI 구분이 없다. 좌표를 사용한 파일은
+        # 값을 잃지 않는 coordinate로 복원하고, 끈 파일은 AI 자동으로 복원한다.
+        params["position_mode"] = normalize_position_mode(
+            "", params["use_coords"])
     model = values.get("model") or values.get("source") or ""
     if model:
         params["model"] = str(model)
@@ -2392,6 +2408,7 @@ STYLE_BUNDLE_SETTING_KEYS = (
     "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
     "controlnet_strength", "prefer_brownian",
     "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
+    "position_mode",
 )
 _STYLE_SETTING_ALIASES = {
     "cfg_scale": ("cfg_scale", "scale"),
@@ -4743,10 +4760,30 @@ def record_import_batch(batch):
 
 DATAPACK_SCHEMA = "nais-datapack/v1"
 DATA_INDEX_SCHEMA = "nais-data-index/v1"
+_DATA_INDEX_CACHE = {"path": None, "mtime_ns": None, "value": None}
 
 
 def _data_index_path():
     return BASE_DIR / "수집" / "자료색인.json"
+
+
+def _load_data_index_cached():
+    """큰 색인을 요청마다 다시 역직렬화하지 않고 파일 변경 때만 새로 읽는다."""
+    path = _data_index_path()
+    if not path.is_file():
+        return None
+    stamp = path.stat().st_mtime_ns
+    key = str(path.resolve())
+    if (
+        _DATA_INDEX_CACHE["path"] == key
+        and _DATA_INDEX_CACHE["mtime_ns"] == stamp
+        and isinstance(_DATA_INDEX_CACHE["value"], dict)
+    ):
+        return _DATA_INDEX_CACHE["value"]
+    value = load_json_recover(path)
+    _DATA_INDEX_CACHE.update(
+        {"path": key, "mtime_ns": stamp, "value": value})
+    return value
 
 
 def _iter_indexed_data_files():
@@ -4821,6 +4858,11 @@ def rebuild_data_index():
         "entries": entries,
     }
     atomic_write_json(_data_index_path(), index, indent=1, keep_backup=False)
+    _DATA_INDEX_CACHE.update({
+        "path": str(_data_index_path().resolve()),
+        "mtime_ns": _data_index_path().stat().st_mtime_ns,
+        "value": index,
+    })
     return index
 
 
@@ -4831,7 +4873,7 @@ def data_storage_status():
     path = _data_index_path()
     if path.is_file():
         try:
-            loaded = load_json_recover(path)
+            loaded = _load_data_index_cached()
             if isinstance(loaded, dict) and loaded.get("schema") == DATA_INDEX_SCHEMA:
                 restoration = folder_inventory_summary(loaded)
                 index = {key: loaded.get(key) for key in (
@@ -4930,7 +4972,9 @@ def metadata_audit_control(body):
     action = str(data.get("action") or "").strip().casefold()
     adapter = metadata_audit_adapter()
     if action == "start":
-        index = load_json_recover(_data_index_path())
+        index = _load_data_index_cached()
+        if not isinstance(index, dict):
+            raise ValueError("자료 색인이 없습니다. 먼저 자료 색인을 만들어주세요.")
         result = adapter.start_light(index, chunk_size=500)
     elif action in ("continue", "resume"):
         result = adapter.resume_light()
@@ -4945,7 +4989,7 @@ def metadata_audit_control(body):
     return {"ok": True, **result}
 
 
-def metadata_audit_candidate(body):
+def metadata_audit_candidate(body, *, include_raw=False):
     """사용자가 고른 한 건만 다시 SHA 검증해 읽고, 저장 없이 복원 후보를 보여 준다."""
     data = json.loads(body or b"{}")
     rel = str(data.get("path") or "")
@@ -4969,22 +5013,186 @@ def metadata_audit_candidate(body):
             "negative": negative,
             "characters": characters,
             "params": params,
+            "raw": raw,
         }
     else:
         raise ValueError("PNG, WebP, JSON 후보만 열 수 있습니다.")
     if meta.get("metadata_status") != "ok":
         raise ValueError("선택한 파일의 NAI 생성 메타데이터가 더 이상 유효하지 않습니다.")
+    candidate = {
+        "base": str(meta.get("base") or ""),
+        "negative": str(meta.get("negative") or ""),
+        "negative_full": str(meta.get("negative") or ""),
+        "characters": copy.deepcopy(meta.get("characters") or []),
+        "params": copy.deepcopy(meta.get("params") or {}),
+    }
+    safe_preview = image_inspect_queue(
+        {
+            "ok": True,
+            "style": {
+                **candidate,
+                "metadata_raw": copy.deepcopy(meta.get("raw") or {}),
+            },
+        },
+        filename=redact_diagnostic_text(Path(rel).name),
+    )
+    safe_actual = (
+        safe_preview["items"][0]["result"]["evidence_candidate"]
+        .get("actual_generation") or {}
+    )
+    candidate.update({
+        "base": str(safe_actual.get("base") or ""),
+        "negative": str(safe_actual.get("negative") or ""),
+        "negative_full": str(safe_actual.get("negative") or ""),
+        "characters": copy.deepcopy(safe_actual.get("characters") or []),
+        "params": copy.deepcopy(safe_actual.get("settings") or {}),
+    })
+    if include_raw:
+        candidate["metadata_raw"] = copy.deepcopy(meta.get("raw") or {})
     return {
         "ok": True,
         "path": rel,
         "sha256": digest.lower(),
-        "candidate": {
-            "base": str(meta.get("base") or ""),
-            "negative": str(meta.get("negative") or ""),
-            "negative_full": str(meta.get("negative") or ""),
-            "characters": copy.deepcopy(meta.get("characters") or []),
-            "params": copy.deepcopy(meta.get("params") or {}),
+        "candidate": candidate,
+    }
+
+
+def metadata_audit_save_candidate(body):
+    """검증된 후보 한 건을 사용자가 명시적으로 고른 때만 그림체 자료로 저장한다."""
+    result = metadata_audit_candidate(body, include_raw=True)
+    candidate = result["candidate"]
+    rel = result["path"]
+    digest = result["sha256"]
+    artists, rest = parse_artist_combo(candidate.get("base") or "")
+    record = {
+        "id": f"audit-{digest[:20]}",
+        "content_sha256": digest,
+        "title": f"복원 후보 {digest[:12]}",
+        "source": "보유 자료 감사",
+        "tab": "",
+        "posted_at": "",
+        "recommend": None,
+        "views": None,
+        "url": "",
+        "count": len(artists),
+        "combo": ", ".join(
+            f"{weight:g}::artist:{name}::"
+            if weight is not None else f"artist:{name}"
+            for weight, name in artists
+        ),
+        "artists": [name for _, name in artists],
+        "weights": {
+            name: (weight if weight is not None else 1.0)
+            for weight, name in artists
         },
+        "base": str(candidate.get("base") or ""),
+        "rest": ", ".join(rest),
+        "negative": str(candidate.get("negative") or ""),
+        "negative_full": str(candidate.get("negative_full") or ""),
+        "characters": copy.deepcopy(candidate.get("characters") or []),
+        "metadata_raw": copy.deepcopy(candidate.get("metadata_raw") or {}),
+        "params": copy.deepcopy(candidate.get("params") or {}),
+        "images": [],
+    }
+    safe_queue = image_inspect_queue(
+        {"ok": True, "style": record},
+        filename=redact_diagnostic_text(Path(rel).name),
+    )
+    evidence_record = copy.deepcopy(
+        safe_queue["items"][0]["result"]["evidence_candidate"])
+    safe_actual = evidence_record.get("actual_generation") or {}
+    record["base"] = str(safe_actual.get("base") or "")
+    record["negative"] = str(safe_actual.get("negative") or "")
+    record["negative_full"] = record["negative"]
+    record["characters"] = copy.deepcopy(
+        safe_actual.get("characters") or [])
+    record["params"] = copy.deepcopy(safe_actual.get("settings") or {})
+    safe_artists, safe_rest = parse_artist_combo(record["base"])
+    record["combo"] = ", ".join(
+        f"{weight:g}::artist:{name}::"
+        if weight is not None else f"artist:{name}"
+        for weight, name in safe_artists
+    )
+    record["artists"] = [name for _, name in safe_artists]
+    record["weights"] = {
+        name: (weight if weight is not None else 1.0)
+        for weight, name in safe_artists
+    }
+    record["count"] = len(safe_artists)
+    record["rest"] = ", ".join(safe_rest)
+    record["metadata_raw"] = copy.deepcopy(
+        evidence_record.get("raw_metadata") or {})
+    record["evidence_records"] = [evidence_record]
+    record["knowledge_asset"] = style_asset_from_record(
+        record,
+        evidence_refs=[evidence_record["id"]],
+        lifecycle="candidate",
+    )
+    saved = add_style(
+        record,
+        import_info={
+            "kind": "metadata-audit",
+            "file": f"자료색인 후보 {digest[:12]}",
+        },
+        return_detail=True,
+    )
+    return {
+        "ok": True,
+        "sha256": digest,
+        "import": {
+            key: saved.get(key)
+            for key in ("action", "total", "batch", "changed", "id")
+        },
+    }
+
+
+def folder_inventory_page(offset=0, limit=50):
+    """대형 자료 색인을 한 번에 펼치지 않고 공통 복원 큐 계약으로 나눠 보여 준다."""
+    index = _load_data_index_cached()
+    if not isinstance(index, dict) or index.get("schema") != DATA_INDEX_SCHEMA:
+        return {"ok": True, "empty": True, "items": [], "total": 0}
+    entries = index.get("entries") if isinstance(index.get("entries"), list) else []
+    start = max(0, int(offset or 0))
+    page_size = max(1, min(100, int(limit or 50)))
+    page = [
+        item for item in entries[start:start + page_size]
+        if isinstance(item, dict)
+    ]
+    safe_rows = [
+        {
+            "path": f"index-item:{str(item.get('sha256') or '')}",
+            "filename": redact_diagnostic_text(
+                Path(str(item.get("path") or "")).name),
+            "content_sha256": item.get("sha256"),
+            "size": item.get("size"),
+            "cursor": start + index_no,
+            "status": "pending",
+        }
+        for index_no, item in enumerate(page)
+    ]
+    queue = folder_inventory_queue(
+        safe_rows,
+        folder_label="개인 자료",
+        cursor=start + len(page),
+        status="indexed",
+    )
+    return {
+        "ok": True,
+        "empty": not entries,
+        "total": len(entries),
+        "offset": start,
+        "more": min(start + page_size, len(entries)) < len(entries),
+        "next_offset": min(start + page_size, len(entries)),
+        "restoration_queue": queue,
+        "restoration": summarize_restore_queue(queue),
+        "items": [
+            {
+                "name": safe_rows[index_no]["filename"],
+                "size": int(item.get("size") or 0),
+                "cursor": start + index_no,
+            }
+            for index_no, item in enumerate(page)
+        ],
     }
 
 
@@ -5268,7 +5476,12 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         "archive_sha256": batch.get("archive_sha256"),
         "log": pack_log_brief(),
     }
-    queue = pack_import_queue(result, filename=filename)
+    # brief log는 화면용이라 목록 key·설치 파일 계보가 없다. 복원 큐에는 이번 판의
+    # 실제 장부를 직접 투영하되, API result 최상위에는 중복으로 싣지 않는다.
+    queue = pack_import_queue(
+        {**result, "batch_record": copy.deepcopy(batch)},
+        filename=filename,
+    )
     result["restoration"] = summarize_restore_queue(queue)
     result["restoration_queue"] = queue
     return result
@@ -6387,8 +6600,8 @@ def comparison_selected_job_values(cfg, plan, job):
         used = scratch
         if plan["options"].get("include_refs"):
             used, _, _ = setting_reference_config(used, scene)
-        if use_positions:
-            used["use_coords"] = True
+        used = with_position_mode(
+            used, character.get("position_mode"), use_positions)
     else:
         used = scratch
         base = str(used.get("base_prompt") or "1girl")
@@ -6401,7 +6614,7 @@ def comparison_selected_job_values(cfg, plan, job):
         if isinstance(selected_character, dict) and (
                 selected_character.get("position")
                 or selected_character.get("center")):
-            used["use_coords"] = True
+            used = with_position_mode(used, "coordinate", True)
     if plan["options"].get("fixed_size"):
         used["width"] = plan["options"]["width"]
         used["height"] = plan["options"]["height"]
@@ -6685,8 +6898,8 @@ def comparison_character_setting_job_values(cfg, plan, job):
         width = plan["options"]["width"]
         height = plan["options"]["height"]
     used["width"], used["height"] = int(width), int(height)
-    if use_positions:
-        used["use_coords"] = True
+    used = with_position_mode(
+        used, character.get("position_mode"), use_positions)
     return used, base, negative, people, centers
 
 
@@ -6932,7 +7145,7 @@ def comparison_signature(cfg, plan, styles, chars):
             "sampler", "scheduler", "variety", "model", "uc_preset",
             "quality_toggle", "smea", "smea_dyn", "dynamic_thresholding",
             "uncond_scale", "controlnet_strength", "prefer_brownian",
-            "deliberate_euler_ancestral_bug", "use_coords", "char_slots",
+            "deliberate_euler_ancestral_bug", "use_coords", "position_mode", "char_slots",
             "char_centers", "vibes", "char_refs", "out_dir", "out_by_date",
         )
     }
@@ -8032,7 +8245,7 @@ def slot_bundle_identity(sl):
     )
 
 
-def character_run_from_group(group, fallback_index=0):
+def character_run_from_group(group, fallback_index=0, position_mode=None):
     """캐릭터 슬롯/캐스트 여러 명을 한 장의 세팅 입력 구조로 바꾼다."""
     members = [item for item in (group or [])
                if isinstance(item, dict) and slot_prompt(item).strip()]
@@ -8064,6 +8277,9 @@ def character_run_from_group(group, fallback_index=0):
             for item in members[2:]
         ],
         "centers": centers,
+        "position_mode": (
+            normalize_position_mode(position_mode, bool([c for c in centers if c]))
+            if position_mode not in (None, "") else ""),
         "reference_ids": list(dict.fromkeys(
             str(resource_id)
             for item in members for resource_id in (item.get("reference_ids") or [])
@@ -8284,6 +8500,7 @@ def annotate_nai_comment(
     *,
     request_id="",
     payload_hash="",
+    blueprint_fingerprint="",
 ):
     """UI 토글과 재현 계보 식별값을 결과 Comment JSON에 명시한다."""
     try:
@@ -8296,6 +8513,8 @@ def annotate_nai_comment(
             data["requestId"] = str(request_id)
         if payload_hash:
             data["payloadHash"] = str(payload_hash)
+        if blueprint_fingerprint:
+            data["blueprintFingerprint"] = str(blueprint_fingerprint)
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError, json.JSONDecodeError):
         return comment
@@ -8541,7 +8760,7 @@ BLUEPRINT_GENERATION_KEYS = (
     "cfg_rescale", "sampler", "scheduler", "uc_preset", "quality_toggle",
     "variety", "smea", "smea_dyn", "dynamic_thresholding",
     "uncond_scale", "controlnet_strength", "prefer_brownian",
-    "deliberate_euler_ancestral_bug", "use_coords",
+    "deliberate_euler_ancestral_bug", "use_coords", "position_mode",
 )
 
 
@@ -8571,7 +8790,10 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
             "position": {
                 "x": center.get("x", 0.5),
                 "y": center.get("y", 0.5),
-                "enabled": bool(cfg.get("use_coords")),
+                "mode": normalize_position_mode(
+                    cfg.get("position_mode"), cfg.get("use_coords")),
+                "enabled": position_mode_uses_coords(
+                    cfg.get("position_mode"), cfg.get("use_coords")),
             },
             "variant": copy.deepcopy(slot.get("variant") or {}),
             "variants": copy.deepcopy(slot.get("variants") or []),
@@ -8613,7 +8835,7 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
     style_settings = {
         key: copy.deepcopy(cfg.get(key))
         for key in BLUEPRINT_GENERATION_KEYS
-        if key not in ("nai_seed", "use_coords")
+        if key not in ("nai_seed", "use_coords", "position_mode")
     }
     blueprint = canonical_generation_plan({
         "source": copy.deepcopy(source or {"kind": "current-config"}),
@@ -8660,6 +8882,19 @@ def with_centers(cfg, ctrs):
     """params 사본에 이 장에 쓸 좌표를 실어 준다 (원본 cfg 는 안 건드린다)."""
     q = dict(cfg or {})
     q["char_centers"] = ctrs
+    return q
+
+
+def with_position_mode(cfg, mode=None, use_positions=False):
+    """실행 사본에 위치 방식을 적용한다. 원본 설정과 보존 좌표는 바꾸지 않는다."""
+    q = dict(cfg or {})
+    raw = str(mode or "").strip().lower()
+    if raw in ("ai", "grid", "coordinate"):
+        q["position_mode"] = raw
+        q["use_coords"] = raw != "ai"
+    elif use_positions:
+        q["position_mode"] = "coordinate"
+        q["use_coords"] = True
     return q
 
 
@@ -8846,7 +9081,23 @@ def setting_scene_people(scene, female, male, char_negative, male_negative,
     has_cast_centers = any(
         isinstance(center, dict) and center.get("x") is not None
         for center in raw_cast_centers)
-    use_positions = bool(explicit) or has_cast_centers or bool(cfg.get("use_coords"))
+    cast_mode = str(char.get("position_mode") or "").strip().lower()
+    cast_mode_known = cast_mode in ("ai", "grid", "coordinate")
+    cfg_mode = str(cfg.get("position_mode") or "").strip().lower()
+    cfg_mode_known = cfg_mode in ("ai", "grid", "coordinate")
+    if cast_mode_known:
+        # 사용자가 세팅 캐스트에서 고른 모드가 저장된 옛 좌표보다 우선한다.
+        # AI 자동은 좌표를 삭제하지 않되 이번 요청에는 적용하지 않는다.
+        use_positions = position_mode_uses_coords(cast_mode)
+    elif cfg_mode_known:
+        use_positions = position_mode_uses_coords(cfg_mode)
+    else:
+        # mode 필드가 없던 구형 자료만 좌표 존재 여부와 use_coords로 복원한다.
+        use_positions = (
+            bool(explicit)
+            or has_cast_centers
+            or position_mode_uses_coords(None, cfg.get("use_coords"))
+        )
     if not use_positions:
         return people, [], False
 
@@ -8973,7 +9224,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     #   예전에는 꺼도 사용자가 고른 좌표가 그대로 나갔다. 그림은 안 바뀌지만(NAI 가 무시)
     #   **저장 메타데이터에 적용된 적 없는 좌표가 남아**, 나중에 그 그림을 불러오면
     #   "이 자리에 놓고 뽑았다"고 오해하게 된다. 공홈·NAIS3-MM·nais_blue 모두 끄면 0.5/0.5 다.
-    use_coords = bool(p.get("use_coords", False))
+    position_mode = normalize_position_mode(
+        p.get("position_mode"), p.get("use_coords", False))
+    use_coords = position_mode_uses_coords(
+        position_mode, p.get("use_coords", False))
     ctrs = p.get("char_centers") or []
 
     def center(i):
@@ -9165,7 +9419,15 @@ def _atomic_save_image(path, writer):
     return path
 
 
-def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
+def save_with_meta(
+    img,
+    path,
+    quality=92,
+    fmt="webp",
+    clean=False,
+    max_side=0,
+    blueprint_fingerprint="",
+):
     """생성 결과를 저장하면서 NAI 메타데이터(시드·프롬프트·설정)를 EXIF 로 심는다.
     이렇게 해두면 나중에 이 그림을 앱에 끌어다 놓아 그림체를 복원할 수 있다.
     fmt="png" 이면 확장자를 .png 로 바꿔 무손실로 저장한다.
@@ -9200,6 +9462,29 @@ def save_with_meta(img, path, quality=92, fmt="webp", clean=False, max_side=0):
         path = path.with_suffix(".webp")
     exif_bytes = None
     comment = getattr(img, "nai_comment", "")
+    # NAI가 돌려준 원문 Comment는 그대로 두고, 우리 실행 계보 식별값만 같은
+    # JSON에 보강한다. clean 저장은 위에서 먼저 반환하므로 사용자가 고른
+    # 메타데이터 제거 계약은 바뀌지 않는다.
+    try:
+        raw_comment = json.loads(str(comment or ""))
+        if isinstance(raw_comment, dict):
+            request_id = str(getattr(img, "nai_request_id", "") or "")
+            payload_hash = str(getattr(img, "nai_payload_hash", "") or "")
+            blueprint_id = str(
+                blueprint_fingerprint
+                or getattr(img, "nai_blueprint_fingerprint", "")
+                or ""
+            )
+            if request_id:
+                raw_comment["requestId"] = request_id
+            if payload_hash:
+                raw_comment["payloadHash"] = payload_hash
+            if blueprint_id:
+                raw_comment["blueprintFingerprint"] = blueprint_id
+            comment = json.dumps(
+                raw_comment, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
     try:
         if comment:
             ex = Image.Exif()
@@ -10355,10 +10640,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
 /* 캐릭터 위치 격자 — NAI 처럼 화면 어디에 둘지 5×5 로 고른다 */
 .posrow{display:flex;align-items:center;gap:7px;margin-top:4px;}
-.posgrid{display:grid;grid-template-columns:repeat(5,10px);grid-template-rows:repeat(5,10px);
-  gap:2px;flex:none;}
-.poscell{width:10px;height:10px;border-radius:2px;background:var(--line);cursor:pointer;}
+.posgrid{display:grid;grid-template-columns:repeat(5,22px);grid-template-rows:repeat(5,22px);
+  gap:3px;flex:none;}
+.poscell{width:22px;min-height:22px;padding:0;border:0;border-radius:3px;
+  background:var(--line);cursor:pointer;box-shadow:none;}
 .poscell:hover{background:var(--accent-dim);}
+.poscell:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
 .poscell.on{background:var(--accent);box-shadow:0 0 0 1px var(--accent);}
 .posnum{width:52px;padding:2px 4px;font-size:var(--fs-xs);}
 
@@ -10457,11 +10744,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .preset-bar select{flex:1;font-size:var(--fs-sm);padding:6px 8px;}
   .preset-bar button{padding:6px 9px;font-size:var(--fs-xs);}
   .psec{display:flex;flex-direction:column;min-height:0;}
-  .psec-head{display:flex;align-items:center;gap:8px;padding:10px 14px 7px;cursor:pointer;user-select:none;}
+  .psec-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:10px 14px 7px;cursor:pointer;user-select:none;}
   .psec-head .t{font-size:var(--fs-sm);color:var(--text);font-weight:750;}
   .psec-head .chev{font-size:var(--fs-xs);color:var(--muted);transition:transform .15s;}
   .psec-head.closed .chev{transform:rotate(-90deg);}
-  .psec-head .count{margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);}
+  .psec-head .count{margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);white-space:nowrap;}
+  .prompt-editors{display:flex;flex:1 0 100%;align-items:center;justify-content:flex-end;gap:12px;
+    min-width:0;color:var(--muted);}
+  .prompt-editors .ed{white-space:nowrap;line-height:1.2;}
   .psec-body{padding:0 14px 10px;flex:1;min-height:0;display:flex;}
   .psec-body.hidden{display:none;}
   .psec-body textarea{flex:1;min-height:90px;line-height:1.55;}
@@ -10776,11 +11066,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="psec" style="flex:1.2;">
       <div class="psec-head" data-fold="pPos"><span class="chev">▾</span><span class="t">프롬프트</span>
         <span class="count" id="posTok">0</span>
-        <span class="ed" id="weightDownBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 낮춤">−강조</span>
-        <span class="ed" id="weightUpBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 높임">+강조</span>
-        <span class="ed" id="tagVerifyBtn" title="단부루에 실제로 있는 태그인지 확인 (없는 태그는 토큰만 먹는다)">✓태그</span>
-        <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄바꾸기</span>
-        <span class="ed" id="split3Btn" title="고정 / 가변 / 디테일 세 칸으로 나누기">⋮⋮</span></div>
+        <span class="prompt-editors" aria-label="프롬프트 편집 도구">
+          <span class="ed" id="weightDownBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 낮춤">−강조</span>
+          <span class="ed" id="weightUpBtn" title="선택 영역이나 커서가 있는 태그의 가중치를 0.1 높임">+강조</span>
+          <span class="ed" id="tagVerifyBtn" title="단부루에 실제로 있는 태그인지 확인 (없는 태그는 토큰만 먹는다)">✓태그</span>
+          <span class="ed" id="findRepBtn" title="프롬프트·네거티브·캐릭터 칸에서 한꺼번에 찾아 바꾸기 (SDStudio 참고)">⇄바꾸기</span>
+          <span class="ed" id="split3Btn" title="고정 / 가변 / 디테일 세 칸으로 나누기">⋮⋮</span>
+        </span>
+      </div>
       <div class="psec-body" id="pPos">
         <textarea id="basePrompt" placeholder="1girl, artist:..., masterpiece"></textarea>
         <!-- 3분할 — 켜면 아래 세 칸이 위 칸을 대신한다. 보낼 때는 위에서부터 이어 붙인다.
@@ -10806,10 +11099,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- 이 줄은 '여기서 바로 여는 것' — 오버레이가 프롬프트 패널 위에 뜬다 -->
     <div class="tools">
+      <button class="tool" data-ovl="frags"><span class="ico">🎲</span>조각<span class="badge" id="bgFrags">0</span></button>
       <button class="tool" data-ovl="chars"><span class="ico">👥</span>캐릭터<span class="badge" id="bgChars">0</span></button>
       <button class="tool" data-ovl="refs"><span class="ico">🎨</span>레퍼런스<span class="badge" id="bgRefs">0</span></button>
       <button class="tool" data-ovl="params"><span class="ico">🎚</span>파라미터</button>
-      <button class="tool" data-ovl="frags"><span class="ico">🎲</span>조각<span class="badge" id="bgFrags">0</span></button>
     </div>
     <!-- 이 줄은 '다른 탭으로 넘어가는 것'. 같은 모양이면 눌러 보고서야
          알게 되므로 줄을 나누고 ↗ 를 붙였다. -->
@@ -10818,6 +11111,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <button class="tool jump" data-mode-jump="builder"><span class="ico">🧰</span>빌더<span class="ar">↗</span></button>
     </div>
 
+    <div class="genrow" id="anlasRow" style="border:none;justify-content:space-between;">
+      <span class="hint" id="anlasCost">비용 계산 중...</span>
+      <button id="anlasBal" title="NAI 계정의 남은 Anlas 조회">잔액 확인</button>
+    </div>
     <div class="genrow">
       <div class="qty">
         <button id="qtyM" title="수량 줄이기">−</button>
@@ -10829,12 +11126,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <button class="danger go hidden" id="stopBtn" title="도는 작업을 장 경계에서 멈춥니다 (전송 중인 장은 마저 받음)"
         onclick="fetch('/api/stop',{method:'POST'})">■ 중지</button>
     </div>
-    <div class="genrow" style="border:none;padding-top:0;">
+    <div class="genrow" id="settingBatchRow" style="border:none;padding-top:0;">
       <button class="go" id="batchBtn" style="flex:1;">🎬 선택 세팅 일괄 생성</button>
-    </div>
-    <div class="genrow" id="anlasRow" style="border:none;padding-top:0;justify-content:space-between;">
-      <span class="hint" id="anlasCost">비용 계산 중...</span>
-      <button id="anlasBal" title="NAI 계정의 남은 Anlas 조회">잔액 확인</button>
     </div>
 
     <!-- 캐릭터 오버레이 -->
@@ -10843,21 +11136,22 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <span class="count" style="font-size:var(--fs-2xs);color:var(--muted);">한 그림에 함께 들어갈 인물 · 보내는 건 켠 것만 (NAI 상한 6명)</span>
         <button class="x" data-ovl-close>✕</button></div>
       <div class="ovl-body">
-        <div class="bar" style="margin-bottom:6px;">
-          <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;"
-                 title="끄면 AI's Choice (NAI가 위치 결정)">
-            <input type="checkbox" id="chUseCoords"> 위치 지정</label>
+        <div class="position-mode-row" style="margin-bottom:8px;">
+          <!-- 구형 내부 경로와 설정 호환용. 실제 선택 UI는 아래 세 단추다. -->
+          <input type="checkbox" id="chUseCoords" hidden aria-hidden="true">
+          <div class="position-mode-picker" id="chPositionMode" role="radiogroup"
+               aria-label="캐릭터 위치 방식">
+            <button type="button" data-position-mode="ai" role="radio">AI 자동</button>
+            <button type="button" data-position-mode="grid" role="radio">위치판</button>
+            <button type="button" data-position-mode="coordinate" role="radio">좌표</button>
+          </div>
+          <button type="button" id="chSpread" title="켠 인물을 겹치지 않는 추천 위치에 놓습니다">추천 배치</button>
           <span class="hint" id="chCoordsNote"></span>
         </div>
-        <!-- 인물이 둘 이상인데 좌표를 안 쓰면 NAI 가 몸을 겹쳐 그리는 일이 흔하다.
-             한 번 눌러 좌우로 떨어뜨릴 수 있게 해 둔다. -->
+        <!-- 좌표를 안 쓰는 AI 자동은 정상 모드다. 경고는 중복 좌표나 6명 초과처럼
+             실제로 사용자가 고쳐야 하는 경우에만 보여 준다. -->
         <div class="row hidden" id="chFuseWarn" style="margin:0 0 8px;padding:8px 10px;">
-          <div style="font-size:var(--fs-xs);"><b>인물이 둘 이상인데 위치를 안 정했습니다.</b>
-            이러면 NAI 가 <b>몸을 붙여</b> 그리는 일이 흔합니다.</div>
-          <div class="bar" style="margin-top:6px;">
-            <button class="primary" id="chSpread">좌우로 떨어뜨리기</button>
-            <span class="hint">위치 지정을 켜고 x 0.3 / 0.7 로 놓습니다</span>
-          </div>
+          <div style="font-size:var(--fs-xs);"></div>
         </div>
         <div id="slotList"></div>
         <div class="bar" style="margin-top:8px;">
@@ -10961,29 +11255,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div class="ovl-body">
         <div class="grid2">
           <div class="field"><label>모델</label><select id="pModel">__MODELS__</select></div>
-          <div class="field"><label>저장 포맷 <span class="hint">(공홈과 같은 선택)</span></label>
-            <select id="pFormat">
-              <option value="webp">WebP — 용량이 작음 (기본)</option>
-              <option value="png">PNG — 무손실 · 투명 지원</option></select></div>
-          <!-- 저장 폴더 — 비우면 프로필의 output/. 탐색기도 이 폴더를 본다 -->
-          <div class="field"><label>저장 폴더 <span class="hint">(비우면 기본 output)</span></label>
-            <input type="text" id="pOutDir" placeholder="예: D:\\NAI결과"></div>
-          <div class="field"><label>날짜별로 나누기</label>
-            <select id="pOutDate">
-              <option value="off">한 폴더에 모으기 (기본)</option>
-              <option value="on">모드 폴더 아래 날짜별로</option></select></div>
-          <!-- 저장 시점에 메타를 아예 안 넣는 선택. 나중에 따로 지우는 기능(관리 탭)은 그대로 둔다. -->
-          <div class="field"><label>메타데이터 <span class="hint">(저장 시점)</span></label>
-            <select id="pClean">
-              <option value="off">넣기 — 나중에 끌어다 놓아 그림체 복원 가능 (기본)</option>
-              <option value="on">지우고 저장 — 공유용 · 복원 불가</option></select></div>
-          <div class="field" id="pCleanOpts" style="display:none;"><label>가볍게 — 긴 변
-            <span class="hint">품질은 아래 저장 품질</span></label>
-            <select id="pMaxSide">
-              <option value="0">그대로</option><option value="1536">1536px</option>
-              <option value="1024">1024px</option><option value="768">768px</option></select></div>
-          <div class="field"><label>저장 품질 <span class="hint">(WebP · 40~100)</span></label>
-            <input type="number" id="pSaveQ" min="40" max="100" step="5"></div>
           <div class="field"><label>해상도 <span class="hint">(세팅 씬은 씬별 값을 씀)</span></label>
             <select id="pRes">__RES__<option value="">직접 입력...</option></select></div>
           <div class="field" id="pWHwrap" style="display:none;"><label>가로 × 세로</label>
@@ -11007,6 +11278,34 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
               <button id="pSeedClear" title="고정 해제 (0)">✕</button></div>
             <p class="hint" id="pSeedNow" style="margin-top:5px;"></p></div>
         </div>
+        <details class="output-settings" id="pOutputSettings" style="margin-top:10px;">
+          <summary>출력·저장 <span class="hint">포맷·폴더·날짜·메타데이터</span></summary>
+          <div class="grid2" style="margin-top:10px;">
+            <div class="field"><label>저장 포맷 <span class="hint">(공홈과 같은 선택)</span></label>
+              <select id="pFormat">
+                <option value="webp">WebP — 용량이 작음 (기본)</option>
+                <option value="png">PNG — 무손실 · 투명 지원</option></select></div>
+            <!-- 저장 폴더 — 비우면 프로필의 output/. 탐색기도 이 폴더를 본다 -->
+            <div class="field"><label>저장 폴더 <span class="hint">(비우면 기본 output)</span></label>
+              <input type="text" id="pOutDir" placeholder="예: D:\\NAI결과"></div>
+            <div class="field"><label>날짜별로 나누기</label>
+              <select id="pOutDate">
+                <option value="off">한 폴더에 모으기 (기본)</option>
+                <option value="on">모드 폴더 아래 날짜별로</option></select></div>
+            <!-- 저장 시점에 메타를 아예 안 넣는 선택. 나중에 따로 지우는 기능(관리 탭)은 그대로 둔다. -->
+            <div class="field"><label>메타데이터 <span class="hint">(저장 시점)</span></label>
+              <select id="pClean">
+                <option value="off">넣기 — 나중에 끌어다 놓아 그림체 복원 가능 (기본)</option>
+                <option value="on">지우고 저장 — 공유용 · 복원 불가</option></select></div>
+            <div class="field" id="pCleanOpts" style="display:none;"><label>가볍게 — 긴 변
+              <span class="hint">품질은 아래 저장 품질</span></label>
+              <select id="pMaxSide">
+                <option value="0">그대로</option><option value="1536">1536px</option>
+                <option value="1024">1024px</option><option value="768">768px</option></select></div>
+            <div class="field"><label>저장 품질 <span class="hint">(WebP · 40~100)</span></label>
+              <input type="number" id="pSaveQ" min="40" max="100" step="5"></div>
+          </div>
+        </details>
         <div class="fold closed" id="pAdvHead" data-fold="pAdv" style="margin-top:10px;">고급 (기본값 그대로 두어도 됩니다)</div>
         <div id="pAdv" class="hidden">
           <p class="hint" id="pAdvNote"></p>
@@ -11019,7 +11318,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <div class="field" data-gen="v4"><label>Prefer Brownian</label><select id="pBrownian"><option value="on">켬</option><option value="off">끔</option></select></div>
             <div class="field" data-gen="v4"><label>Euler Ancestral 버그 재현 <span class="hint">(구버전 그림체 재현용)</span></label>
               <select id="pEulerBug"><option value="off">끔</option><option value="on">켬</option></select></div>
-            <div class="field" data-gen="v4"><label>캐릭터 위치 좌표 사용 <span class="hint">(끄면 NAI가 배치)</span></label>
+            <div class="field hidden" data-gen="v4" aria-hidden="true"><label>캐릭터 위치 좌표 사용</label>
               <select id="pCoords"><option value="off">끔</option><option value="on">켬</option></select></div>
           </div>
         </div>
@@ -11103,20 +11402,26 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <div class="pbar"><div id="pvBar"></div></div>
         </div>
       </div>
-      <div class="card" id="generateImportCard">
-        <h2><span class="n">임포트</span>NAI 이미지에서 생성값 가져오기
-          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">PNG · WebP · 여러 장</span></h2>
+      <details class="card compact-import" id="generateImportCard">
+        <summary><span class="n">불러오기</span>이미지에서 현재 생성값 복원
+          <span class="count">PNG · WebP · 여러 장</span></summary>
         <p class="hint">원본 이미지의 베이스·네거티브·캐릭터·생성 설정을 읽습니다.
         한 장이면 읽은 묶음을 확인한 뒤 통째로 적용하고, 여러 장이면 자료실에 연속 등록합니다.</p>
         <div id="generateInspectDrop" class="row"
-             style="text-align:center;padding:18px 14px;border-style:dashed;cursor:pointer;">
+             style="text-align:center;padding:14px;border-style:dashed;cursor:pointer;">
           <b>＋ 생성값을 가져올 이미지를 놓거나 눌러서 고르세요</b>
           <div class="hint" style="margin-top:4px;">원문은 자르거나 세부 자료로 임의 분해하지 않습니다.</div>
           <input type="file" id="generateInspectFile" accept="image/png,image/webp" multiple style="display:none;">
         </div>
+      </details>
+      <div class="result-tool-switcher" id="resultToolSwitcher" aria-label="이미지 결과 활용">
+        <span><b>이미지 결과 활용</b><small>필요한 도구 하나만 펼칩니다</small></span>
+        <button type="button" data-result-tool="i2i">고쳐 그리기</button>
+        <button type="button" data-result-tool="director">디렉터</button>
+        <button type="button" data-result-tool="mosaic">모자이크</button>
       </div>
       <!-- img2img · 인페인트 — 왼쪽 프롬프트·파라미터를 그대로 쓰고 원본만 더한다 -->
-      <div class="card">
+      <div class="card" id="resultToolI2I" data-result-tool-panel="i2i">
         <h2><span class="n">고쳐 그리기</span>img2img · 인페인트
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">왼쪽 프롬프트·파라미터를 그대로 씁니다</span></h2>
         <p class="hint">그림을 넣고 <b>변화 강도</b>만 주면 <b>img2img</b>(전체를 다시 그림),
@@ -11164,7 +11469,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="resultToolDirector" data-result-tool-panel="director">
         <h2><span class="n">디렉터</span>NAI 가 그림을 다시 손봐줍니다 <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">배경 제거 · 라인아트 · 스케치 · 색칠 · 표정 · 정리 · 업스케일</span></h2>
         <p class="hint">이미 있는 그림을 넣으면 NAI 가 손봐서 돌려줍니다. 결과는
         <b>output/디렉터/</b> 에 저장되고 미리보기에도 뜹니다.
@@ -11622,9 +11927,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             자료 저장 위치를 확인하는 중입니다.
           </div>
           <button type="button" id="dataOriginsShow">이미지 출처·중복</button>
+          <button type="button" id="dataInventoryShow">보유 폴더 목록</button>
           <button type="button" id="dataIndexBuild">자료 색인 다시 만들기</button>
         </div>
         <div id="dataOriginsStatus" class="hint hidden" style="margin-top:7px;"></div>
+        <div id="dataInventoryStatus" class="hint hidden" style="margin-top:7px;"></div>
         <p class="hint" style="margin-top:6px;">색인은 자료 파일의 경로·크기·SHA-256만 다시 세는
         파생 목록입니다. 원본을 옮기거나 지우지 않으며, 대용량 자료에서는 시간이 걸릴 수 있습니다.</p>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);">
@@ -12038,6 +12345,7 @@ window.addEventListener('error', event => showFatalError(event.error || event.me
 window.addEventListener('unhandledrejection', event => showFatalError(event.reason));
 
 let STATE = null, SAVED_STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
+let LAST_STUDIO_LAYOUT = null;
 let FRAGS = {};
 const RES_PRESETS = __RESJSON__;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
 
@@ -13115,55 +13423,94 @@ function bindRefs(){
   renderRefs();
 }
 
-/* NAIS3 와 같은 스위치 — 끄면 NAI 가 알아서 배치한다 (AI's Choice) */
+const POSITION_MODES = new Set(['ai','grid','coordinate']);
+function positionMode(){
+  const value = String(STATE.position_mode || '').toLowerCase();
+  if(POSITION_MODES.has(value)) return value;
+  /* 구형 설정은 use_coords만 있었다. 읽기 호환만 하고 사용자가 직접 고르기
+     전에는 position_mode를 써 넣지 않는다. */
+  return STATE.use_coords ? 'coordinate' : 'ai';
+}
+function setPositionMode(mode, persist=true){
+  if(!POSITION_MODES.has(mode)) mode = 'ai';
+  STATE.position_mode = mode;
+  STATE.use_coords = mode !== 'ai';
+  const legacy = $('chUseCoords');
+  if(legacy) legacy.checked = STATE.use_coords;
+  if($('pCoords')) $('pCoords').value = STATE.use_coords ? 'on' : 'off';
+  if(persist) save();
+}
+function renderPositionEditors(mode=positionMode()){
+  document.querySelectorAll('[data-posgrid-wrap]').forEach(el =>
+    el.classList.toggle('hidden', mode !== 'grid'));
+  document.querySelectorAll('[data-poscoord-wrap]').forEach(el =>
+    el.classList.toggle('hidden', mode !== 'coordinate'));
+  document.querySelectorAll('[data-posai]').forEach(el =>
+    el.classList.toggle('hidden', mode !== 'ai'));
+}
+/* 위치 방식 하나만 고른다. 위치판과 좌표는 같은 NAI centers를 편집하는 두 UI고,
+   AI 자동은 저장된 centers를 지우지 않은 채 이번 요청에서만 적용하지 않는다. */
 function bindUseCoords(){
   const c = $('chUseCoords');
-  if(!c || c._bound) return;
+  const picker = $('chPositionMode');
+  if(!c || !picker || picker._bound) return;
+  picker._bound = true;
   c._bound = true;
   const paint = () => {
-    c.checked = !!STATE.use_coords;
-    /* 실측(라운드01): 좌표는 2명부터 적용된다 — 1명일 때는 NAI 가 통째로 무시.
-       0명일 때 "1명" 안내를 내면 거짓말이 된다 — 정확히 1명일 때만 */
+    const mode = positionMode();
+    c.checked = mode !== 'ai';
+    picker.querySelectorAll('[data-position-mode]').forEach(button => {
+      const on = button.dataset.positionMode === mode;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-checked', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+    });
     const solo = activeSlotIdx().length === 1;
-    $('chCoordsNote').textContent = STATE.use_coords
-      ? (solo
-        ? '켜져 있지만 인물이 1명일 때는 좌표가 무시됩니다(V4.5 실측) — 2명부터 적용됩니다.'
-        : '인물마다 격자(빠른 선택)나 숫자 칸(0~1 자유값)으로 자리를 정합니다.')
-      : "끔 = AI's Choice — NAI 가 알아서 배치합니다.";
-    /* 몸이 붙는 조건 두 가지 — ① 좌표를 안 씀 ② 좌표가 서로 겹침 */
+    $('chCoordsNote').textContent = mode === 'ai'
+      ? "AI's Choice — NAI가 인물 순서와 프롬프트를 보고 배치합니다."
+      : solo
+      ? `${mode === 'grid' ? '위치판' : '좌표'} 값은 보존되지만 인물이 1명일 때는 NAI가 무시합니다.`
+      : mode === 'grid'
+      ? '각 인물 카드에서 5×5 칸을 고릅니다.'
+      : '각 인물 카드에서 X·Y를 0~1 연속값으로 입력합니다.';
+    /* AI 자동은 정상 선택이다. 수동 모드의 중복 위치와 상한 초과만 경고한다. */
     const n = activeSlotIdx().length;
     const over = n > MAX_CHARS;
     const warn = $('chFuseWarn');
     if(warn){
-      const off = n >= 2 && !STATE.use_coords;
       const clash = coordsClash();
-      warn.classList.toggle('hidden', !(off || clash || over));
-      if(off || clash || over){
-        /* ⚠ 아래에서 이 div 의 innerHTML 을 다시 쓰므로 그 안에 있던
-           #chFuseN span 은 사라진다. 인원수는 문구에 직접 박아 넣는다. */
+      warn.classList.toggle('hidden', !(clash || over));
+      if(clash || over){
         const w = warn.querySelector('div');
         if(w) w.innerHTML = over
-          ? `<b>켠 인물이 ${n}명입니다.</b> NAI 는 <b>${MAX_CHARS}명</b>까지만 받습니다 —
-             앞 ${MAX_CHARS}명만 보내고 나머지는 <b>칸에 그대로 남습니다</b>.
-             안 보낼 인물은 왼쪽 스위치를 끄세요.`
-          : off
-          ? `<b>인물이 ${n}명인데 위치를 안 정했습니다.</b> 이러면 NAI 가 <b>몸을 붙여</b> 그리는 일이 흔합니다.`
-          : `<b>인물 ${n}명 중 같은 자리에 겹친 사람이 있습니다.</b> 겹치면 위치를 켜도 <b>몸이 붙습니다</b>.`;
-        const btn = $('chSpread');
-        if(btn) btn.style.display = over ? 'none' : '';
+          ? `<b>켠 인물이 ${n}명입니다.</b> NAI는 <b>${MAX_CHARS}명</b>까지만 받습니다 —
+             앞 ${MAX_CHARS}명만 보내고 나머지는 칸에 그대로 남습니다.`
+          : `<b>인물 ${n}명 중 같은 자리에 겹친 사람이 있습니다.</b>
+             위치판이나 좌표를 다르게 고르거나 추천 배치를 사용하세요.`;
       }
     }
+    renderPositionEditors(mode);
   };
-  c.addEventListener('change', () => {
-    STATE.use_coords = c.checked;
-    if($('pCoords')) $('pCoords').value = c.checked ? 'on' : 'off';
-    paint(); save();
+  picker.querySelectorAll('[data-position-mode]').forEach(button => {
+    button.addEventListener('click', () => {
+      setPositionMode(button.dataset.positionMode);
+      paint();
+    });
+    button.addEventListener('keydown', event => {
+      if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return;
+      event.preventDefault();
+      const buttons = [...picker.querySelectorAll('[data-position-mode]')];
+      const delta = ['ArrowLeft','ArrowUp'].includes(event.key) ? -1 : 1;
+      const next = buttons[
+        (buttons.indexOf(button) + delta + buttons.length) % buttons.length];
+      next.click();
+      next.focus();
+    });
   });
   const spread = $('chSpread');
   if(spread) spread.addEventListener('click', () => {
-    /* 실제 NAI 이미지에서 2인 구도에 가장 흔한 값이 x 0.3 / 0.7 · y 0.5 다.
-       3명 이상이면 0.1~0.9 사이를 고르게 나눈다. 6명부터는 두 줄.
-       좌표는 **칸 순서**로 저장하므로 켠 인물의 자리만 다시 배치한다. */
+    /* 추천 배치는 네 번째 모드가 아니다. 현재 인물에게 겹치지 않는 5×5 칸
+       중심값을 채우고 위치판 모드로 전환한다. */
     const idx = activeSlotIdx();
     const n = idx.length || 2;
     const auto = spreadCenters(n);
@@ -13171,10 +13518,9 @@ function bindUseCoords(){
     while(cs.length < (STATE.char_slots || []).length) cs.push(null);
     idx.forEach((i, k) => { cs[i] = auto[k]; });
     STATE.char_centers = cs;
-    STATE.use_coords = true;
-    if($('pCoords')) $('pCoords').value = 'on';
+    setPositionMode('grid', false);
     paint(); drawPosGrids(); save();
-    flash(`켠 인물 ${n}명을 ${auto.map(c=>`x${c.x}·y${c.y}`).join(' / ')} 로 떨어뜨렸습니다.`);
+    flash(`켠 인물 ${n}명을 ${auto.map(c=>`x${c.x}·y${c.y}`).join(' / ')} 로 배치했습니다.`);
   });
   paint();
   window._paintCoords = paint;
@@ -13187,7 +13533,7 @@ function bindUseCoords(){
    ⚠ 실측 주의(2026-07 · V4.5 full 기준): **인물이 1명이면 좌표가 통째로 무시된다**
    (12장 픽셀 동일 확인). 좌표는 2명부터 적용되고, 핀 고정이 아니라 느슨한 유도다.
    다른 모델·향후 서버에서는 다를 수 있다 — 모델이 바뀌면 재실측할 것.
-   '캐릭터 위치 좌표 사용'(use_coords)이 꺼져 있으면 NAI 가 알아서 배치한다. */
+   `position_mode=ai`이면 저장된 좌표를 지우지 않고 NAI가 알아서 배치하게 한다. */
 const POS_STEPS = [0.1, 0.3, 0.5, 0.7, 0.9];
 const MAX_CHARS = 6;      // NAI 가 한 그림에 받는 인물 수 (서버 상수와 같음)
 /* 인물 n 명을 겹치지 않게 벌린 좌표 — 서버 spread_centers() 와 같은 규칙.
@@ -13217,16 +13563,42 @@ function drawPosGrids(){
     const cur = slotCenter(i);
     host.innerHTML = '';
     POS_STEPS.forEach(y => POS_STEPS.forEach(x => {
-      const cell = document.createElement('span');
+      const cell = document.createElement('button');
+      cell.type = 'button';
       const on = Math.abs(x - cur.x) < 0.01 && Math.abs(y - cur.y) < 0.01;
       cell.className = 'poscell' + (on ? ' on' : '');
       cell.title = `x ${x} · y ${y}`;
-      cell.addEventListener('click', () => {
+      cell.dataset.x = x;
+      cell.dataset.y = y;
+      cell.setAttribute('aria-label', `캐릭터 ${i + 1} 위치 x ${x}, y ${y}`);
+      cell.setAttribute('aria-pressed', on ? 'true' : 'false');
+      cell.tabIndex = on ? 0 : -1;
+      const choose = (nextX, nextY, focus=false) => {
         STATE.char_centers = STATE.char_centers || [];
         while(STATE.char_centers.length <= i) STATE.char_centers.push({x:0.5, y:0.5});
-        STATE.char_centers[i] = {x, y};
+        STATE.char_centers[i] = {x: nextX, y: nextY};
         drawPosGrids(); save();
-        if(!(STATE.use_coords)) flash('위치를 쓰려면 파라미터에서 [캐릭터 위치 좌표 사용]을 켜세요.');
+        if(positionMode() === 'ai') flash('위치판이나 좌표 모드를 먼저 고르세요.');
+        if(focus) requestAnimationFrame(() => {
+          const next = host.querySelector(
+            `[data-x="${nextX}"][data-y="${nextY}"]`);
+          if(next) next.focus();
+        });
+      };
+      cell.addEventListener('click', () => choose(x, y));
+      cell.addEventListener('keydown', event => {
+        const moves = {
+          ArrowLeft:[-1,0], ArrowRight:[1,0],
+          ArrowUp:[0,-1], ArrowDown:[0,1],
+        };
+        const move = moves[event.key];
+        if(!move) return;
+        event.preventDefault();
+        const column = Math.max(0, Math.min(
+          POS_STEPS.length - 1, POS_STEPS.indexOf(x) + move[0]));
+        const row = Math.max(0, Math.min(
+          POS_STEPS.length - 1, POS_STEPS.indexOf(y) + move[1]));
+        choose(POS_STEPS[column], POS_STEPS[row], true);
       });
       host.appendChild(cell);
     }));
@@ -13531,6 +13903,8 @@ async function doSave(){
       ? `⚠ NAI 규격(64 배수·64~2048)으로 맞췄습니다: ${wh.map(k => `${k==='width'?'가로':'세로'} ${f[k].sent}→${f[k].used}`).join(' · ')}` : '';
     if(r && r.rejected && r.rejected.length) flash(`저장하지 않은 잘못된 값: ${r.rejected.join(', ')}`);
     rememberSavedKeys((r && r.accepted) || changed);
+    /* 최종 생성 설계도를 열어 둔 동안에는 저장된 현재 작업과 같은 화면을 보여 준다. */
+    if($('blueprintPlan') && $('blueprintPlan').open) loadBlueprint();
     if(r && r.external_changes && r.external_changes.length){
       reloadAfterSave = true;
       flash(`다른 실행본의 변경 ${r.external_changes.length}개도 반영했습니다. 화면을 맞추는 중입니다.`);
@@ -13774,12 +14148,56 @@ function bindStudioLibraryNav(){
     });
   });
 }
+function activeResultTool(){
+  const tool = String(((STATE || {}).ui || {}).result_tool || '');
+  return ['i2i','director','mosaic'].includes(tool) ? tool : '';
+}
+function bindResultToolSwitcher(){
+  const host = $('resultToolSwitcher');
+  if(!host || host._bound) return;
+  host._bound = true;
+  host.querySelectorAll('[data-result-tool]').forEach(button => {
+    button.addEventListener('click', () => {
+      STATE.ui = STATE.ui || {};
+      STATE.ui.result_tool = activeResultTool() === button.dataset.resultTool
+        ? '' : button.dataset.resultTool;
+      arrangeResultTools((STATE.ui || {}).layout !== 'classic');
+      save();
+    });
+  });
+}
+function arrangeResultTools(studio){
+  bindResultToolSwitcher();
+  const host = $('resultToolSwitcher');
+  const tool = activeResultTool();
+  if(host) host.classList.toggle('hidden', !studio);
+  document.querySelectorAll('[data-result-tool-panel]').forEach(panel => {
+    panel.classList.toggle('hidden', studio && panel.dataset.resultToolPanel !== tool);
+  });
+  const mosaic = $('mosaicCard');
+  if(mosaic) mosaic.classList.toggle('hidden', studio && tool !== 'mosaic');
+  if(host){
+    host.querySelectorAll('[data-result-tool]').forEach(button => {
+      const on = studio && button.dataset.resultTool === tool;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+}
 function arrangeStudioWorkspace(){
   if(!STATE) return;
   bindStudioSettingsNav();
   bindStudioLibraryNav();
   bindStudioManageNav();
   const studio = (STATE.ui || {}).layout !== 'classic';
+  const layoutChanged = LAST_STUDIO_LAYOUT !== studio;
+  const importCard = $('generateImportCard');
+  const outputSettings = $('pOutputSettings');
+  if(layoutChanged){
+    if(importCard) importCard.open = !studio;
+    if(outputSettings) outputSettings.open = !studio;
+    LAST_STUDIO_LAYOUT = studio;
+  }
 
   const mosaicCard = $('mosaicCard');
   const mosaicHome = studio ? $('mosaicGenerateHome') : $('mosaicClassicHome');
@@ -13849,6 +14267,7 @@ function arrangeStudioWorkspace(){
       button.tabIndex = on ? 0 : -1;
     });
   }
+  arrangeResultTools(studio);
 }
 const MODE_CONTEXT = {
   preview: ['01 · GENERATE', '생성', '프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.'],
@@ -13915,7 +14334,9 @@ function styleSettingsFromUI(){
     controlnet_strength: Number($('pCtrl').value),
     prefer_brownian: $('pBrownian').value === 'on',
     deliberate_euler_ancestral_bug: $('pEulerBug').value === 'on',
-    legacy_v3_extend: !!STATE.legacy_v3_extend
+    legacy_v3_extend: !!STATE.legacy_v3_extend,
+    use_coords: positionMode() !== 'ai',
+    position_mode: positionMode()
   };
 }
 function applyStyleSettings(raw){
@@ -13947,7 +14368,16 @@ function applyStyleSettings(raw){
   set('prefer_brownian', first('prefer_brownian'), Boolean);
   set('deliberate_euler_ancestral_bug', first('deliberate_euler_ancestral_bug'), Boolean);
   set('legacy_v3_extend', first('legacy_v3_extend'), Boolean);
+  const importedUseCoords = first('use_coords');
+  const importedPositionMode = first('position_mode');
+  if(importedUseCoords !== undefined || importedPositionMode !== undefined){
+    const mode = POSITION_MODES.has(String(importedPositionMode || '').toLowerCase())
+      ? String(importedPositionMode).toLowerCase()
+      : (Boolean(importedUseCoords) ? 'coordinate' : 'ai');
+    setPositionMode(mode, false);
+  }
   paintParams();
+  if(window._paintCoords) window._paintCoords();
 }
 function renderPresets(){
   const s = $('presetSel');
@@ -14052,13 +14482,17 @@ function renderSlots(){
       <input type="text" data-sf="outfit" data-si="${i}" placeholder="의상 (비워도 됨 · 외형 뒤에 붙습니다)" value="${escA(s.outfit || '')}">
       <input type="text" data-sf="negative" data-si="${i}" placeholder="이 인물 전용 네거티브" value="${escA(s.negative)}">
       <div class="posrow"><span class="hint">위치</span>
-        <div class="posgrid" data-pos="${i}"></div>
-        <input type="number" class="posnum" data-posx="${i}" min="0" max="1" step="0.01" title="x (0~1 자유값 — 격자 밖도 됩니다)">
-        <input type="number" class="posnum" data-posy="${i}" min="0" max="1" step="0.01" title="y (0~1 자유값 — 격자 밖도 됩니다)">
+        <span class="hint" data-posai>AI가 배치</span>
+        <span data-posgrid-wrap><div class="posgrid" data-pos="${i}"></div></span>
+        <span class="poscoords" data-poscoord-wrap>
+          <label class="hint">X <input type="number" class="posnum" data-posx="${i}" min="0" max="1" step="0.01" title="가로 위치 0~1 연속값"></label>
+          <label class="hint">Y <input type="number" class="posnum" data-posy="${i}" min="0" max="1" step="0.01" title="세로 위치 0~1 연속값"></label>
+        </span>
         <span class="hint" data-poslabel="${i}"></span></div>`;
     h.appendChild(el);
   });
   drawPosGrids();
+  renderPositionEditors();
   h.querySelectorAll('[data-sf]').forEach(el => el.addEventListener('input', () => {
     STATE.char_slots[+el.dataset.si][el.dataset.sf] = el.value; tokens(); save();
   }));
@@ -14089,7 +14523,7 @@ function renderSlots(){
        change 는 포커스가 남은 채로도 오므로, 안 쓰면 화면 1.5 / 저장 1 처럼 어긋난다 */
     el.value = String(v);
     drawPosGrids(); save();
-    if(!(STATE.use_coords)) flash('위치를 쓰려면 파라미터에서 [캐릭터 위치 좌표 사용]을 켜세요.');
+    if(positionMode() === 'ai') flash('위치판이나 좌표 모드를 먼저 고르세요.');
   }));
   const lib = $('slotLib');
   lib.innerHTML = '<option value="">+ 라이브러리에서...</option>';
@@ -14100,9 +14534,8 @@ function renderSlots(){
   });
   if(window._paintCoords) window._paintCoords();   // 인물 수가 바뀌면 몸 붙음 경고도 다시
 }
-/* 공홈은 **인물을 둘째로 넣는 순간 좌표를 켠다**. 그래야 몸이 안 붙는다.
-   NAIS2 는 V3 라 좌표 개념이 없어서 이 문제가 없었고, NAIS3 는 좌표를 쓰면서
-   기본을 안 켜 둬서 몸이 붙었다. 우리는 공홈을 따라간다. */
+/* 수동 모드를 이미 고른 경우에만 새 인물의 빈 위치값을 채운다.
+   AI 자동은 정상 선택이므로 인물이 늘어도 임의로 위치판/좌표로 바꾸지 않는다. */
 /* 보낼 인물 = 켠 것 + 내용이 있는 것. 칸은 6명 넘게 둬도 된다. */
 function activeSlotIdx(){
   /* 주석(#) 줄만 있는 칸은 '켠 인물'이 아니다 — 서버 slot_prompt 와 같은 규칙 (CQA-003) */
@@ -14115,12 +14548,7 @@ function activeSlotIdx(){
 }
 function autoCoordsOnSecond(){
   const n = activeSlotIdx().length;
-  if(n < 2) return false;
-  const first = !STATE.use_coords;
-  if(first){
-    STATE.use_coords = true;
-    if($('pCoords')) $('pCoords').value = 'on';
-  }
+  if(n < 2 || positionMode() === 'ai') return false;
   /* ★ 인물이 늘 때 좌표도 따라가야 한다.
      안 그러면 셋째부터는 기본 0.5/0.5 를 써서 서로 겹치고, 좌표를 켜 둔 게 무의미해진다
      (2명 기준 0.3/0.7 에 멈춰 있던 것을 실측에서 잡았다).
@@ -14135,18 +14563,19 @@ function autoCoordsOnSecond(){
   while(cs.length < slots) cs.push(null);
   const auto = spreadCenters(n);
   const taken = new Set(cs.filter(Boolean).map(c => `${c.x},${c.y}`));
+  let changed = false;
   idx.forEach((slotI, k) => {
     if(cs[slotI] && cs[slotI].x != null) return;      // 손으로 고른 자리는 보존
     const free = auto.find(a => !taken.has(`${a.x},${a.y}`)) || auto[k] || {x:0.5, y:0.5};
-    cs[slotI] = free; taken.add(`${free.x},${free.y}`);
+    cs[slotI] = free; taken.add(`${free.x},${free.y}`); changed = true;
   });
   STATE.char_centers = cs.map(c => c || {x:0.5, y:0.5});
-  return first;
+  return changed;
 }
 /* 좌표가 서로 겹치는 인물이 있는지 (겹치면 분리가 안 된다) */
 function coordsClash(){
   const idx = activeSlotIdx();
-  if(idx.length < 2 || !STATE.use_coords) return false;
+  if(idx.length < 2 || positionMode() === 'ai') return false;
   const seen = new Set();
   for(const i of idx){
     const c = (STATE.char_centers || [])[i] || {x:0.5, y:0.5};
@@ -14158,7 +14587,7 @@ function coordsClash(){
 }
 $('slotAdd').addEventListener('click', () => {
   (STATE.char_slots = STATE.char_slots || []).push({name:'', prompt:'', negative:''});
-  if(autoCoordsOnSecond()) flash('인물이 둘이 되어 위치 지정을 켜고 좌우로 벌렸습니다 (공홈과 같은 동작).');
+  if(autoCoordsOnSecond()) flash('새 인물의 빈 위치값을 현재 수동 모드에 맞게 채웠습니다.');
   renderSlots(); tokens(); save();
 });
 /* ── 진단 서랍 — 서버에서 먼저 redaction한 구조화 이벤트만 받는다 ── */
@@ -14263,7 +14692,7 @@ if($('slotDelOff')) $('slotDelOff').addEventListener('click', () => {
 $('slotLib').addEventListener('change', () => {
   const c = (STATE.characters||[]).find(x => x.id === $('slotLib').value);
   if(c){ (STATE.char_slots = STATE.char_slots || []).push(characterBundle(c, true));
-  if(autoCoordsOnSecond()) flash('인물이 둘이 되어 위치 지정을 켜고 좌우로 벌렸습니다 (공홈과 같은 동작).');
+  if(autoCoordsOnSecond()) flash('새 인물의 빈 위치값을 현재 수동 모드에 맞게 채웠습니다.');
     renderSlots(); tokens(); save(); }
   $('slotLib').value = '';
 });
@@ -14317,6 +14746,13 @@ function castPresets(){
 }
 function castMode(state){
   return state && state.cast_mode === 'together' ? 'together' : 'sequence';
+}
+function castPositionMode(state){
+  const mode = String((state || {}).position_mode || '').toLowerCase();
+  if(POSITION_MODES.has(mode)) return mode;
+  return ((state || {}).cast || []).some(member =>
+    member && member.position && member.position.x != null)
+    ? 'coordinate' : 'ai';
 }
 function castPresetId(){
   const tail = (globalThis.crypto && crypto.randomUUID)
@@ -14638,6 +15074,7 @@ function bindSettings(){
       id: same ? same.id : castPresetId(),
       name,
       mode: castMode(stState(setting)),
+      position_mode: castPositionMode(stState(setting)),
       members: JSON.parse(JSON.stringify(members)),
     };
     if(same) presets[presets.indexOf(same)] = record; else presets.push(record);
@@ -14657,6 +15094,8 @@ function bindSettings(){
     if(state.cast.length && !confirm('현재 전용 캐스트를 고른 조합으로 바꿀까요?')) return;
     state.cast = JSON.parse(JSON.stringify(preset.members || []));
     state.cast_mode = preset.mode === 'together' ? 'together' : 'sequence';
+    state.position_mode = POSITION_MODES.has(preset.position_mode)
+      ? preset.position_mode : castPositionMode(state);
     renderCast(setting); tokens(); save();
     msg.textContent = `"${preset.name}" ${state.cast.length}명을 불러왔습니다.`;
   }));
@@ -14675,6 +15114,7 @@ function bindSettings(){
   counts();
 }
 function counts(){
+  let selectedSettingScenes = 0;
   SETTINGS.forEach(st => {
     const s = stState(st.name); const sel = new Set(s.selected);
     const rep = s.reserve || {};
@@ -14693,7 +15133,13 @@ function counts(){
     }
     const el = document.querySelector(`[data-scnt="${CSS.escape(st.name)}"]`);
     if(el) el.textContent = s.selected.length ? `${s.selected.length}세트 · ${im}장` : '';
+    if(s.use !== false && s.selected.length) selectedSettingScenes += im;
   });
+  const batchRow = $('settingBatchRow');
+  if(batchRow) batchRow.classList.toggle('hidden', selectedSettingScenes < 1);
+  if($('batchBtn')) $('batchBtn').textContent = selectedSettingScenes > 0
+    ? `🎬 선택 세팅 ${selectedSettingScenes.toLocaleString()}장 생성`
+    : '🎬 선택 세팅 일괄 생성';
 }
 function castResourceChoices(memberIndex, field, items, selected, title){
   const chosen = new Set(Array.isArray(selected) ? selected.map(String) : []);
@@ -14708,36 +15154,145 @@ function castResourceChoices(memberIndex, field, items, selected, title){
       <span>${esc(item.name || item.id)}</span></label>`).join('') +
     `</div></div>`;
 }
-function renderCast(name){
+function renderCast(name, openMember=-1){
   const host = document.querySelector(`[data-cast="${CSS.escape(name)}"]`);
   if(!host) return;
   const s = stState(name);
-  host.innerHTML = '';
+  const mode = castPositionMode(s);
+  host.innerHTML = `<div class="cast-position-mode">
+    <span class="hint">캐릭터 위치</span>
+    <div class="position-mode-picker" role="radiogroup" aria-label="세팅 캐스트 위치 방식">
+      ${[['ai','AI 자동'],['grid','위치판'],['coordinate','좌표']].map(([value,label]) =>
+        `<button type="button" data-cast-posmode="${value}" role="radio"
+          aria-checked="${mode===value?'true':'false'}" class="${mode===value?'on':''}">${label}</button>`).join('')}
+    </div>
+    <button type="button" data-cast-spread>추천 배치</button>
+    <span class="hint">${mode === 'ai' ? 'NAI가 배치 · 저장된 수동 값은 유지' : '이 세팅에서 함께 출연할 때 적용'}</span>
+  </div>`;
   s.cast.forEach((c,i) => {
     const position = c.position && typeof c.position === 'object' ? c.position : {};
+    const px = Number.isFinite(Number(position.x)) ? Number(position.x) : 0.5;
+    const py = Number.isFinite(Number(position.y)) ? Number(position.y) : 0.5;
+    const advancedOpen = i === openMember;
+    /* 닫힌 고급 영역이나 AI/좌표 모드에서는 25칸 DOM을 만들지 않는다. */
+    const board = mode === 'grid' && advancedOpen ? POS_STEPS.map(y => POS_STEPS.map(x =>
+      `<button type="button" class="cast-poscell${Math.abs(px-x)<.01&&Math.abs(py-y)<.01?' on':''}"
+        data-cgrid="${i}" data-x="${x}" data-y="${y}" title="x ${x} · y ${y}"
+        aria-label="${escA(c.name || `캐릭터 ${i+1}`)} 위치 x ${x}, y ${y}"
+        aria-pressed="${Math.abs(px-x)<.01&&Math.abs(py-y)<.01?'true':'false'}"
+        tabindex="${Math.abs(px-x)<.01&&Math.abs(py-y)<.01?'0':'-1'}"></button>`).join('')).join('') : '';
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-cf="name" data-ci="${i}" placeholder="이름" value="${escA(c.name)}">
       <button class="danger" data-cdel="${i}">✕</button></div>
       <textarea data-cf="prompt" data-ci="${i}" placeholder="외형·캐릭터 원문">${esc(c.prompt)}</textarea>
       <input type="text" data-cf="outfit" data-ci="${i}" placeholder="착의·예술적 변형" value="${escA(c.outfit||'')}">
       <input type="text" data-cf="negative" data-ci="${i}" placeholder="전용 네거티브" value="${escA(c.negative)}">
-      <details class="cast-advanced">
+      <details class="cast-advanced" data-cast-advanced="${i}"${advancedOpen?' open':''}>
         <summary>위치 · Vibe · Reference</summary>
         <div class="cast-position">
-          <label>자유 좌표 X
+          <span class="hint${mode==='ai'?'':' hidden'}" data-cast-posai>AI가 배치합니다.</span>
+          <div class="cast-posgrid${mode==='grid'?'':' hidden'}" data-cast-posgrid>${board}</div>
+          <span class="cast-poscoords${mode==='coordinate'?'':' hidden'}" data-cast-poscoord>
+          <label>좌표 X
             <input type="number" data-cpos="x" data-ci="${i}" min="0" max="1" step="0.01"
-              value="${position.x == null ? '' : escA(position.x)}" placeholder="자동">
+              value="${escA(px)}">
           </label>
-          <label>자유 좌표 Y
+          <label>좌표 Y
             <input type="number" data-cpos="y" data-ci="${i}" min="0" max="1" step="0.01"
-              value="${position.y == null ? '' : escA(position.y)}" placeholder="자동">
+              value="${escA(py)}">
           </label>
-          <span class="hint">비우면 인원수에 맞춰 자동 배치</span>
+          </span>
         </div>
         ${castResourceChoices(i, 'reference_ids', STATE.char_refs, c.reference_ids, '캐릭터 Reference')}
         ${castResourceChoices(i, 'vibe_ids', STATE.vibes, c.vibe_ids, 'Vibe')}
       </details>`;
     host.appendChild(el);
+  });
+  host.querySelectorAll('[data-cast-advanced]').forEach(details =>
+    details.addEventListener('toggle', () => {
+      if(details.open && mode === 'grid'
+          && !details.querySelector('[data-cgrid]')){
+        const memberIndex = Number(details.dataset.castAdvanced);
+        renderCast(name, memberIndex);
+        requestAnimationFrame(() => {
+          const next = host.querySelector(
+            `[data-cast-advanced="${memberIndex}"] summary`);
+          if(next) next.focus();
+        });
+      }
+    }));
+  host.querySelectorAll('[data-cast-posmode]').forEach(button =>
+    button.addEventListener('click', () => {
+      const next = button.dataset.castPosmode;
+      s.position_mode = next;
+      if(next !== 'ai'){
+        const recommended = spreadCenters(Math.max(1, s.cast.length));
+        s.cast.forEach((member, index) => {
+          if(!(member.position && member.position.x != null && member.position.y != null)){
+            member.position = Object.assign({}, recommended[index] || {x:0.5,y:0.5});
+          }
+        });
+      }
+      renderCast(name); save();
+    }));
+  host.querySelectorAll('[data-cast-posmode]').forEach(button => {
+    button.tabIndex = button.getAttribute('aria-checked') === 'true' ? 0 : -1;
+    button.addEventListener('keydown', event => {
+      if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return;
+      event.preventDefault();
+      const buttons = [...host.querySelectorAll('[data-cast-posmode]')];
+      const delta = ['ArrowLeft','ArrowUp'].includes(event.key) ? -1 : 1;
+      const nextMode = buttons[
+        (buttons.indexOf(button) + delta + buttons.length) % buttons.length
+      ].dataset.castPosmode;
+      buttons.find(item => item.dataset.castPosmode === nextMode).click();
+      requestAnimationFrame(() => {
+        const next = host.querySelector(`[data-cast-posmode="${nextMode}"]`);
+        if(next) next.focus();
+      });
+    });
+  });
+  const spreadButton = host.querySelector('[data-cast-spread]');
+  if(spreadButton) spreadButton.addEventListener('click', () => {
+    const recommended = spreadCenters(Math.max(1, s.cast.length));
+    s.cast.forEach((member, index) =>
+      member.position = Object.assign({}, recommended[index] || {x:0.5,y:0.5}));
+    s.position_mode = 'grid';
+    renderCast(name); save();
+  });
+  host.querySelectorAll('[data-cgrid]').forEach(button => {
+    button.addEventListener('click', () => {
+      const member = s.cast[+button.dataset.cgrid];
+      member.position = {x:Number(button.dataset.x), y:Number(button.dataset.y)};
+      s.position_mode = 'grid';
+      renderCast(name, +button.dataset.cgrid); save();
+    });
+    button.addEventListener('keydown', event => {
+      const moves = {
+        ArrowLeft:[-1,0], ArrowRight:[1,0],
+        ArrowUp:[0,-1], ArrowDown:[0,1],
+      };
+      const move = moves[event.key];
+      if(!move) return;
+      event.preventDefault();
+      const memberIndex = +button.dataset.cgrid;
+      const x = Number(button.dataset.x), y = Number(button.dataset.y);
+      const column = Math.max(0, Math.min(
+        POS_STEPS.length - 1, POS_STEPS.indexOf(x) + move[0]));
+      const row = Math.max(0, Math.min(
+        POS_STEPS.length - 1, POS_STEPS.indexOf(y) + move[1]));
+      s.cast[memberIndex].position = {
+        x: POS_STEPS[column], y: POS_STEPS[row],
+      };
+      s.position_mode = 'grid';
+      renderCast(name, memberIndex); save();
+      requestAnimationFrame(() => {
+        const next = host.querySelector(
+          `[data-cgrid="${memberIndex}"][data-x="${POS_STEPS[column]}"]`
+          + `[data-y="${POS_STEPS[row]}"]`);
+        if(next) next.focus();
+      });
+    });
   });
   host.querySelectorAll('[data-cf]').forEach(el => el.addEventListener('input', () => {
     s.cast[+el.dataset.ci][el.dataset.cf] = el.value; tokens(); save();
@@ -14856,6 +15411,9 @@ async function resultToI2I(url, name, msg, variationCharacter=null){
     const file = await resultFile(url, name);
     expClose();
     setMode('preview');
+    STATE.ui = STATE.ui || {};
+    STATE.ui.result_tool = 'i2i';
+    arrangeResultTools((STATE.ui || {}).layout !== 'classic');
     i2iLoad(file);
     if(msg) msg.textContent = 'img2img·인페인트에 넣었습니다.';
     setTimeout(() => $('i2iStage').scrollIntoView({behavior:'smooth', block:'start'}), 80);
@@ -15370,7 +15928,7 @@ const EXP_RECIPE_KEYS = [
   'vibes','char_refs','model','width','height','cfg_scale','cfg_rescale','steps',
   'sampler','scheduler','variety','uc_preset','quality_toggle','smea','smea_dyn',
   'dynamic_thresholding','uncond_scale','controlnet_strength','prefer_brownian',
-  'deliberate_euler_ancestral_bug','legacy_v3_extend','use_coords'
+  'deliberate_euler_ancestral_bug','legacy_v3_extend','use_coords','position_mode'
 ];
 function comparisonRecipeSnapshot(){
   const out = {};
@@ -16684,6 +17242,29 @@ if($('dataOriginsShow')) $('dataOriginsShow').addEventListener('click', async ()
       + (examples ? `<div style="margin-top:4px;">${examples}</div>` : '');
   }catch(error){ host.textContent = '출처 장부 확인 실패: ' + error; }
 });
+var DATA_INVENTORY_OFFSET = 0;
+if($('dataInventoryShow')) $('dataInventoryShow').addEventListener('click', async () => {
+  const button = $('dataInventoryShow');
+  const host = $('dataInventoryStatus');
+  host.classList.remove('hidden');
+  host.textContent = '보유 폴더 색인을 복원 대기 목록으로 여는 중입니다.';
+  try{
+    const r = await (await fetch(
+      '/api/folder_inventory?offset=' + DATA_INVENTORY_OFFSET + '&limit=20',
+      {cache:'no-store'})).json();
+    if(!r.ok){ host.textContent = r.error || '보유 폴더 목록을 읽지 못했습니다.'; return; }
+    if(r.empty){ host.textContent = '색인이 없습니다. 먼저 자료 색인을 만들어주세요.'; return; }
+    window.LAST_RESTORATION_BATCH = r.restoration_queue;
+    host.innerHTML = `<b>${Number(r.total||0).toLocaleString()}개 파일</b> · `
+      + `원본을 옮기거나 읽어 들이지 않은 복원 대기 목록`
+      + `<div style="margin-top:4px;font-family:var(--mono);">`
+      + (r.items||[]).map(item =>
+        `${esc(item.name)} · ${(Number(item.size||0)/1024).toFixed(1)}KB`).join('<br>')
+      + `</div>`;
+    DATA_INVENTORY_OFFSET = r.more ? Number(r.next_offset||0) : 0;
+    button.textContent = r.more ? '보유 폴더 다음 목록' : '보유 폴더 처음부터';
+  }catch(error){ host.textContent = '보유 폴더 목록 확인 실패: ' + error; }
+});
 
 var METADATA_AUDIT_OFFSET = 0;
 function renderMetadataAudit(r, append=false){
@@ -16735,6 +17316,10 @@ function renderMetadataAudit(r, append=false){
         });
         const value = await response.json();
         if(!value.ok) throw new Error(value.error || '복원 후보를 열지 못했습니다.');
+        value.candidate._audit = {
+          path:value.path,
+          sha256:value.sha256,
+        };
         openApplyPicker(value.candidate);
       }catch(error){
         alert(error.message || String(error));
@@ -17766,11 +18351,32 @@ function openApplyPicker(c){
     ${rows.map(([label, val]) => `<div class="row">
       <b>${esc(label)}</b>
       ${val ? `<div class="hint" style="font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(val)}</div>` : ''}</div>`).join('')}
-    <div class="bar"><button class="primary" id="impAll">그림체 통째로 적용</button></div>`;
+    <div class="bar"><button class="primary" id="impAll">그림체 통째로 적용</button>
+      ${c._audit ? '<button type="button" id="impSaveCandidate">자료실 후보로 저장</button>' : ''}
+    </div>
+    ${c._audit ? '<div class="hint">원본 파일은 이동하거나 바꾸지 않습니다. 저장을 눌러야 자료실 후보가 생깁니다.</div>' : ''}`;
   $('modalBg').style.display = 'flex';
   $('impAll').addEventListener('click', () => {
     applyStyle(c);
     $('modalBg').style.display = 'none';
+  });
+  if($('impSaveCandidate')) $('impSaveCandidate').addEventListener('click', async () => {
+    const button = $('impSaveCandidate');
+    button.disabled = true;
+    try{
+      const response = await fetch('/api/metadata_audit_save', {
+        method:'POST',
+        body:JSON.stringify(c._audit),
+      });
+      const value = await response.json();
+      if(!value.ok) throw new Error(value.error || '자료실 후보를 저장하지 못했습니다.');
+      button.textContent = value.import && value.import.action === 'existing'
+        ? '이미 같은 후보가 있습니다' : '자료실 후보 저장됨 ✓';
+      if($('comboList')) await loadCombos(false);
+    }catch(error){
+      button.disabled = false;
+      alert(error.message || String(error));
+    }
   });
 }
 
@@ -19651,6 +20257,7 @@ def normalize_cast_presets(value):
         preset_id = preset.get("id")
         name = preset.get("name")
         mode = preset.get("mode", "sequence")
+        position_mode = preset.get("position_mode", "")
         members = preset.get("members")
         if (not isinstance(preset_id, str) or not preset_id
                 or len(preset_id) > 120
@@ -19663,6 +20270,8 @@ def normalize_cast_presets(value):
             raise ValueError("duplicate cast preset")
         if mode not in ("sequence", "together"):
             raise ValueError("invalid cast preset mode")
+        if position_mode not in ("", "ai", "grid", "coordinate"):
+            raise ValueError("invalid cast preset position mode")
         if not isinstance(members, list) or not members or len(members) > 64:
             raise ValueError("cast preset must contain 1 to 64 members")
         clean_members = []
@@ -19713,6 +20322,8 @@ def normalize_cast_presets(value):
         }
         if "mode" in preset:
             clean_preset["mode"] = mode
+        if "position_mode" in preset:
+            clean_preset["position_mode"] = position_mode
         result.append(clean_preset)
         seen_ids.add(preset_id)
         seen_names.add(folded_name)
@@ -19755,6 +20366,10 @@ def validate_config_value(key, value, current):
                 fixed["pace.delay_max"] = {"sent": sent, "used": used["delay_max"]}
         elif key == "cast_presets":
             used = normalize_cast_presets(value)
+        elif key == "position_mode":
+            used = str(value or "").strip().lower()
+            if used not in ("", "ai", "grid", "coordinate"):
+                raise ValueError("unsupported position mode")
         else:
             return True, value, fixed
     except (TypeError, ValueError, OverflowError):
@@ -20477,12 +21092,15 @@ def _finish_durable_job(existing, projected):
     target = str(projected.get("phase") or "")
     progress = copy.deepcopy(projected.get("progress") or {})
     if target == "completed":
+        has_verified_result = bool(existing.get("results"))
         merged = reconcile_job(
             existing,
             {
                 "progress": progress,
-                "confirmed_complete": True,
-                "artifacts_intact": True,
+                # 실행 스레드가 완료라고 말해도 저장 뒤 해시를 확인해 장부에
+                # 등록한 결과가 하나도 없으면 완료로 닫지 않는다.
+                "confirmed_complete": has_verified_result,
+                "artifacts_intact": has_verified_result,
             },
             now=str(projected.get("updated_at") or ""),
         )
@@ -20533,6 +21151,64 @@ def finish_job_record(job_id, *, status, completed=0, failed=0,
                 _finish_durable_job(existing, projected))
             break
         _save_job_ledger(data)
+
+
+def record_job_result(
+    job_id,
+    path,
+    *,
+    artifact="",
+    source_result_ids=(),
+    result_id="",
+):
+    """저장된 결과 파일을 실행 중인 공통 Job에 연결한다.
+
+    파일 저장이 끝난 뒤에만 호출하며, 절대경로·토큰·프롬프트는 장부에 넣지 않는다.
+    기존 기능별 progress/manifest는 그대로 유지하는 호환 투영이다.
+    """
+    if not job_id:
+        return None
+    result_path = Path(path)
+    if not result_path.is_file():
+        raise ValueError("결과 파일을 확인할 수 없어 Job에 완료로 기록하지 않았습니다.")
+    content_hash = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    safe_artifact = str(artifact or result_path.name).replace("\\", "/")
+    if Path(safe_artifact).is_absolute() or ".." in Path(safe_artifact).parts:
+        safe_artifact = result_path.name
+    stable_result_id = str(result_id or "").strip()
+    if not stable_result_id:
+        stable_result_id = "result-" + hashlib.sha256(
+            f"{job_id}\0{safe_artifact}\0{content_hash}".encode("utf-8")
+        ).hexdigest()[:32]
+    store = common_job_store()
+    job = store.get(job_id)
+    changed = add_result(
+        job,
+        stable_result_id,
+        artifact=safe_artifact,
+        content_hash=content_hash,
+        source_result_ids=source_result_ids,
+    )
+    store.save(changed)
+    return next(
+        item for item in changed["results"]
+        if item.get("id") == stable_result_id)
+
+
+def link_job_ancestor(job_id, source_job_id):
+    """재개 시 이전 실행 Job을 현재 실행의 부모 계보로만 연결한다."""
+    current = str(job_id or "")
+    source = str(source_job_id or "")
+    if not current or not source or current == source:
+        return None
+    store = common_job_store()
+    job = store.get(current)
+    ancestry = job.setdefault("lineage", {}).setdefault(
+        "source_job_ids", [])
+    if source not in ancestry:
+        ancestry.append(source)
+        store.save(job)
+    return job
 
 
 def job_ledger_summary():
@@ -20602,6 +21278,7 @@ class LiveState:
         self.eta_base_completed = 0
         self.persist_jobs = bool(persist_jobs)
         self.job_id = ""
+        self._blueprint_snapshot = {}
 
     def update(self, **kwargs):
         with self.lock:
@@ -20645,6 +21322,8 @@ class LiveState:
             self.started_at = time.time()
             self.finished_at = 0.0
             self.eta_base_completed = 0
+            self._blueprint_snapshot = copy.deepcopy(
+                blueprint if isinstance(blueprint, dict) else {})
             if self.persist_jobs:
                 self.job_id = start_job_record(
                     self.operation,
@@ -20653,6 +21332,11 @@ class LiveState:
                     payload_identity=payload_identity,
                 )
             return self._owner
+
+    def frozen_blueprint(self):
+        """실행 시작 순간의 토큰 없는 설계도 사본."""
+        with self.lock:
+            return copy.deepcopy(self._blueprint_snapshot)
 
     def release(self, token):
         """소유 토큰이 맞을 때만 running 을 끈다 — 옛 작업이 새 작업 상태를 못 끄게."""
@@ -20872,13 +21556,18 @@ class ConfigServer:
         live = self.live.snapshot()
         if live.get("running") or live.get("phase") not in ("", "idle"):
             try:
+                frozen_blueprint = self.live.frozen_blueprint()
                 active_contracts.append(project_live_state(
                     live,
                     kind=_runtime_kind(
                         live.get("operation"), live.get("retry_mode")),
                     job_id=live.get("job_id") or "",
-                    blueprint=generation_blueprint(
-                        self.cfg, source={"kind": "live-state-projection"}),
+                    blueprint=(
+                        frozen_blueprint or generation_blueprint(
+                            self.cfg,
+                            source={"kind": "live-state-projection-fallback"},
+                        )
+                    ),
                     payload_identity={
                         "operation": live.get("operation"),
                         "seed_key": live.get("seed_key"),
@@ -21041,13 +21730,17 @@ class ConfigServer:
                     img, out_dir / f"{n:04d}.webp",
                     fmt=out_format(job_cfg), clean=_ocargs(job_cfg)[0],
                     max_side=_ocargs(job_cfg)[1], quality=out_clean(job_cfg)[2])
+                rel_saved = saved.resolve().relative_to(
+                    out_root(job_cfg).resolve()).as_posix()
+                record_job_result(
+                    self.live.job_id, saved, artifact=rel_saved)
                 self.live.set_image(img)
                 bump_daily(state)
                 save_state(state)
                 self.live.update(
                     status_text=(
                         "단독 생성 완료 ✓ ("
-                        + saved.resolve().relative_to(out_root(job_cfg).resolve()).as_posix()
+                        + rel_saved
                         + ")"
                     ),
                     completed=1, phase="completed")
@@ -21067,7 +21760,8 @@ class ConfigServer:
         body: {image: dataURL, mask: dataURL|없음, strength, noise, seed}"""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        cfg = self.cfg
+        with self.config_lock:
+            cfg = copy.deepcopy(self.cfg)
         if not cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         try:
@@ -21178,9 +21872,19 @@ class ConfigServer:
                     pace_complete()
                 out_dir = out_sub(job_cfg, "캐릭터 변형" if variation_id else mode)
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(job_cfg),
-                               clean=_ocargs(job_cfg)[0], max_side=_ocargs(job_cfg)[1],
-                               quality=out_clean(job_cfg)[2])
+                frozen = self.live.frozen_blueprint()
+                img.nai_blueprint_fingerprint = str(
+                    (frozen or {}).get("fingerprint") or "")
+                saved = save_with_meta(
+                    img, out_dir / f"{n:04d}.webp", fmt=out_format(job_cfg),
+                    clean=_ocargs(job_cfg)[0], max_side=_ocargs(job_cfg)[1],
+                    quality=out_clean(job_cfg)[2])
+                record_job_result(
+                    self.live.job_id,
+                    saved,
+                    artifact=saved.resolve().relative_to(
+                        out_root(job_cfg).resolve()).as_posix(),
+                )
                 self.live.set_image(img)
                 st = load_state(); bump_daily(st); save_state(st)
                 self.live.update(
@@ -21284,6 +21988,8 @@ class ConfigServer:
                         "model": model_id_from_metadata(
                             meta_model, cfg.get("model") or "nai-diffusion-4-5-full"),
                         "use_coords": bool(v4.get("use_coords")),
+                        "position_mode": normalize_position_mode(
+                            "", bool(v4.get("use_coords"))),
                         "char_centers": [{"x": float(c.get("x", 0.5)), "y": float(c.get("y", 0.5))}
                                          for c in ctrs],
                         "smea": bool(raw.get("sm")), "smea_dyn": bool(raw.get("sm_dyn")),
@@ -21326,9 +22032,19 @@ class ConfigServer:
                             last_error=str(e))
                         continue
                     tag = "_i2i" if mode == "img2img" else ""
-                    save_with_meta(img, out_dir / f"{f.stem}{tag}.webp",
-                                   fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-                                   max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                    frozen = self.live.frozen_blueprint()
+                    img.nai_blueprint_fingerprint = str(
+                        (frozen or {}).get("fingerprint") or "")
+                    saved = save_with_meta(
+                        img, out_dir / f"{f.stem}{tag}.webp",
+                        fmt=out_format(cfg), clean=_ocargs(cfg)[0],
+                        max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                    record_job_result(
+                        self.live.job_id,
+                        saved,
+                        artifact=saved.resolve().relative_to(
+                            out_root(cfg).resolve()).as_posix(),
+                    )
                     self.live.set_image(img)
                     bump_daily(state); save_state(state)
                     done += 1
@@ -21360,7 +22076,8 @@ class ConfigServer:
         세팅 배치와 별개의 가벼운 경로다 (세팅 상태를 건드리지 않는다)."""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        cfg = self.cfg
+        with self.config_lock:
+            cfg = copy.deepcopy(self.cfg)
         if not cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         jobs = scene_mode_pending(cfg)
@@ -21368,14 +22085,15 @@ class ConfigServer:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
+        run_blueprint = generation_blueprint(
+            cfg,
+            source={"kind": "scene-run"},
+            setting={"name": "씬 모드", "steps": copy.deepcopy(jobs)},
+        )
         tok = self.live.try_claim(
             "씬 모드",
             "settings",
-            blueprint=generation_blueprint(
-                cfg,
-                source={"kind": "scene-run"},
-                setting={"name": "씬 모드", "steps": copy.deepcopy(jobs)},
-            ),
+            blueprint=run_blueprint,
             payload_identity={"kind": "setting", "jobs": len(jobs)},
         )
         if tok is None:
@@ -21393,15 +22111,76 @@ class ConfigServer:
                 state["seeds"][seed_key] = random.randint(0, 2**32 - 1)
                 save_state(state)
             base_seed = state["seeds"][seed_key]
+            run_fingerprint = hashlib.sha256(
+                f"{run_blueprint['fingerprint']}\0{base_seed}".encode("utf-8")
+            ).hexdigest()
+            scene_progress = state.setdefault(
+                "scene_progress", {}).setdefault(run_fingerprint, {})
             style = (cfg.get("base_prompt") or "").strip()
-            done = 0
+            valid_cells = {}
+            lineage_failures = 0
+            for i, (scene, copy_no) in enumerate(jobs, 1):
+                scene_id = _safe_name(
+                    str(scene.get("id") or f"scene-{i}"))
+                cell_fingerprint = hashlib.sha256(
+                    f"{run_fingerprint}\0{scene_id}\0{copy_no}"
+                    .encode("utf-8")
+                ).hexdigest()
+                cell_id = f"{scene_id}:{int(copy_no)}"
+                record = scene_progress.get(cell_id)
+                if not isinstance(record, dict):
+                    continue
+                path = progress_record_path(record, cfg)
+                try:
+                    valid = (
+                        record.get("fingerprint") == cell_fingerprint
+                        and path is not None
+                        and path.is_file()
+                        and path.stat().st_size == int(record.get("bytes", -1))
+                        and hashlib.sha256(path.read_bytes()).hexdigest()
+                        == str(record.get("content_sha256") or "")
+                    )
+                except (OSError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    continue
+                valid_cells[cell_id] = record
+                try:
+                    record_job_result(
+                        self.live.job_id,
+                        path,
+                        artifact=str(record.get("path") or ""),
+                        result_id="result-scene-" + cell_fingerprint[:24],
+                    )
+                except Exception as error:
+                    log.warning("검증된 씬 결과의 Job 계보 연결 실패: %s", error)
+                    lineage_failures += 1
+            done = len(valid_cells)
             failed = 0
             blocked = False
-            self.live.update(total=len(jobs), index=0, char_name="씬 모드")
+            self.live.update(
+                total=len(jobs), index=done, completed=done,
+                eta_base_completed=done, char_name="씬 모드")
             try:
                 for i, (sc, copy) in enumerate(jobs, 1):
                     if self.live.stop_req:
                         break
+                    scene_id = _safe_name(
+                        str(sc.get("id") or f"scene-{i}"))
+                    cell_fingerprint = hashlib.sha256(
+                        f"{run_fingerprint}\0{scene_id}\0{copy}"
+                        .encode("utf-8")
+                    ).hexdigest()
+                    cell_id = f"{scene_id}:{int(copy)}"
+                    if cell_id in valid_cells:
+                        self.live.update(
+                            index=i,
+                            completed=done,
+                            filename=Path(str(
+                                valid_cells[cell_id].get("path") or "")).name,
+                            status_text="확인된 완료 장면 건너뜀",
+                        )
+                        continue
                     okp, why = pace_gate(cfg, self.live, "씬")   # 밴 예방 (CQA-013)
                     if not okp:
                         self.live.update(status_text=why)
@@ -21409,7 +22188,6 @@ class ConfigServer:
                         break
                     suffix = "" if copy == 1 else f"_{copy}벌"
                     seed = seed_for(cfg, base_seed, i + (copy - 1) * 100003)
-                    scene_id = _safe_name(str(sc.get("id") or f"scene-{i}"))
                     stem = f"{scene_id}_{_safe_name(sc['name'])}_seed{seed}{suffix}"
                     target = available_output_path(out_dir / f"{stem}.webp", out_format(cfg))
                     fname = target.name
@@ -21426,16 +22204,8 @@ class ConfigServer:
                     extra = [{"prompt": sc[k], "negative": sc.get(k + "_neg", "")}
                              for k in ("char1", "char2") if (sc.get(k) or "").strip()]
                     people, ctrs = active_people(slots, cfg.get("char_centers"), extra)
-                    # 인물이 둘 이상이면 좌표를 켜고 고르게 벌린다 (공홈과 같은 동작).
-                    # 안 그러면 NAI 가 몸을 붙여 그린다.
-                    if len(people) > 1 and not cfg.get("use_coords"):
-                        cfg["use_coords"] = True
-                        log.info(f"씬에 인물이 {len(people)}명이라 캐릭터 좌표를 켰습니다")
-                    # 좌표가 없거나 겹치면 고르게 다시 벌린다
-                    if len(people) > 1:
-                        pts = {(c.get("x"), c.get("y")) for c in ctrs}
-                        if len(pts) < len(people):
-                            ctrs = spread_centers(len(people))
+                    # 위치 방식은 사용자가 고른 AI 자동/위치판/좌표를 그대로 따른다.
+                    # 인물이 늘었다는 이유로 좌표를 켜거나 값을 다시 배치하지 않는다.
                     try:
                         try:
                             img = call_nai_api(
@@ -21459,12 +22229,49 @@ class ConfigServer:
                             status_text=f"'{sc['name']}' 실패: {e}", failed=failed,
                             last_error=str(e))
                         continue
+                    frozen = self.live.frozen_blueprint()
+                    img.nai_blueprint_fingerprint = str(
+                        (frozen or {}).get("fingerprint") or "")
                     saved_path = save_with_meta(img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                                                 max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
                     self.live.update(filename=saved_path.name)
                     self.live.set_image(img)
                     bump_daily(state)
-                    save_state(state)
+                    rel_saved = saved_path.resolve().relative_to(
+                        out_root(cfg).resolve()).as_posix()
+                    scene_progress[cell_id] = {
+                        "scene": scene_id,
+                        "copy": int(copy),
+                        "path": rel_saved,
+                        "bytes": saved_path.stat().st_size,
+                        "content_sha256": hashlib.sha256(
+                            saved_path.read_bytes()).hexdigest(),
+                        "fingerprint": cell_fingerprint,
+                    }
+                    # 유료 생성은 이미 끝났다. 재개 기록을 먼저 남기고 Job 계보는
+                    # 별도로 연결해, 계보 저장 실패가 같은 장의 유료 재호출로
+                    # 이어지지 않게 한다.
+                    try:
+                        save_state(state)
+                    except Exception as error:
+                        lineage_failures += 1
+                        log.warning(
+                            "씬 결과는 저장했지만 재개 장부 저장에 실패: %s",
+                            error,
+                        )
+                    try:
+                        record_job_result(
+                            self.live.job_id,
+                            saved_path,
+                            artifact=rel_saved,
+                            result_id="result-scene-" + cell_fingerprint[:24],
+                        )
+                    except Exception as error:
+                        lineage_failures += 1
+                        log.warning(
+                            "씬 결과는 저장했지만 Job 계보 연결에 실패: %s",
+                            error,
+                        )
                     done += 1
                     self.live.update(
                         completed=done, index=i, daily=daily_count(state))
@@ -21477,12 +22284,21 @@ class ConfigServer:
                 elif failed:
                     phase = "partial"
                     text = f"씬 모드 일부 완료 — 성공 {done} · 실패 {failed}"
+                elif lineage_failures:
+                    phase = "partial"
+                    text = (
+                        "씬 이미지는 저장했지만 작업 계보·재개 장부 "
+                        f"{lineage_failures}건을 확인해야 합니다."
+                    )
                 else:
                     phase = "completed"
                     text = f"씬 모드 완료 ✓ {done}/{len(jobs)}장 (output/씬/)"
                 self.live.update(
-                    status_text=text, completed=done, failed=failed, phase=phase,
-                    can_retry=bool(failed or blocked or self.live.stop_req))
+                    status_text=text, completed=done,
+                    failed=max(failed, lineage_failures), phase=phase,
+                    can_retry=bool(
+                        failed or lineage_failures or blocked
+                        or self.live.stop_req))
             finally:
                 cfg.pop("_frag_counters", None)
                 self.live.release(tok)
@@ -22044,6 +22860,7 @@ class ConfigServer:
 
     def handle_director(self, body, tool, prompt="", defry="0", scale="4", filename=""):
         """디렉터 툴 실행 → 결과를 output/디렉터/ 에 저장하고 미리보기에 띄운다."""
+        tok = None
         try:
             if not body:
                 return {"ok": False, "error": "이미지가 비어 있습니다."}
@@ -22053,6 +22870,24 @@ class ConfigServer:
             names = {t for t, _, _ in DIRECTOR_TOOLS} | {"upscale"}
             if tool not in names:
                 return {"ok": False, "error": f"알 수 없는 도구: {tool}"}
+            tok = self.live.try_claim(
+                f"디렉터 · {tool}",
+                "director",
+                blueprint=generation_blueprint(
+                    self.cfg,
+                    source={"kind": "director", "tool": tool},
+                ),
+                payload_identity={
+                    "kind": "director",
+                    "tool": tool,
+                    "input_sha256": hashlib.sha256(body).hexdigest(),
+                },
+            )
+            if tok is None:
+                return {"ok": False, "error": "이미 다른 NAI 작업이 실행 중입니다."}
+            self.live.update(
+                status_text=f"디렉터 · {tool} 처리 중...",
+                char_name=f"디렉터 · {tool}", index=1, total=1)
 
             if tool == "upscale":
                 out = call_upscale(token, body, int(scale or 4))
@@ -22080,15 +22915,29 @@ class ConfigServer:
                 converted = img.convert("RGB")
                 _atomic_save_image(
                     p, lambda tmp: converted.save(tmp, "WEBP", quality=95))
+            record_job_result(
+                self.live.job_id,
+                p,
+                artifact=p.resolve().relative_to(
+                    out_root(self.cfg).resolve()).as_posix(),
+            )
             self.live.set_image(img.convert("RGB"))
             self.live.update(filename=p.name, char_name=f"디렉터 · {tool}",
-                             status_text="디렉터 툴 완료")
+                             status_text="디렉터 툴 완료", completed=1,
+                             phase="completed")
             log.info(f"디렉터 {tool} → {p.name} ({img.width}×{img.height})")
             return {"ok": True, "tool": tool, "file": p.name,
                     "path": str(p), "width": img.width, "height": img.height}
         except Exception as e:
             log.warning(f"디렉터 툴 실패: {traceback.format_exc()}")
+            if tok is not None:
+                self.live.update(
+                    status_text=f"디렉터 툴 실패: {e}", failed=1,
+                    last_error=str(e), can_retry=True, phase="failed")
             return {"ok": False, "error": str(e)}
+        finally:
+            if tok is not None:
+                self.live.release(tok)
 
     @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_norm_save(self, body):
@@ -22433,6 +23282,16 @@ class ConfigServer:
                         self._json(metadata_audit_status(
                             found_offset=int(q.get("offset", ["0"])[0]),
                             found_limit=int(q.get("limit", ["50"])[0]),
+                        ))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/folder_inventory"):
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    try:
+                        self._json(folder_inventory_page(
+                            q.get("offset", ["0"])[0],
+                            q.get("limit", ["50"])[0],
                         ))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
@@ -22910,6 +23769,11 @@ class ConfigServer:
                         self._json(metadata_audit_candidate(body))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/metadata_audit_save"):
+                    try:
+                        self._json(metadata_audit_save_candidate(body))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/restoration_batch"):
                     try:
                         data = json.loads(body or b"{}")
@@ -23009,11 +23873,14 @@ class ConfigServer:
                             used_members = (
                                 cast_members if scene_state.get("cast_mode") == "together"
                                 else cast_members[:1])
-                            cast = character_run_from_group(used_members)
+                            cast = character_run_from_group(
+                                used_members,
+                                position_mode=scene_state.get("position_mode"))
                         if cast is None:
                             slots = [s for s in (cfg.get("char_slots") or [])
                                      if slot_prompt(s).strip()]
-                            cast = (character_run_from_group(slots)
+                            cast = (character_run_from_group(
+                                slots, position_mode=cfg.get("position_mode"))
                                     if slots else {"name": "(캐릭터 없음)", "female": "", "negative": ""})
                         base, fem, male, cneg, mneg, w, h = build_scene(acfg, cast, cfg, num)
                         _, scene_ref_override, scene_ref_names = \
@@ -23664,17 +24531,23 @@ def progress_item_key(item):
     except (KeyError, TypeError, ValueError):
         return None
 
+
+def progress_record_path(record, cfg):
+    value = record.get("path") if isinstance(record, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else out_root(cfg).resolve() / path
+
+
 def progress_record_valid(record, cfg, expected_fingerprint):
     if not isinstance(record, dict):
         return False
     if record.get("fingerprint") != expected_fingerprint:
         return False
-    value = record.get("path")
-    if not isinstance(value, str) or not value.strip():
+    path = progress_record_path(record, cfg)
+    if path is None:
         return False
-    path = Path(value)
-    if not path.is_absolute():
-        path = out_root(cfg).resolve() / path
     try:
         return (path.is_file() and path.stat().st_size > 0
                 and path.stat().st_size == int(record.get("bytes", -1)))
@@ -23746,7 +24619,8 @@ def compute_pending(cfg, acfg, done_this_run, skip_set):
         else:
             runs = [(slots, None)] if slots else []
         for i, (group, identity) in enumerate(runs):
-            char = character_run_from_group(group, i)
+            char = character_run_from_group(
+                group, i, scene_setting_state.get("position_mode"))
             cid = _safe_name(char["name"]).lower() or f"char{i+1}"
             if identity is not None:
                 digest = zlib.crc32(identity.encode("utf-8")) & 0xffffffff
@@ -24370,15 +25244,51 @@ def _comparison_progress_start(cfg, plan, styles, chars):
     root = out_root(cfg).resolve()
     signature = comparison_signature(cfg, plan, styles, chars)
     old = _comparison_progress_load()
-    resumable = (old.get("signature") == signature
-                 and old.get("status") not in ("complete",)
-                 and isinstance(old.get("completed"), dict))
+    same_plan = (
+        old.get("signature") == signature
+        and isinstance(old.get("completed"), dict)
+    )
     folder = None
-    if resumable:
+    old_has_invalid_result = False
+    if same_plan:
         rel = str(old.get("folder") or "")
         candidate = (root / rel).resolve()
         if (_path_is_inside(candidate, root) and candidate.is_dir()):
             folder = candidate
+            for record in old["completed"].values():
+                rel_result = (
+                    record.get("file") if isinstance(record, dict) else record
+                )
+                result_path = output_file_for_preview(cfg, rel_result)
+                valid = (
+                    result_path is not None
+                    and result_path.is_file()
+                    and result_path.stat().st_size > 0
+                )
+                expected_hash = (
+                    str(record.get("content_sha256") or "")
+                    if isinstance(record, dict) else ""
+                )
+                if valid and expected_hash:
+                    try:
+                        valid = (
+                            hashlib.sha256(result_path.read_bytes()).hexdigest()
+                            == expected_hash
+                        )
+                    except OSError:
+                        valid = False
+                if not valid:
+                    old_has_invalid_result = True
+                    break
+    resumable = (
+        folder is not None
+        and (
+            old.get("status") not in ("complete",)
+            or old_has_invalid_result
+        )
+    )
+    if not resumable:
+        folder = None
     if folder is None:
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
         folder = out_sub(cfg, "비교생성") / run_id
@@ -24415,7 +25325,17 @@ def _comparison_progress_start(cfg, plan, styles, chars):
     for key, rec in list(completed.items()):
         rel = rec.get("file") if isinstance(rec, dict) else rec
         path = output_file_for_preview(cfg, rel)
-        if path is None or not path.is_file() or path.stat().st_size <= 0:
+        valid = path is not None and path.is_file() and path.stat().st_size > 0
+        expected_hash = (
+            str(rec.get("content_sha256") or "")
+            if isinstance(rec, dict) else ""
+        )
+        if valid and expected_hash:
+            try:
+                valid = hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash
+            except OSError:
+                valid = False
+        if not valid:
             completed.pop(key, None)
     _comparison_progress_save(progress, folder)
     return progress, folder
@@ -24549,12 +25469,17 @@ def _rerun_selected_comparison(server, cfg, rel):
         else f"{job['index']:06d}_selected")
     target = available_output_path(
         folder / f"{stem}_rerun{attempt}.webp", out_format(cfg))
+    image.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
     saved = save_with_meta(
         image, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
         max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
     server.live.set_image(image)
     root = out_root(cfg).resolve()
     rel_saved = saved.resolve().relative_to(root).as_posix()
+    record_job_result(
+        server.live.job_id, saved, artifact=rel_saved,
+        source_result_ids=[source_key],
+    )
     rerun_key = f"{source_key}:rerun:{attempt}:{uuid.uuid4().hex[:8]}"
     record = copy.deepcopy(source)
     record.update({
@@ -24587,7 +25512,48 @@ def _rerun_selected_comparison(server, cfg, rel):
 def _run_comparison(server, cfg, plan, styles, chars):
     """자료 비교 큐. 한 번에 한 요청만 보내고 중지·일일 상한·재개를 모두 지킨다."""
     progress, folder = _comparison_progress_start(cfg, plan, styles, chars)
+    previous_job_id = str(progress.get("job_id") or "")
+    # 실행권을 잡을 때 만든 durable Job과 비교 manifest가 같은 작업을 가리킨다.
+    # 옛 manifest에는 이 필드가 없으므로 새 실행에서만 보강하고 결과는 건드리지 않는다.
+    if server.live.job_id and progress.get("job_id") != server.live.job_id:
+        if previous_job_id:
+            try:
+                link_job_ancestor(server.live.job_id, previous_job_id)
+            except Exception as error:
+                log.warning("이전 비교 Job 계보 연결 실패: %s", error)
+        attempts = progress.setdefault("attempt_job_ids", [])
+        for identifier in (previous_job_id, server.live.job_id):
+            if identifier and identifier not in attempts:
+                attempts.append(identifier)
+        progress["job_id"] = server.live.job_id
+        progress["request_id"] = server.live.job_id
+        _comparison_progress_save(progress, folder)
     completed = progress["completed"]
+    lineage_errors = progress.setdefault("lineage_errors", {})
+    if server.live.job_id:
+        for key, record in completed.items():
+            if not isinstance(record, dict):
+                continue
+            path = output_file_for_preview(cfg, record.get("file"))
+            if path is None:
+                continue
+            try:
+                record_job_result(
+                    server.live.job_id,
+                    path,
+                    artifact=str(record.get("file") or ""),
+                    result_id=(
+                        "result-comparison-"
+                        + hashlib.sha256(
+                            f"{key}\0{record.get('blueprint_fingerprint') or ''}"
+                            .encode("utf-8")
+                        ).hexdigest()[:24]
+                    ),
+                )
+                lineage_errors.pop(str(key), None)
+            except Exception as error:
+                log.warning("검증된 비교 결과의 Job 계보 연결 실패: %s", error)
+                lineage_errors[str(key)] = redact_diagnostic_text(error)
     errors = progress.setdefault("errors", {})
     options = plan["options"]
     token = cfg["token"]
@@ -24713,12 +25679,32 @@ def _run_comparison(server, cfg, plan, styles, chars):
                         seed=seed, params=with_centers(params, centers))
                 finally:
                     pace_complete()
+                img.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
                 saved = save_with_meta(
                     img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                     max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-                img.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
                 server.live.set_image(img)
                 rel = saved.resolve().relative_to(out_root(cfg).resolve()).as_posix()
+                try:
+                    record_job_result(
+                        server.live.job_id,
+                        saved,
+                        artifact=rel,
+                        result_id=(
+                            "result-comparison-"
+                            + hashlib.sha256(
+                                f"{key}\0{execution_blueprint['fingerprint']}"
+                                .encode("utf-8")
+                            ).hexdigest()[:24]
+                        ),
+                    )
+                    lineage_errors.pop(str(key), None)
+                except Exception as error:
+                    lineage_errors[str(key)] = redact_diagnostic_text(error)
+                    log.warning(
+                        "비교 결과는 저장했지만 Job 계보 연결에 실패: %s",
+                        error,
+                    )
                 completed[key] = {
                     "index": job["index"], "file": rel,
                     "style": style_label, "character": char_label,
@@ -24772,9 +25758,23 @@ def _run_comparison(server, cfg, plan, styles, chars):
                         }
                 errors.pop(key, None)
                 bump_daily(state)
-                save_state(state)
+                try:
+                    save_state(state)
+                except Exception as error:
+                    lineage_errors[str(key)] = redact_diagnostic_text(error)
+                    log.warning(
+                        "비교 결과는 저장했지만 생성량 장부 저장에 실패: %s",
+                        error,
+                    )
                 progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                _comparison_progress_save(progress, folder)
+                try:
+                    _comparison_progress_save(progress, folder)
+                except Exception as error:
+                    lineage_errors[str(key)] = redact_diagnostic_text(error)
+                    log.warning(
+                        "비교 결과는 저장했지만 재개 manifest 저장에 실패: %s",
+                        error,
+                    )
                 server.live.update(
                     daily=daily_count(state),
                     completed=len(completed),
@@ -24835,6 +25835,8 @@ def _run_comparison(server, cfg, plan, styles, chars):
             if fatal or final_status in ("stopped", "daily_limit"):
                 break
 
+    if final_status == "complete" and lineage_errors:
+        final_status = "partial"
     if final_status == "complete" and len(completed) < plan["count"]:
         final_status = "partial" if errors else "stopped"
     progress["status"] = final_status
@@ -25011,7 +26013,9 @@ def _run_generation(server, cfg_snapshot=None):
             records[key] = item
 
     done_this_run = {}
+    verified_records = []
     invalid_records = 0
+    lineage_failures = 0
     candidates = compute_pending(cfg, acfg, {}, set())
     for char, cid, num, copy_num in candidates:
         record = records.get((cid, num, copy_num))
@@ -25021,16 +26025,40 @@ def _run_generation(server, cfg_snapshot=None):
             context_fingerprint, char, cid, num, copy_num)
         if progress_record_valid(record, cfg, fingerprint):
             done_this_run.setdefault(cid, set()).add((num, copy_num))
+            verified_records.append(
+                (str(cid), int(num), int(copy_num), record, fingerprint))
         else:
             invalid_records += 1
-    if done_this_run:
-        n_done = sum(len(v) for v in done_this_run.values())
+    n_done = sum(len(v) for v in done_this_run.values())
+    if n_done:
         log.info(f"회차 {seed_key}의 파일·설정이 일치하는 완료 {n_done}장을 건너뜁니다.")
+        for cid, num, copy_num, record, fingerprint in verified_records:
+            try:
+                record_job_result(
+                    server.live.job_id,
+                    progress_record_path(record, cfg),
+                    artifact=str(record.get("path") or ""),
+                    result_id=(
+                        "result-setting-"
+                        + hashlib.sha256(
+                            f"{seed_key}\0{cid}\0{num}\0{copy_num}\0"
+                            f"{fingerprint}".encode("utf-8")
+                        ).hexdigest()[:24]
+                    ),
+                )
+            except Exception as error:
+                log.warning("검증된 세팅 결과의 Job 계보 연결 실패: %s", error)
+                lineage_failures += 1
     if legacy_records or invalid_records:
         log.warning("재개 기록 중 파일 또는 설정 근거가 없는 %d건은 다시 생성합니다.",
                     legacy_records + invalid_records)
     skip_set = set()   # 이번 실행에서 계속 실패해 건너뛴 작업 (재실행하면 다시 시도)
-    completed = 0
+    completed = n_done
+    server.live.update(
+        completed=completed,
+        eta_base_completed=completed,
+        total=max(len(candidates), completed),
+    )
 
     while True:
         if server.live.stop_req:   # /api/stop — 장 경계에서 멈춘다 (실행권은 finally 가 푼다)
@@ -25136,10 +26164,10 @@ def _run_generation(server, cfg_snapshot=None):
                 # 만든다. 씬 전용 위치가 있으면 전역 위치보다 우선한다.
                 people, centers, use_positions = setting_scene_people(
                     scene, female, male, char_neg, male_neg, char, cfg)
-                scene_params = dict(params)
+                scene_params = with_position_mode(
+                    params, char.get("position_mode"), use_positions)
                 if use_positions:
                     scene_params = with_centers(scene_params, centers)
-                    scene_params["use_coords"] = True
                 try:
                     img = call_nai_api(token, base_p, "", "", neg_now, w, h,
                                        chars=people,
@@ -25148,9 +26176,34 @@ def _run_generation(server, cfg_snapshot=None):
                                        seed=seed, variety=variety, params=scene_params)
                 finally:
                     pace_complete()
+                frozen = server.live.frozen_blueprint()
+                img.nai_blueprint_fingerprint = str(
+                    (frozen or {}).get("fingerprint") or "")
                 saved_path = save_with_meta(
                     img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                     max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                fingerprint = generation_task_fingerprint(
+                    context_fingerprint, char, cid, num, copy_num)
+                try:
+                    record_job_result(
+                        server.live.job_id,
+                        saved_path,
+                        artifact=saved_path.resolve().relative_to(
+                            out_root(cfg).resolve()).as_posix(),
+                        result_id=(
+                            "result-setting-"
+                            + hashlib.sha256(
+                                f"{seed_key}\0{cid}\0{num}\0{copy_num}\0"
+                                f"{fingerprint}".encode("utf-8")
+                            ).hexdigest()[:24]
+                        ),
+                    )
+                except Exception as error:
+                    lineage_failures += 1
+                    log.warning(
+                        "세팅 결과는 저장했지만 Job 계보 연결에 실패: %s",
+                        error,
+                    )
                 server.live.set_image(img)
                 ok = True
                 break
@@ -25197,8 +26250,6 @@ def _run_generation(server, cfg_snapshot=None):
 
         if ok:
             done_this_run.setdefault(cid, set()).add((num, copy_num))
-            fingerprint = generation_task_fingerprint(
-                context_fingerprint, char, cid, num, copy_num)
             record = make_progress_record(
                 cfg, num, copy_num, saved_path, fingerprint)
             rec = state["progress"].setdefault(seed_key, {}).setdefault(cid, [])
@@ -25213,12 +26264,29 @@ def _run_generation(server, cfg_snapshot=None):
                 daily=daily_count(state), completed=completed,
                 failed=len(skip_set))
             # 매 장 저장한다 — 중지·강제 종료 후 재개가 정확해야 하고 파일은 몇 KB 다
-            save_state(state)
+            try:
+                save_state(state)
+            except Exception as error:
+                lineage_failures += 1
+                log.warning(
+                    "세팅 결과는 저장했지만 재개 장부 저장에 실패: %s",
+                    error,
+                )
         else:
             skip_set.add((cid, num, copy_num))
             server.live.update(
                 status_text=f"실패 — 건너뜀: {fname}",
                 failed=len(skip_set), can_retry=True)
+
+    if lineage_failures:
+        server.live.update(
+            failed=max(server.live.failed, lineage_failures),
+            status_text=(
+                "이미지는 저장했지만 작업 계보·재개 장부 일부를 확인해야 합니다."
+            ),
+            phase="partial",
+            can_retry=True,
+        )
 
 
 if __name__ == "__main__":
