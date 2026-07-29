@@ -45,7 +45,7 @@ NAIS3-Custom = C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세�
 nais_blue = C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세계 미아 작업\참고\nais_blue | https://github.com/JaCha00/nais_blue
 NAIS3-MM 보관본 = C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세계 미아 작업\참고\NAIS3-MM-1.1.1.0 | 공개 저장소 없음
 NAIS3-MM 설치본 = C:\Users\82108\AppData\Local\Programs\NAIS3-MM | 공개 저장소 없음
-NAIA 2.0 = 로컬 사본 없음 | https://github.com/DNT-LAB/NAIA2.0/releases
+NAIA 2.0 = C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세계 미아 작업\참고\NAIA2.0 | https://github.com/DNT-LAB/NAIA2.0/releases
 
 [빌더·평가·데스크톱]
 SDStudio = C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세계 미아 작업\참고\SDStudio | https://github.com/Dd154663/SDStudio

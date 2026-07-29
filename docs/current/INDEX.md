@@ -14,7 +14,7 @@
    - [LIVE_NAI_VERIFICATION_2026-07-29.md](LIVE_NAI_VERIFICATION_2026-07-29.md)
 6. **작업 파일·비교 프로그램 위치**
    - [WORKSPACE_AND_REFERENCES.md](WORKSPACE_AND_REFERENCES.md)
-7. **최종 빌드 뒤 Claude push 절차**
+7. **공개 저장소 문서·파일 정리와 Claude push 절차**
    - [CLAUDE_PUSH_HANDOFF.md](CLAUDE_PUSH_HANDOFF.md)
 
 ## 역사 자료
