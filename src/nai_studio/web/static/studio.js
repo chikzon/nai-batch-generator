@@ -5,7 +5,8 @@ let FRAGS = {};
 const RES_PRESETS = window.NAI_STUDIO_BOOTSTRAP.resolutions;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
 
 function genId(){ return Math.random().toString(36).slice(2,10); }
-function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return String(s||'').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function escA(s){ return esc(s).replace(/"/g,'&quot;'); }
 function $(id){ return document.getElementById(id); }
 
@@ -166,7 +167,10 @@ async function reloadConfig(){
   const d = await (await fetch('/api/config')).json();
   SETTINGS = d.settings || [];
   CLASHES = d.scene_clashes || {};
-  renderSettings(); tokens(); counts(); sbPickList(); paintClash();
+  if(ACTIVE_MODES.has('settings')){
+    renderSettings(); sbPickList(); paintClash();
+  }
+  tokens(); counts();
   if($('setThumbs') && $('setThumbs').checked) loadSetThumbs();
 }
 
@@ -185,13 +189,10 @@ function paint(){
   $('pSched').value = STATE.scheduler || 'karras';
   $('pVariety').value = STATE.variety ? 'on' : 'off';
   paintParams();
-  renderPresets(); renderSlots(); renderSettings(); renderLibrary(); renderScenePresets();
-  bindComparison(); bindUserBackup(); bindTrashCenter(); bindLocalImageIntegrity();
-  renderFrags(); renderScenes(); applySplit3(); paintPace(); acScan(document);
-  sbPickList(); paintClash();
-  if($('expGrid')) expLoad('');
+  renderPresets(); renderSlots();
+  renderFrags(); applySplit3(); paintPace(); acScan(document);
   bindWelcome(); refreshWelcome();
-  setupHL(); bindHLToggle(); bindDirector(); bindRefs(); bindUseCoords(); bindBooru();
+  setupHL(); bindHLToggle(); bindDirector(); bindRefs(); bindUseCoords();
   if(!$('anlasBal')._bound){
     $('anlasBal')._bound = true;
     $('anlasBal').addEventListener('click', () => anlasRefresh(true));
@@ -203,7 +204,6 @@ function paint(){
   /* 레시피 6,388건은 자료 탭에서 그 영역을 실제로 볼 때 읽는다.
      첫 화면에서 미리 읽고 이미지 60장을 예열하면, 사용자가 먼저 누른
      작가 조합 빌더와 디스크·네트워크 작업이 겹쳐 화면이 멈춘다. */
-  bindRecipes();
   applyUI(); renderUIChips();
   if($('notifySound')) $('notifySound').checked = !!(STATE.ui||{}).notify_sound;
   if($('notifySystem')) $('notifySystem').checked = !!(STATE.ui||{}).notify_system;
@@ -2098,7 +2098,24 @@ const MODE_CONTEXT = {
   builder: ['04 · 빌더', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
   system: ['05 · 관리', '관리', '작업 큐, 출력, 백업·복구와 앱 환경을 관리합니다.'],
 };
+const ACTIVE_MODES = new Set(['preview']);
+function activateMode(mode){
+  if(ACTIVE_MODES.has(mode)) return;
+  ACTIVE_MODES.add(mode);
+  if(mode === 'settings'){
+    renderSettings(); renderScenePresets(); renderScenes();
+    sbPickList(); paintClash(); bindComparison();
+  }else if(mode === 'library'){
+    renderLibrary(); bindBooru(); bindRecipes();
+    if($('expGrid')) expLoad('');
+  }else if(mode === 'builder'){
+    renderScenes();
+  }else if(mode === 'system'){
+    bindUserBackup(); bindTrashCenter(); bindLocalImageIntegrity();
+  }
+}
 function setMode(m){
+  activateMode(m);
   document.body.dataset.mode = m;
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   ['preview','settings','builder','library','system'].forEach(x =>
@@ -3674,7 +3691,7 @@ const EXP_CHUNK = 120;
 let EXP = {dir:'', files:[], dirs:[], total:0, loading:false,
   loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1,
   folders:{}, ranks:{}, ratings:{}, elo:{}, elo_matches:{}, tags:{},
-  memos:{}, review_states:{}};
+  memos:{}, review_states:{}, moreObserver:null};
 function expListUrl(dir, offset=0){
   const q = new URLSearchParams({
     dir: dir ?? EXP.dir, limit: String(EXP_CHUNK), offset: String(offset)
@@ -3761,6 +3778,10 @@ function expPaintGroups(){
   select.value = names.includes(before) ? before : '';
 }
 function expDraw(){
+  if(EXP.moreObserver){
+    EXP.moreObserver.disconnect();
+    EXP.moreObserver = null;
+  }
   const dh = $('expDirs'); dh.innerHTML = '';
   EXP.dirs.forEach(d => {
     const b = document.createElement('button');
@@ -3816,11 +3837,12 @@ function expChunk(){
     more.addEventListener('click', () =>
       EXP.shown < (EXP.vis || []).length ? expChunk() : expFetchMore());
     /* 화면에 가까워지면 자동 로딩 — 탭이 숨어 있으면 안 돌므로 안전하다 */
-    new IntersectionObserver(es => es.forEach(e => {
+    EXP.moreObserver = new IntersectionObserver(es => es.forEach(e => {
       if(!e.isIntersecting) return;
       if(EXP.shown < (EXP.vis || []).length) expChunk();
       else if(EXP.files.length < EXP.total) expFetchMore();
-    }), {rootMargin: '600px'}).observe(more);
+    }), {rootMargin: '600px'});
+    EXP.moreObserver.observe(more);
   }
   g.appendChild(more);   // 항상 그리드 맨 끝
   more.textContent = `더 보기 (${Math.max(0, EXP.total - EXP.shown)}장 남음)`;
@@ -5258,9 +5280,6 @@ $('setExport').addEventListener('click', () => {
 /* ── 자료팩 넣기 ───────────────────────────────────────────────────
    배포본에 수집물을 넣지 않으므로 여기로 받는다. 서버가 합쳐 주고(덮어쓰지 않음)
    무엇이 몇 건 들어왔는지 그대로 보여 준다. */
-function esc(s){ return String(s).replace(/[&<>"]/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
 /* 가져온 기록 — 넣고 나서 정리하려면 '이번에 무엇이 들어왔나' 를 볼 수 있어야 한다.
    되돌리기는 **그때 새로 들어온 것만** 뺀다 (원래 갖고 있던 자료는 안 건드린다). */
 function renderPackLog(log){
@@ -8315,10 +8334,6 @@ async function poll(){
   setTimeout(poll, 1400);
 }
 
-init();
-bindLatestResultActions();
-poll();
-
 /* ── 왼쪽 패널 폭 드래그 조절 — 브라우저별 취향이라 localStorage 에 저장 ── */
 (function(){
   const d = $('lwDrag');
@@ -8477,3 +8492,9 @@ if($('tagVerifyBtn')) $('tagVerifyBtn').addEventListener('click', (e) => {
   e.stopPropagation();   /* 머리를 누르면 접히므로 막는다 */
   runTagVerify();
 });
+
+/* 모든 기능 선언과 영구 바인딩이 준비된 뒤 한 번만 시작한다. 기능별 화면은 첫 진입 때
+   activateMode()가 초기화해 첫 생성 화면에서 자료·휴지통 조회가 경쟁하지 않게 한다. */
+init();
+bindLatestResultActions();
+poll();

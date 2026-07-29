@@ -4944,6 +4944,13 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("fetch('/api/img_origins'", page)
         self.assertIn("if(last && imgs.length === 1) openApplyPicker(last);", page)
         self.assertNotIn("applyStyle(last)", page)
+        self.assertIn("const ACTIVE_MODES = new Set(['preview']);", page)
+        self.assertIn("function activateMode(mode){", page)
+        self.assertIn("activateMode(m);", page)
+        self.assertEqual(page.count("function esc("), 1)
+        self.assertIn("EXP.moreObserver.disconnect();", page)
+        self.assertIn("EXP.moreObserver.observe(more);", page)
+        self.assertGreater(page.index("init();"), page.index("function runTagVerify()"))
 
     def test_studio_library_groups_inputs_catalog_and_results_without_duplicate_cards(self):
         """자료 작업을 세 흐름으로 나누되 기존 화면에서는 같은 카드를 모두 보여야 한다."""
