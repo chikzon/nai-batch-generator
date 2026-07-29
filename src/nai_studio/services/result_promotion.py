@@ -717,6 +717,30 @@ def new_promotion_ledger() -> dict:
     return {"schema": PROMOTION_LEDGER_SCHEMA, "events": []}
 
 
+def _promotion_ledger_key(value: Mapping[str, Any]) -> str:
+    """표시 이름·외부 record ID가 아닌 실제 승격 결정의 안정 ID."""
+    promotion = value.get("promotion_event")
+    if not isinstance(promotion, Mapping):
+        promotion = {}
+    event_id = str(promotion.get("id") or "").strip()
+    if event_id:
+        return f"event:{event_id}"
+    payload = promotion.get("payload")
+    decision = (
+        payload.get("decision")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    decision_id = (
+        str(decision.get("id") or "").strip()
+        if isinstance(decision, Mapping)
+        else ""
+    )
+    if decision_id:
+        return f"decision:{decision_id}"
+    raise ValueError("promotion event or decision id is required")
+
+
 def append_promotion_events(
     ledger: Mapping[str, Any] | None,
     events: Sequence[Mapping[str, Any]],
@@ -732,15 +756,16 @@ def append_promotion_events(
     ):
         raise ValueError("invalid promotion ledger")
     output = [_canonical_promotion(item) for item in source["events"]]
-    seen = {item["id"] for item in output}
+    seen = {_promotion_ledger_key(item) for item in output}
     appended = []
     duplicates = []
     for event in events:
         item = _canonical_promotion(event)
-        if item["id"] in seen:
+        semantic_key = _promotion_ledger_key(item)
+        if semantic_key in seen:
             duplicates.append(item["id"])
             continue
-        seen.add(item["id"])
+        seen.add(semantic_key)
         output.append(item)
         appended.append(item["id"])
     return {

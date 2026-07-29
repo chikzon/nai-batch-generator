@@ -473,6 +473,27 @@ class ResultPromotionContractTests(unittest.TestCase):
         self.assertEqual(duplicate["appended"], [])
         self.assertEqual(duplicate["duplicates"], [style["id"]])
 
+        renamed = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="style",
+            content=self.style_content(),
+            name="표시 이름만 변경",
+        )
+        self.assertNotEqual(renamed["id"], style["id"])
+        self.assertEqual(
+            renamed["promotion_event"]["id"],
+            style["promotion_event"]["id"],
+        )
+        renamed_result = append_promotion_events(
+            duplicate["ledger"],
+            [renamed],
+        )
+        self.assertEqual(len(renamed_result["ledger"]["events"]), 1)
+        self.assertEqual(renamed_result["appended"], [])
+        self.assertEqual(renamed_result["duplicates"], [renamed["id"]])
+
         changed_content = self.style_content()
         changed_content["base"] += ", new explicit artist"
         changed = build_result_promotion(
@@ -483,9 +504,13 @@ class ResultPromotionContractTests(unittest.TestCase):
             content=changed_content,
         )
         self.assertNotEqual(changed["id"], style["id"])
-        final = append_promotion_events(duplicate["ledger"], [changed])
-        self.assertEqual(len(final["ledger"]["events"]), 2)
-        self.assertEqual(final["appended"], [changed["id"]])
+        final = append_promotion_events(
+            renamed_result["ledger"],
+            [changed],
+        )
+        self.assertEqual(len(final["ledger"]["events"]), 1)
+        self.assertEqual(final["appended"], [])
+        self.assertEqual(final["duplicates"], [changed["id"]])
         self.assert_no_runtime_secrets(final)
 
     def test_append_rejects_raw_metadata_or_raw_payload_in_forged_event(self):
