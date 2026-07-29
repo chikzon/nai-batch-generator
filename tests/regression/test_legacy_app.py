@@ -292,8 +292,7 @@ class RegressionTests(unittest.TestCase):
             server = APP.ConfigServer(cfg)
             captured = {}
 
-            def generate(_token, _base, _female, _male, _negative,
-                         width, height, **kwargs):
+            def generate(_token, _base, _negative, width, height, **kwargs):
                 captured["width"] = width
                 captured["height"] = height
                 captured["i2i"] = copy.deepcopy(kwargs["params"]["_i2i"])
@@ -1750,8 +1749,7 @@ class RegressionTests(unittest.TestCase):
                 runtime_cfgs.append((copy.deepcopy(used), include_refs))
                 return dict(used)
 
-            def fake_generate(_token, base, _female, _male, negative,
-                              width, height, **kw):
+            def fake_generate(_token, base, negative, width, height, **kw):
                 calls.append({
                     "base": base, "negative": negative,
                     "width": width, "height": height,
@@ -2040,8 +2038,7 @@ class RegressionTests(unittest.TestCase):
             server = APP.ConfigServer(cfg)
             calls = []
 
-            def fake_generate(_token, base, _female, _male, negative,
-                              width, height, **kwargs):
+            def fake_generate(_token, base, negative, width, height, **kwargs):
                 calls.append({
                     "base": base, "negative": negative,
                     "width": width, "height": height,
@@ -2155,8 +2152,7 @@ class RegressionTests(unittest.TestCase):
 
             calls = []
 
-            def fake_generate(_token, base, _female, _male, negative,
-                              width, height, **kwargs):
+            def fake_generate(_token, base, negative, width, height, **kwargs):
                 calls.append({
                     "base": base,
                     "negative": negative,
@@ -2276,7 +2272,7 @@ class RegressionTests(unittest.TestCase):
             result_links = []
             ancestors = []
 
-            def fake_generate(_token, base, _female, _male, negative, width, height, **kw):
+            def fake_generate(_token, base, negative, width, height, **kw):
                 calls.append({
                     "base": base, "negative": negative,
                     "width": width, "height": height,
@@ -7535,8 +7531,7 @@ class RegressionTests(unittest.TestCase):
                 captured["job_cfg"] = copy.deepcopy(value)
                 return {}
 
-            def generate(_token, _base, _female, _male, _negative,
-                         width, height, **kwargs):
+            def generate(_token, _base, _negative, width, height, **kwargs):
                 captured["chars"] = copy.deepcopy(kwargs["chars"])
                 image = Image.new("RGB", (width, height), "white")
                 image.nai_seed = kwargs["seed"]
@@ -7634,8 +7629,7 @@ class RegressionTests(unittest.TestCase):
             }).encode()
             captured = {}
 
-            def generate(_token, base, _female, _male, negative,
-                         width, height, **kwargs):
+            def generate(_token, base, negative, width, height, **kwargs):
                 captured.update({
                     "base": base, "negative": negative,
                     "width": width, "height": height,
