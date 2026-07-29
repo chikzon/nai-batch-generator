@@ -61,15 +61,32 @@ from src.nai_studio.runtime import (
     fingerprint_payload,
     from_legacy_job_record,
     new_job,
+    reconcile_job,
+    retry_job,
     transition_job,
 )
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
-    evaluations_from_picks,
     knowledge_assets_from_config,
     restoration_queue_from_collection,
     sequence_plan_from_setting,
     style_asset_from_record,
+)
+from src.nai_studio.services.evaluation_bridge import (
+    append_evaluation_events,
+    blind_match_event,
+    fixed_board_event,
+    lifecycle_event,
+    project_legacy_evaluations,
+    promotion_event,
+)
+from src.nai_studio.services.experiment_bridge import (
+    expand_legacy_experiment_cells,
+)
+from src.nai_studio.services.job_bridge import (
+    make_job_command,
+    project_comparison_progress,
+    project_live_state,
 )
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
@@ -5967,7 +5984,7 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         expected = opus_total
     elif opus is False:
         expected = paid_total
-    return {
+    result = {
         "ok": not errors,
         "errors": errors,
         "options": options,
@@ -5988,6 +6005,33 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         "sample_styles": [x["_compare_name"] for x in styles[:3]],
         "sample_characters": [x["_compare_name"] for x in chars[:3]],
     }
+    # 기존 세 비교 모드의 실제 실행 순서와 재개 키를 공통 실험 셀에서도
+    # 똑같이 계산한다. 이 값은 미리보기·진단용이며 NAI 요청은 만들지 않는다.
+    try:
+        experiment = expand_legacy_experiment_cells(
+            cfg, result, styles=styles, characters=chars)
+        result["experiment"] = {
+            "schema": experiment.get("schema"),
+            "id": experiment.get("id"),
+            "mode": experiment.get("legacy_mode"),
+            "total": experiment.get("total", 0),
+            "pending": experiment.get("pending", 0),
+            "completed": experiment.get("completed", 0),
+            "cell_ids": [
+                {
+                    "id": cell.get("id"),
+                    "resume_key": cell.get("legacy_resume_key"),
+                }
+                for cell in (experiment.get("cells") or [])[:10]
+            ],
+        }
+    except Exception as error:
+        # 기존 비교 기능은 공통 투영의 진단 실패 때문에 막지 않는다.
+        result["experiment"] = {
+            "ok": False,
+            "error": redact_diagnostic_text(error),
+        }
+    return result
 
 
 def comparison_signature(cfg, plan, styles, chars):
@@ -8227,6 +8271,80 @@ def save_picks(d):
     return cleaned
 
 
+def apply_evaluation_action(data):
+    """결과 평가 결정을 기존 선별 장부와 append-only 사건으로 함께 남긴다."""
+    data = data if isinstance(data, dict) else {}
+    action = str(data.get("action") or "")
+    with _JSON_IO_LOCK:
+        picks = load_picks()
+        paths = [
+            str(value or "").replace("\\", "/")
+            for value in (data.get("paths") or [])
+            if str(value or "").strip()
+        ]
+        projection = project_legacy_evaluations(
+            picks,
+            result_records=[{"path": path} for path in paths],
+        )
+        by_path = {
+            str((item.get("subject") or {}).get("path") or ""): item
+            for item in projection["evaluations"]
+        }
+        if action == "blind-match":
+            if len(paths) != 2 or paths[0] == paths[1]:
+                raise ValueError("블라인드 비교에는 서로 다른 결과 두 개가 필요합니다.")
+            event = blind_match_event(
+                by_path[paths[0]],
+                by_path[paths[1]],
+                outcome=str(data.get("outcome") or "first"),
+                k_factor=24,
+            )
+            for path, values in (
+                event.get("payload", {}).get("legacy_projection") or {}
+            ).items():
+                picks.setdefault("elo", {})[path] = values["elo"]
+                picks.setdefault("elo_matches", {})[path] = values["elo_matches"]
+        elif action == "fixed-board":
+            if len(paths) != 1:
+                raise ValueError("고정 비교판에는 결과 한 개가 필요합니다.")
+            board = str(data.get("board") or "").strip()[:40]
+            member = bool(data.get("member", True))
+            event = fixed_board_event(by_path[paths[0]], board, member=member)
+            members = picks.setdefault("folders", {}).setdefault(board, [])
+            if member and paths[0] not in members:
+                members.append(paths[0])
+            elif not member:
+                picks["folders"][board] = [
+                    item for item in members if item != paths[0]]
+        elif action == "lifecycle":
+            if len(paths) != 1:
+                raise ValueError("생명주기 변경에는 결과 한 개가 필요합니다.")
+            state = str(data.get("state") or "")
+            event = lifecycle_event(by_path[paths[0]], state)
+            picks.setdefault("review_states", {})[paths[0]] = state
+        elif action == "promotion":
+            if len(paths) != 1:
+                raise ValueError("승격 제안에는 결과 한 개가 필요합니다.")
+            event = promotion_event(
+                by_path[paths[0]], str(data.get("target") or ""))
+        else:
+            raise ValueError("지원하지 않는 평가 작업입니다.")
+        appended = append_evaluation_events(picks, [event])
+        saved = save_picks(appended["picks"])
+    return {
+        "ok": True,
+        "event": event,
+        "appended": appended["appended"],
+        "duplicate": bool(appended["duplicates"]),
+        "picks": {
+            "elo": saved.get("elo", {}),
+            "elo_matches": saved.get("elo_matches", {}),
+            "folders": saved.get("folders", {}),
+            "review_states": saved.get("review_states", {}),
+        },
+    }
+
+
 TRASH_DIR_NAME = ".NAI-휴지통"
 
 
@@ -8571,6 +8689,10 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
         files = files[offset:offset + limit]
     else:
         offset = 0
+    evaluation_projection = project_legacy_evaluations(
+        picks,
+        result_records=[{"path": item["path"]} for item in files],
+    )
     return {"ok": True, "dir": sub, "dirs": dirs, "files": files,
             "total": total, "offset": offset,
             "has_more": bool(limit and offset + len(files) < total),
@@ -8580,8 +8702,8 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
             "elo": picks.get("elo", {}),
             "elo_matches": picks.get("elo_matches", {}),
             "tags": picks.get("tags", {}),
-            "evaluations": evaluations_from_picks(
-                picks, paths=[item["path"] for item in files]),
+            "evaluations": evaluation_projection["evaluations"],
+            "evaluation_issues": evaluation_projection["issues"],
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
 
 
@@ -12219,9 +12341,31 @@ async function loadJobCenter(){
       : `대기 · 최근 ${live.phase || 'idle'}`;
     const collectState = collection.status || 'idle';
     const recent = (ledger.jobs || []).slice(0, 5);
+    const activeContracts = ledger.active_contracts || [];
     const contracts = new Map(
       (ledger.contracts || []).map(job => [String(job.id || ''), job])
     );
+    const jobActions = job => {
+      const phase = String(job.phase || '');
+      if(['preparing','encoding','uploading','generating','downloading','persisting','reconciling'].includes(phase)){
+        return [['pause','일시정지'],['cancel','취소']];
+      }
+      if(phase === 'paused') return [['resume','이어가기'],['cancel','취소']];
+      if(phase === 'failed') return [['retry','재시도 준비']];
+      if(phase === 'queued') return [['cancel','취소']];
+      return [];
+    };
+    const activeRows = activeContracts.length
+      ? activeContracts.map(job => {
+          const progress = job.progress || {};
+          const actions = jobActions(job).map(([action,label]) =>
+            `<button type="button" data-job-action="${action}" data-job-id="${escA(job.id||'')}">${label}</button>`
+          ).join('');
+          return `<div class="row"><div style="flex:1;min-width:0;"><b>${esc(job.kind||'작업')}</b>
+            <div class="hint">${esc(job.phase||'')} · ${Number(progress.completed||0)}/${Number(progress.total||0)}
+            · 요청 ${esc(String(job.request_id||'').slice(0,18))}</div></div>${actions}</div>`;
+        }).join('')
+      : '<div class="row hint">현재 투영된 실행 작업이 없습니다.</div>';
     host.innerHTML = `
       <div class="row"><div><b>현재 생성 실행권</b><div class="hint">${esc(liveState)}</div>
         <div class="hint">${esc(live.status_text || '')}</div></div>
@@ -12231,6 +12375,8 @@ async function loadJobCenter(){
       <div class="row"><div><b>공개자료 수집</b><div class="hint">${esc(collectState)}
         · ${Number(collection.cursor||0)}/${Number((collection.queue||[]).length||collection.found_posts||0)}</div></div>
         <button type="button" data-job-go="library">자료 수집으로</button></div>
+      <div style="grid-column:1/-1;display:grid;gap:7px;"><b>실행 가능한 공통 작업</b>
+        ${activeRows}</div>
       <div class="row" style="grid-column:1/-1;display:block;"><b>최근 실행 기록</b>
         <div class="hint" style="margin-top:5px;">${recent.length ? recent.map(job =>
           {
@@ -12250,6 +12396,28 @@ async function loadJobCenter(){
         STATE.ui = STATE.ui || {}; STATE.ui.settings_work = 'compare';
         setMode('settings'); arrangeStudioWorkspace(); comparisonRunsLoad();
       }else setMode(target);
+    }));
+    host.querySelectorAll('[data-job-action]').forEach(button => button.addEventListener('click', async () => {
+      button.disabled = true;
+      const r = await (await fetch('/api/job_command', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          job_id:button.dataset.jobId,
+          action:button.dataset.jobAction
+        })
+      })).json();
+      if(!r.ok){
+        alert(r.error || '작업 명령을 적용하지 못했습니다.');
+        button.disabled = false; return;
+      }
+      if(r.navigation === 'compare'){
+        STATE.ui = STATE.ui || {}; STATE.ui.settings_work = 'compare';
+        setMode('settings'); arrangeStudioWorkspace(); comparisonRunsLoad();
+      }else if(r.navigation){
+        setMode(r.navigation);
+      }
+      if(r.message) alert(r.message);
+      loadJobCenter();
     }));
   }catch(error){
     host.innerHTML = `<div class="row" style="color:var(--danger);">${esc(String(error))}</div>`;
@@ -13792,16 +13960,22 @@ function eloNext(){
 async function eloPick(which){
   if(!ELO || !ELO.pair) return;
   const [a,b] = ELO.pair;
-  const ra = Number(EXP.elo[a] || 1000), rb = Number(EXP.elo[b] || 1000);
-  const expectedA = 1 / (1 + Math.pow(10, (rb - ra) / 400));
-  const actualA = which === 'a' ? 1 : (which === 'b' ? 0 : .5);
-  const delta = 24 * (actualA - expectedA);
-  EXP.elo[a] = Math.round((ra + delta) * 10) / 10;
-  EXP.elo[b] = Math.round((rb - delta) * 10) / 10;
-  EXP.elo_matches[a] = Number(EXP.elo_matches[a] || 0) + 1;
-  EXP.elo_matches[b] = Number(EXP.elo_matches[b] || 0) + 1;
+  const r = await (await fetch('/api/evaluation_action', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      action:'blind-match', paths:[a,b],
+      outcome:which === 'a' ? 'first' : (which === 'b' ? 'second' : 'tie')
+    })
+  })).json();
+  if(!r.ok){
+    $('expStat').textContent = r.error || '블라인드 평가를 저장하지 못했습니다.';
+    const el = $('eloBg'); if(el) el.remove();
+    ELO = null; return;
+  }
+  EXP.elo = Object.assign({}, EXP.elo || {}, (r.picks || {}).elo || {});
+  EXP.elo_matches = Object.assign(
+    {}, EXP.elo_matches || {}, (r.picks || {}).elo_matches || {});
   ELO.played++;
-  await picksSave();
   eloNext();
 }
 async function picksSave(){
@@ -18916,6 +19090,7 @@ class LiveState:
                 "last_error": self.last_error,
                 "can_retry": self.can_retry,
                 "retry_mode": self.retry_mode,
+                "job_id": self.job_id,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "elapsed_seconds": round(elapsed, 1),
@@ -19040,6 +19215,130 @@ class ConfigServer:
             "ok": True,
             "sequence": plan,
             "steps": len(plan["steps"]),
+        }
+
+    def snapshot_jobs(self):
+        """기존 장부와 현재 실행·비교 진행을 공통 Job 계약으로 함께 보여 준다."""
+        summary = job_ledger_summary()
+        active_contracts = []
+        issues = []
+        live = self.live.snapshot()
+        if live.get("running") or live.get("phase") not in ("", "idle"):
+            try:
+                active_contracts.append(project_live_state(
+                    live,
+                    kind=_runtime_kind(
+                        live.get("operation"), live.get("retry_mode")),
+                    job_id=live.get("job_id") or "",
+                    blueprint=generation_blueprint(
+                        self.cfg, source={"kind": "live-state-projection"}),
+                    payload_identity={
+                        "operation": live.get("operation"),
+                        "seed_key": live.get("seed_key"),
+                        "total": live.get("total"),
+                    },
+                ))
+            except Exception as error:
+                issues.append({
+                    "source": "live-state",
+                    "error": redact_diagnostic_text(error),
+                })
+        progress = _comparison_progress_load()
+        if progress.get("signature"):
+            try:
+                active_contracts.append(project_comparison_progress(
+                    progress,
+                    blueprint=generation_blueprint(
+                        self.cfg,
+                        source={"kind": "comparison-progress-projection"},
+                        experiment=(progress.get("plan") or {}).get(
+                            "options") or {},
+                    ),
+                    payload_identity={
+                        "signature": progress.get("signature"),
+                        "folder": progress.get("folder"),
+                        "completed": sorted(
+                            (progress.get("completed") or {}).keys()),
+                    },
+                ))
+            except Exception as error:
+                issues.append({
+                    "source": "comparison-progress",
+                    "error": redact_diagnostic_text(error),
+                })
+        persisted = []
+        for contract in active_contracts:
+            try:
+                common_job_store().save(contract)
+                persisted.append(contract.get("id"))
+            except Exception as error:
+                issues.append({
+                    "source": "job-store",
+                    "job_id": contract.get("id"),
+                    "error": redact_diagnostic_text(error),
+                })
+        summary["active_contracts"] = active_contracts
+        summary["persisted_active_contract_ids"] = persisted
+        summary["projection_issues"] = issues
+        return summary
+
+    def handle_job_command(self, body):
+        """Job 센터 조작을 기존 실행기의 안전한 진입점으로 연결한다."""
+        data = json.loads(body or b"{}")
+        job_id = str(data.get("job_id") or "")
+        action = str(data.get("action") or "")
+        if not job_id or action not in (
+            "pause", "cancel", "retry", "resume", "reconcile",
+        ):
+            raise ValueError("작업과 명령을 올바르게 골라주세요.")
+        store = common_job_store()
+        job = store.get(job_id)
+        command = make_job_command(
+            job, action, observation=data.get("observation"))
+        handler = command.get("handler") or {}
+        handled = False
+        navigation = ""
+        message = ""
+
+        if action in ("pause", "cancel"):
+            handled = self.live.request_stop()
+            if not handled and job.get("phase") not in (
+                "completed", "failed", "cancelled",
+            ):
+                message = "현재 실행 중인 NAI 요청이 없어 상태만 기록했습니다."
+            updated = transition_job(job, command["next_phase"])
+        elif action in ("retry", "resume"):
+            if handler.get("target") == "comparison":
+                activated = activate_comparison_run(
+                    self.cfg, handler.get("folder"))
+                handled = bool(activated.get("resumable"))
+                navigation = "compare"
+                message = (
+                    "중단 지점을 활성화했습니다. 장수와 비용을 확인한 뒤 실행하세요."
+                )
+            else:
+                navigation = (
+                    "settings" if job.get("kind") == "setting" else "preview")
+                message = (
+                    "원래 작업 화면을 열었습니다. 현재 입력과 비용을 확인한 뒤 "
+                    "다시 실행하세요."
+                )
+            updated = (
+                retry_job(job) if action == "retry"
+                else transition_job(job, command["next_phase"])
+            )
+        else:
+            updated = reconcile_job(job, data.get("observation") or {})
+            handled = True
+            message = "디스크의 실제 결과와 작업 기록을 대조했습니다."
+        store.save(updated)
+        return {
+            "ok": True,
+            "handled": handled,
+            "command": command,
+            "job": updated,
+            "navigation": navigation,
+            "message": message,
         }
 
     def handle_generate_one(self):
@@ -19620,6 +19919,24 @@ class ConfigServer:
                 if result.get("changed_config"):
                     self.config_revision += 1
                 result["revision"] = self.config_revision
+                try:
+                    event = apply_evaluation_action({
+                        "action": "promotion",
+                        "paths": [data.get("path")],
+                        "target": (
+                            "style" if data.get("kind") == "style"
+                            else "character"
+                        ),
+                    })
+                    result["evaluation_event"] = {
+                        "appended": event.get("appended", []),
+                        "duplicate": event.get("duplicate", False),
+                    }
+                except Exception as error:
+                    # 자산 저장은 이미 끝났으므로 평가 장부 문제로 되돌리지 않는다.
+                    result["evaluation_event"] = {
+                        "error": redact_diagnostic_text(error),
+                    }
                 return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -20350,7 +20667,7 @@ class ConfigServer:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/jobs"):
                     try:
-                        self._json(job_ledger_summary())
+                        self._json(server.snapshot_jobs())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/config"):
@@ -21037,6 +21354,15 @@ class ConfigServer:
                     # 중지 — 취소 **플래그**만 세운다 (CQA-001: running 을 직접 끄면
                     # 옛 작업이 마저 도는 동안 새 작업이 실행권을 얻어 겹친다).
                     self._json({"ok": server.live.request_stop()})
+                elif self.path.startswith("/api/job_command"):
+                    try:
+                        if len(body or b"") > 128 * 1024:
+                            self._json({
+                                "ok": False, "error": "요청이 너무 큽니다."})
+                            return
+                        self._json(server.handle_job_command(body))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/artist_workspace"):
                     try:
                         if len(body or b"") > 128 * 1024:
@@ -21090,6 +21416,16 @@ class ConfigServer:
                                     "shared": base + sum(chars),
                                     "shared_negative": neg + sum(cnegs), "limit": 512,
                                     "finalized": bool(d.get("finalize"))})
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/evaluation_action"):
+                    try:
+                        if len(body or b"") > 64 * 1024:
+                            self._json({
+                                "ok": False, "error": "요청이 너무 큽니다."})
+                            return
+                        self._json(apply_evaluation_action(
+                            json.loads(body or b"{}")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/picks_save"):

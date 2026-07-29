@@ -1251,6 +1251,10 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(multi_seed_plan["combinations"], 4)
         self.assertEqual(multi_seed_plan["seed_count"], 3)
         self.assertEqual(multi_seed_plan["total"], 12)
+        self.assertEqual(multi_seed_plan["experiment"]["total"], 12)
+        self.assertEqual(multi_seed_plan["experiment"]["mode"], "both")
+        self.assertTrue(
+            multi_seed_plan["experiment"]["cell_ids"][0]["resume_key"])
         multi_seed_jobs = list(APP.iter_comparison_jobs(
             cfg, multi_seed_plan, source_styles, source_chars))
         self.assertEqual(len(multi_seed_jobs), 12)
@@ -1645,6 +1649,45 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(live.snapshot()["eta_seconds"], 0.0)
         self.assertIn('id="pvEta"', APP.PAGE_TEMPLATE)
         self.assertIn("남은 시간 계산 중", APP.PAGE_TEMPLATE)
+
+    def test_job_center_command_uses_common_contract_without_starting_generation(self):
+        job = APP.new_job(
+            "comparison",
+            blueprint_fingerprint="a" * 64,
+            payload_hash="b" * 64,
+            request_id="request-job-center",
+            job_id="job-center-fixture",
+            metadata={"plan": {"folder": "비교생성/fixture"}},
+        )
+        job = APP.transition_job(job, "preparing")
+
+        class MemoryStore:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self, job_id):
+                self.assert_id = job_id
+                return copy.deepcopy(self.value)
+
+            def save(self, value):
+                self.value = copy.deepcopy(value)
+                return value
+
+        store = MemoryStore(job)
+        server = APP.ConfigServer(
+            copy.deepcopy(APP.DEFAULT_CONFIG), persist_jobs=False)
+        with patch.object(APP, "common_job_store", return_value=store):
+            result = server.handle_job_command(json.dumps({
+                "job_id": "job-center-fixture",
+                "action": "pause",
+            }).encode("utf-8"))
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["handled"])
+        self.assertEqual(result["job"]["phase"], "paused")
+        self.assertEqual(result["command"]["resource"]["mode"], "exclusive")
+        page = APP.render_page()
+        self.assertIn("/api/job_command", page)
+        self.assertIn("data-job-action", page)
 
     def test_live_state_eta_does_not_count_failed_work_as_remaining(self):
         live = APP.LiveState()
@@ -4360,6 +4403,33 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("tags:EXP.tags || {}", page)
         self.assertIn("folders:EXP.folders || {}", page)
         self.assertIn("원본 파일은 이동하지 않습니다.", page)
+
+    def test_blind_elo_action_updates_legacy_maps_and_appends_evidence_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            picks_file = Path(td) / "선별.json"
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                APP.save_picks({
+                    "picked": [], "fav": [], "folders": {}, "ranks": {},
+                    "ratings": {}, "elo": {}, "elo_matches": {}, "tags": {},
+                })
+                result = APP.apply_evaluation_action({
+                    "action": "blind-match",
+                    "paths": ["비교/A.webp", "비교/B.webp"],
+                    "outcome": "first",
+                })
+                saved = APP.load_picks()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved["elo_matches"]["비교/A.webp"], 1)
+        self.assertEqual(saved["elo_matches"]["비교/B.webp"], 1)
+        self.assertGreater(saved["elo"]["비교/A.webp"], 1000)
+        self.assertLess(saved["elo"]["비교/B.webp"], 1000)
+        self.assertEqual(len(saved["evaluation_events"]), 1)
+        self.assertEqual(
+            saved["evaluation_events"][0]["kind"], "blind-match")
+        page = APP.render_page()
+        self.assertIn("/api/evaluation_action", page)
+        self.assertNotIn("const delta = 24 *", page)
 
     def test_structured_diagnostics_redact_secrets_paths_and_export_safe_events(self):
         raw_lines = [
