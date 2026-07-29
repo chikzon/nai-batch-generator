@@ -106,7 +106,7 @@ def _character_slot(value: Mapping[str, Any]) -> tuple[dict, dict]:
     }
     for key in (
         "variants", "variant", "references", "character_references", "vibes",
-        "source", "evidence_ids",
+        "reference_ids", "vibe_ids", "position", "source", "evidence_ids",
     ):
         if key in safe:
             slot[key] = deepcopy(safe[key])

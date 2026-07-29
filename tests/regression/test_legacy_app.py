@@ -1653,6 +1653,236 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(record["scene"], 10)
             self.assertIn("resolved", recipe)
 
+    def test_selected_comparison_expands_only_chosen_sources_axes_and_seed_policy(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(
+            base_prompt="current base",
+            negative_prompt="current negative",
+            characters=[{
+                "id": "char-a", "name": "A",
+                "female": "appearance", "clothed": "outfit",
+                "negative": "character negative",
+                "position": {"x": 0.2, "y": 0.8},
+                "reference_ids": ["ref-a"],
+                "vibe_ids": ["vibe-a"],
+            }],
+            char_refs=[{"id": "ref-a", "enabled": False}],
+            vibes=[{"id": "vibe-a", "enabled": False}],
+            setting_state={
+                "Setting A": {
+                    "use": True, "selected": [10], "stages": [1],
+                    "reserve": {"10": 1},
+                },
+            },
+        )
+        before = copy.deepcopy(cfg)
+        styles = [{
+            "id": "style-a", "_compare_id": "style-a",
+            "_compare_name": "Style A", "base": "style base",
+            "negative": "style negative", "params": {},
+        }, {
+            "id": "style-b", "_compare_id": "style-b",
+            "_compare_name": "Style B", "base": "unused",
+            "negative": "unused", "params": {},
+        }]
+        chars = APP.comparison_characters(cfg)
+        settings = APP.comparison_settings(cfg)
+        acfg = {
+            "base": {
+                "base_prompt": "1girl, style base",
+                "nsfw_base_prompt": "1girl, 1boy, style base",
+                "yuri_base_prompt": "2girls, yuri, style base",
+                "negative_prompt": "style negative",
+                "nsfw_negative_prompt": "style negative",
+                "cfg_scale": 5.5, "cfg_rescale": 0.56,
+                "sampler": "k_euler_ancestral", "scheduler": "karras",
+            },
+            "_settings": {
+                "Setting A": {
+                    "mode": "단독", "options": {}, "role": {},
+                    "opts": {}, "specs": {},
+                },
+            },
+            "scenes": {
+                "10": {
+                    "name": "Scene", "_setting": "Setting A",
+                    "_mode": "단독", "_num": 10, "_stage": 0,
+                    "width": 640, "height": 960,
+                    "female_prompt": "scene prompt",
+                },
+            },
+        }
+        raw = {
+            "mode": "selected",
+            "fixed_size": True, "width": 512, "height": 512,
+            "same_seed": True, "seed": 100, "seed_count": 2,
+            "include_refs": True,
+            "selection": {
+                "styles": ["style-a"],
+                "characters": ["char-a"],
+                "settings": ["Setting A"],
+                "axes": {
+                    "generation.cfg_scale": [5.0, 7.0],
+                    "generation.steps": [20, 30],
+                },
+            },
+        }
+        options = APP.normalize_comparison_options(raw, cfg)
+        with patch.object(APP, "load_asset_config", return_value=acfg):
+            plan = APP.comparison_selected_plan(
+                cfg, options, styles, chars, settings, opus=True)
+            jobs = list(APP.iter_selected_comparison_jobs(
+                cfg, plan, styles, chars, settings=settings,
+                runtime_base_seed=100))
+        self.assertTrue(plan["ok"], plan)
+        self.assertEqual(plan["count"], 8)
+        self.assertEqual(len(jobs), 8)
+        self.assertEqual({job["style"]["_compare_id"] for job in jobs},
+                         {"style-a"})
+        self.assertEqual({job["character"]["_compare_id"] for job in jobs},
+                         {"char-a"})
+        self.assertEqual({job["setting"]["id"] for job in jobs},
+                         {"Setting A"})
+        self.assertEqual(
+            [job["seed"] for job in jobs],
+            [100, 100103, 100, 100103, 100, 100103, 100, 100103],
+        )
+        with patch.object(APP, "load_asset_config", return_value=acfg):
+            used, base, negative, people, centers = (
+                APP.comparison_selected_job_values(cfg, plan, jobs[0]))
+        self.assertEqual((used["width"], used["height"]), (512, 512))
+        self.assertIn(used["cfg_scale"], (5.0, 7.0))
+        self.assertIn(used["steps"], (20, 30))
+        self.assertIn("style base", base)
+        self.assertEqual(negative, "style negative")
+        self.assertIn("appearance", people[0]["prompt"])
+        self.assertIn("outfit", people[0]["prompt"])
+        self.assertEqual(people[0]["negative"], "character negative")
+        self.assertEqual(centers, [{"x": 0.2, "y": 0.8}])
+        self.assertTrue(used["char_refs"][0]["enabled"])
+        self.assertTrue(used["vibes"][0]["enabled"])
+
+        independent = copy.deepcopy(raw)
+        independent["same_seed"] = False
+        independent_options = APP.normalize_comparison_options(
+            independent, cfg)
+        with patch.object(APP, "load_asset_config", return_value=acfg):
+            independent_plan = APP.comparison_selected_plan(
+                cfg, independent_options, styles, chars, settings, opus=True)
+            independent_jobs = list(APP.iter_selected_comparison_jobs(
+                cfg, independent_plan, styles, chars, settings=settings,
+                runtime_base_seed=100))
+        self.assertEqual(
+            [job["seed"] for job in independent_jobs],
+            [100 + index * 100003 for index in range(8)],
+        )
+        self.assertEqual(cfg, before)
+
+    def test_selected_worker_resumes_and_reruns_one_canonical_cell_without_token_persistence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(
+                token="pst-fixture",
+                out_dir=str(root / "output"),
+                characters=[{
+                    "id": "char-a", "name": "A",
+                    "female": "appearance", "clothed": "outfit",
+                    "negative": "character negative",
+                    "position": {"x": 0.25, "y": 0.75},
+                }],
+                pace={"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            )
+            original = copy.deepcopy(cfg)
+            styles = [{
+                "id": "style-a", "_compare_id": "style-a",
+                "_compare_name": "Style A", "base": "style base",
+                "negative": "style negative", "params": {},
+            }]
+            chars = APP.comparison_characters(cfg)
+            options = APP.normalize_comparison_options({
+                "mode": "selected",
+                "fixed_size": True, "width": 512, "height": 512,
+                "same_seed": True, "seed": 77, "seed_count": 2,
+                "selection": {
+                    "styles": ["style-a"],
+                    "characters": ["char-a"],
+                    "axes": {"generation.cfg_scale": [5.0, 7.0]},
+                },
+            }, cfg)
+            plan = APP.comparison_selected_plan(
+                cfg, options, styles, chars, [], opus=True)
+            state = {
+                "seeds": {}, "progress": {}, "daily": {},
+                "total_generated": 0,
+            }
+            server = APP.ConfigServer(cfg)
+            calls = []
+
+            def fake_generate(_token, base, _female, _male, negative,
+                              width, height, **kwargs):
+                calls.append({
+                    "base": base, "negative": negative,
+                    "width": width, "height": height,
+                    "chars": copy.deepcopy(kwargs["chars"]),
+                    "seed": kwargs["seed"], "scale": kwargs["scale"],
+                })
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kwargs["seed"]
+                if len(calls) == 1:
+                    server.live.stop_req = True
+                return image
+
+            progress_file = root / "비교생성-진행.json"
+            with (
+                patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=fake_generate),
+            ):
+                APP._run_comparison(server, cfg, plan, styles, chars)
+                stopped = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
+                self.assertEqual(stopped["status"], "stopped")
+                self.assertEqual(len(stopped["completed"]), 1)
+
+                server.live.stop_req = False
+                APP._run_comparison(server, cfg, plan, styles, chars)
+                complete = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
+                source = min(
+                    complete["completed"].values(),
+                    key=lambda item: item["index"])
+                APP._rerun_selected_comparison(
+                    server, cfg, source["file"])
+                rerun = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(cfg, original)
+            self.assertEqual(plan["count"], 4)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(complete["status"], "complete")
+            self.assertEqual(len(complete["completed"]), 4)
+            self.assertEqual(len(rerun["reruns"]), 1)
+            rerun_record = next(iter(rerun["reruns"].values()))
+            self.assertEqual(rerun_record["seed"], source["seed"])
+            self.assertEqual(calls[-1]["seed"], source["seed"])
+            self.assertEqual(calls[-1]["base"], "style base")
+            self.assertEqual(calls[-1]["negative"], "style negative")
+            self.assertIn("canonical_cell", source)
+            self.assertNotIn(
+                "pst-fixture",
+                json.dumps(rerun, ensure_ascii=False),
+            )
+            self.assertEqual(
+                {call["scale"] for call in calls[:4]}, {5.0, 7.0})
+            self.assertEqual(
+                [call["seed"] for call in calls[:4]],
+                [77, 100080, 77, 100080],
+            )
+
     def test_comparison_requires_the_exact_recounted_job_confirmation(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["token"] = "pst-fixture"
@@ -1848,7 +2078,9 @@ class RegressionTests(unittest.TestCase):
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
         page = APP.render_page()
-        for value in ("styles", "characters", "both", "character_setting"):
+        for value in (
+                "styles", "characters", "both",
+                "character_setting", "selected"):
             self.assertIn(f'name="cmpMode" value="{value}"', page)
         self.assertIn('id="cmpPlanAllChars"', page)
         self.assertIn('id="cmpPlanManual"', page)
@@ -1869,6 +2101,16 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="cmpRunOpen"', page)
         self.assertIn("fetch('/api/compare_runs')", page)
         self.assertIn("fetch('/api/compare_activate'", page)
+        self.assertIn("fetch('/api/compare_catalog'", page)
+        self.assertIn("fetch('/api/compare_rerun'", page)
+        self.assertIn('id="cmpSelected"', page)
+        self.assertIn('id="cmpSelectStyles"', page)
+        self.assertIn('id="cmpSelectCharacters"', page)
+        self.assertIn('id="cmpSelectSettings"', page)
+        self.assertIn('id="cmpAxisCfg"', page)
+        self.assertIn('id="cmpAxisSteps"', page)
+        self.assertIn('id="cmpAxisSampler"', page)
+        self.assertIn('id="expRerunCell"', page)
         self.assertIn("await openComparisonFolder(", page)
         self.assertIn('id="expApplyPicked"', page)
         self.assertIn("fetch('/api/compare_recipe'", page)

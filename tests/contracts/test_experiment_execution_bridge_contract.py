@@ -65,6 +65,8 @@ class ExperimentExecutionBridgeContractTests(unittest.TestCase):
             "clothed": "artistically transformed outfit",
             "negative": "character negative",
             "position": {"x": 0.4, "y": 0.6},
+            "reference_ids": ["ref-one"],
+            "vibe_ids": ["vibe-one"],
         }]
         settings = [{
             "id": "setting-one",
@@ -168,6 +170,10 @@ class ExperimentExecutionBridgeContractTests(unittest.TestCase):
             material["char_slots"][0]["negative"], "character negative"
         )
         self.assertEqual(material["char_centers"][0], {"x": 0.4, "y": 0.6})
+        self.assertEqual(
+            material["char_slots"][0]["reference_ids"], ["ref-one"])
+        self.assertEqual(
+            material["char_slots"][0]["vibe_ids"], ["vibe-one"])
         self.assertEqual(
             material["setting_state"]["setting-one"]["selected"], ["scene-a"]
         )

@@ -82,6 +82,10 @@ from src.nai_studio.services.evaluation_bridge import (
 from src.nai_studio.services.experiment_bridge import (
     expand_legacy_experiment_cells,
 )
+from src.nai_studio.services.experiment_execution_bridge import (
+    legacy_execution_material,
+    regenerate_legacy_execution_material,
+)
 from src.nai_studio.services.job_bridge import (
     make_job_command,
     project_comparison_progress,
@@ -5713,9 +5717,18 @@ COMPARE_MODE_LABELS = {
     "characters": "캐릭터 전체",
     "both": "그림체 × 캐릭터",
     "character_setting": "캐릭터 × 선택 세팅",
+    "selected": "선택 자료·축",
 }
 COMPARE_MAX_JOBS = 2_000_000
 COMPARE_RECIPE_SETTING_KEYS = STYLE_BUNDLE_SETTING_KEYS
+COMPARE_SELECTED_AXES = {
+    "generation.cfg_scale": ("float", -10.0, 10.0),
+    "generation.cfg_rescale": ("float", 0.0, 1.0),
+    "generation.steps": ("int", 1, 50),
+    "generation.sampler": ("text", None, None),
+    "generation.scheduler": ("text", None, None),
+    "generation.variety": ("bool", None, None),
+}
 
 
 def _comparison_id(prefix, *parts):
@@ -5863,6 +5876,59 @@ def _compare_bool(value, default=False):
     return bool(value)
 
 
+def normalize_comparison_selection(value):
+    """선택 실험 입력을 허용된 자료 id와 생성 설정 축으로만 줄인다."""
+    raw = value if isinstance(value, dict) else {}
+
+    def ids(key):
+        values = raw.get(key)
+        values = values if isinstance(values, list) else []
+        out, seen = [], set()
+        for item in values[:20_000]:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+        return out
+
+    axes = {}
+    raw_axes = raw.get("axes") if isinstance(raw.get("axes"), dict) else {}
+    for path, spec in COMPARE_SELECTED_AXES.items():
+        values = raw_axes.get(path)
+        if not isinstance(values, list):
+            continue
+        kind, lower, upper = spec
+        normalized, seen = [], set()
+        for item in values[:50]:
+            try:
+                if kind == "int":
+                    parsed = max(int(lower), min(int(upper), int(item)))
+                elif kind == "float":
+                    parsed = max(float(lower), min(float(upper), float(item)))
+                elif kind == "bool":
+                    parsed = _compare_bool(item)
+                else:
+                    parsed = str(item or "").strip()[:80]
+                    if not parsed:
+                        continue
+            except (TypeError, ValueError, OverflowError):
+                continue
+            marker = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            normalized.append(parsed)
+        if normalized:
+            axes[path] = normalized
+    return {
+        "styles": ids("styles"),
+        "characters": ids("characters"),
+        "settings": ids("settings"),
+        "axes": axes,
+    }
+
+
 def normalize_comparison_options(raw, cfg):
     raw = raw if isinstance(raw, dict) else {}
     mode = str(raw.get("mode") or "styles")
@@ -5897,6 +5963,7 @@ def normalize_comparison_options(raw, cfg):
         "limit": limit,
         # 레퍼런스는 비교 변수를 흐리고 추가 과금도 생기므로 사용자가 켠 경우만 쓴다.
         "include_refs": _compare_bool(raw.get("include_refs"), False),
+        "selection": normalize_comparison_selection(raw.get("selection")),
     }
 
 
@@ -5959,6 +6026,314 @@ def comparison_settings(cfg):
             "state": state,
         })
     return rows
+
+
+def comparison_catalog(cfg, spec=None):
+    """선택 실험 UI가 쓰는 가벼운 자료 목록. 원문은 실행 요청에 되돌려 보내지 않는다."""
+    styles = comparison_styles(spec)
+    characters = comparison_characters(cfg)
+    settings = comparison_settings(cfg)
+    return {
+        "ok": True,
+        "styles": [{
+            "id": item["_compare_id"],
+            "name": item["_compare_name"],
+        } for item in styles],
+        "characters": [{
+            "id": item["_compare_id"],
+            "name": item["_compare_name"],
+        } for item in characters],
+        "settings": [{
+            "id": item["id"],
+            "name": item["name"],
+        } for item in settings],
+    }
+
+
+def _comparison_selected_sources(styles, characters, settings, selection):
+    wanted_styles = set(selection.get("styles") or [])
+    wanted_characters = set(selection.get("characters") or [])
+    wanted_settings = set(selection.get("settings") or [])
+    return (
+        [item for item in styles
+         if str(item.get("_compare_id") or "") in wanted_styles],
+        [item for item in characters
+         if str(item.get("_compare_id") or "") in wanted_characters],
+        [item for item in settings
+         if str(item.get("id") or "") in wanted_settings],
+    )
+
+
+def _selected_character_from_slot(slot):
+    value = slot if isinstance(slot, dict) else {}
+    return {
+        "id": value.get("id") or "",
+        "name": value.get("name") or "캐릭터",
+        "female": value.get("prompt") or value.get("female") or "",
+        "clothed": value.get("outfit") or value.get("clothed") or "",
+        "negative": value.get("negative") or "",
+        "variant": copy.deepcopy(
+            value.get("variant") or value.get("variants") or {}),
+        "reference_ids": copy.deepcopy(value.get("reference_ids") or []),
+        "vibe_ids": copy.deepcopy(value.get("vibe_ids") or []),
+        "position": copy.deepcopy(value.get("position") or {}),
+        "enabled": value.get("enabled") is not False,
+    }
+
+
+def _comparison_selected_cfg(cfg, material):
+    """canonical 셀 재료를 사용자 설정을 건드리지 않는 실행 사본으로 바꾼다."""
+    scratch = copy.deepcopy(cfg or {})
+    scratch.update(copy.deepcopy(material.get("config_overrides") or {}))
+    slots = copy.deepcopy(material.get("char_slots") or [])
+    centers = copy.deepcopy(material.get("char_centers") or [])
+    scratch["char_slots"] = slots
+    scratch["char_centers"] = centers
+    if material.get("setting_state"):
+        scratch["setting_state"] = copy.deepcopy(material["setting_state"])
+
+    selected_character = (material.get("job") or {}).get("character")
+    if isinstance(selected_character, dict) and material.get("setting_state"):
+        cast = _comparison_character_setting_slot(selected_character)
+        for state in scratch["setting_state"].values():
+            if not isinstance(state, dict):
+                continue
+            state["cast_source"] = "manual"
+            state["cast_mode"] = "sequence"
+            state["cast"] = [cast]
+
+    if material.get("include_references") and isinstance(
+            selected_character, dict):
+        scratch = character_resource_config(
+            scratch, _comparison_character_setting_scene_character(
+                selected_character))
+    return scratch
+
+
+def iter_selected_comparison_jobs(
+    cfg, plan, styles, chars, settings=None, runtime_base_seed=None,
+):
+    """선택 자료·축 canonical 셀을 실제 비교/세팅 leaf 작업으로 펼친다."""
+    selection = plan.get("selection") or plan["options"].get("selection") or {}
+    settings = comparison_settings(cfg) if settings is None else list(settings)
+    selected_styles, selected_chars, selected_settings = (
+        _comparison_selected_sources(
+            styles, chars, settings, selection))
+    expanded = expand_legacy_experiment_cells(
+        cfg,
+        {"options": dict(plan["options"], limit=0), "count": 0},
+        styles=selected_styles,
+        characters=selected_chars,
+        settings=selected_settings,
+        selected=selection,
+    )
+    limit = max(0, int(plan.get("count") or 0))
+    made = 0
+    for cell in expanded.get("cells") or []:
+        material = legacy_execution_material(
+            cell, cfg, runtime_base_seed=runtime_base_seed)
+        scratch = _comparison_selected_cfg(cfg, material)
+        source = material.get("job") or {}
+        style = source.get("style")
+        character = source.get("character")
+        setting = source.get("setting")
+        style_name = source.get("style_name") or "현재 그림체"
+        char_name = source.get("char_name") or "현재 캐릭터"
+        setting_name = source.get("setting_name") or ""
+        common = {
+            "cell_id": material.get("cell_id"),
+            "cell_resume_key": material.get("resume_key"),
+            "canonical_cell": copy.deepcopy(cell),
+            "material": material,
+            "scratch_cfg": scratch,
+            "style": style,
+            "character": character,
+            "setting": setting,
+            "style_name": style_name,
+            "char_name": char_name,
+            "setting_name": setting_name,
+            "seed_index": int(
+                (material.get("seed_material") or {}).get("seed_index") or 0),
+            "seed": material.get("seed"),
+        }
+        if isinstance(setting, dict):
+            acfg = load_asset_config(scratch)
+            for derived, cid, scene_num, copy_num in compute_pending(
+                    scratch, acfg, {}, set()):
+                if limit and made >= limit:
+                    return
+                made += 1
+                yield dict(
+                    common,
+                    index=made,
+                    key=_comparison_id(
+                        "job", "selected", material.get("resume_key"),
+                        str(cid), int(scene_num), int(copy_num)),
+                    asset_config=acfg,
+                    scene_character=copy.deepcopy(derived),
+                    scene_num=int(scene_num),
+                    copy=int(copy_num),
+                )
+        else:
+            if limit and made >= limit:
+                return
+            made += 1
+            yield dict(
+                common,
+                index=made,
+                key=str(material.get("resume_key") or cell.get("id") or ""),
+            )
+
+
+def comparison_selected_job_values(cfg, plan, job):
+    scratch = job["scratch_cfg"]
+    material = job["material"]
+    if job.get("asset_config") is not None:
+        acfg = job["asset_config"]
+        scene = acfg["scenes"][str(job["scene_num"])]
+        character = copy.deepcopy(job["scene_character"])
+        base, female, male, char_negative, male_negative, width, height = (
+            build_scene(acfg, character, scratch, int(job["scene_num"])))
+        negative = acfg["base"].get(
+            "nsfw_negative_prompt", acfg["base"].get("negative_prompt", ""))
+        if scene.get("negative"):
+            negative = _join_tags(negative, scene["negative"])
+        people, centers, use_positions = setting_scene_people(
+            scene, female, male, char_negative, male_negative,
+            character, scratch)
+        used = scratch
+        if plan["options"].get("include_refs"):
+            used, _, _ = setting_reference_config(used, scene)
+        if use_positions:
+            used["use_coords"] = True
+    else:
+        used = scratch
+        base = str(used.get("base_prompt") or "1girl")
+        negative = str(used.get("negative_prompt") or "")
+        people, centers = active_people(
+            material.get("char_slots") or [],
+            material.get("char_centers") or [],
+        )
+        selected_character = (material.get("job") or {}).get("character")
+        if isinstance(selected_character, dict) and (
+                selected_character.get("position")
+                or selected_character.get("center")):
+            used["use_coords"] = True
+    if plan["options"].get("fixed_size"):
+        used["width"] = plan["options"]["width"]
+        used["height"] = plan["options"]["height"]
+    return used, base, negative, people, centers
+
+
+def comparison_selected_plan(
+    cfg, options, styles, chars, settings, opus=None,
+):
+    selection = options.get("selection") or {}
+    chosen_styles, chosen_chars, chosen_settings = (
+        _comparison_selected_sources(
+            styles, chars, settings, selection))
+    errors = []
+    if len(chosen_styles) != len(selection.get("styles") or []):
+        errors.append("선택한 그림체 중 현재 찾을 수 없는 항목이 있습니다.")
+    if len(chosen_chars) != len(selection.get("characters") or []):
+        errors.append("선택한 캐릭터 중 현재 찾을 수 없는 항목이 있습니다.")
+    if len(chosen_settings) != len(selection.get("settings") or []):
+        errors.append("선택한 세팅 중 현재 찾을 수 없는 항목이 있습니다.")
+    if not any((
+        chosen_styles, chosen_chars, chosen_settings,
+        selection.get("axes"),
+    )):
+        errors.append("그림체·캐릭터·세팅 또는 바꿀 생성 설정 축을 하나 이상 선택해주세요.")
+
+    probe = {
+        "options": options,
+        "selection": selection,
+        "count": COMPARE_MAX_JOBS + 1,
+    }
+    total = paid_total = opus_total = eligible = 0
+    cost_cap = int(options.get("limit") or 0) or COMPARE_MAX_JOBS
+    if not errors:
+        for job in iter_selected_comparison_jobs(
+                cfg, probe, styles, chars, settings=settings):
+            total += 1
+            if total <= cost_cap:
+                used, _, _, _, _ = comparison_selected_job_values(
+                    cfg, probe, job)
+                refs = (
+                    sum(1 for item in (used.get("char_refs") or [])
+                        if item.get("enabled"))
+                    if options.get("include_refs") else 0
+                )
+                paid = anlas_estimate(
+                    used, 1, opus=False, char_refs=refs)
+                free = anlas_estimate(
+                    used, 1, opus=True, char_refs=refs)
+                paid_total += paid["per_image"]
+                opus_total += free["per_image"]
+                eligible += int(bool(free["free_eligible"]))
+            if total > COMPARE_MAX_JOBS:
+                break
+    count = min(total, int(options.get("limit") or total))
+    if count > COMPARE_MAX_JOBS:
+        errors.append(
+            f"한 계획은 최대 {COMPARE_MAX_JOBS:,}장까지 만들 수 있습니다.")
+    result = {
+        "ok": not errors,
+        "errors": errors,
+        "options": options,
+        "selection": selection,
+        "mode_label": COMPARE_MODE_LABELS["selected"],
+        "styles": len(chosen_styles),
+        "characters": len(chosen_chars),
+        "settings": len(chosen_settings),
+        "axes": len(selection.get("axes") or {}),
+        "current_slots": len([
+            slot for slot in (cfg.get("char_slots") or [])
+            if isinstance(slot, dict) and slot_prompt(slot).strip()
+            and slot.get("enabled") is not False
+        ]),
+        "combinations": total // max(1, options["seed_count"]),
+        "seed_count": options["seed_count"],
+        "total": total,
+        "count": count,
+        "limited": count < total,
+        "free_eligible": min(eligible, count),
+        "paid_anlas_max": paid_total,
+        "opus_anlas": opus_total,
+        "expected_anlas": (
+            opus_total if opus is True
+            else paid_total if opus is False else None),
+        "subscription_known": opus is not None,
+        "sample_styles": [
+            item["_compare_name"] for item in chosen_styles[:3]],
+        "sample_characters": [
+            item["_compare_name"] for item in chosen_chars[:3]],
+        "sample_settings": [
+            item["name"] for item in chosen_settings[:3]],
+    }
+    if not errors:
+        experiment = expand_legacy_experiment_cells(
+            cfg,
+            {"options": dict(options, limit=0), "count": 0},
+            styles=chosen_styles,
+            characters=chosen_chars,
+            settings=chosen_settings,
+            selected=selection,
+        )
+        result["experiment"] = {
+            "schema": experiment.get("schema"),
+            "id": experiment.get("id"),
+            "mode": experiment.get("legacy_mode"),
+            "cells": experiment.get("total", 0),
+            "total": total,
+            "pending": total,
+            "completed": 0,
+            "cell_ids": [{
+                "id": cell.get("id"),
+                "resume_key": cell.get("legacy_resume_key"),
+            } for cell in (experiment.get("cells") or [])[:10]],
+        }
+    return result
 
 
 def _comparison_character_setting_slot(character):
@@ -6239,6 +6614,11 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
         styles, chars = [], comparison_characters(cfg)
     else:
         styles, chars = comparison_sources(cfg, spec)
+    if mode == "selected":
+        return comparison_selected_plan(
+            cfg, options, styles, chars, comparison_settings(cfg),
+            opus=opus,
+        )
     if mode == "character_setting":
         return comparison_character_setting_plan(
             cfg, options, chars, opus=opus)
@@ -6354,6 +6734,15 @@ def comparison_plan(cfg, raw, spec=None, opus=None):
 
 def comparison_signature(cfg, plan, styles, chars):
     options = plan["options"]
+    selected_settings = comparison_settings(cfg)
+    if options["mode"] == "selected":
+        selected_styles, selected_chars, selected_settings = (
+            _comparison_selected_sources(
+                styles, chars, selected_settings,
+                plan.get("selection") or options.get("selection") or {},
+            ))
+    else:
+        selected_styles, selected_chars = styles, chars
     relevant_cfg = {
         k: cfg.get(k) for k in (
             "base_prompt", "negative_prompt", "cfg_scale", "cfg_rescale", "steps",
@@ -6366,17 +6755,29 @@ def comparison_signature(cfg, plan, styles, chars):
     }
     raw = {
         "options": options,
+        "selection": (
+            plan.get("selection") or options.get("selection") or {}
+            if options["mode"] == "selected" else {}
+        ),
         "config": relevant_cfg,
         "styles": [
             (x["_compare_id"], x.get("base"), x.get("combo"),
              x.get("negative"), x.get("params")) for x in styles
-        ] if options["mode"] in ("styles", "both") else [],
+        ] if options["mode"] in ("styles", "both") else [
+            (x["_compare_id"], x.get("base"), x.get("combo"),
+             x.get("negative"), x.get("params")) for x in selected_styles
+        ] if options["mode"] == "selected" else [],
         "characters": [
             (x["_compare_id"], x.get("female"), x.get("clothed"), x.get("negative"))
             for x in chars
-        ] if options["mode"] in ("characters", "both", "character_setting") else [],
-        "settings": comparison_settings(cfg)
-        if options["mode"] == "character_setting" else [],
+        ] if options["mode"] in ("characters", "both", "character_setting") else [
+            (x["_compare_id"], x.get("female"), x.get("clothed"),
+             x.get("negative"), x.get("position"),
+             x.get("reference_ids"), x.get("vibe_ids"))
+            for x in selected_chars
+        ] if options["mode"] == "selected" else [],
+        "settings": selected_settings
+        if options["mode"] in ("character_setting", "selected") else [],
     }
     return hashlib.sha256(json.dumps(
         raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -6444,6 +6845,8 @@ def iter_comparison_jobs(cfg, plan, styles, chars):
 def comparison_job_values(cfg, plan, job):
     if plan["options"].get("mode") == "character_setting":
         return comparison_character_setting_job_values(cfg, plan, job)
+    if plan["options"].get("mode") == "selected":
+        return comparison_selected_job_values(cfg, plan, job)
     options = plan["options"]
     style = job.get("style")
     used = comparison_style_config(cfg, style, options)
@@ -6472,7 +6875,9 @@ def comparison_job_recipe_snapshot(
     """현재 자료가 나중에 바뀌어도 한 결과를 복원할 수 있는 비밀값 없는 사본."""
     character = job.get("character") or {}
     setting = job.get("setting") or {}
-    if plan["options"].get("mode") == "character_setting":
+    style = job.get("style") or {}
+    mode = plan["options"].get("mode")
+    if mode == "character_setting":
         slots = [{
             "id": character.get("id") or character.get("_compare_id") or "",
             "name": character.get("name") or character.get("_compare_name") or "",
@@ -6493,6 +6898,17 @@ def comparison_job_recipe_snapshot(
             "scene": int(job.get("scene_num") or 0),
             "copy": int(job.get("copy") or 1),
         }
+    elif mode == "selected":
+        material = job.get("material") or {}
+        slots = copy.deepcopy(material.get("char_slots") or [])
+        char_centers = copy.deepcopy(material.get("char_centers") or [])
+        source_setting = {
+            "id": setting.get("id") or setting.get("name") or "",
+            "name": setting.get("name") or setting.get("id") or "",
+            "state": copy.deepcopy(setting.get("state") or {}),
+            "scene": int(job.get("scene_num") or 0),
+            "copy": int(job.get("copy") or 1),
+        } if setting else {}
     else:
         slots = []
         char_centers = []
@@ -6537,7 +6953,14 @@ def comparison_job_recipe_snapshot(
         "vibes": saved_vibes,
         "char_refs": saved_refs,
         "source": {
-            "style": {},
+            "style": {
+                key: copy.deepcopy(style.get(key))
+                for key in (
+                    "id", "_compare_id", "title", "name", "_compare_name",
+                    "base", "combo", "negative", "params",
+                )
+                if style.get(key) is not None
+            },
             "character": {
                 key: copy.deepcopy(character.get(key))
                 for key in (
@@ -6548,6 +6971,8 @@ def comparison_job_recipe_snapshot(
                 if character.get(key) is not None
             },
             "setting": source_setting,
+            "axes": copy.deepcopy(
+                (job.get("material") or {}).get("selected_axes") or {}),
         },
         "resolved": {
             "base_prompt": base,
@@ -6561,6 +6986,12 @@ def comparison_job_recipe_snapshot(
 def comparison_recipe_context(cfg, plan, styles, chars):
     """비교 결과가 현재 자료 변경 뒤에도 재현되도록 원문을 한 번만 스냅샷한다."""
     options = plan.get("options") or {}
+    context_settings = comparison_settings(cfg)
+    if options.get("mode") == "selected":
+        styles, chars, context_settings = _comparison_selected_sources(
+            styles, chars, context_settings,
+            plan.get("selection") or options.get("selection") or {},
+        )
     all_slots = cfg.get("char_slots") or []
     active_slots = [
         dict(slot) for slot in all_slots
@@ -6592,7 +7023,7 @@ def comparison_recipe_context(cfg, plan, styles, chars):
             "negative": item.get("negative") or "",
             "params": item.get("params") or {},
         } for item in styles
-            if options.get("mode") in ("styles", "both")],
+            if options.get("mode") in ("styles", "both", "selected")],
         "characters": [{
             "id": item.get("_compare_id"),
             "name": item.get("_compare_name"),
@@ -6602,9 +7033,11 @@ def comparison_recipe_context(cfg, plan, styles, chars):
             "source": item.get("source") or "",
         } for item in chars
             if options.get("mode") in (
-                "characters", "both", "character_setting")],
-        "settings": comparison_settings(cfg)
-        if options.get("mode") == "character_setting" else [],
+                "characters", "both", "character_setting", "selected")],
+        "settings": context_settings
+        if options.get("mode") in ("character_setting", "selected") else [],
+        "selection": copy.deepcopy(
+            plan.get("selection") or options.get("selection") or {}),
     }
     # 기존 비교 기록 필드는 그대로 두고 같은 내용을 생성 설계도 관점에서도 남긴다.
     # 과거 기록을 읽는 코드는 영향을 받지 않고, 새 화면·챗봇 계약은 한 경계를 사용한다.
@@ -10559,8 +10992,35 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <label class="row" style="cursor:pointer;margin:0;">
             <input type="radio" name="cmpMode" value="character_setting" style="width:auto;flex:none;">
             <span><b>캐릭터 × 선택 세팅</b><br><span class="hint">선택 씬·단계·예약 매수까지</span></span></label>
+          <label class="row" style="cursor:pointer;margin:0;">
+            <input type="radio" name="cmpMode" value="selected" style="width:auto;flex:none;">
+            <span><b>직접 고른 자료·축</b><br><span class="hint">선택한 것만 교차 실험</span></span></label>
         </div>
-        <div class="row" style="margin-top:8px;">
+        <div class="row hidden" id="cmpSelected" style="margin-top:8px;">
+          <div style="width:100%;">
+            <b>선택 실험 재료</b>
+            <div class="hint">Ctrl·Shift로 여러 개를 고릅니다. 비운 자료 종류는 현재 생성값을 유지합니다.
+            아래 축은 쉼표로 여러 값을 적은 경우에만 교차됩니다.</div>
+            <div class="grid3" style="margin-top:7px;">
+              <div class="field"><label>그림체</label>
+                <select id="cmpSelectStyles" multiple size="5"></select></div>
+              <div class="field"><label>캐릭터</label>
+                <select id="cmpSelectCharacters" multiple size="5"></select></div>
+              <div class="field"><label>세팅</label>
+                <select id="cmpSelectSettings" multiple size="5"></select></div>
+            </div>
+            <div class="grid3" style="margin-top:7px;">
+              <div class="field"><label>CFG 축 <span class="hint">예: 5, 6.5, 8</span></label>
+                <input id="cmpAxisCfg" type="text" placeholder="비우면 현재값"></div>
+              <div class="field"><label>Steps 축 <span class="hint">예: 20, 28, 35</span></label>
+                <input id="cmpAxisSteps" type="text" placeholder="비우면 현재값"></div>
+              <div class="field"><label>Sampler 축 <span class="hint">쉼표 구분</span></label>
+                <input id="cmpAxisSampler" type="text" placeholder="k_euler_ancestral, k_dpmpp_2m"></div>
+            </div>
+            <span class="hint" id="cmpSelectedMsg">선택 자료 목록을 읽는 중입니다.</span>
+          </div>
+        </div>
+        <div class="row" id="cmpCharacterSettingPlan" style="margin-top:8px;">
           <div style="flex:1;min-width:220px;"><b>캐릭터 × 선택 세팅 계획</b>
             <div class="hint">캐릭터 자료를 복사하지 않고, 현재 켠 세팅·씬을 캐릭터마다 순회합니다.
             세팅의 직접 입력 캐스트는 보존되어 언제든 돌아갈 수 있습니다.</div></div>
@@ -11430,7 +11890,82 @@ function paint(){
 /* ── 자료 비교 생성 ───────────────────────────────────────────────────
    그림체 전체 / 캐릭터 전체 / 직교 조합을 같은 크기·시드로 한 장씩 본다.
    실제 장수는 서버가 자료 파일을 다시 세어 확정하며, 확인한 수와 달라지면 시작을 거부한다. */
-let CMP_PLAN = null, CMP_TIMER = null, CMP_RUNS = [];
+let CMP_PLAN = null, CMP_TIMER = null, CMP_RUNS = [], CMP_CATALOG = null;
+let CMP_SELECTION_PENDING = null;
+function comparisonSelectedValues(id){
+  const el = $(id);
+  return el ? [...el.selectedOptions].map(option => option.value) : [];
+}
+function comparisonAxisValues(id, numeric=false){
+  const text = String(($(id) || {}).value || '');
+  const out = [];
+  text.split(',').forEach(raw => {
+    const value = raw.trim();
+    if(!value) return;
+    const parsed = numeric ? Number(value) : value;
+    if(numeric && !Number.isFinite(parsed)) return;
+    if(!out.some(item => item === parsed)) out.push(parsed);
+  });
+  return out;
+}
+function comparisonSelectionRead(){
+  const axes = {};
+  const cfg = comparisonAxisValues('cmpAxisCfg', true);
+  const steps = comparisonAxisValues('cmpAxisSteps', true)
+    .map(value => Math.trunc(value));
+  const sampler = comparisonAxisValues('cmpAxisSampler');
+  if(cfg.length) axes['generation.cfg_scale'] = cfg;
+  if(steps.length) axes['generation.steps'] = steps;
+  if(sampler.length) axes['generation.sampler'] = sampler;
+  return {
+    styles: comparisonSelectedValues('cmpSelectStyles'),
+    characters: comparisonSelectedValues('cmpSelectCharacters'),
+    settings: comparisonSelectedValues('cmpSelectSettings'),
+    axes
+  };
+}
+function comparisonApplySelection(value){
+  const selection = value || {};
+  CMP_SELECTION_PENDING = JSON.parse(JSON.stringify(selection));
+  if(!CMP_CATALOG) return;
+  [
+    ['cmpSelectStyles', selection.styles || []],
+    ['cmpSelectCharacters', selection.characters || []],
+    ['cmpSelectSettings', selection.settings || []]
+  ].forEach(([id, values]) => {
+    const wanted = new Set(values.map(String));
+    [...$(id).options].forEach(option => {
+      option.selected = wanted.has(option.value);
+    });
+  });
+  const axes = selection.axes || {};
+  $('cmpAxisCfg').value = (axes['generation.cfg_scale'] || []).join(', ');
+  $('cmpAxisSteps').value = (axes['generation.steps'] || []).join(', ');
+  $('cmpAxisSampler').value = (axes['generation.sampler'] || []).join(', ');
+  CMP_SELECTION_PENDING = null;
+}
+async function comparisonCatalogLoad(){
+  try{
+    const result = await (await fetch('/api/compare_catalog', {cache:'no-store'})).json();
+    if(!result.ok) throw new Error(result.error || '선택 자료 목록을 읽지 못했습니다.');
+    CMP_CATALOG = result;
+    [
+      ['cmpSelectStyles', result.styles || []],
+      ['cmpSelectCharacters', result.characters || []],
+      ['cmpSelectSettings', result.settings || []]
+    ].forEach(([id, rows]) => {
+      $(id).innerHTML = rows.map(row =>
+        `<option value="${escA(row.id)}">${esc(row.name)}</option>`).join('');
+    });
+    $('cmpSelectedMsg').textContent =
+      `그림체 ${(result.styles||[]).length.toLocaleString()} · 캐릭터 ${(result.characters||[]).length.toLocaleString()} · 세팅 ${(result.settings||[]).length.toLocaleString()}`;
+    comparisonApplySelection(
+      CMP_SELECTION_PENDING || (((STATE.ui||{}).comparison||{}).selection) || {});
+  }catch(error){
+    CMP_CATALOG = null;
+    $('cmpSelectedMsg').textContent = String(error);
+  }
+}
 function comparisonRead(){
   const mode = (document.querySelector('input[name="cmpMode"]:checked') || {}).value || 'styles';
   let w = Number($('cmpW').value) || Number(STATE.width) || 832;
@@ -11448,7 +11983,8 @@ function comparisonRead(){
     seed_count: Math.max(1, Math.min(4,
       Math.trunc(Number($('cmpSeedCount').value) || 1))),
     limit: Math.max(0, Math.trunc(Number($('cmpLimit').value) || 0)),
-    include_refs: $('cmpRefs').checked
+    include_refs: $('cmpRefs').checked,
+    selection: comparisonSelectionRead()
   };
 }
 function comparisonStore(opts){
@@ -11458,7 +11994,7 @@ function comparisonStore(opts){
 }
 function comparisonApply(saved){
   saved = saved || {};
-  const mode = ['styles','characters','both','character_setting'].includes(saved.mode)
+  const mode = ['styles','characters','both','character_setting','selected'].includes(saved.mode)
     ? saved.mode : 'styles';
   const radio = document.querySelector(`input[name="cmpMode"][value="${mode}"]`);
   if(radio) radio.checked = true;
@@ -11474,17 +12010,22 @@ function comparisonApply(saved){
     Math.trunc(Number(saved.seed_count) || 1))));
   $('cmpLimit').value = Number(saved.limit) || 0;
   $('cmpRefs').checked = saved.include_refs === true;
+  comparisonApplySelection(saved.selection || {});
   comparisonPaintControls();
 }
 function comparisonRestore(){
   comparisonApply(((STATE.ui || {}).comparison) || {});
 }
 function comparisonPaintControls(){
+  const mode = (document.querySelector('input[name="cmpMode"]:checked') || {}).value || 'styles';
   const custom = $('cmpRes').value === 'custom';
   $('cmpCustom').classList.toggle('hidden', !custom);
   $('cmpRes').disabled = !$('cmpFix').checked;
   $('cmpW').disabled = !$('cmpFix').checked;
   $('cmpH').disabled = !$('cmpFix').checked;
+  $('cmpSelected').classList.toggle('hidden', mode !== 'selected');
+  $('cmpCharacterSettingPlan').classList.toggle(
+    'hidden', mode !== 'character_setting');
 }
 function comparisonRunSelected(){
   const folder = ($('cmpRuns') || {}).value || '';
@@ -11543,8 +12084,10 @@ async function comparisonPreview(){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(opts)})).json();
     CMP_PLAN = r;
     $('cmpCounts').textContent = `그림체 ${Number(r.styles||0).toLocaleString()} · 캐릭터 ${Number(r.characters||0).toLocaleString()}`
-      + (opts.mode === 'character_setting'
-        ? ` · 선택 세팅 ${Number(r.settings||0).toLocaleString()}` : '');
+      + (['character_setting','selected'].includes(opts.mode)
+        ? ` · 세팅 ${Number(r.settings||0).toLocaleString()}` : '')
+      + (opts.mode === 'selected'
+        ? ` · 축 ${Number(r.axes||0).toLocaleString()}` : '');
     if(!r.ok){
       $('cmpSummary').innerHTML = `<span style="color:var(--danger)">${esc((r.errors||[r.error||'계산 실패']).join(' '))}</span>`;
       return;
@@ -11557,9 +12100,16 @@ async function comparisonPreview(){
       formula = `현재 그림체 1개 × 캐릭터 ${r.characters.toLocaleString()}개`;
     }else if(opts.mode === 'both'){
       formula = `그림체 ${r.styles.toLocaleString()}개 × 캐릭터 ${r.characters.toLocaleString()}개`;
-    }else{
+    }else if(opts.mode === 'character_setting'){
       formula = `캐릭터 ${r.characters.toLocaleString()}개 × 선택 세팅 ${Number(r.settings||0).toLocaleString()}개`
         + ` · 실제 선택 씬·단계·예약 매수`;
+    }else{
+      const parts = [];
+      if(Number(r.styles||0)) parts.push(`그림체 ${Number(r.styles).toLocaleString()}개`);
+      if(Number(r.characters||0)) parts.push(`캐릭터 ${Number(r.characters).toLocaleString()}개`);
+      if(Number(r.settings||0)) parts.push(`세팅 ${Number(r.settings).toLocaleString()}개`);
+      if(Number(r.axes||0)) parts.push(`생성 설정 축 ${Number(r.axes).toLocaleString()}개`);
+      formula = parts.join(' × ');
     }
     if(Number(r.seed_count || 1) > 1){
       formula += ` × 시드 ${Number(r.seed_count).toLocaleString()}개`;
@@ -11594,6 +12144,7 @@ function bindComparison(){
   if(!$('compareCard') || $('compareCard')._bound) return;
   $('compareCard')._bound = true;
   comparisonRestore();
+  comparisonCatalogLoad();
   $('cmpPlanAllChars').addEventListener('click', () => {
     const characters = comparisonCharacterChoices();
     const targets = SETTINGS.filter(setting => {
@@ -11633,10 +12184,15 @@ function bindComparison(){
   });
   document.querySelectorAll('input[name="cmpMode"]').forEach(x => x.addEventListener('change', comparisonSchedule));
   ['cmpRes','cmpFix','cmpSameSeed','cmpSeed','cmpSeedCount',
-   'cmpLimit','cmpRefs','cmpW','cmpH'].forEach(id => {
+   'cmpLimit','cmpRefs','cmpW','cmpH',
+   'cmpSelectStyles','cmpSelectCharacters','cmpSelectSettings',
+   'cmpAxisCfg','cmpAxisSteps','cmpAxisSampler'].forEach(id => {
     const el = $(id); if(!el) return;
     el.addEventListener('change', comparisonSchedule);
-    if(['cmpSeed','cmpLimit','cmpW','cmpH'].includes(id)) el.addEventListener('input', comparisonSchedule);
+    if(['cmpSeed','cmpLimit','cmpW','cmpH','cmpAxisCfg',
+        'cmpAxisSteps','cmpAxisSampler'].includes(id)){
+      el.addEventListener('input', comparisonSchedule);
+    }
   });
   $('cmpConfirm').addEventListener('change', () => {
     $('cmpStart').disabled = !(CMP_PLAN && CMP_PLAN.ok && CMP_PLAN.count && $('cmpConfirm').checked);
@@ -14688,6 +15244,8 @@ function expOpen(i){
       <button type="button" data-exp-result="vibe">바이브</button>
       <button type="button" data-exp-result="cref">캐릭터 레퍼런스</button>
       <button type="button" data-exp-result="i2i">img2img·인페인트</button>
+      <button type="button" id="expRerunCell"
+        title="직접 고른 자료·축 비교 결과만 같은 seed로 한 장 더 만듭니다">이 셀 다시 생성</button>
       <span class="result-action-msg" id="expResultMsg"></span>
     </div>`;
   $('expRate').addEventListener('change', async () => {
@@ -14733,6 +15291,16 @@ function expOpen(i){
       if(done) expClose();
     }
   }));
+  $('expRerunCell').addEventListener('click', async () => {
+    if(!confirm('이 선택 실험 셀을 같은 seed로 한 장 더 생성할까요?')) return;
+    const result = await (await fetch('/api/compare_rerun', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:f.path})
+    })).json();
+    $('expStat').textContent = result.ok
+      ? '한 셀 재실행을 시작했습니다. 완료되면 이 폴더에 새 결과가 추가됩니다.'
+      : (result.error || '한 셀 재실행을 시작하지 못했습니다.');
+  });
 }
 function expClose(){ const o = $('expViewer'); if(o) o.remove(); EXP.open = -1; }
 window.addEventListener('keydown', async e => {
@@ -20598,7 +21166,13 @@ class ConfigServer:
             blueprint=generation_blueprint(
                 self.cfg,
                 source={"kind": "comparison-plan"},
-                experiment=data,
+                experiment={
+                    **copy.deepcopy(plan.get("options") or {}),
+                    "selection": copy.deepcopy(
+                        plan.get("selection")
+                        or (plan.get("options") or {}).get("selection")
+                        or {}),
+                },
             ),
             payload_identity={
                 "kind": "comparison",
@@ -20631,6 +21205,44 @@ class ConfigServer:
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, "plan": plan}
+
+    def handle_compare_rerun(self, body):
+        """선택 실험 결과 한 장의 canonical 셀만 같은 seed로 다시 실행한다."""
+        if self.live.running:
+            return {"ok": False, "error": "이미 생성 중입니다."}
+        if not self.cfg.get("token", "").startswith("pst-"):
+            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
+        try:
+            data = json.loads(body or b"{}")
+            path = str(data.get("path") or "")
+            # 실행권을 잡기 전에 manifest와 셀 재료가 실제로 있는지 확인한다.
+            _selected_comparison_record(self.cfg, path)
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+        token = self.live.try_claim(
+            "비교 한 셀 재실행",
+            "library",
+            payload_identity={"kind": "comparison-rerun", "path": path},
+        )
+        if token is None:
+            return {"ok": False, "error": "이미 생성 중입니다."}
+        run_cfg = copy.deepcopy(self.cfg)
+
+        def run():
+            try:
+                _rerun_selected_comparison(self, run_cfg, path)
+            except Exception as error:
+                log.error("비교 한 셀 재실행 실패: %s", error)
+                self.live.update(
+                    status_text=f"비교 한 셀 재실행 실패: {error}",
+                    failed=1, last_error=str(error),
+                    phase="failed", can_retry=True,
+                )
+            finally:
+                self.live.release(token)
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, "path": path}
 
     def handle_inspect(self, body, filename="", save_flag=""):
         """이미지에서 NAI 메타데이터를 뽑아 그림체 레코드로. (novelai.net/inspect 대체)
@@ -21485,6 +22097,11 @@ class ConfigServer:
                         self._json(local_image_integrity())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_catalog"):
+                    try:
+                        self._json(comparison_catalog(server.cfg, server.spec))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_runs"):
                     try:
                         self._json(comparison_runs(server.cfg))
@@ -21795,6 +22412,8 @@ class ConfigServer:
                             server.cfg, data.get("folder")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/compare_rerun"):
+                    self._json(server.handle_compare_rerun(body))
                 elif self.path.startswith("/api/compare_recipe"):
                     try:
                         data = json.loads(body or b"{}")
@@ -22770,6 +23389,12 @@ def comparison_recipe_for_output(cfg, rel):
         if isinstance(item, dict)
         and str(item.get("file") or "").replace("\\", "/") == wanted
     ), None)
+    if record is None and isinstance(progress.get("reruns"), dict):
+        record = next((
+            item for item in progress["reruns"].values()
+            if isinstance(item, dict)
+            and str(item.get("file") or "").replace("\\", "/") == wanted
+        ), None)
     if record is None:
         raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
     if isinstance(record.get("recipe"), dict):
@@ -23097,6 +23722,138 @@ def _comparison_progress_start(cfg, plan, styles, chars):
     return progress, folder
 
 
+def _selected_comparison_record(cfg, rel):
+    image = output_file_for_preview(cfg, rel)
+    if image is None:
+        raise ValueError("다시 실행할 비교 결과를 찾지 못했습니다.")
+    root = out_root(cfg).resolve()
+    folder = image.parent.resolve()
+    if not _path_is_inside(folder, (root / "비교생성").resolve()):
+        raise ValueError("비교 생성 결과만 한 셀 다시 실행할 수 있습니다.")
+    progress = load_json_recover(folder / "manifest.json")
+    if not isinstance(progress, dict) or progress.get("mode") != "selected":
+        raise ValueError("직접 고른 자료·축 실험 결과만 한 셀 다시 실행할 수 있습니다.")
+    wanted = image.relative_to(root).as_posix()
+    for section in ("completed", "reruns"):
+        rows = progress.get(section)
+        if not isinstance(rows, dict):
+            continue
+        for key, record in rows.items():
+            if (isinstance(record, dict)
+                    and str(record.get("file") or "").replace("\\", "/")
+                    == wanted):
+                return progress, folder, str(key), copy.deepcopy(record)
+    raise ValueError("manifest에서 선택한 셀 기록을 찾지 못했습니다.")
+
+
+def _rerun_selected_comparison(server, cfg, rel):
+    """선택 실험의 한 canonical 셀만 같은 seed로 다시 실행해 새 결과로 남긴다."""
+    progress, folder, source_key, source = _selected_comparison_record(cfg, rel)
+    cell = source.get("canonical_cell")
+    if not isinstance(cell, dict):
+        raise ValueError("이 결과에는 한 셀 재실행 정보가 없습니다.")
+    plan = progress.get("plan")
+    if not isinstance(plan, dict):
+        raise ValueError("이 결과의 선택 실험 계획을 읽지 못했습니다.")
+    attempt = max(2, int(source.get("rerun_attempt") or 1) + 1)
+    material = regenerate_legacy_execution_material(
+        cell, cfg, attempt=attempt,
+        runtime_base_seed=int(progress.get("base_seed") or source.get("seed") or 1),
+    )
+    scratch = _comparison_selected_cfg(cfg, material)
+    job = {
+        "index": int(source.get("index") or 1),
+        "key": source_key,
+        "cell_id": material.get("cell_id"),
+        "cell_resume_key": material.get("resume_key"),
+        "canonical_cell": cell,
+        "material": material,
+        "scratch_cfg": scratch,
+        "style": (material.get("job") or {}).get("style"),
+        "character": (material.get("job") or {}).get("character"),
+        "setting": (material.get("job") or {}).get("setting"),
+        "style_name": source.get("style") or "현재 그림체",
+        "char_name": source.get("character") or "현재 캐릭터",
+        "setting_name": source.get("setting") or "",
+        "seed_index": int(source.get("seed_index") or 0),
+        "seed": int(source.get("seed") or material.get("seed") or 1),
+        "scene_num": int(source.get("scene") or 0),
+        "copy": int(source.get("copy") or 1),
+    }
+    if isinstance(job["setting"], dict) and job["scene_num"]:
+        acfg = load_asset_config(scratch)
+        match = next((
+            derived for derived, _cid, scene_num, copy_num in compute_pending(
+                scratch, acfg, {}, set())
+            if int(scene_num) == job["scene_num"]
+            and int(copy_num) == job["copy"]
+        ), None)
+        if match is None:
+            raise ValueError("선택했던 세팅 씬을 현재 자료에서 찾지 못했습니다.")
+        job["asset_config"] = acfg
+        job["scene_character"] = copy.deepcopy(match)
+    used, base, negative, people, centers = comparison_selected_job_values(
+        cfg, plan, job)
+    token = cfg["token"]
+    allowed, why = pace_gate(cfg, server.live, "비교 한 셀 재실행")
+    if not allowed:
+        raise ValueError(why)
+    params = runtime_generation_params(
+        used, token, include_refs=plan["options"].get("include_refs", False))
+    try:
+        image = call_nai_api(
+            token, base, "", "", negative,
+            int(used.get("width", 832)), int(used.get("height", 1216)),
+            chars=people,
+            scale=used.get("cfg_scale", 5.5),
+            cfg_rescale=used.get("cfg_rescale", 0.56),
+            steps=int(used.get("steps", 28)),
+            sampler=used.get("sampler", "k_euler_ancestral"),
+            scheduler=used.get("scheduler", "karras"),
+            variety=used.get("variety", False),
+            uc_preset=int(used.get("uc_preset", 4)),
+            seed=job["seed"], params=with_centers(params, centers),
+        )
+    finally:
+        pace_complete()
+    source_path = output_file_for_preview(cfg, source["file"])
+    stem = (
+        source_path.stem if source_path is not None
+        else f"{job['index']:06d}_selected")
+    target = available_output_path(
+        folder / f"{stem}_rerun{attempt}.webp", out_format(cfg))
+    saved = save_with_meta(
+        image, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
+        max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+    server.live.set_image(image)
+    root = out_root(cfg).resolve()
+    rel_saved = saved.resolve().relative_to(root).as_posix()
+    rerun_key = f"{source_key}:rerun:{attempt}:{uuid.uuid4().hex[:8]}"
+    record = copy.deepcopy(source)
+    record.update({
+        "file": rel_saved,
+        "rerun_of": source_key,
+        "rerun_attempt": attempt,
+        "request_id": material.get("request_id"),
+        "seed": job["seed"],
+        "recipe": comparison_job_recipe_snapshot(
+            cfg, plan, job, used, base, negative,
+            people, centers, job["seed"]),
+    })
+    progress.setdefault("reruns", {})[rerun_key] = record
+    progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _comparison_progress_save(progress, folder)
+    state = load_state()
+    bump_daily(state)
+    save_state(state)
+    server.live.update(
+        index=1, total=1, completed=1, failed=0,
+        filename=saved.name, seed=job["seed"],
+        status_text=f"선택 실험 한 셀 재실행 완료 · {saved.name}",
+        phase="completed", can_retry=False,
+    )
+
+
 def _run_comparison(server, cfg, plan, styles, chars):
     """자료 비교 큐. 한 번에 한 요청만 보내고 중지·일일 상한·재개를 모두 지킨다."""
     progress, folder = _comparison_progress_start(cfg, plan, styles, chars)
@@ -23106,11 +23863,13 @@ def _run_comparison(server, cfg, plan, styles, chars):
     token = cfg["token"]
     base_seed = int(progress["base_seed"])
     state = load_state()
-    jobs = (
-        iter_character_setting_jobs(cfg, plan, chars)
-        if options.get("mode") == "character_setting"
-        else iter_comparison_jobs(cfg, plan, styles, chars)
-    )
+    if options.get("mode") == "character_setting":
+        jobs = iter_character_setting_jobs(cfg, plan, chars)
+    elif options.get("mode") == "selected":
+        jobs = iter_selected_comparison_jobs(
+            cfg, plan, styles, chars, runtime_base_seed=base_seed)
+    else:
+        jobs = iter_comparison_jobs(cfg, plan, styles, chars)
     done_n = len(completed)
     run_failed = set()
     server.live.update(
@@ -23136,9 +23895,13 @@ def _run_comparison(server, cfg, plan, styles, chars):
         used, base, negative, people, centers = comparison_job_values(cfg, plan, job)
         seed_index = int(job.get("seed_index") or 0)
         seed = (
-            (base_seed + seed_index * 100003) & 0xffffffff
-            if options["same_seed"]
-            else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff
+            int(job.get("seed") or 0)
+            if options.get("mode") == "selected"
+            else (
+                (base_seed + seed_index * 100003) & 0xffffffff
+                if options["same_seed"]
+                else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff
+            )
         )
         seed = seed or 1
         style_label = job["style_name"]
@@ -23206,7 +23969,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
                     "seed": seed, "width": int(used["width"]),
                     "height": int(used["height"]),
                 }
-                if options.get("mode") == "character_setting":
+                if options.get("mode") in ("character_setting", "selected"):
                     completed[key].update({
                         "cell_id": job.get("cell_id"),
                         "cell_resume_key": job.get("cell_resume_key"),
@@ -23222,6 +23985,22 @@ def _run_comparison(server, cfg, plan, styles, chars):
                             people, centers, seed,
                         ),
                     })
+                    if options.get("mode") == "selected":
+                        cell = job.get("canonical_cell") or {}
+                        completed[key]["canonical_cell"] = {
+                            name: copy.deepcopy(cell.get(name))
+                            for name in (
+                                "id", "legacy_resume_key",
+                                "legacy_job_key", "seed_material",
+                                "legacy_material",
+                            )
+                            if cell.get(name) is not None
+                        }
+                        completed[key]["canonical_cell"]["blueprint"] = {
+                            "experiment": {
+                                "mode": "selected_groups",
+                            },
+                        }
                 errors.pop(key, None)
                 bump_daily(state)
                 save_state(state)
