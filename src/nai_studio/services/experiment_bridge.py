@@ -64,8 +64,8 @@ def _stable_id(prefix: str, value: Any) -> str:
     return f"{prefix}-{hashlib.sha256(encoded).hexdigest()[:24]}"
 
 
-def _legacy_comparison_id(prefix: str, *parts: Any) -> str:
-    """legacy_app._comparison_id와 바이트 단위로 같은 재개 key."""
+def legacy_comparison_id(prefix: str, *parts: Any) -> str:
+    """비교 계획·실험 셀이 함께 쓰는 기존 20자리 재개 key."""
     encoded = json.dumps(
         parts,
         ensure_ascii=False,
@@ -117,7 +117,7 @@ def _legacy_job_key(
         key = [_source_id(style), _source_id(character)]
     else:
         return None
-    return _legacy_comparison_id("job", legacy_mode, key, int(seed_index))
+    return legacy_comparison_id("job", legacy_mode, key, int(seed_index))
 
 
 def _source_id(value: Any) -> str:
