@@ -182,6 +182,7 @@ from src.nai_studio.services import (
     catalog_search as _catalog_search,
     character_storage as _character_storage,
     comparison_planning as _comparison_planning,
+    comparison_promotion as _comparison_promotion,
     datapack_store as _datapack_store,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
@@ -7791,106 +7792,58 @@ def _comparison_result_context(cfg, rel):
     raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
 
 
+def _comparison_promotion_paths():
+    """현재 프로필의 승격 저장 경로를 호출 시점에 조립한다."""
+    return _comparison_promotion.ComparisonPromotionPaths(
+        base_dir=BASE_DIR,
+        style_dir=STYLE_DIR,
+        character_dir=CHAR_DIR,
+        settings_file=SETTINGS_FILE,
+    )
+
+
+def _comparison_promotion_operations(include_recipe_adapter=False):
+    """현재 비교·평가·저장 경계를 늦게 주입해 APP patch를 보존한다."""
+    return _comparison_promotion.ComparisonPromotionOperations(
+        transaction=shared_data_transaction,
+        comparison_result_context=globals()["_comparison_result_context"],
+        default_config=globals()["DEFAULT_CONFIG"],
+        comparison_style_config=globals()["comparison_style_config"],
+        recipe_setting_keys=COMPARE_RECIPE_SETTING_KEYS,
+        slot_prompt=globals()["slot_prompt"],
+        comparison_result_evaluation=globals()[
+            "_comparison_result_evaluation"
+        ],
+        build_result_promotion=globals()["build_result_promotion"],
+        style_bundle_signature=globals()["style_bundle_signature"],
+        character_bundle_signature=globals()[
+            "character_bundle_signature"
+        ],
+        list_styles=globals()["list_styles"],
+        load_spec=globals()["load_spec"],
+        load_combos=globals()["load_combos"],
+        unique_library_name=globals()["_unique_library_name"],
+        save_style_file=globals()["save_style_file"],
+        safe_name=globals()["_safe_name"],
+        record_import_batch=globals()["record_import_batch"],
+        sync_characters_to_files=globals()["sync_chars_to_files"],
+        save_config=globals()["save_config"],
+        random_character_id=lambda: "".join(random.choices(
+            string.ascii_lowercase + string.digits, k=8)),
+        recipe_for_output=(
+            globals()["comparison_recipe_for_output"]
+            if include_recipe_adapter
+            else None
+        ),
+    )
+
+
 def comparison_recipe_for_output(cfg, rel):
-    """선택한 비교 이미지가 실제로 사용한 원문·설정·캐릭터를 manifest에서 복원한다."""
-    context_result = _comparison_result_context(cfg, rel)
-    progress = context_result["manifest"]
-    completed = progress.get("completed")
-    if not isinstance(completed, dict):
-        raise ValueError("비교 결과 기록 형식이 올바르지 않습니다.")
-    wanted = context_result["file"]
-    record = context_result["record"]
-    if isinstance(record.get("recipe"), dict):
-        recipe = copy.deepcopy(record["recipe"])
-        recipe["nai_seed"] = int(record.get("seed") or recipe.get("nai_seed") or 0)
-        return {
-            "ok": True,
-            "file": wanted,
-            "recipe": recipe,
-        }
-    context = progress.get("recipe_context")
-    if not isinstance(context, dict):
-        raise ValueError(
-            "이 결과는 원문 레시피 기록 기능 이전에 만들어져 자동 적용할 수 없습니다.")
-    context_cfg = dict(DEFAULT_CONFIG)
-    context_cfg.update(
-        context.get("config") if isinstance(context.get("config"), dict) else {})
-    options = context.get("options")
-    if not isinstance(options, dict):
-        plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
-        options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
-    styles = context.get("styles") if isinstance(context.get("styles"), list) else []
-    chars = (context.get("characters")
-             if isinstance(context.get("characters"), list) else [])
-    style_id = record.get("style_id")
-    character_id = record.get("character_id")
-    style = next((
-        item for item in styles
-        if isinstance(item, dict)
-        and str(item.get("id")) == str(style_id)
-    ), None) if style_id is not None else None
-    character = next((
-        item for item in chars
-        if isinstance(item, dict)
-        and str(item.get("id")) == str(character_id)
-    ), None) if character_id is not None else None
-    used = comparison_style_config(context_cfg, style, options)
-    base = ((style or {}).get("base")
-            or context_cfg.get("base_prompt") or "1girl").strip()
-    negative = ((style or {}).get("negative")
-                if style is not None
-                else context_cfg.get("negative_prompt", ""))
-    negative = negative or ""
-    if character is not None:
-        char_slots = [{
-            "name": character.get("name") or record.get("character") or "캐릭터",
-            "prompt": character.get("female") or "",
-            "outfit": character.get("clothed") or "",
-            "negative": character.get("negative") or "",
-            "variant": copy.deepcopy(character.get("variant") or {}),
-            "variants": copy.deepcopy(character.get("variants") or []),
-            "reference_ids": copy.deepcopy(
-                character.get("reference_ids") or []),
-            "vibe_ids": copy.deepcopy(character.get("vibe_ids") or []),
-            "enabled": True,
-        }]
-        char_centers = [{"x": 0.5, "y": 0.5}]
-    else:
-        char_slots = [
-            dict(slot) for slot in (context.get("char_slots") or [])
-            if isinstance(slot, dict)
-        ]
-        char_centers = [
-            dict(center) for center in (context.get("char_centers") or [])
-            if isinstance(center, dict)
-        ]
-    include_refs = bool(options.get("include_refs"))
-    return {
-        "ok": True,
-        "file": wanted,
-        "recipe": {
-            "version": 1,
-            "mode": str(progress.get("mode") or options.get("mode") or ""),
-            "base_prompt": base,
-            "negative_prompt": negative,
-            "style_name": ((style or {}).get("name")
-                           or context_cfg.get("style_name")
-                           or record.get("style") or ""),
-            "settings": {
-                key: used.get(key) for key in COMPARE_RECIPE_SETTING_KEYS
-            },
-            "char_slots": char_slots,
-            "char_centers": char_centers,
-            "nai_seed": int(record.get("seed") or 0),
-            "include_refs": include_refs,
-            "vibes": context_cfg.get("vibes") or [] if include_refs else [],
-            "char_refs": context_cfg.get("char_refs") or [] if include_refs else [],
-            "source": {
-                "style": (style or {}),
-                "character": (character or {}),
-            },
-        },
-    }
+    return _comparison_promotion.comparison_recipe_for_output(
+        _comparison_promotion_operations(),
+        cfg,
+        rel,
+    )
 
 
 def _unique_library_name(directory, requested, fallback, existing_names=()):
@@ -7906,12 +7859,6 @@ def _unique_library_name(directory, requested, fallback, existing_names=()):
         candidate = f"{base} ({suffix})"
         suffix += 1
     return candidate
-
-
-def _style_signature(prompt, negative, settings):
-    return style_bundle_signature({
-        "prompt": prompt, "negative": negative, "settings": settings,
-    })
 
 
 def _comparison_result_evaluation(path, manifest, job_key):
@@ -7941,106 +7888,22 @@ def _comparison_result_evaluation(path, manifest, job_key):
     }
 
 
-class LegacyPromotionLineageUnavailable(ValueError):
-    """엄격 실행 식별자가 전혀 없는 구형 비교 결과."""
+LegacyPromotionLineageUnavailable = (
+    _comparison_promotion.LegacyPromotionLineageUnavailable
+)
 
 
 def _result_promotion_records(
     cfg, rel, kind, name="", resolved_names=None,
 ):
-    """새 비교 결과의 검증 가능한 계보와 명시적 자산 내용을 승격 레코드로 만든다."""
-    context = _comparison_result_context(cfg, rel)
-    restored = comparison_recipe_for_output(cfg, rel)
-    recipe = restored["recipe"]
-    record = context["record"]
-    strict_keys = (
-        "content_sha256", "request_id", "payload_hash",
-        "blueprint_fingerprint",
+    return _comparison_promotion.result_promotion_records(
+        _comparison_promotion_operations(include_recipe_adapter=True),
+        cfg,
+        rel,
+        kind,
+        name,
+        resolved_names,
     )
-    # 진짜 구형은 키 자체가 없다. 새 형식의 키가 있는데 값이 비었거나 일부만
-    # 남은 경우는 손상된 strict 결과이지 구형 호환 대상으로 낮추면 안 된다.
-    present = [key for key in strict_keys if key in record]
-    if not present:
-        raise LegacyPromotionLineageUnavailable(
-            "이 비교 결과에는 엄격 실행 식별자가 없습니다.")
-    missing = [key for key in strict_keys if not record.get(key)]
-    if missing:
-        raise ValueError(
-            "비교 결과의 엄격 실행 식별자가 일부 빠졌습니다: "
-            + ", ".join(missing))
-    actual_sha = hashlib.sha256(
-        context["image_path"].read_bytes()).hexdigest()
-    if actual_sha != str(record.get("content_sha256") or "").lower():
-        raise ValueError(
-            "저장된 비교 이미지가 manifest 기록 뒤 바뀌어 엄격한 계보로 승격할 수 없습니다.")
-    result = {
-        "path": context["file"],
-        "content_sha256": actual_sha,
-        "request_id": record.get("request_id"),
-        "payload_hash": record.get("payload_hash"),
-        "blueprint_fingerprint": record.get("blueprint_fingerprint"),
-    }
-    evaluation = _comparison_result_evaluation(
-        context["file"], context["manifest"], context["job_key"])
-    target = str(kind or "").strip().casefold()
-    if target == "style":
-        settings = {
-            key: value for key, value in (recipe.get("settings") or {}).items()
-            if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
-        }
-        return [build_result_promotion(
-            result,
-            context["manifest"],
-            evaluation,
-            target="style",
-            name=str(
-                ((resolved_names or [""])[0] if resolved_names else "")
-                or name or recipe.get("style_name") or ""),
-            content={
-                "base": str(recipe.get("base_prompt") or ""),
-                "negative": str(recipe.get("negative_prompt") or ""),
-                "generation_settings": settings,
-            },
-        )]
-    if target != "characters":
-        raise ValueError("승격할 자료 종류가 올바르지 않습니다.")
-    output = []
-    slots = [
-        slot for slot in (recipe.get("char_slots") or [])
-        if isinstance(slot, dict) and slot_prompt(slot).strip()
-    ]
-    for index, slot in enumerate(slots, 1):
-        variants = copy.deepcopy(slot.get("variants") or [])
-        variant = copy.deepcopy(slot.get("variant") or {})
-        if variant and variant not in variants:
-            variants.insert(0, variant)
-        output.append(build_result_promotion(
-            result,
-            context["manifest"],
-            evaluation,
-            target="character",
-            name=str(
-                (
-                    resolved_names[index - 1]
-                    if resolved_names and index <= len(resolved_names)
-                    else ""
-                )
-                or slot.get("name") or f"비교 결과 캐릭터 {index}"),
-            content={
-                "prompt": slot_prompt(slot),
-                "appearance": str(
-                    slot.get("prompt") or slot.get("female") or ""),
-                "clothed": str(
-                    slot.get("outfit") or slot.get("clothed") or ""),
-                "negative": str(slot.get("negative") or ""),
-                "variants": variants,
-                "reference_refs": list(slot.get("reference_ids") or []),
-                "vibe_refs": list(slot.get("vibe_ids") or []),
-            },
-        ))
-    if not output:
-        raise ValueError("이 비교 결과에는 승격할 캐릭터가 없습니다.")
-    return output
 
 
 def _append_result_promotion_ledger(records):
@@ -8059,169 +7922,16 @@ def _append_result_promotion_ledger(records):
     }
 
 
-@serialized_data_write(lambda: BASE_DIR)
 def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
-    """선택 결과를 중복·덮어쓰기 없이 기존 그림체 또는 캐릭터 자료로 승격한다.
-
-    세팅은 비교 생성에 사용되지 않고 manifest에도 상태가 없으므로 그림 한 장에서
-    역추정하지 않는다. 생성 설정은 그림체의 일부로 함께 저장한다.
-    """
-    restored = comparison_recipe_for_output(cfg, rel)
-    recipe = restored["recipe"]
-    kind = str(kind or "").strip().lower()
-    if kind == "setting":
-        return {
-            "ok": False,
-            "error": "이 비교 결과에는 세팅 선택 상태가 없습니다. 그림만 보고 세팅을 추정해 저장하지 않습니다.",
-        }
-    if kind == "style":
-        prompt = recipe.get("base_prompt") or ""
-        negative = recipe.get("negative_prompt") or ""
-        settings = {
-            key: value for key, value in (recipe.get("settings") or {}).items()
-            if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
-        }
-        wanted = _style_signature(prompt, negative, settings)
-        styles = list_styles(spec or load_spec())
-        same = next((
-            item for item in styles
-            if _style_signature(
-                item.get("prompt"), item.get("negative"), item.get("settings")
-            ) == wanted
-        ), None)
-        if same is not None:
-            return {
-                "ok": True, "kind": "style", "saved": 0, "existing": 1,
-                "names": [same.get("name") or "기존 그림체"],
-                "styles": styles, "changed_config": False,
-            }
-        same_collected = next((
-            item for item in load_combos()
-            if isinstance(item, dict) and style_bundle_signature(item) == wanted
-        ), None)
-        if same_collected is not None:
-            return {
-                "ok": True, "kind": "style", "saved": 0, "existing": 1,
-                "names": [same_collected.get("title")
-                          or same_collected.get("id") or "기존 그림체"],
-                "styles": styles, "changed_config": False,
-                "existing_store": "수집/그림체.json",
-            }
-        final_name = _unique_library_name(
-            STYLE_DIR,
-            name or recipe.get("style_name"),
-            "비교 결과 그림체",
-            (item.get("name") for item in styles),
-        )
-        save_style_file(
-            final_name, prompt=prompt, negative=negative, settings=settings)
-        batch_id = None
-        saved_path = STYLE_DIR / f"{_safe_name(final_name)}.json"
-        try:
-            rel_path = saved_path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
-        except (OSError, ValueError):
-            rel_path = ""
-        if rel_path and saved_path.is_file():
-            batch_id = record_import_batch({
-                "kind": "comparison", "file": restored["file"],
-                "installed": [{
-                    "path": rel_path,
-                    "sha256": hashlib.sha256(saved_path.read_bytes()).hexdigest(),
-                }],
-                "요약": "비교 결과: 그림체 묶음 1건 승격",
-            })
-        return {
-            "ok": True, "kind": "style", "saved": 1, "existing": 0,
-            "names": [final_name],
-            "styles": list_styles(spec or load_spec()),
-            "changed_config": False, "batch": batch_id,
-        }
-    if kind != "characters":
-        return {"ok": False, "error": "저장할 자료 종류가 올바르지 않습니다."}
-
-    slots = [
-        slot for slot in (recipe.get("char_slots") or [])
-        if isinstance(slot, dict) and slot_prompt(slot).strip()
-    ]
-    if not slots:
-        return {"ok": False, "error": "이 비교 결과에는 저장할 캐릭터가 없습니다."}
-    characters = cfg.setdefault("characters", [])
-    names, saved, existing, saved_records = [], 0, 0, []
-    for index, slot in enumerate(slots, 1):
-        prompt = str(slot.get("prompt") or "")
-        outfit = str(slot.get("outfit") or "")
-        negative = str(slot.get("negative") or "")
-        wanted_character = character_bundle_signature({
-            "female": prompt,
-            "clothed": outfit,
-            "negative": negative,
-            "variant": copy.deepcopy(slot.get("variant") or {}),
-            "variants": copy.deepcopy(slot.get("variants") or []),
-            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
-            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
-        })
-        same = next((
-            item for item in characters
-            if character_bundle_signature(item) == wanted_character
-        ), None)
-        if same is not None:
-            names.append(same.get("name") or f"기존 캐릭터 {index}")
-            existing += 1
-            continue
-        requested = slot.get("name") or (
-            f"{name} {index}" if name and len(slots) > 1 else name)
-        final_name = _unique_library_name(
-            CHAR_DIR,
-            requested,
-            f"비교 결과 캐릭터 {index}",
-            (item.get("name") for item in characters),
-        )
-        created = {
-            "id": "".join(random.choices(
-                string.ascii_lowercase + string.digits, k=8)),
-            "name": final_name,
-            "female": prompt,
-            "clothed": outfit,
-            "negative": negative,
-            "variant": copy.deepcopy(slot.get("variant") or {}),
-            "variants": copy.deepcopy(slot.get("variants") or []),
-            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
-            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
-            "enabled": True,
-            "folder_id": None,
-            "subfolder_id": None,
-            "source": f"비교 결과: {restored['file']}",
-        }
-        characters.append(created)
-        saved_records.append(created)
-        names.append(final_name)
-        saved += 1
-    if saved:
-        sync_chars_to_files(cfg)
-        save_config(cfg)
-    batch_id = None
-    try:
-        settings_inside = (
-            SETTINGS_FILE.resolve() == BASE_DIR.resolve()
-            or BASE_DIR.resolve() in SETTINGS_FILE.resolve().parents
-        )
-    except OSError:
-        settings_inside = False
-    if saved and settings_inside:
-        records = [{
-            "id": item.get("id"),
-            "after_signature": character_bundle_signature(item),
-        } for item in saved_records]
-        batch_id = record_import_batch({
-            "kind": "comparison", "file": restored["file"],
-            "characters": records,
-            "요약": f"비교 결과: 캐릭터 묶음 {len(records)}건 승격",
-        })
-    return {
-        "ok": True, "kind": "characters", "saved": saved, "existing": existing,
-        "names": names, "characters": characters,
-        "changed_config": bool(saved), "batch": batch_id,
-    }
+    return _comparison_promotion.promote_comparison_recipe_assets(
+        _comparison_promotion_paths(),
+        _comparison_promotion_operations(include_recipe_adapter=True),
+        cfg,
+        rel,
+        kind,
+        name,
+        spec,
+    )
 
 
 def _comparison_progress_save(progress, folder):
