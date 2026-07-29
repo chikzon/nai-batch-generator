@@ -718,13 +718,11 @@ def new_promotion_ledger() -> dict:
 
 
 def _promotion_ledger_key(value: Mapping[str, Any]) -> str:
-    """표시 이름·외부 record ID가 아닌 실제 승격 결정의 안정 ID."""
+    """같은 결정 안에서도 서로 다른 명시적 자산 내용은 각각 보존한다."""
     promotion = value.get("promotion_event")
     if not isinstance(promotion, Mapping):
         promotion = {}
     event_id = str(promotion.get("id") or "").strip()
-    if event_id:
-        return f"event:{event_id}"
     payload = promotion.get("payload")
     decision = (
         payload.get("decision")
@@ -736,9 +734,23 @@ def _promotion_ledger_key(value: Mapping[str, Any]) -> str:
         if isinstance(decision, Mapping)
         else ""
     )
-    if decision_id:
-        return f"decision:{decision_id}"
-    raise ValueError("promotion event or decision id is required")
+    identity = event_id or decision_id
+    if not identity:
+        raise ValueError("promotion event or decision id is required")
+    target = str(value.get("target") or "").strip()
+    asset = value.get("knowledge_asset")
+    content = (
+        asset.get("content")
+        if isinstance(asset, Mapping)
+        else None
+    )
+    if target not in PROMOTION_TARGETS or not isinstance(content, Mapping):
+        raise ValueError("promotion target and knowledge content are required")
+    return "promotion-ledger-key:" + _stable_hash({
+        "promotion_identity": identity,
+        "target": target,
+        "knowledge_content": content,
+    })
 
 
 def append_promotion_events(

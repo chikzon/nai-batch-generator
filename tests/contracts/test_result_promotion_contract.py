@@ -508,10 +508,39 @@ class ResultPromotionContractTests(unittest.TestCase):
             renamed_result["ledger"],
             [changed],
         )
-        self.assertEqual(len(final["ledger"]["events"]), 1)
-        self.assertEqual(final["appended"], [])
-        self.assertEqual(final["duplicates"], [changed["id"]])
+        self.assertEqual(len(final["ledger"]["events"]), 2)
+        self.assertEqual(final["appended"], [changed["id"]])
+        self.assertEqual(final["duplicates"], [])
         self.assert_no_runtime_secrets(final)
+
+    def test_two_character_contents_from_one_result_are_both_preserved(self):
+        first_content = self.character_content()
+        second_content = copy.deepcopy(first_content)
+        second_content["prompt"] = "1boy,\nshort black hair"
+        first = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="character",
+            content=first_content,
+            name="첫째",
+        )
+        second = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="character",
+            content=second_content,
+            name="둘째",
+        )
+        self.assertEqual(
+            first["promotion_event"]["id"],
+            second["promotion_event"]["id"],
+        )
+        merged = append_promotion_events(None, [first, second])
+        self.assertEqual(len(merged["ledger"]["events"]), 2)
+        self.assertEqual(merged["appended"], [first["id"], second["id"]])
+        self.assertEqual(merged["duplicates"], [])
 
     def test_append_rejects_raw_metadata_or_raw_payload_in_forged_event(self):
         event = build_result_promotion(
