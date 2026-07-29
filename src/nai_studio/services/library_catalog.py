@@ -48,6 +48,8 @@ class LibraryCatalogOperations:
     load_json: Callable[[Path], Any]
     atomic_write_json: Callable[..., None]
     now: Callable[[], Any]
+    review_lock: Any
+    warning: Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -130,8 +132,6 @@ def _style_indexes(rows: list) -> tuple[list[str], dict, dict, int]:
         if (row.get("params") or {}).get("seed"):
             seeded += 1
     return search, sources, tabs, seeded
-    review_lock: Any
-    warning: Callable[..., Any]
 
 
 def _combo_texts(
