@@ -163,6 +163,48 @@ class BlueprintExecutionBridgeContractTests(unittest.TestCase):
             json.dumps(material, ensure_ascii=False),
         )
 
+    def test_blank_character_keeps_editing_slot_but_not_a_misaligned_call_center(self):
+        cfg = self.fixture()
+        cfg["char_slots"] = [{
+            "id": "blank",
+            "name": "Blank",
+            "prompt": "",
+            "outfit": "",
+            "negative": "blank negative",
+            "enabled": True,
+        }, {
+            "id": "real",
+            "name": "Real",
+            "prompt": "blue hair",
+            "outfit": "black coat",
+            "negative": "real negative",
+            "enabled": True,
+        }]
+        cfg["char_centers"] = [
+            {"x": 0.1, "y": 0.2},
+            {"x": 0.8, "y": 0.9},
+        ]
+        material = single_generation_legacy_material(
+            APP.generation_blueprint(cfg)
+        )
+        people, centers = APP.active_people(
+            cfg["char_slots"], cfg["char_centers"]
+        )
+
+        self.assertEqual(material["call"]["characters"], people)
+        self.assertEqual(material["call"]["char_centers"], centers)
+        self.assertEqual(material["call"]["positions"], [
+            {"enabled": True, "x": 0.8, "y": 0.9},
+        ])
+        self.assertEqual(
+            [slot["id"] for slot in material["config_overrides"]["char_slots"]],
+            ["blank", "real"],
+        )
+        self.assertEqual(
+            material["config_overrides"]["char_centers"],
+            cfg["char_centers"],
+        )
+
     def test_input_is_immutable_unknown_fields_survive_and_credentials_do_not(self):
         blueprint = APP.generation_blueprint(self.fixture())
         blueprint["future_top_level"] = {

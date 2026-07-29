@@ -177,6 +177,7 @@ def single_generation_legacy_material(
     char_slots = []
     char_centers = []
     call_characters = []
+    call_centers = []
     positions = []
     enabled_index = 0
     for character in plan.get("characters") or []:
@@ -231,14 +232,15 @@ def single_generation_legacy_material(
         slot["position"] = _secret_free(position)
         char_slots.append(_secret_free(slot))
         char_centers.append(_secret_free(center))
-        positions.append({
-            "enabled": position_enabled,
-            **_secret_free(center),
-        })
         if resolved_prompt.strip():
             call_characters.append({
                 "prompt": resolved_prompt,
                 "negative": character_negative,
+            })
+            call_centers.append(_secret_free(center))
+            positions.append({
+                "enabled": position_enabled,
+                **_secret_free(center),
             })
 
     output, output_passthrough = _output_material(
@@ -290,7 +292,7 @@ def single_generation_legacy_material(
             "base_prompt": base_prompt,
             "negative_prompt": negative_prompt,
             "characters": _secret_free(call_characters[:6]),
-            "char_centers": _secret_free(char_centers[:6]),
+            "char_centers": _secret_free(call_centers[:6]),
             "positions": _secret_free(positions[:6]),
             "width": deepcopy(width),
             "height": deepcopy(height),
