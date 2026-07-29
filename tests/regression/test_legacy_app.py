@@ -4820,14 +4820,21 @@ class RegressionTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             for name in (
                 "generation_execution.py",
+                "generation_handlers.py",
                 "comparison_runtime.py",
                 "comparison_execution.py",
             )
         }
-        self.assertEqual(legacy.count("runtime_generation_params("), 5)
+        self.assertEqual(legacy.count("runtime_generation_params("), 1)
         self.assertIn(
             "operations.runtime_params(",
             services["generation_execution.py"],
+        )
+        self.assertEqual(
+            services["generation_handlers.py"].count(
+                "operations.runtime_generation_params("
+            ),
+            4,
         )
         for name in ("comparison_runtime.py", "comparison_execution.py"):
             self.assertIn(
@@ -6445,12 +6452,13 @@ class RegressionTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             for name in (
                 "generation_retry.py",
+                "generation_handlers.py",
                 "comparison_runtime.py",
                 "comparison_execution.py",
             )
         ]
-        self.assertEqual(legacy.count("call_nai_api("), 5)
-        self.assertEqual(legacy.count("pace_complete()"), 5)
+        self.assertEqual(legacy.count("call_nai_api("), 1)
+        self.assertEqual(legacy.count("pace_complete()"), 1)
         for source in services:
             self.assertIn("operations.call_nai_api(", source)
             self.assertIn("operations.pace_complete()", source)

@@ -189,6 +189,7 @@ from src.nai_studio.services import (
     datapack_store as _datapack_store,
     generation_commit as _generation_commit,
     generation_execution as _generation_execution,
+    generation_handlers as _generation_handlers,
     generation_retry as _generation_retry,
     generation_step as _generation_step,
     library_catalog as _library_catalog,
@@ -3913,6 +3914,63 @@ def _generation_execution_operations():
     )
 
 
+def _generation_handler_operations():
+    """생성 HTTP handler의 Job·NAI·저장 의존성을 호출 시점에 연결한다."""
+    return _generation_handlers.GenerationHandlerOperations(
+        common_job_store=globals()["common_job_store"],
+        make_job_command=globals()["make_job_command"],
+        transition_job=globals()["transition_job"],
+        activate_comparison_run=globals()["activate_comparison_run"],
+        retry_job=globals()["retry_job"],
+        reconcile_job=globals()["reconcile_job"],
+        inherited_blueprint=globals()["inherited_blueprint"],
+        single_generation_material=globals()[
+            "single_generation_legacy_material"
+        ],
+        characters_resource_config=globals()["characters_resource_config"],
+        pace_gate=globals()["pace_gate"],
+        runtime_generation_params=globals()["runtime_generation_params"],
+        load_state=globals()["load_state"],
+        call_nai_api=globals()["call_nai_api"],
+        with_centers=globals()["with_centers"],
+        pace_complete=globals()["pace_complete"],
+        output_subdir=globals()["out_sub"],
+        output_format=globals()["out_format"],
+        output_clean_args=globals()["out_clean"],
+        save_with_meta=globals()["save_with_meta"],
+        output_root=globals()["out_root"],
+        record_job_result=globals()["record_job_result"],
+        bump_daily=globals()["bump_daily"],
+        save_state=globals()["save_state"],
+        start_daemon=lambda target: globals()["threading"].Thread(
+            target=target, daemon=True
+        ).start(),
+        error=globals()["log"].error,
+        random_seed=globals()["random"].randint,
+        reference_inset_canvas=globals()["reference_inset_canvas"],
+        character_asset_from_record=globals()[
+            "character_asset_from_legacy_record"
+        ],
+        variation_plan_material=globals()[
+            "variation_plan_to_legacy_payload_material"
+        ],
+        slot_prompt=globals()["slot_prompt"],
+        active_people=globals()["active_people"],
+        now=lambda: globals()["datetime"].now(),
+        extract_metadata=globals()["extract_nai_metadata"],
+        model_id_from_metadata=globals()["model_id_from_metadata"],
+        normalize_position_mode=globals()["normalize_position_mode"],
+        scene_mode_pending=globals()["scene_mode_pending"],
+        daily_count=globals()["daily_count"],
+        safe_name=globals()["_safe_name"],
+        progress_record_path=globals()["progress_record_path"],
+        join_tags=globals()["_join_tags"],
+        seed_for=globals()["seed_for"],
+        available_output_path=globals()["available_output_path"],
+        warning=globals()["log"].warning,
+    )
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -5488,484 +5546,22 @@ class ConfigServer:
         return summary
 
     def handle_job_command(self, body):
-        """Job 센터 조작을 기존 실행기의 안전한 진입점으로 연결한다."""
         data = json.loads(body or b"{}")
-        job_id = str(data.get("job_id") or "")
-        action = str(data.get("action") or "")
-        if not job_id or action not in (
-            "pause", "cancel", "retry", "resume", "reconcile",
-        ):
-            raise ValueError("작업과 명령을 올바르게 골라주세요.")
-        store = common_job_store()
-        job = store.get(job_id)
-        command = make_job_command(
-            job, action, observation=data.get("observation"))
-        handler = command.get("handler") or {}
-        handled = False
-        navigation = ""
-        message = ""
-
-        if action in ("pause", "cancel"):
-            live = self.live.snapshot()
-            if (
-                not live.get("running")
-                or str(live.get("job_id") or "") != job_id
-            ):
-                raise ValueError(
-                    "이 기록은 현재 NAI 실행권을 가진 작업이 아닙니다. "
-                    "무관한 현재 작업은 멈추지 않았습니다.")
-            handled = self.live.request_stop()
-            updated = transition_job(job, command["next_phase"])
-        elif action in ("retry", "resume"):
-            if handler.get("target") == "comparison":
-                activated = activate_comparison_run(
-                    self.cfg, handler.get("folder"))
-                if not activated.get("resumable"):
-                    raise ValueError(
-                        "이 비교 기록은 완료됐거나 재개 근거가 없습니다.")
-                handled = True
-                navigation = "compare"
-                message = (
-                    "중단 지점을 활성화했습니다. 장수와 비용을 확인한 뒤 실행하세요."
-                )
-                updated = (
-                    retry_job(job) if action == "retry"
-                    else transition_job(job, command["next_phase"])
-                )
-            else:
-                navigation = (
-                    "settings" if job.get("kind") == "setting" else "preview")
-                message = (
-                    "원래 작업 화면으로 이동합니다. 현재 입력과 비용을 확인해 "
-                    "실제로 다시 실행할 때까지 작업 상태는 바꾸지 않았습니다."
-                )
-                updated = job
-        else:
-            # make_job_command가 whitelist로 정제한 관찰값만 저장한다.
-            updated = reconcile_job(job, command.get("observation") or {})
-            handled = True
-            message = "디스크의 실제 결과와 작업 기록을 대조했습니다."
-        store.save(updated)
-        return {
-            "ok": True,
-            "handled": handled,
-            "command": command,
-            "job": updated,
-            "navigation": navigation,
-            "message": message,
-        }
+        return _generation_handlers.handle_job_command(
+            self, data, _generation_handler_operations())
 
     def handle_generate_one(self):
-        """① 설정만으로 단독 1장 생성 (세팅 무관 — NAI 기본 생성처럼)"""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        # 누른 순간의 설계도를 고정한다. 실행 중 자동 저장이나 화면 편집이 들어와도
-        # 이미 시작한 요청의 프롬프트·인물·좌표·출력 설정이 섞이지 않는다.
-        with self.config_lock:
-            cfg = copy.deepcopy(self.cfg)
-        if not cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-        blueprint = inherited_blueprint(
-            cfg, source={"kind": "single-generate"})
-        material = single_generation_legacy_material(blueprint)
-        job_cfg = copy.deepcopy(cfg)
-        job_cfg.update(material.get("config_overrides") or {})
-        job_cfg = characters_resource_config(
-            job_cfg, blueprint.get("characters") or [])
-        call = material["call"]
-        tok = self.live.try_claim(
-            "단독 생성",
-            "preview",
-            blueprint=blueprint,
-            payload_identity={"kind": "single", "output": "one-image"},
-        )
-        if tok is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-
-        def run():
-            self.live.update(status_text="단독 생성 중...", char_name="단독 생성",
-                             filename="", index=1, total=1)
-            try:
-                okp, why = pace_gate(job_cfg, self.live, "단독")   # 밴 예방 (CQA-013)
-                if not okp:
-                    self.live.update(
-                        status_text=why, phase="stopped", can_retry=True)
-                    return
-                style = str(call.get("base_prompt") or "").strip()
-                base = style or "1girl"
-                people = copy.deepcopy(call.get("characters") or [])
-                ctrs = copy.deepcopy(call.get("char_centers") or [])
-                params = runtime_generation_params(job_cfg, cfg["token"])
-                state = load_state()
-                try:
-                    img = call_nai_api(
-                        cfg["token"], base, call.get("negative_prompt", ""),
-                        int(call.get("width") or 832), int(call.get("height") or 1216),
-                        chars=people,
-                        scale=job_cfg.get("cfg_scale", 5.5),
-                        cfg_rescale=job_cfg.get("cfg_rescale", 0.56),
-                        steps=int(job_cfg.get("steps", 28)),
-                        sampler=job_cfg.get("sampler", "k_euler_ancestral"),
-                        scheduler=job_cfg.get("scheduler", "karras"),
-                        variety=job_cfg.get("variety", False),
-                        uc_preset=int(job_cfg.get("uc_preset", 3)),
-                        seed=call.get("seed") or None,
-                        params=with_centers(params, ctrs))
-                finally:
-                    pace_complete()
-                img.nai_blueprint_fingerprint = blueprint["fingerprint"]
-                out_dir = out_sub(job_cfg, "단독")
-                n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                saved = save_with_meta(
-                    img, out_dir / f"{n:04d}.webp",
-                    fmt=out_format(job_cfg), clean=_ocargs(job_cfg)[0],
-                    max_side=_ocargs(job_cfg)[1], quality=out_clean(job_cfg)[2])
-                rel_saved = saved.resolve().relative_to(
-                    out_root(job_cfg).resolve()).as_posix()
-                record_job_result(
-                    self.live.job_id, saved, artifact=rel_saved)
-                self.live.set_image(img)
-                bump_daily(state)
-                save_state(state)
-                self.live.update(
-                    status_text=(
-                        "단독 생성 완료 ✓ ("
-                        + rel_saved
-                        + ")"
-                    ),
-                    completed=1, phase="completed")
-            except Exception as e:
-                log.error(f"단독 생성 실패: {e}")
-                self.live.update(
-                    status_text=f"단독 생성 실패: {e}", failed=1,
-                    last_error=str(e), can_retry=True, phase="failed")
-            finally:
-                self.live.release(tok)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {"ok": True}
+        return _generation_handlers.handle_generate_one(
+            self, None, _generation_handler_operations())
 
     def handle_i2i(self, body):
-        """img2img · 인페인트 · Outpaint.
-        Outpaint는 넓힌 캔버스와 바깥 마스크를 기존 infill 실행 계층에 태운다.
-        body: {image, mask, original?, operation, expansion?, strength, noise, seed}"""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        with self.config_lock:
-            cfg = copy.deepcopy(self.cfg)
-        if not cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         try:
-            d = json.loads(body or b"{}")
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        variation_mode = str(d.get("variation_mode") or "img2img").strip().lower()
-        if variation_mode not in (
-            "img2img", "inpaint", "character-reference", "reference-inset"
-        ):
-            return {"ok": False, "error": "알 수 없는 캐릭터 시험 방식입니다."}
-        operation = str(d.get("operation") or "edit").strip().lower()
-        if operation not in ("edit", "outpaint"):
-            return {"ok": False, "error": "알 수 없는 이미지 편집 작업입니다."}
-        img_b64 = (d.get("image") or "").split(",", 1)[-1]
-        if not img_b64:
-            return {"ok": False, "error": "원본 그림이 없습니다."}
-        mask_b64 = (d.get("mask") or "").split(",", 1)[-1] or None
-        if operation == "outpaint" and not mask_b64:
-            return {"ok": False, "error": "Outpaint 확장 영역 마스크가 없습니다."}
-        mode = "Outpaint" if operation == "outpaint" else (
-            "Character Reference" if variation_mode == "character-reference"
-            else "Reference inset" if variation_mode == "reference-inset"
-            else "인페인트" if mask_b64 else "img2img")
-        expansion = {}
-        for key in ("left", "right", "top", "bottom"):
-            try:
-                value = int((d.get("expansion") or {}).get(key, 0))
-            except (TypeError, ValueError):
-                return {"ok": False, "error": f"Outpaint {key} 확장값이 올바르지 않습니다."}
-            if value < 0 or value > 1536 or value % 64:
-                return {"ok": False, "error": "Outpaint 확장값은 0~1536의 64px 단위여야 합니다."}
-            expansion[key] = value
-        if operation == "outpaint" and not any(expansion.values()):
-            return {"ok": False, "error": "Outpaint 확장 방향과 크기가 없습니다."}
-        try:
-            raw = base64.b64decode(img_b64)
-            original_source_raw = raw
-            with Image.open(io.BytesIO(raw)) as im:
-                w, h = im.size
-            if mask_b64:
-                with Image.open(io.BytesIO(base64.b64decode(mask_b64))) as mask:
-                    if mask.size != (w, h):
-                        return {"ok": False, "error": "원본과 마스크 크기가 다릅니다."}
-        except Exception as e:
-            return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
-        if variation_mode in ("character-reference", "reference-inset"):
-            try:
-                trial_w = int(d.get("trial_width") or cfg.get("width") or w)
-                trial_h = int(d.get("trial_height") or cfg.get("height") or h)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "시험 해상도가 올바르지 않습니다."}
-            trial_w = max(64, min(2048, trial_w // 64 * 64))
-            trial_h = max(64, min(2048, trial_h // 64 * 64))
-            if variation_mode == "character-reference":
-                w, h = trial_w, trial_h
-                mask_b64 = None
-            else:
-                try:
-                    inset = reference_inset_canvas(
-                        original_source_raw, trial_w, trial_h)
-                except Exception as e:
-                    return {"ok": False, "error": str(e)}
-                raw = inset["image"]
-                img_b64 = base64.b64encode(raw).decode("ascii")
-                mask_b64 = base64.b64encode(inset["mask"]).decode("ascii")
-                w, h = inset["width"], inset["height"]
-        # NAI 는 64 의 배수를 원한다
-        w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
-        if w > 2048 or h > 2048:
-            return {"ok": False, "error": "최종 크기는 가로·세로 2048px를 넘을 수 없습니다."}
-        original_b64 = (d.get("original") or "").split(",", 1)[-1] or None
-        try:
-            source_raw = (
-                base64.b64decode(original_b64)
-                if original_b64 else original_source_raw
-            )
-            with Image.open(io.BytesIO(source_raw)) as source:
-                source_size = {"width": source.width, "height": source.height}
-        except Exception as e:
-            return {"ok": False, "error": f"Outpaint 원본을 못 읽었습니다: {e}"}
-        source_hash = hashlib.sha256(source_raw).hexdigest()
-        seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
-        job_cfg = cfg
-        variation_id = str(d.get("variation_character_id") or "").strip()
-        variation_name = ""
-        variation_plan = None
-        transient_reference_bytes = None
-        if variation_id:
-            record = next(
-                (item for item in cfg.get("characters", [])
-                 if str(item.get("id") or "") == variation_id),
-                None,
-            )
-            if record is None:
-                return {"ok": False, "error": "변형할 캐릭터 자산을 찾지 못했습니다."}
-            try:
-                asset = character_asset_from_legacy_record(
-                    record,
-                    char_refs=cfg.get("char_refs") or [],
-                    vibes=cfg.get("vibes") or [],
-                )
-                planned_mode = (
-                    variation_mode
-                    if variation_mode != "reference-inset" else "inpaint"
-                )
-                prompt_overrides = {}
-                for target, source_key in (
-                    ("appearance", "trial_appearance"),
-                    ("outfit", "trial_outfit"),
-                    ("negative", "trial_negative"),
-                ):
-                    if source_key in d:
-                        prompt_overrides[target] = str(d.get(source_key) or "")
-                temporary_settings = {
-                    "strength": (
-                        1.0 if variation_mode == "reference-inset"
-                        else float(d.get("strength", 0.7))
-                    ),
-                    "noise": (
-                        0.0 if variation_mode == "reference-inset"
-                        else float(d.get("noise", 0.0))
-                    ),
-                    "reference_strength": float(
-                        d.get("reference_strength", 1.0)),
-                    "reference_fidelity": float(
-                        d.get("reference_fidelity", 0.6)),
-                }
-                plan = variation_plan_to_legacy_payload_material(asset, {
-                    "mode": planned_mode,
-                    "source_image": {
-                        "content_hash": hashlib.sha256(raw).hexdigest()},
-                    "reference": (
-                        {"content_hash": source_hash}
-                        if variation_mode == "character-reference" else None
-                    ),
-                    "mask": ({"content_hash": hashlib.sha256(
-                        base64.b64decode(mask_b64)).hexdigest()}
-                             if mask_b64 else None),
-                    "inset": (
-                        {"content_hash": source_hash}
-                        if variation_mode == "reference-inset" else None
-                    ),
-                    "prompt_overrides": prompt_overrides,
-                    "seed": seed,
-                    "resolution": {"width": w, "height": h},
-                    "temporary_settings": temporary_settings,
-                })
-            except Exception as e:
-                return {"ok": False, "error": f"캐릭터 변형 계획을 만들지 못했습니다: {e}"}
-            job_cfg = copy.deepcopy(cfg)
-            job_cfg["char_slots"] = plan["char_slots"]
-            if variation_mode == "character-reference":
-                # Character Reference와 Vibe는 NAI에서 동시에 쓸 수 없다. 저장 자산의
-                # 연결은 유지하고, 이 요청 한 번에서만 새 Reference를 사용한다.
-                job_cfg["char_refs"] = [copy.deepcopy(plan["char_refs"][0])]
-                job_cfg["vibes"] = []
-                transient_reference_bytes = original_source_raw
-            else:
-                job_cfg["char_refs"] = plan["char_refs"]
-                job_cfg["vibes"] = plan["vibes"]
-            if "trial_scene_prompt" in d:
-                job_cfg["base_prompt"] = str(d.get("trial_scene_prompt") or "")
-            if "trial_base_negative" in d:
-                job_cfg["negative_prompt"] = str(
-                    d.get("trial_base_negative") or "")
-            job_cfg["width"], job_cfg["height"] = w, h
-            variation_plan = copy.deepcopy(plan["variation_plan"])
-            variation_name = str(record.get("name") or variation_id)
-        tok = self.live.try_claim(
-            mode,
-            "preview",
-            blueprint=inherited_blueprint(
-                job_cfg,
-                source={
-                    "kind": "character-variation" if variation_id else (
-                        "outpaint" if operation == "outpaint" else "image-edit"),
-                    "mode": mode,
-                    "character_id": variation_id,
-                    "content_hash": source_hash,
-                    "source_size": source_size,
-                    "expansion": expansion if operation == "outpaint" else None,
-                },
-            ),
-            payload_identity={
-                "kind": operation if operation == "outpaint" else (
-                    "inpaint" if mask_b64 else "img2img"),
-                "width": w,
-                "height": h,
-                "has_mask": bool(mask_b64),
-                "source_hash": source_hash,
-                "expansion": expansion if operation == "outpaint" else None,
-                "character_id": variation_id,
-            },
-        )
-        if tok is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        if transient_reference_bytes is not None:
-            job_cfg["char_refs"][0]["_image_bytes"] = transient_reference_bytes
-            job_cfg["char_refs"][0]["_required"] = True
-        with self.config_lock:
-            self.pending_variation = ({
-                "character_id": variation_id,
-                "character_name": variation_name,
-                "asset_fingerprint": (
-                    variation_plan.get("character_asset_fingerprint")
-                    if variation_plan else ""),
-                "plan": copy.deepcopy(variation_plan),
-                "mode": variation_mode,
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "result_path": "",
-                "job_id": self.live.job_id,
-            } if variation_id else None)
+            data = json.loads(body or b"{}")
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+        return _generation_handlers.handle_i2i(
+            self, data, _generation_handler_operations())
 
-        def run():
-            label = f"{variation_name} 변형" if variation_name else mode
-            self.live.update(status_text=f"{label} 생성 중...",
-                             char_name=label, index=1, total=1)
-            try:
-                okp, why = pace_gate(job_cfg, self.live, mode)     # 밴 예방 (CQA-013)
-                if not okp:
-                    self.live.update(
-                        status_text=why, phase="stopped", can_retry=True)
-                    return
-                slots = [s for s in job_cfg.get("char_slots", [])
-                 if slot_prompt(s).strip() and s.get("enabled") is not False]
-                params = runtime_generation_params(job_cfg, job_cfg["token"])
-                if variation_mode != "character-reference":
-                    params["_i2i"] = {
-                        "image": img_b64,
-                        "mask": mask_b64,
-                        "strength": (
-                            1.0 if variation_mode == "reference-inset"
-                            else float(d.get("strength", 0.7))
-                        ),
-                        "noise": (
-                            0.0 if variation_mode == "reference-inset"
-                            else float(d.get("noise", 0.0))
-                        ),
-                        "seed": seed,
-                    }
-                try:
-                    img = call_nai_api(
-                        job_cfg["token"], job_cfg.get("base_prompt", "") or "1girl",
-                        job_cfg.get("negative_prompt", ""), w, h,
-                        chars=active_people(slots, job_cfg.get("char_centers"))[0],
-                        scale=job_cfg.get("cfg_scale", 5.5), cfg_rescale=job_cfg.get("cfg_rescale", 0.56),
-                        steps=int(job_cfg.get("steps", 28)), sampler=job_cfg.get("sampler", "k_euler_ancestral"),
-                        scheduler=job_cfg.get("scheduler", "karras"), variety=job_cfg.get("variety", False),
-                        uc_preset=int(job_cfg.get("uc_preset", 3)), seed=seed,
-                        params=with_centers(params, active_people(slots, job_cfg.get("char_centers"))[1]))
-                finally:
-                    pace_complete()
-                out_dir = out_sub(job_cfg, "캐릭터 변형" if variation_id else mode)
-                n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                frozen = self.live.frozen_blueprint()
-                img.nai_blueprint_fingerprint = str(
-                    (frozen or {}).get("fingerprint") or "")
-                saved = save_with_meta(
-                    img, out_dir / f"{n:04d}.webp", fmt=out_format(job_cfg),
-                    clean=_ocargs(job_cfg)[0], max_side=_ocargs(job_cfg)[1],
-                    quality=out_clean(job_cfg)[2])
-                record_job_result(
-                    self.live.job_id,
-                    saved,
-                    artifact=saved.resolve().relative_to(
-                        out_root(job_cfg).resolve()).as_posix(),
-                )
-                if variation_id:
-                    with self.config_lock:
-                        pending = self.pending_variation
-                        if (
-                            isinstance(pending, dict)
-                            and pending.get("character_id") == variation_id
-                            and pending.get("job_id") == self.live.job_id
-                        ):
-                            pending.update({
-                                "result_path": str(saved.resolve()),
-                                "result_hash": hashlib.sha256(
-                                    saved.read_bytes()).hexdigest(),
-                                "seed": seed,
-                                "width": w,
-                                "height": h,
-                                "completed_at": datetime.now().isoformat(
-                                    timespec="seconds"),
-                            })
-                self.live.set_image(img)
-                st = load_state(); bump_daily(st); save_state(st)
-                self.live.update(
-                    status_text=f"{label} 완료 ✓ (output/{out_dir.name}/{saved.name} · 시드 {seed})",
-                    seed=seed, completed=1, phase="completed")
-            except Exception as e:
-                log.error(f"{mode} 실패: {e}")
-                self.live.update(
-                    status_text=f"{mode} 실패: {e}", failed=1,
-                    last_error=str(e), can_retry=True, phase="failed")
-            finally:
-                self.live.release(tok)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {
-            "ok": True, "mode": mode, "width": w, "height": h,
-            "source_hash": source_hash, "expansion": (
-                expansion if operation == "outpaint" else None),
-            "variation_character": variation_name,
-            "variation_mode": variation_mode if variation_id else "",
-            "temporary": bool(variation_id),
-            "vibe_suppressed": bool(
-                variation_id and variation_mode == "character-reference"
-                and plan.get("vibes")),
-        }
-
-    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_character_variation_save(self, body):
         """완료된 고정 결과를 명시 선택한 캐릭터 자산 항목에만 추가한다."""
         try:
@@ -6050,408 +5646,17 @@ class ConfigServer:
             }
 
     def handle_regen(self, body):
-        """그림체 복구 — 뽑아 둔 그림의 **메타데이터를 읽어 그 설정 그대로 다시 돌린다**.
-        (NAIS3-Custom 의 '그림체 복구(메타데이터 i2i 일괄 재생성)' 와 같은 생각)
-        용도: 흐릿하게 나온 장을 같은 프롬프트·시드로 다시 뽑거나,
-              img2img 로 원본을 바탕에 두고 다듬는다.
-        body: {paths: [output 상대경로…], mode: "generate"|"img2img", strength}"""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        cfg = self.cfg
-        if not cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         try:
-            d = json.loads(body or b"{}")
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        mode = d.get("mode") or "generate"
-        strength = float(d.get("strength", 0.5))
-        root = out_root(cfg).resolve()
-        jobs = []
-        for rel in (d.get("paths") or []):
-            f = (root / rel).resolve()
-            try:
-                inside = f.is_relative_to(root)
-            except AttributeError:
-                inside = str(f).startswith(str(root))
-            if not (inside and f.is_file()):
-                continue
-            meta = extract_nai_metadata(f.read_bytes(),
-                                       "image/png" if f.suffix.lower() == ".png" else "image/webp")
-            raw = (meta or {}).get("raw") or {}
-            if not raw:
-                continue                      # 메타가 없는 그림은 되살릴 수 없다
-            # ⚠ 모델은 `raw` 가 아니라 `params["model"]` 에 **표시명**으로 들어 있다
-            #   ("NovelAI Diffusion V4.5 4BDE2A90" 같은 꼴). 예전엔 `raw["source_model"]`
-            #   을 읽었는데 그 키는 어디서도 만들어지지 않아 **모델 복원이 늘 무시**됐다.
-            #   표시명을 그대로 보내면 400 이므로 `model_id_from_metadata()` 로 옮긴다.
-            #   Variety+ 시그마도 모델에서 역산하므로 이걸 고쳐야 재현이 맞는다.
-            meta_model = ((meta or {}).get("params") or {}).get("model")
-            jobs.append((f, raw, meta_model))
-        if not jobs:
-            return {"ok": False, "error": "메타데이터가 있는 그림이 없습니다. "
-                                          "(카톡·디스코드를 거친 그림은 정보가 지워집니다)"}
-        tok = self.live.try_claim(
-            "그림체 복구",
-            "library",
-            blueprint=inherited_blueprint(
-                cfg,
-                source={"kind": "metadata-recovery", "items": len(jobs)},
-            ),
-            payload_identity={
-                "kind": "recovery", "items": len(jobs), "mode": mode},
-        )
-        if tok is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-
-        def run():
-            out_dir = out_sub(cfg, "복구")
-            state = load_state()
-            done = 0
-            failed = 0
-            blocked = False
-            self.live.update(total=len(jobs), index=0, char_name="그림체 복구")
-            try:
-                for i, (f, raw, meta_model) in enumerate(jobs, 1):
-                    if self.live.stop_req:
-                        break
-                    self.live.update(index=i, filename=f.name, status_text="복구 중...")
-                    # 메타에서 그때 쓴 값을 그대로 꺼낸다
-                    v4 = raw.get("v4_prompt") or {}
-                    cap = (v4.get("caption") or {})
-                    base = cap.get("base_caption") or raw.get("prompt") or ""
-                    v4n = (raw.get("v4_negative_prompt") or {}).get("caption") or {}
-                    neg = v4n.get("base_caption") or raw.get("uc") or ""
-                    chars = [{"prompt": c.get("char_caption", ""), "negative": ""}
-                             for c in (cap.get("char_captions") or [])]
-                    for k, c in enumerate(v4n.get("char_captions") or []):
-                        if k < len(chars):
-                            chars[k]["negative"] = c.get("char_caption", "")
-                    ctrs = [(c.get("centers") or [{}])[0] for c in (cap.get("char_captions") or [])]
-                    prm = runtime_generation_params(cfg, cfg["token"], include_refs=False)
-                    prm.update({
-                        "model": model_id_from_metadata(
-                            meta_model, cfg.get("model") or "nai-diffusion-4-5-full"),
-                        "use_coords": bool(v4.get("use_coords")),
-                        "position_mode": normalize_position_mode(
-                            "", bool(v4.get("use_coords"))),
-                        "char_centers": [{"x": float(c.get("x", 0.5)), "y": float(c.get("y", 0.5))}
-                                         for c in ctrs],
-                        "smea": bool(raw.get("sm")), "smea_dyn": bool(raw.get("sm_dyn")),
-                        "prefer_brownian": bool(raw.get("prefer_brownian", True)),
-                        "variety": raw.get("skip_cfg_above_sigma") is not None,
-                    })
-                    if mode == "img2img":
-                        with Image.open(f) as im:
-                            w0 = max(64, im.width // 64 * 64)
-                            h0 = max(64, im.height // 64 * 64)
-                            b = io.BytesIO(); im.convert("RGB").resize((w0, h0)).save(b, "PNG")
-                        prm["_i2i"] = {"image": base64.b64encode(b.getvalue()).decode(),
-                                       "mask": None, "strength": strength, "noise": 0.0}
-                    seed = int(raw.get("seed") or 0) or random.randint(0, 2**32 - 1)
-                    okp, why = pace_gate(cfg, self.live, "복구")
-                    if not okp:
-                        self.live.update(status_text=why)
-                        blocked = True
-                        break
-                    try:
-                        try:
-                            img = call_nai_api(
-                                cfg["token"], base, neg,
-                                int(raw.get("width") or cfg.get("width", 832)),
-                                int(raw.get("height") or cfg.get("height", 1216)),
-                                scale=float(raw.get("scale") or cfg.get("cfg_scale", 5.5)),
-                                cfg_rescale=float(raw.get("cfg_rescale") or 0.0),
-                                steps=int(raw.get("steps") or 28),
-                                sampler=raw.get("sampler") or "k_euler_ancestral",
-                                scheduler=raw.get("noise_schedule") or "karras",
-                                uc_preset=int(raw.get("ucPreset", cfg.get("uc_preset", 3))),
-                                seed=seed, params=prm, chars=chars)
-                        finally:
-                            pace_complete()
-                    except Exception as e:
-                        log.error(f"복구 실패 {f.name}: {e}")
-                        failed += 1
-                        self.live.update(
-                            status_text=f"{f.name} 실패: {e}", failed=failed,
-                            last_error=str(e))
-                        continue
-                    tag = "_i2i" if mode == "img2img" else ""
-                    frozen = self.live.frozen_blueprint()
-                    img.nai_blueprint_fingerprint = str(
-                        (frozen or {}).get("fingerprint") or "")
-                    saved = save_with_meta(
-                        img, out_dir / f"{f.stem}{tag}.webp",
-                        fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-                        max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-                    record_job_result(
-                        self.live.job_id,
-                        saved,
-                        artifact=saved.resolve().relative_to(
-                            out_root(cfg).resolve()).as_posix(),
-                    )
-                    self.live.set_image(img)
-                    bump_daily(state); save_state(state)
-                    done += 1
-                    self.live.update(
-                        completed=done, index=i, daily=daily_count(state))
-                if self.live.stop_req:
-                    phase = "stopped"
-                    text = f"그림체 복구 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
-                elif blocked:
-                    phase = "stopped"
-                    text = self.live.status_text
-                elif failed:
-                    phase = "partial"
-                    text = f"그림체 복구 일부 완료 — 성공 {done} · 실패 {failed}"
-                else:
-                    phase = "completed"
-                    text = f"그림체 복구 완료 ✓ {done}/{len(jobs)}장 (output/복구/)"
-                self.live.update(
-                    status_text=text, completed=done, failed=failed, phase=phase,
-                    can_retry=bool(failed or blocked or self.live.stop_req))
-            finally:
-                self.live.release(tok)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {"ok": True, "count": len(jobs), "mode": mode}
+            data = json.loads(body or b"{}")
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+        return _generation_handlers.handle_regen(
+            self, data, _generation_handler_operations())
 
     def handle_scene_run(self):
-        """씬 모드 일괄 — 예약 매수를 걸어 둔 씬만 그 매수만큼 뽑는다.
-        세팅 배치와 별개의 가벼운 경로다 (세팅 상태를 건드리지 않는다)."""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        with self.config_lock:
-            cfg = copy.deepcopy(self.cfg)
-        if not cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-        jobs = scene_mode_pending(cfg)
-        if not jobs:
-            return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
-        slots = [s for s in cfg.get("char_slots", [])
-                 if slot_prompt(s).strip() and s.get("enabled") is not False]
-        run_blueprint = inherited_blueprint(
-            cfg,
-            source={"kind": "scene-run"},
-            setting={"name": "씬 모드", "steps": copy.deepcopy(jobs)},
-        )
-        tok = self.live.try_claim(
-            "씬 모드",
-            "settings",
-            blueprint=run_blueprint,
-            payload_identity={"kind": "setting", "jobs": len(jobs)},
-        )
-        if tok is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
+        return _generation_handlers.handle_scene_run(
+            self, None, _generation_handler_operations())
 
-        def run():
-            state = load_state()
-            state.setdefault("frag_seq", {})
-            cfg["_frag_counters"] = state["frag_seq"]
-            params = runtime_generation_params(cfg, cfg["token"])
-            out_dir = out_sub(cfg, "씬")
-            seed_key = f"{int(cfg.get('seed', 1)):02d}"
-            state.setdefault("seeds", {})
-            if seed_key not in state["seeds"]:
-                state["seeds"][seed_key] = random.randint(0, 2**32 - 1)
-                save_state(state)
-            base_seed = state["seeds"][seed_key]
-            run_fingerprint = hashlib.sha256(
-                f"{run_blueprint['fingerprint']}\0{base_seed}".encode("utf-8")
-            ).hexdigest()
-            scene_progress = state.setdefault(
-                "scene_progress", {}).setdefault(run_fingerprint, {})
-            style = (cfg.get("base_prompt") or "").strip()
-            valid_cells = {}
-            lineage_failures = 0
-            for i, (scene, copy_no) in enumerate(jobs, 1):
-                scene_id = _safe_name(
-                    str(scene.get("id") or f"scene-{i}"))
-                cell_fingerprint = hashlib.sha256(
-                    f"{run_fingerprint}\0{scene_id}\0{copy_no}"
-                    .encode("utf-8")
-                ).hexdigest()
-                cell_id = f"{scene_id}:{int(copy_no)}"
-                record = scene_progress.get(cell_id)
-                if not isinstance(record, dict):
-                    continue
-                path = progress_record_path(record, cfg)
-                try:
-                    valid = (
-                        record.get("fingerprint") == cell_fingerprint
-                        and path is not None
-                        and path.is_file()
-                        and path.stat().st_size == int(record.get("bytes", -1))
-                        and hashlib.sha256(path.read_bytes()).hexdigest()
-                        == str(record.get("content_sha256") or "")
-                    )
-                except (OSError, TypeError, ValueError):
-                    valid = False
-                if not valid:
-                    continue
-                valid_cells[cell_id] = record
-                try:
-                    record_job_result(
-                        self.live.job_id,
-                        path,
-                        artifact=str(record.get("path") or ""),
-                        result_id="result-scene-" + cell_fingerprint[:24],
-                    )
-                except Exception as error:
-                    log.warning("검증된 씬 결과의 Job 계보 연결 실패: %s", error)
-                    lineage_failures += 1
-            done = len(valid_cells)
-            failed = 0
-            blocked = False
-            self.live.update(
-                total=len(jobs), index=done, completed=done,
-                eta_base_completed=done, char_name="씬 모드")
-            try:
-                for i, (sc, copy) in enumerate(jobs, 1):
-                    if self.live.stop_req:
-                        break
-                    scene_id = _safe_name(
-                        str(sc.get("id") or f"scene-{i}"))
-                    cell_fingerprint = hashlib.sha256(
-                        f"{run_fingerprint}\0{scene_id}\0{copy}"
-                        .encode("utf-8")
-                    ).hexdigest()
-                    cell_id = f"{scene_id}:{int(copy)}"
-                    if cell_id in valid_cells:
-                        self.live.update(
-                            index=i,
-                            completed=done,
-                            filename=Path(str(
-                                valid_cells[cell_id].get("path") or "")).name,
-                            status_text="확인된 완료 장면 건너뜀",
-                        )
-                        continue
-                    okp, why = pace_gate(cfg, self.live, "씬")   # 밴 예방 (CQA-013)
-                    if not okp:
-                        self.live.update(status_text=why)
-                        blocked = True
-                        break
-                    suffix = "" if copy == 1 else f"_{copy}벌"
-                    seed = seed_for(cfg, base_seed, i + (copy - 1) * 100003)
-                    stem = f"{scene_id}_{_safe_name(sc['name'])}_seed{seed}{suffix}"
-                    target = available_output_path(out_dir / f"{stem}.webp", out_format(cfg))
-                    fname = target.name
-                    self.live.update(index=i, filename=fname, status_text="생성 중...", seed=seed)
-                    # 씬 프롬프트는 그림체(베이스) 뒤에 붙는다 — 세팅과 같은 규칙.
-                    # ★ 인물 묘사는 base 가 아니라 **캐릭터 칸**으로 보내야 한다.
-                    #   씬의 char1/char2 가 있으면 그것을 쓰고, 없으면 왼쪽 캐릭터 칸을 쓴다.
-                    #   왼쪽 칸과 씬 칸이 모두 있으면 이어 붙인다 (씬이 그 인물을 꾸미는 셈).
-                    base = _join_tags(style, sc.get("prompt", ""))
-                    neg = _join_tags(cfg.get("negative_prompt", ""), sc.get("negative", ""))
-                    # ★ 씬의 인물 칸은 **별개 인물**이다 (왼쪽 칸에 이어 붙이지 않는다).
-                    #   왼쪽에 남자만 넣고 씬에 여자를 적는 식으로 쓰는 게 목적이라,
-                    #   합쳐 버리면 한 사람 안에 두 사람이 들어가 몸이 뭉개진다.
-                    extra = [{"prompt": sc[k], "negative": sc.get(k + "_neg", "")}
-                             for k in ("char1", "char2") if (sc.get(k) or "").strip()]
-                    people, ctrs = active_people(slots, cfg.get("char_centers"), extra)
-                    # 위치 방식은 사용자가 고른 AI 자동/위치판/좌표를 그대로 따른다.
-                    # 인물이 늘었다는 이유로 좌표를 켜거나 값을 다시 배치하지 않는다.
-                    try:
-                        try:
-                            img = call_nai_api(
-                                cfg["token"], base, neg,
-                                int(sc.get("width", 832)), int(sc.get("height", 1216)),
-                                chars=people,
-                                scale=cfg.get("cfg_scale", 5.5),
-                                cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                                steps=int(cfg.get("steps", 28)),
-                                sampler=cfg.get("sampler", "k_euler_ancestral"),
-                                scheduler=cfg.get("scheduler", "karras"),
-                                variety=cfg.get("variety", False),
-                                uc_preset=int(cfg.get("uc_preset", 3)),
-                                seed=seed, params=with_centers(params, ctrs))
-                        finally:
-                            pace_complete()
-                    except Exception as e:
-                        log.error(f"씬 '{sc['name']}' 실패: {e}")
-                        failed += 1
-                        self.live.update(
-                            status_text=f"'{sc['name']}' 실패: {e}", failed=failed,
-                            last_error=str(e))
-                        continue
-                    frozen = self.live.frozen_blueprint()
-                    img.nai_blueprint_fingerprint = str(
-                        (frozen or {}).get("fingerprint") or "")
-                    saved_path = save_with_meta(img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-                                                max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-                    self.live.update(filename=saved_path.name)
-                    self.live.set_image(img)
-                    bump_daily(state)
-                    rel_saved = saved_path.resolve().relative_to(
-                        out_root(cfg).resolve()).as_posix()
-                    scene_progress[cell_id] = {
-                        "scene": scene_id,
-                        "copy": int(copy),
-                        "path": rel_saved,
-                        "bytes": saved_path.stat().st_size,
-                        "content_sha256": hashlib.sha256(
-                            saved_path.read_bytes()).hexdigest(),
-                        "fingerprint": cell_fingerprint,
-                    }
-                    # 유료 생성은 이미 끝났다. 재개 기록을 먼저 남기고 Job 계보는
-                    # 별도로 연결해, 계보 저장 실패가 같은 장의 유료 재호출로
-                    # 이어지지 않게 한다.
-                    try:
-                        save_state(state)
-                    except Exception as error:
-                        lineage_failures += 1
-                        log.warning(
-                            "씬 결과는 저장했지만 재개 장부 저장에 실패: %s",
-                            error,
-                        )
-                    try:
-                        record_job_result(
-                            self.live.job_id,
-                            saved_path,
-                            artifact=rel_saved,
-                            result_id="result-scene-" + cell_fingerprint[:24],
-                        )
-                    except Exception as error:
-                        lineage_failures += 1
-                        log.warning(
-                            "씬 결과는 저장했지만 Job 계보 연결에 실패: %s",
-                            error,
-                        )
-                    done += 1
-                    self.live.update(
-                        completed=done, index=i, daily=daily_count(state))
-                if self.live.stop_req:
-                    phase = "stopped"
-                    text = f"씬 모드 중지 — {done}/{len(jobs)}장 (다시 실행 가능)"
-                elif blocked:
-                    phase = "stopped"
-                    text = self.live.status_text
-                elif failed:
-                    phase = "partial"
-                    text = f"씬 모드 일부 완료 — 성공 {done} · 실패 {failed}"
-                elif lineage_failures:
-                    phase = "partial"
-                    text = (
-                        "씬 이미지는 저장했지만 작업 계보·재개 장부 "
-                        f"{lineage_failures}건을 확인해야 합니다."
-                    )
-                else:
-                    phase = "completed"
-                    text = f"씬 모드 완료 ✓ {done}/{len(jobs)}장 (output/씬/)"
-                self.live.update(
-                    status_text=text, completed=done,
-                    failed=max(failed, lineage_failures), phase=phase,
-                    can_retry=bool(
-                        failed or lineage_failures or blocked
-                        or self.live.stop_req))
-            finally:
-                cfg.pop("_frag_counters", None)
-                self.live.release(tok)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {"ok": True, "count": len(jobs)}
-
-    @serialized_setting_write
     def handle_role_save(self, body):
         """세팅의 상대역 저장 → 세팅 파일에 기록"""
         try:
