@@ -53,6 +53,22 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 APP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(APP)
+STATIC_UI_DIR = ROOT / "src" / "nai_studio" / "web" / "static"
+UI_SOURCE = (
+    APP.PAGE_TEMPLATE
+    + (STATIC_UI_DIR / "base.css").read_text(encoding="utf-8")
+    + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
+    + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
+)
+
+
+def rendered_ui_source():
+    return (
+        APP.render_page()
+        + (STATIC_UI_DIR / "base.css").read_text(encoding="utf-8")
+        + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
+        + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
+    )
 
 
 def _cleanup_test_log():
@@ -100,6 +116,9 @@ class RegressionTests(unittest.TestCase):
 
         parser = PageAudit()
         parser.feed(APP.render_page())
+        parser.scripts.append(
+            (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
+        )
         duplicates = sorted({
             element_id for element_id in parser.ids
             if parser.ids.count(element_id) > 1
@@ -167,11 +186,11 @@ class RegressionTests(unittest.TestCase):
             params["v4_negative_prompt"]["caption"]["char_captions"][0]["char_caption"],
             char_negative,
         )
-        self.assertIn("⚠ 입력은 보존", APP.PAGE_TEMPLATE)
-        self.assertNotIn("뒷부분이 잘립니다", APP.PAGE_TEMPLATE)
+        self.assertIn("⚠ 입력은 보존", UI_SOURCE)
+        self.assertNotIn("뒷부분이 잘립니다", UI_SOURCE)
 
     def test_first_run_guide_leads_to_token_data_pack_and_prompt(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertIn("세 가지만 준비하면 바로 생성할 수 있습니다", page)
         self.assertIn('id="welcomeApi"', page)
         self.assertIn('id="welcomePack"', page)
@@ -183,7 +202,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("tokenReady && (promptReady || dismissed)", page)
 
     def test_weight_highlight_does_not_draw_text_twice(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertIn(
             ".hlwrap .hl *{color:transparent!important;"
             "-webkit-text-fill-color:transparent!important;", page)
@@ -208,7 +227,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_generated_result_has_one_path_to_reference_and_img2img(self):
         """최근 결과와 탐색기 결과가 같은 무손실 전달 함수를 써야 한다."""
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         for marker in (
             'id="pvResultActions"',
             'data-latest-action="vibe"',
@@ -345,7 +364,7 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(len(combo_slots), 1)
         self.assertTrue(combo_slots[0].get("조합전용"))
 
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertIn('data-output="${output}"', page)
         self.assertIn("composeSelected('positive')", page)
         self.assertIn("composeSelected('negative')", page)
@@ -376,7 +395,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_builder_saves_style_settings_and_character_negative(self):
         """빌더 저장도 빠른 프리셋 저장과 같은 묶음 규칙을 지킨다."""
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         builder_save = page[page.index("if(m === 'style' || m === 'char')"):]
         self.assertIn("negative, settings:styleSettingsFromUI()", builder_save)
         self.assertIn("function styleSettingsFromUI()", page)
@@ -466,7 +485,7 @@ class RegressionTests(unittest.TestCase):
                 {"name": "same", "weight": 0.5},
             ])
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         for element_id in (
             "comboComposer", "comboWeightMode", "comboArtistRows",
             "comboArtistPrompt", "comboArtistApply",
@@ -706,7 +725,7 @@ class RegressionTests(unittest.TestCase):
                     duplicated_again["new_id"],
                     APP.load_json_recover(first)["씬"])
 
-            page = APP.render_page()
+            page = rendered_ui_source()
             for marker in (
                     "data-scenedup", 'id="sceneCloneUndo"',
                     "/api/scene_duplicate", "/api/scene_duplicate_undo"):
@@ -752,7 +771,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(used)
         self.assertEqual(centers, stored_scene["char_centers"])
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("data-posuse", page)
         self.assertIn("setting:window._sceneSetting", page)
         self.assertIn("expect_revision:last.revision", page)
@@ -822,7 +841,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("partner smile", partner)
         self.assertEqual(partner_neg, "partner bad anatomy, partner blur")
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("장면 공통 태그", page)
         self.assertIn("등장 관계 이름", page)
         self.assertIn("실제 관계 태그", page)
@@ -974,11 +993,16 @@ class RegressionTests(unittest.TestCase):
             with urllib.request.urlopen(url, timeout=3) as response:
                 self.assertEqual(response.status, 200)
                 self.assertIn(b"<!DOCTYPE html>", response.read(100))
-            with urllib.request.urlopen(url + "ui/studio.css", timeout=3) as response:
-                self.assertEqual(response.status, 200)
-                self.assertEqual(
-                    response.headers.get_content_type(), "text/css"
-                )
+            for asset, content_type in (
+                ("ui/base.css", "text/css"),
+                ("ui/studio.css", "text/css"),
+                ("ui/studio.js", "text/javascript"),
+            ):
+                with urllib.request.urlopen(url + asset, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        response.headers.get_content_type(), content_type
+                    )
             for endpoint in (
                 "api/blueprint",
                 "api/setting_sequence?name=",
@@ -1050,7 +1074,7 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(final["base_prompt"], "C FULL")
                 self.assertEqual(final["negative_prompt"], "B FULL")
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("function stateSavePatch()", page)
         self.assertIn("body: JSON.stringify(patch)", page)
         self.assertIn("reloadAfterSave = true", page)
@@ -1106,7 +1130,7 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(final["vibes"], changed_c)
                 self.assertEqual(final["char_refs"], char_ref)
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("const changed = ['vibes','char_refs'].filter", page)
         self.assertIn("payload[key] = STATE[key] || []", page)
 
@@ -1123,7 +1147,7 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(list(Path(td).glob(".*.tmp")))
 
     def test_combo_cards_do_not_duplicate_full_records_into_html_attributes(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertIn("el._comboRecord = c", page)
         self.assertNotIn('data-cfull="${escA(JSON.stringify(c))}"', page)
         self.assertNotIn('data-csave="${escA(JSON.stringify(c))}"', page)
@@ -1183,7 +1207,7 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(len(rating_calls), 732)
 
     def test_builder_combo_picker_preserves_builder_and_recipes_load_lazily(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         paint = page[page.index("function paint(){"):
                      page.index("/* ── 자료 비교 생성")]
         self.assertNotIn("loadRecipes(false)", paint)
@@ -2431,7 +2455,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual((live["completed"], live["failed"]), (2, 1))
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         for value in (
                 "styles", "characters", "both",
                 "character_setting", "selected"):
@@ -2683,8 +2707,8 @@ class RegressionTests(unittest.TestCase):
             live.update(completed=10, phase="completed")
             live.release(token)
         self.assertEqual(live.snapshot()["eta_seconds"], 0.0)
-        self.assertIn('id="pvEta"', APP.PAGE_TEMPLATE)
-        self.assertIn("남은 시간 계산 중", APP.PAGE_TEMPLATE)
+        self.assertIn('id="pvEta"', UI_SOURCE)
+        self.assertIn("남은 시간 계산 중", UI_SOURCE)
 
     def test_job_center_command_uses_common_contract_without_starting_generation(self):
         job = APP.new_job(
@@ -2723,7 +2747,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(result["handled"])
         self.assertEqual(result["job"]["phase"], "paused")
         self.assertEqual(result["command"]["resource"]["mode"], "exclusive")
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("/api/job_command", page)
         self.assertIn("data-job-action", page)
 
@@ -2861,7 +2885,7 @@ class RegressionTests(unittest.TestCase):
                     json.loads(settings.read_text(encoding="utf-8"))["token"], "")
                 self.assertTrue((kept / "복구기록.json").is_file())
 
-        self.assertIn('id="startupRecovery"', APP.PAGE_TEMPLATE)
+        self.assertIn('id="startupRecovery"', UI_SOURCE)
         self.assertIn("startup_recovery", APP.ConfigServer(
             copy.deepcopy(APP.DEFAULT_CONFIG)).snapshot_config())
 
@@ -2981,7 +3005,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("fixture failure", status["last_error"])
 
     def test_preview_exposes_operation_phase_status_and_retry_navigation(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         for element_id in ("pvPhase", "pvStatus", "pvCounts", "pvReturn"):
             self.assertIn(f'id="{element_id}"', page)
         self.assertIn("LIVE_PHASE_LABEL", page)
@@ -3436,7 +3460,7 @@ class RegressionTests(unittest.TestCase):
             APP.preview_user_backup(payload.getvalue())
 
     def test_whole_backup_ui_reloads_without_losing_rollback_handle(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         for element_id in (
             "backupCard", "backupExport", "backupChoose", "backupFile",
             "backupRestore", "backupRollback", "backupMsg", "backupDiff",
@@ -3679,7 +3703,7 @@ class RegressionTests(unittest.TestCase):
                 json.loads(data_file.read_text(encoding="utf-8")), edited)
 
     def test_local_image_integrity_ui_has_scan_normalize_and_rollback(self):
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         for element_id in (
             "localImageCard", "localImageScan", "localImageNormalize",
             "localImageRollback", "localImageMsg",
@@ -3738,7 +3762,7 @@ class RegressionTests(unittest.TestCase):
                 self.assertTrue(APP.load_spec())
                 self.assertFalse((root / "옵션.json").exists())
                 self.assertFalse((root / "규격.json").exists())
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertIn("아직 넣은 세팅이 없습니다.", page)
         self.assertIn("빌더 후보 자료가 아직 없습니다.", page)
         self.assertIn(
@@ -3924,7 +3948,7 @@ class RegressionTests(unittest.TestCase):
                 second = APP.rebuild_data_index()
                 self.assertEqual(first["fingerprint"], second["fingerprint"])
 
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         for marker in (
             'id="dataStorageStatus"', 'id="dataIndexBuild"',
             "/api/data_storage", "/api/data_index_rebuild",
@@ -4128,7 +4152,7 @@ class RegressionTests(unittest.TestCase):
                         style_file.read_text(encoding="utf-8"),
                     )
 
-        page = APP.PAGE_TEMPLATE
+        page = UI_SOURCE
         self.assertNotIn('id="packOver"', page)
         for marker in (
             'id="packDiff"', 'id="packSelectAll"', 'id="packSelectNone"',
@@ -4465,9 +4489,9 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(
                     APP.restore_trash_batch(cfg, two["batch_id"])["restored"], 1)
 
-        self.assertIn('id="trashCard"', APP.PAGE_TEMPLATE)
-        self.assertIn("fetch('/api/trash'", APP.PAGE_TEMPLATE)
-        self.assertIn("자동 만료와 영구 비우기는 하지 않습니다.", APP.PAGE_TEMPLATE)
+        self.assertIn('id="trashCard"', UI_SOURCE)
+        self.assertIn("fetch('/api/trash'", UI_SOURCE)
+        self.assertIn("자동 만료와 영구 비우기는 하지 않습니다.", UI_SOURCE)
 
     def test_trash_writes_recovery_manifest_before_moving_any_file(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4710,7 +4734,7 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("ensure_refs(", source)
 
     def test_page_installs_visible_runtime_error_handlers_before_app_code(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         handlers_at = page.index("window.addEventListener('error'")
         state_at = page.index("let STATE = null")
         self.assertLess(handlers_at, state_at)
@@ -4719,7 +4743,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("새로고침", page)
 
     def test_metadata_audit_is_in_data_storage_and_rejects_app_json(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         for element_id in (
             "metadataAuditStart",
             "metadataAuditContinue",
@@ -4816,7 +4840,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_studio_layout_is_default_and_classic_remains_compatible(self):
         """작업실을 기본으로 쓰되 설정 한 번으로 기존 호환 화면을 복원해야 한다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
         ).read_text(encoding="utf-8")
@@ -4842,7 +4866,7 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("수집", BUILD.ASSET_DIRS)
 
     def test_studio_workflow_has_context_and_descriptions_at_common_desktop_width(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
         ).read_text(encoding="utf-8")
@@ -4876,7 +4900,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_studio_library_groups_inputs_catalog_and_results_without_duplicate_cards(self):
         """자료 작업을 세 흐름으로 나누되 기존 화면에서는 같은 카드를 모두 보여야 한다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
         ).read_text(encoding="utf-8")
@@ -4898,7 +4922,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_studio_settings_separates_existing_cards_and_classic_shows_all(self):
         """작업실은 세 작업을 나누되 기존 화면에서는 원래 카드가 모두 복원돼야 한다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
         ).read_text(encoding="utf-8")
@@ -4920,7 +4944,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_character_duplicate_uses_latest_client_state_and_unique_identity(self):
         """캐릭터 변형은 기존 전체 프롬프트를 깊은 복사하고 id·이름만 새로 만든다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn('data-xdup="${c.id}"', page)
         self.assertIn("const cloned = JSON.parse(JSON.stringify(chars[at]));", page)
         self.assertIn("cloned.id = genId();", page)
@@ -4929,7 +4953,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("renderLibrary(); renderSlots(); save();", page)
 
     def test_character_delete_requires_confirmation_and_can_be_undone(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn('id="charUndo" class="hidden"', page)
         self.assertIn("const DELETED_CHARS = [];", page)
         self.assertIn("if(!confirm(`'${character.name || '캐릭터'}'을 삭제할까요?", page)
@@ -5150,7 +5174,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(len(restarted["character_folders"]), 10)
 
     def test_large_character_library_renders_bounded_searchable_pages(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         for element_id in (
             "libFilter", "libType", "libSource", "libManage", "libCount",
             "libMore", "recipeLibraryCard", "charEditorCard",
@@ -5189,7 +5213,7 @@ class RegressionTests(unittest.TestCase):
         정해 두지 않으면 좌패널을 접었을 때 자동 배치가 한 칸씩 당겨져 가운데가
         1번 열(0px)로 밀리고 오른쪽이 `1fr` 을 가져간다 — 브라우저 실측에서
         중 860→48 · 우 300→1300 이었다. 화면 없이도 지킬 수 있게 여기서 막는다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         squished = page.replace(" ", "")
         # ⚠ 실패해도 페이지를 통째로 덤프하지 않게 참/거짓으로 잰다 (300KB 가 쏟아진다)
         for sel in (".left{grid-column:1;}", ".center{grid-column:2;}",
@@ -5212,7 +5236,7 @@ class RegressionTests(unittest.TestCase):
 
         그림체 복구는 **고르는 일이 아니라 새로 뽑는 일**이라(결과가 `output/복구/` 에
         쌓이고 Anlas 도 든다) 카드를 갈랐다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         bar_at = page.index('id="expCup"')
         bar_end = page.index("</div>", bar_at)
         bar = page[bar_at:bar_end]
@@ -5294,7 +5318,7 @@ class RegressionTests(unittest.TestCase):
         프로젝트 이름처럼 프롬프트가 아닌 짧은 식별 입력의 제한까지 실패로
         오인하지 않는다.
         """
-        page = APP.render_page()
+        page = rendered_ui_source()
         textareas = re.findall(r"<textarea\b[^>]*>", page, flags=re.I)
         self.assertTrue(textareas)
         limited = [tag for tag in textareas if "maxlength" in tag.lower()]
@@ -5310,7 +5334,7 @@ class RegressionTests(unittest.TestCase):
         `선별 외 삭제`·`꺼진 칸 정리`·`세팅 삭제` 는 각각 파일·칸·씬 수백 개를
         지운다. `+ 새 세팅` 이나 `⧉ 복제` 옆에 붙어 있으면 손이 미끄러진다.
         단추를 없애거나 빨간색을 빼지 않는다 — **자리만** 떼어 놓는다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         for bid in ('id="slotDelOff"', 'id="sbDel"', 'id="expDelUnpicked"'):
             self.assertTrue(bid in page, f"파괴적 단추가 사라졌다: {bid}")
         # 빨간 경고색은 유지해야 한다
@@ -5337,7 +5361,7 @@ class RegressionTests(unittest.TestCase):
         `⇄찾바` 는 한국어 낱말이 아니라 뜻을 알 수 없었고(모달 제목은
         `찾아 바꾸기` 로 제대로 돼 있었다), `Highlight Emphasis` 는 전부 한국어인
         화면에 홀로 영어였다. 되돌아가지 않게 못박는다."""
-        page = APP.render_page()
+        page = rendered_ui_source()
         # ⚠ `assertIn`/`assertNotIn` 은 실패하면 **페이지 300KB 를 통째로 덤프**해
         #   로그를 못 쓰게 만든다. 참/거짓으로 재고 짧은 말로 알린다.
         self.assertFalse("찾바" in page, "라벨이 `⇄찾바` 로 되돌아갔다 (낱말이 아니다)")
@@ -6412,7 +6436,7 @@ class RegressionTests(unittest.TestCase):
             self.assertNotIn("empty.webp", loaded["tags"])
 
     def test_explorer_exposes_rating_tags_and_virtual_candidate_groups(self):
-        page = APP.render_page()
+        page = rendered_ui_source()
         for element_id in (
             "expGroupFilter", "expGroupName", "expGroupSave",
             "expGroupDelete", "expRate", "expTagInput", "expTagSave",
@@ -6479,7 +6503,7 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertEqual(saved["review_states"]["비교/A.webp"], "confirmed")
         self.assertEqual(saved["memos"]["비교/A.webp"], memo)
-        page = APP.render_page()
+        page = rendered_ui_source()
         self.assertIn("/api/evaluation_action", page)
         self.assertNotIn("const delta = 24 *", page)
 
@@ -6587,8 +6611,8 @@ class RegressionTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, api_text)
         self.assertIn("Traceback (most recent call last):", errors_only["events"][0]["message"])
-        self.assertNotIn("toISOString().slice(0,10)", APP.PAGE_TEMPLATE)
-        self.assertIn("getFullYear()", APP.PAGE_TEMPLATE)
+        self.assertNotIn("toISOString().slice(0,10)", UI_SOURCE)
+        self.assertIn("getFullYear()", UI_SOURCE)
 
     def test_local_http_rejects_cross_site_post_but_allows_local_cli(self):
         with socket.socket() as probe:
@@ -7105,7 +7129,7 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(blocked["ok"])
             self.assertIn("손상", blocked["error"])
             self.assertEqual(corrupt_file.read_bytes(), b'{"queue":')
-            page = APP.render_page()
+            page = rendered_ui_source()
             for marker in (
                     'id="publicCollectFailures"', 'id="publicCollectRetry"',
                     "/api/public_collection_retry", "changed_posts",
@@ -7333,7 +7357,7 @@ class RegressionTests(unittest.TestCase):
                         })
                 self.assertEqual(corrupt.read_bytes(), b'{"items":')
 
-            page = APP.render_page()
+            page = rendered_ui_source()
             for marker in (
                     'id="libReview"', 'id="libLabel"', 'id="libSelectPage"',
                     'id="libBulkApply"', 'id="libBulkUndo"',
@@ -7392,7 +7416,7 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(used, presets)
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         for marker in (
                 "cast_presets", "data-castpreset=", "data-castload=",
                 "data-castsave=", "data-castpresetdel=", "data-castmode=",
@@ -7438,7 +7462,7 @@ class RegressionTests(unittest.TestCase):
                 self.assertNotIn("must-not-cross-resource-export", exported)
                 self.assertIn("QUJD" * 5000, exported)
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         for marker in (
                 'id="refBundleExport"', 'id="refBundleImport"',
                 "/api/ref_bundle_export", "/api/ref_bundle_import"):
@@ -7532,7 +7556,7 @@ class RegressionTests(unittest.TestCase):
                              "1girl, red hair, blue dress")
             self.assertEqual(server.cfg, original_cfg)
 
-        page = APP.render_page()
+        page = rendered_ui_source()
         for marker in (
                 'id="libVary"', "variation_character_id",
                 "이 증거 그림으로 캐릭터 변형",

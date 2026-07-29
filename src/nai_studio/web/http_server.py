@@ -13,7 +13,9 @@ from urllib.parse import urlparse
 
 MAX_REQUEST_BODY = 128 * 1024 * 1024
 STATIC_ASSETS = {
+    "/ui/base.css": ("base.css", "text/css; charset=utf-8"),
     "/ui/studio.css": ("studio.css", "text/css; charset=utf-8"),
+    "/ui/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
 }
 
 

@@ -9972,6 +9972,7 @@ def render_page():
     """파라미터 선택지를 파이썬 상수에서 채워 넣는다 (목록을 한 곳에서만 관리)."""
     def opts(pairs):
         return "".join(f'<option value="{v}">{esc_html(l)}</option>' for v, l in pairs)
+    profile = esc_html(PROFILE)
     return (PAGE_TEMPLATE
             .replace("__MODELS__", opts(MODELS))
             .replace("__SAMPLERS__", opts((s, s.replace("k_", "")) for s in SAMPLERS))
@@ -9984,10 +9985,10 @@ def render_page():
             .replace("__EMOTIONS__", opts((e, e) for e in EMOTIONS))
             .replace("__BOORUS__", opts((k, v["name"] + v.get("note", ""))
                                        for k, v in BOORUS.items()))
-            .replace("__PROFNOW__", f"프로필 「{PROFILE}」" if PROFILE else "기본 (첫째 계정)")
-            .replace("__PROFTITLE__", f" — {PROFILE}" if PROFILE else "")
+            .replace("__PROFNOW__", f"프로필 「{profile}」" if profile else "기본 (첫째 계정)")
+            .replace("__PROFTITLE__", f" — {profile}" if profile else "")
             .replace("__PROFBADGE__", (f'<span class="badge" style="margin-left:7px;">'
-                                       f'프로필 {PROFILE}</span>') if PROFILE else ""))
+                                       f'프로필 {profile}</span>') if profile else ""))
 
 
 def esc_html(s):
