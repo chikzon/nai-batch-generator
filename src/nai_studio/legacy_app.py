@@ -7133,7 +7133,7 @@ def comparison_job_recipe_snapshot(
         for value in (slot.get("reference_ids") or []) if value
     }
     saved_vibes = [
-        copy.deepcopy(item) for item in (cfg.get("vibes") or [])
+        copy.deepcopy(item) for item in (used.get("vibes") or [])
         if include_refs and isinstance(item, dict)
         and (
             str(item.get("id") or "") in wanted_vibes
@@ -7141,7 +7141,7 @@ def comparison_job_recipe_snapshot(
         )
     ]
     saved_refs = [
-        copy.deepcopy(item) for item in (cfg.get("char_refs") or [])
+        copy.deepcopy(item) for item in (used.get("char_refs") or [])
         if include_refs and isinstance(item, dict)
         and (
             str(item.get("id") or "") in wanted_refs
@@ -21574,16 +21574,20 @@ class ConfigServer:
         """그림체 전체·캐릭터 전체·직교 조합을 같은 조건으로 한 장씩 생성한다."""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        if not self.cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         try:
             data = json.loads(body or b"{}")
         except Exception as e:
             return {"ok": False, "error": f"잘못된 요청입니다: {e}"}
+        # 계획·설계도·worker가 같은 클릭 시점 사본을 사용한다. 실행권을 잡는 사이
+        # 자동 저장이 들어와도 계획은 옛 값, 실제 호출은 새 값으로 갈라지지 않는다.
+        with self.config_lock:
+            run_cfg = copy.deepcopy(self.cfg)
+        if not run_cfg.get("token", "").startswith("pst-"):
+            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         opus = None
         if self.anlas_balance_cache is not None:
             opus = bool(self.anlas_balance_cache.get("opus"))
-        plan = comparison_plan(self.cfg, data, self.spec, opus=opus)
+        plan = comparison_plan(run_cfg, data, self.spec, opus=opus)
         if not plan["ok"] or not plan["count"]:
             return {"ok": False, "error": " ".join(plan.get("errors") or [])
                     or "생성할 항목이 없습니다."}
@@ -21599,7 +21603,7 @@ class ConfigServer:
             "자료 비교 생성",
             "library",
             blueprint=generation_blueprint(
-                self.cfg,
+                run_cfg,
                 source={"kind": "comparison-plan"},
                 experiment={
                     **copy.deepcopy(plan.get("options") or {}),
@@ -21618,8 +21622,6 @@ class ConfigServer:
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
-        # 실행 중 화면 편집이 앞 장과 뒤 장의 비교 조건을 바꾸지 않도록 시작 시점 사본을 쓴다.
-        run_cfg = json.loads(json.dumps(self.cfg, ensure_ascii=False, default=str))
         if plan["options"].get("mode") == "character_setting":
             styles, chars = [], comparison_characters(run_cfg)
         else:
@@ -21645,13 +21647,15 @@ class ConfigServer:
         """선택 실험 결과 한 장의 canonical 셀만 같은 seed로 다시 실행한다."""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        if not self.cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         try:
             data = json.loads(body or b"{}")
             path = str(data.get("path") or "")
+            with self.config_lock:
+                run_cfg = copy.deepcopy(self.cfg)
+            if not run_cfg.get("token", "").startswith("pst-"):
+                return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
             # 실행권을 잡기 전에 manifest와 셀 재료가 실제로 있는지 확인한다.
-            _selected_comparison_record(self.cfg, path)
+            _selected_comparison_record(run_cfg, path)
         except Exception as error:
             return {"ok": False, "error": str(error)}
         token = self.live.try_claim(
@@ -21661,7 +21665,6 @@ class ConfigServer:
         )
         if token is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        run_cfg = copy.deepcopy(self.cfg)
 
         def run():
             try:
@@ -24030,7 +24033,9 @@ def _result_promotion_records(
         "content_sha256", "request_id", "payload_hash",
         "blueprint_fingerprint",
     )
-    present = [key for key in strict_keys if record.get(key)]
+    # 진짜 구형은 키 자체가 없다. 새 형식의 키가 있는데 값이 비었거나 일부만
+    # 남은 경우는 손상된 strict 결과이지 구형 호환 대상으로 낮추면 안 된다.
+    present = [key for key in strict_keys if key in record]
     if not present:
         raise LegacyPromotionLineageUnavailable(
             "이 비교 결과에는 엄격 실행 식별자가 없습니다.")

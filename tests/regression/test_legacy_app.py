@@ -2889,6 +2889,17 @@ class RegressionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "일부 빠졌"):
                     APP._result_promotion_records(
                         cfg, rel, "style", name="검증 그림체")
+                blank = copy.deepcopy(partial)
+                for key in (
+                    "content_sha256", "request_id", "payload_hash",
+                    "blueprint_fingerprint",
+                ):
+                    blank["completed"]["cell-one"][key] = ""
+                (run / "manifest.json").write_text(
+                    json.dumps(blank, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "일부 빠졌"):
+                    APP._result_promotion_records(
+                        cfg, rel, "style", name="검증 그림체")
                 for key in (
                     "content_sha256", "payload_hash",
                     "blueprint_fingerprint",
@@ -2972,6 +2983,14 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertEqual([x["id"] for x in used["char_refs"]], ["ref-a"])
         self.assertEqual([x["id"] for x in used["vibes"]], ["vibe-a"])
+        self.assertEqual(
+            [(x["id"], x["enabled"]) for x in recipe["char_refs"]],
+            [("ref-a", True)],
+        )
+        self.assertEqual(
+            [(x["id"], x["enabled"]) for x in recipe["vibes"]],
+            [("vibe-a", True)],
+        )
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
