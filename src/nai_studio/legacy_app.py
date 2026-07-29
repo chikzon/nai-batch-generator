@@ -36,6 +36,7 @@ import uuid
 import webbrowser
 import zipfile
 import zlib
+from contextlib import ExitStack
 from datetime import date, datetime
 from pathlib import Path
 
@@ -200,6 +201,7 @@ from src.nai_studio.services import (
     output_lifecycle as _output_lifecycle,
     public_style_import as _public_style_import,
     setting_runtime as _setting_runtime,
+    settings_handlers as _settings_handlers,
     style_store as _style_store,
     user_backup_store as _user_backup_store,
 )
@@ -4027,6 +4029,57 @@ def _collection_handler_operations():
     )
 
 
+def _setting_transaction():
+    """기존 세팅 파일의 프로세스·스레드 잠금을 같은 순서로 묶는다."""
+    stack = ExitStack()
+    stack.enter_context(
+        globals()["shared_data_transaction"](
+            globals()["SETTINGS_DIR"].parent
+        )
+    )
+    stack.enter_context(globals()["_SETTING_TX_LOCK"])
+    return stack
+
+
+def _settings_handler_operations():
+    """프로젝트·설정·씬 저장 의존성을 호출 시점에 연결한다."""
+    return _settings_handlers.SettingsHandlerOperations(
+        config_transaction=lambda: globals()["shared_data_transaction"](
+            globals()["CHAR_DIR"].parent
+        ),
+        setting_transaction=_setting_transaction,
+        default_config=globals()["DEFAULT_CONFIG"],
+        normalize_projects=globals()["normalize_projects"],
+        normalize_link=globals()["normalize_link"],
+        project_by_id=globals()["project_by_id"],
+        generation_blueprint=globals()["generation_blueprint"],
+        blueprint_common=globals()["blueprint_common"],
+        fingerprint_blueprint=globals()["fingerprint_blueprint"],
+        resolve_inheritance=globals()["resolve_inheritance"],
+        materialize_blueprint=globals()[
+            "materialize_blueprint_into_config"
+        ],
+        save_config=globals()["save_config"],
+        validate_config_value=globals()["validate_config_value"],
+        sync_chars_to_files=globals()["sync_chars_to_files"],
+        sync_blueprint_overrides=globals()[
+            "sync_blueprint_local_overrides"
+        ],
+        delete_char_files=globals()["delete_char_files"],
+        setting_path=globals()["setting_path"],
+        load_json=globals()["load_json_recover"],
+        setting_revision=globals()["setting_content_revision"],
+        normalize_resolution=globals()["normalize_resolution"],
+        normalize_centers=globals()["normalize_scene_centers"],
+        normalize_reference_ids=globals()[
+            "normalize_scene_reference_ids"
+        ],
+        atomic_write_json=globals()["atomic_write_json"],
+        warning=globals()["log"].warning,
+        info=globals()["log"].info,
+    )
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -5439,103 +5492,12 @@ class ConfigServer:
                 "knowledge_assets": knowledge_assets_from_config(self.cfg),
             }
 
-    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_blueprint_project(self, body):
-        """프로젝트 공통값 저장·연결·갱신은 자동저장과 분리해 명시적으로 처리."""
-        try:
-            request = json.loads(body or b"{}")
-        except json.JSONDecodeError:
-            return {"ok": False, "error": "잘못된 프로젝트 요청입니다."}
-        action = str(request.get("action") or "").strip().lower()
-        if action not in ("create", "update", "activate", "accept", "disconnect"):
-            return {"ok": False, "error": "알 수 없는 프로젝트 작업입니다."}
-        with self.config_lock:
-            cfg = self.latest_config_from_disk()
-            projects = normalize_projects(cfg.get("blueprint_projects") or [])
-            link = normalize_link(cfg.get("blueprint_inheritance") or {})
-            project_id = str(request.get("id") or link.get("project_id") or "")
-            current = generation_blueprint(cfg)
-
-            if action in ("create", "update"):
-                name = str(request.get("name") or "").strip()
-                if not name or len(name) > 120:
-                    return {"ok": False, "error": "프로젝트 이름을 1~120자로 적어주세요."}
-                if action == "create":
-                    project_id = f"project-{uuid.uuid4().hex}"
-                existing = project_by_id(projects, project_id)
-                if action == "update" and existing is None:
-                    return {"ok": False, "error": "갱신할 프로젝트를 찾지 못했습니다."}
-                common = blueprint_common(current)
-                record = {
-                    "id": project_id,
-                    "name": name,
-                    "blueprint": common,
-                    "fingerprint": fingerprint_blueprint(common),
-                    "updated_at": datetime.now().astimezone().isoformat(
-                        timespec="seconds"),
-                }
-                projects = [
-                    item for item in projects if item.get("id") != project_id
-                ] + [record]
-                cfg["blueprint_projects"] = normalize_projects(projects)
-
-            elif action == "activate":
-                project = project_by_id(projects, project_id)
-                if project is None:
-                    return {"ok": False, "error": "연결할 프로젝트를 찾지 못했습니다."}
-                accepted = blueprint_common(project["blueprint"])
-                new_link = {
-                    "schema": "nai-blueprint-inheritance/v1",
-                    "project_id": project_id,
-                    "accepted_fingerprint": project["fingerprint"],
-                    "accepted_blueprint": accepted,
-                    "local_overrides": {},
-                }
-                resolution = resolve_inheritance(
-                    current, projects, new_link)
-                cfg = materialize_blueprint_into_config(
-                    cfg, resolution["blueprint"])
-                cfg["blueprint_projects"] = projects
-                cfg["blueprint_inheritance"] = normalize_link(new_link)
-
-            elif action == "accept":
-                if not link:
-                    return {"ok": False, "error": "연결된 프로젝트가 없습니다."}
-                project = project_by_id(projects, link["project_id"])
-                if project is None:
-                    return {"ok": False, "error": "프로젝트 원본을 찾지 못했습니다."}
-                expected = str(request.get("fingerprint") or "")
-                if expected and expected != str(project.get("fingerprint") or ""):
-                    return {
-                        "ok": False,
-                        "conflict": True,
-                        "error": "확인 뒤 프로젝트 공통값이 다시 바뀌었습니다. 내용을 다시 확인해 주세요.",
-                    }
-                new_link = copy.deepcopy(link)
-                new_link["accepted_blueprint"] = blueprint_common(
-                    project["blueprint"])
-                new_link["accepted_fingerprint"] = project["fingerprint"]
-                # 명시해 둔 현재 변경만 새 부모보다 위에 유지한다.
-                resolution = resolve_inheritance(
-                    current, projects, new_link)
-                cfg = materialize_blueprint_into_config(
-                    cfg, resolution["blueprint"])
-                cfg["blueprint_projects"] = projects
-                cfg["blueprint_inheritance"] = normalize_link(new_link)
-
-            else:  # disconnect
-                cfg["blueprint_inheritance"] = {}
-
-            save_config(cfg)
-            self.cfg.clear()
-            self.cfg.update(cfg)
-            self.config_revision += 1
-            snapshot = self.snapshot_blueprint()
-            snapshot.update({
-                "revision": self.config_revision,
-                "project_id": project_id,
-            })
-            return snapshot
+        return _settings_handlers.handle_blueprint_project(
+            self,
+            {"body": body},
+            _settings_handler_operations(),
+        )
 
     def snapshot_sequence(self, name=""):
         """기존 세팅 파일을 바꾸지 않고 공통 순서 계획으로 보여 준다."""
@@ -6028,209 +5990,19 @@ class ConfigServer:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_save(self, body):
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            return {"ok": False, "error": "잘못된 데이터"}
-        revision = data.pop("_revision", None)
-        base_values = data.pop("_base", {})
-        if not isinstance(base_values, dict):
-            base_values = {}
-        with self.config_lock:
-            if revision is not None:
-                try:
-                    stale = int(revision) != self.config_revision
-                except (TypeError, ValueError):
-                    stale = True
-                if stale:
-                    return {"ok": False, "conflict": True, "revision": self.config_revision,
-                            "error": "다른 화면에서 설정이 먼저 변경됐습니다. 새로고침 후 다시 시도하세요."}
-            # 다른 프로세스는 각자 config_revision을 가지므로 파일 잠금만으로는 부족하다.
-            # 잠금을 얻은 뒤 디스크 최신판을 다시 읽고, 이번 요청이 실제로 바꾼
-            # top-level 키만 그 위에 적용한다. 같은 키가 시작값과 달라졌다면 조용히
-            # 덮지 않고 충돌로 돌려준다.
-            local_before = dict(self.cfg)
-            merged = self.latest_config_from_disk()
-            allowed = {k for k in DEFAULT_CONFIG if not k.startswith("_")}
-            allowed |= {"booru_keys"}
-            allowed -= {"male_prompt"}
-            external_changes = sorted(
-                key for key in allowed
-                if key not in data and local_before.get(key) != merged.get(key)
-            )
-            conflicts = [
-                key for key, incoming in data.items()
-                if key in allowed and key in base_values
-                and merged.get(key) != base_values.get(key)
-                and incoming != merged.get(key)
-            ]
-            if conflicts:
-                self.cfg.clear()
-                self.cfg.update(merged)
-                self.config_revision += 1
-                return {
-                    "ok": False, "conflict": True,
-                    "conflict_keys": sorted(conflicts),
-                    "revision": self.config_revision,
-                    "error": "다른 실행본이 같은 설정을 먼저 변경했습니다. "
-                             "새로고침 후 값을 확인하고 다시 시도하세요.",
-                }
-            self.cfg.clear()
-            self.cfg.update(merged)
-            old_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-            accepted, rejected, fixed_vals = [], [], {}
-            for key, val in data.items():
-                if key not in allowed:
-                    if not key.startswith("_"):
-                        rejected.append(key)
-                    continue
-                ok, used, fixes = validate_config_value(key, val, self.cfg.get(key))
-                fixed_vals.update(fixes)
-                if not ok:
-                    rejected.append(key)
-                    continue
-                self.cfg[key] = used
-                accepted.append(key)
-            new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
-            sync_chars_to_files(self.cfg)
-            # 프로젝트 연결 뒤의 일반 편집은 부모 전체를 복제하지 않고 실제로
-            # 달라진 leaf만 override로 기록한다.
-            sync_blueprint_local_overrides(self.cfg)
-            # 새 설정과 남은 캐릭터 파일이 먼저 디스크에 확정된 뒤 삭제본을 목록 밖
-            # 백업으로 옮긴다. 중간 종료 시 삭제가 취소될 수는 있어도 원문이 사라지지 않는다.
-            save_config(self.cfg)
-            delete_char_files(self.cfg, old_ids - new_ids)
-            self.config_revision += 1
-            if rejected:
-                log.warning(f"설정 저장에서 잘못된 키/값을 거절함: {', '.join(sorted(rejected))}")
-            if fixed_vals:
-                log.info(f"설정값을 허용 범위로 맞췄습니다: {fixed_vals}")
-            return {"ok": True, "accepted": accepted, "rejected": rejected,
-                    "fixed": fixed_vals, "revision": self.config_revision,
-                    "external_changes": external_changes}
+        return _settings_handlers.handle_save(
+            self,
+            {"body": body},
+            _settings_handler_operations(),
+        )
 
-    @serialized_setting_write
     def handle_scene_save(self, body):
-        """한 세팅의 씬 내부 값을 원자적으로 저장한다.
-
-        씬 번호는 다른 세팅에도 존재할 수 있으므로 이름으로 파일을 먼저
-        고정한다. expect_revision은 편집 뒤 다른 저장이 끼어든 상태에서
-        되돌리기가 새 내용을 덮는 것을 막는다.
-        """
-        try:
-            data = json.loads(body)
-            setting = str(data.get("setting") or "").strip()
-            if not setting:
-                return {"ok": False, "error": "수정할 세팅 이름이 없습니다."}
-            path = setting_path(setting)
-            if not path:
-                return {"ok": False, "error": f"'{setting}' 세팅을 찾을 수 없습니다."}
-            updates = data.get("updates") or {}
-            if not isinstance(updates, dict):
-                return {"ok": False, "error": "씬 수정 내용의 형식이 잘못되었습니다."}
-            allowed = ("female_prompt", "male_prompt", "partner_prompt", "base_tags",
-                       "relationship_name", "relationship_tags",
-                       "female_negative", "male_negative", "partner_negative",
-                       "remove_char_tags", "remove_male_tags", "remove_partner_tags",
-                       "negative", "width", "height", "char_centers",
-                       "use_character_refs", "character_refs")
-            tag_list_fields = ("remove_char_tags", "remove_male_tags",
-                               "remove_partner_tags")
-            valid_ref_ids = {
-                str(ref.get("id") or "")
-                for ref in (self.cfg.get("char_refs") or [])
-                if isinstance(ref, dict) and ref.get("id")
-            }
-            pack = load_json_recover(path)
-            revision = setting_content_revision(pack)
-            expected = str(data.get("expect_revision") or "")
-            if expected and expected != revision:
-                return {"ok": False, "conflict": True,
-                        "error": "다른 저장이 먼저 반영되어 되돌리지 않았습니다. 다시 열어 확인해주세요."}
-
-            scenes = pack.get("씬") or {}
-            prepared = {}
-            before = {}
-            for sid, fields in updates.items():
-                sid = str(sid)
-                sc = scenes.get(sid)
-                if not isinstance(sc, dict) or not isinstance(fields, dict):
-                    continue
-                clean = {}
-                old = {}
-                for key in allowed:
-                    if key not in fields:
-                        continue
-                    value = fields[key]
-                    if key in ("width", "height"):
-                        value = normalize_resolution(value)
-                    elif key == "char_centers":
-                        value = normalize_scene_centers(value)
-                    elif key == "character_refs":
-                        value = normalize_scene_reference_ids(value)
-                        unknown = [rid for rid in value if rid and rid not in valid_ref_ids]
-                        if unknown:
-                            raise ValueError(
-                                f"찾을 수 없는 캐릭터 레퍼런스입니다: {unknown[0]}")
-                    elif key == "use_character_refs":
-                        if not isinstance(value, bool):
-                            raise ValueError("씬 Reference 사용 여부는 true/false여야 합니다.")
-                    elif key in tag_list_fields:
-                        if isinstance(value, str):
-                            value = [x.strip() for x in re.split(r"[,\n]", value)
-                                     if x.strip()]
-                        elif isinstance(value, list):
-                            value = [str(x).strip() for x in value if str(x).strip()]
-                        else:
-                            raise ValueError(f"{key} 값은 문자열 또는 목록이어야 합니다.")
-                    elif not isinstance(value, str):
-                        raise ValueError(f"{key} 값은 문자열이어야 합니다.")
-                    clean[key] = value
-                    if key == "char_centers":
-                        old[key] = normalize_scene_centers(sc.get(key))
-                    elif key == "character_refs":
-                        old[key] = normalize_scene_reference_ids(
-                            sc.get("character_refs"))
-                    elif key == "use_character_refs":
-                        old[key] = bool(sc.get(key, False))
-                    elif key in tag_list_fields:
-                        previous = sc.get(key) or []
-                        old[key] = (
-                            [x.strip() for x in re.split(r"[,\n]", previous) if x.strip()]
-                            if isinstance(previous, str)
-                            else [str(x).strip() for x in previous if str(x).strip()]
-                        )
-                    else:
-                        old[key] = sc.get(key, "" if key not in ("width", "height") else value)
-                if clean:
-                    prepared[sid] = clean
-                    before[sid] = old
-
-            changed_scenes = 0
-            changed_fields = 0
-            for sid, fields in prepared.items():
-                scene_changed = False
-                for key, value in fields.items():
-                    empty = (
-                        [] if key in ("char_centers", "character_refs")
-                        or key in tag_list_fields
-                        else False if key == "use_character_refs" else ""
-                    )
-                    if scenes[sid].get(key, empty) != value:
-                        scenes[sid][key] = value
-                        changed_fields += 1
-                        scene_changed = True
-                changed_scenes += int(scene_changed)
-            if changed_fields:
-                atomic_write_json(path, pack)
-            after_revision = setting_content_revision(pack)
-            return {"ok": True, "updated": changed_scenes, "fields": changed_fields,
-                    "setting": setting, "before": before,
-                    "revision": after_revision}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _settings_handlers.handle_scene_save(
+            self,
+            {"body": body},
+            _settings_handler_operations(),
+        )
 
     def handle_start(self):
         if self.live.running:
