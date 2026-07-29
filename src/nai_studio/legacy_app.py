@@ -247,6 +247,10 @@ from src.nai_studio.web.routes.collection_post import (
     CollectionPostOperations,
     handle_collection_post,
 )
+from src.nai_studio.web.routes.evaluation_post import (
+    EvaluationPostOperations,
+    handle_evaluation_post,
+)
 from src.nai_studio.web.routes.generation import (
     GenerationGetOperations,
     handle_generation_get,
@@ -12800,6 +12804,20 @@ class ConfigServer:
             delete_styles=delete_styles,
             restore_styles=restore_styles,
         )
+        evaluation_post = EvaluationPostOperations(
+            artist_workspace=artist_workspace_request,
+            load_ratings=load_ratings,
+            rate_artist=rate_artist,
+            apply_evaluation=apply_evaluation_action,
+            picks_lock=_JSON_IO_LOCK,
+            load_picks=load_picks,
+            save_picks=save_picks,
+            trash_outputs=trash_output_files,
+            restore_trash=restore_trash_batch,
+            output_subdir=out_sub,
+            atomic_write=_atomic_write_bytes,
+            strip_and_save=strip_and_save,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12828,6 +12846,8 @@ class ConfigServer:
                 if handle_collection_post(self, server, collection_post, body):
                     return
                 if handle_catalog_post(self, catalog_post, body):
+                    return
+                if handle_evaluation_post(self, server, evaluation_post, body):
                     return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
@@ -13074,34 +13094,6 @@ class ConfigServer:
                         self._json(server.handle_job_command(body))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/artist_workspace"):
-                    try:
-                        if len(body or b"") > 128 * 1024:
-                            self._json({"ok": False, "error": "요청이 너무 큽니다."}); return
-                        self._json(artist_workspace_request(
-                            json.loads(body or b"{}")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/rate"):
-                    # 작가 평가 — 별점·즐겨찾기·차단·메모 (rater 의 ratings 를 우리 구조로)
-                    try:
-                        if len(body or b"") > 64 * 1024:      # 입력 상한 (R4-01)
-                            self._json({"ok": False, "error": "요청이 너무 큽니다."}); return
-                        d = json.loads(body or b"{}")
-                        if not isinstance(d, dict):
-                            self._json({"ok": False, "error": "잘못된 형식"}); return
-                        if not d.get("list") and len(str(d.get("artist", ""))) > 200:
-                            self._json({"ok": False, "error": "작가 이름이 너무 깁니다."}); return
-                        if d.get("list"):
-                            self._json({"ok": True, "ratings": load_ratings()})
-                        else:
-                            cur = rate_artist(d.get("artist", ""),
-                                              **{k: d[k] for k in ("score", "fav", "block", "memo")
-                                                 if k in d})
-                            self._json({"ok": True, "artist": (d.get("artist") or "").lower(),
-                                        "rating": cur})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
@@ -13127,109 +13119,6 @@ class ConfigServer:
                                     "shared": base + sum(chars),
                                     "shared_negative": neg + sum(cnegs), "limit": 512,
                                     "finalized": bool(d.get("finalize"))})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/evaluation_action"):
-                    try:
-                        if len(body or b"") > 4 * 1024 * 1024:
-                            self._json({
-                                "ok": False, "error": "요청이 너무 큽니다."})
-                            return
-                        self._json(apply_evaluation_action(
-                            json.loads(body or b"{}")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/picks_save"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        # load→merge→save 전체가 한 transaction이어야 다른 탭의 선별을 덮지 않는다.
-                        with _JSON_IO_LOCK:
-                            cur = load_picks()
-                            for k in (
-                                "picked", "fav", "folders", "ranks",
-                                "ratings", "elo", "elo_matches", "tags",
-                                "memos", "review_states",
-                            ):
-                                if k in d:
-                                    cur[k] = d[k]
-                            saved = save_picks(cur)
-                        self._json({"ok": True, "picks": saved})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/picks_del"):
-                    # 선별 안 된 것 지우기 — 즉시 삭제하지 않고 출력 폴더 휴지통으로 옮긴다.
-                    try:
-                        d = json.loads(body or b"{}")
-                        keep = set(d.get("keep") or [])
-                        targets = [str(x) for x in (d.get("targets") or [])
-                                   if str(x) not in keep]
-                        result = trash_output_files(server.cfg, targets, keep)
-                        if result["deleted"]:
-                            # 파일이 이미 없어졌거나 경로 검사를 통과하지 못한 요청은 이름표를
-                            # 유지한다. 실제 휴지통으로 옮긴 경로만 선별 기록에서 뺀다.
-                            gone = set(result.get("paths") or [])
-                            with _JSON_IO_LOCK:
-                                picks = load_picks()
-                                picks["picked"] = [
-                                    x for x in picks.get("picked", []) if x not in gone]
-                                picks["fav"] = [
-                                    x for x in picks.get("fav", []) if x not in gone]
-                                picks["ranks"] = {
-                                    k: v for k, v in picks.get("ranks", {}).items()
-                                    if k not in gone}
-                                picks["ratings"] = {
-                                    k: v for k, v in picks.get("ratings", {}).items()
-                                    if k not in gone}
-                                picks["elo"] = {
-                                    k: v for k, v in picks.get("elo", {}).items()
-                                    if k not in gone}
-                                picks["elo_matches"] = {
-                                    k: v for k, v in picks.get("elo_matches", {}).items()
-                                    if k not in gone}
-                                picks["tags"] = {
-                                    k: v for k, v in picks.get("tags", {}).items()
-                                    if k not in gone}
-                                picks["memos"] = {
-                                    k: v for k, v in picks.get("memos", {}).items()
-                                    if k not in gone}
-                                picks["review_states"] = {
-                                    k: v for k, v in
-                                    picks.get("review_states", {}).items()
-                                    if k not in gone}
-                                picks["folders"] = {
-                                    name: [x for x in paths if x not in gone]
-                                    for name, paths in picks.get("folders", {}).items()}
-                                save_picks(picks)
-                        self._json({"ok": True, **result})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/picks_restore"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        result = restore_trash_batch(server.cfg, d.get("batch_id"))
-                        self._json({"ok": True, **result})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/mosaic_save"):
-                    # 모자이크는 브라우저에서 이미 칠해 왔다. 우리는 저장만 한다.
-                    try:
-                        d = out_sub(server.cfg, "모자이크")
-                        d.mkdir(parents=True, exist_ok=True)
-                        n = len(list(d.glob("*.png"))) + 1
-                        f = d / f"{n:04d}.png"
-                        _atomic_write_bytes(f, body, keep_backup=False)
-                        self._json({"ok": True, "file": f.name, "bytes": len(body)})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/strip_meta"):
-                    from urllib.parse import unquote
-                    try:
-                        self._json(strip_and_save(
-                            body, unquote(self.headers.get("X-Filename", "image.png")),
-                            max_side=int(self.headers.get("X-MaxSide", "0") or 0),
-                            quality=int(self.headers.get("X-Quality", "95") or 95),
-                            force_webp=self.headers.get("X-ForceWebp") == "1",
-                            cfg=server.cfg))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/scenes_save"):
