@@ -5715,6 +5715,7 @@ COMPARE_MODE_LABELS = {
     "styles": "그림체 전체",
     "characters": "캐릭터 전체",
     "both": "그림체 × 캐릭터",
+    "character_setting": "캐릭터 × 선택 세팅",
 }
 COMPARE_MAX_JOBS = 2_000_000
 COMPARE_RECIPE_SETTING_KEYS = STYLE_BUNDLE_SETTING_KEYS
@@ -5942,11 +5943,308 @@ def comparison_sources(cfg, spec=None):
     return comparison_styles(spec), comparison_characters(cfg)
 
 
+def comparison_settings(cfg):
+    """현재 켠 세팅 중 실제 세트가 선택된 것만 실행용 사본으로 돌려준다.
+
+    직접 캐스트를 포함한 원래 상태는 읽기만 한다. character_setting 실행은 이
+    사본 위에 캐릭터 한 명을 얹으므로 설정.json과 화면의 직접 캐스트가 바뀌지 않는다.
+    """
+    rows = []
+    for name, raw in (cfg.get("setting_state") or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        state = copy.deepcopy(raw)
+        if state.get("use") is False or not state.get("selected"):
+            continue
+        rows.append({
+            "id": str(name),
+            "name": str(name),
+            "state": state,
+        })
+    return rows
+
+
+def _comparison_character_setting_slot(character):
+    """라이브러리 캐릭터를 세팅 캐스트 한 명의 무손실 사본으로 바꾼다."""
+    item = character if isinstance(character, dict) else {}
+    return {
+        "id": item.get("id") or item.get("_compare_id") or "",
+        "name": item.get("name") or item.get("_compare_name") or "캐릭터",
+        "prompt": item.get("female", ""),
+        "outfit": item.get("clothed", ""),
+        "negative": item.get("negative", ""),
+        "variant": copy.deepcopy(item.get("variant") or {}),
+        "reference_ids": copy.deepcopy(item.get("reference_ids") or []),
+        "vibe_ids": copy.deepcopy(item.get("vibe_ids") or []),
+        "position": copy.deepcopy(
+            item.get("position") or item.get("center") or {}),
+        "enabled": True,
+    }
+
+
+def _comparison_character_setting_cfg(cfg, setting, character):
+    """한 캐릭터×세팅 셀만 보이게 만든 비영구 scratch 설정."""
+    scratch = copy.deepcopy(cfg or {})
+    states = {}
+    setting_id = str((setting or {}).get("id") or (setting or {}).get("name") or "")
+    for name, raw in (scratch.get("setting_state") or {}).items():
+        state = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+        state["use"] = False
+        states[str(name)] = state
+    chosen = copy.deepcopy((setting or {}).get("state") or {})
+    chosen["use"] = True
+    chosen["cast_source"] = "manual"
+    chosen["cast_mode"] = "sequence"
+    chosen["cast"] = [_comparison_character_setting_slot(character)]
+    states[setting_id] = chosen
+    scratch["setting_state"] = states
+    return scratch
+
+
+def _comparison_character_setting_scene_character(character):
+    """build_scene이 외형·착의를 단계별로 고를 수 있는 원형 캐릭터."""
+    slot = _comparison_character_setting_slot(character)
+    center = slot.get("position") if isinstance(slot.get("position"), dict) else {}
+    return {
+        "name": slot["name"],
+        "female": slot["prompt"],
+        "clothed": slot["outfit"],
+        "negative": slot["negative"],
+        "male_prompt_base": "",
+        "partner_negative": "",
+        "extras": [],
+        "centers": [copy.deepcopy(center) if center else None],
+        "reference_ids": copy.deepcopy(slot["reference_ids"]),
+        "vibe_ids": copy.deepcopy(slot["vibe_ids"]),
+    }
+
+
+def iter_character_setting_jobs(cfg, plan, chars, settings=None):
+    """캐릭터×세팅 셀을 선택 씬·단계·예약 매수까지 실제 한 장 단위로 펼친다."""
+    options = plan["options"]
+    limit = max(0, int(plan.get("count") or 0))
+    made = 0
+    settings = comparison_settings(cfg) if settings is None else list(settings)
+    # canonical cell id와 재개 키를 leaf 작업의 부모 식별자로 쓴다. 비교 상한은
+    # leaf 장수 기준이므로 셀 확장 자체에는 limit를 걸지 않는다.
+    cell_plan = {
+        "options": dict(options, limit=0),
+        "count": 0,
+    }
+    expanded = expand_legacy_experiment_cells(
+        cfg, cell_plan, characters=chars, settings=settings)
+    cells = {}
+    for cell in expanded.get("cells") or []:
+        material = cell.get("legacy_material") or {}
+        character = material.get("character") or {}
+        setting = material.get("setting") or {}
+        seed_index = int((cell.get("seed_material") or {}).get("seed_index") or 0)
+        cells[(
+            str(character.get("_compare_id") or character.get("id") or ""),
+            str(setting.get("id") or setting.get("name") or ""),
+            seed_index,
+        )] = cell
+
+    for character in chars:
+        character_id = str(
+            character.get("_compare_id") or character.get("id") or "")
+        for setting in settings:
+            setting_id = str(setting.get("id") or setting.get("name") or "")
+            scratch = _comparison_character_setting_cfg(
+                cfg, setting, character)
+            acfg = load_asset_config(scratch)
+            # compute_pending은 선택 세트·stages·reserve를 해석한다. 반환 캐릭터는
+            # 기존 캐스트 조립 결과이므로, 착의를 따로 보존한 원형 캐릭터로 교체한다.
+            pending = compute_pending(scratch, acfg, {}, set())
+            scene_character = _comparison_character_setting_scene_character(
+                character)
+            for _derived, cid, scene_num, copy_num in pending:
+                for seed_index in range(options["seed_count"]):
+                    if limit and made >= limit:
+                        return
+                    cell = cells.get((character_id, setting_id, seed_index))
+                    if cell is None:
+                        continue
+                    parent_key = str(
+                        cell.get("legacy_resume_key") or cell.get("id") or "")
+                    made += 1
+                    yield {
+                        "index": made,
+                        "key": _comparison_id(
+                            "job", "character_setting",
+                            (parent_key, cid, int(scene_num), int(copy_num)),
+                            int(seed_index),
+                        ),
+                        "cell_id": cell.get("id"),
+                        "cell_resume_key": parent_key,
+                        "style": None,
+                        "character": character,
+                        "setting": setting,
+                        "style_name": (
+                            str(cfg.get("style_name") or "").strip()
+                            or "현재 그림체"
+                        ),
+                        "char_name": (
+                            f"{character.get('_compare_name') or character.get('name') or '캐릭터'}"
+                            f" × {setting.get('name') or setting_id}"
+                        ),
+                        "setting_name": setting.get("name") or setting_id,
+                        "seed_index": int(seed_index),
+                        "scene_num": int(scene_num),
+                        "copy": int(copy_num),
+                        "scratch_cfg": scratch,
+                        "asset_config": acfg,
+                        "scene_character": scene_character,
+                    }
+
+
+def comparison_character_setting_job_values(cfg, plan, job):
+    """세팅 배치의 장면 해석을 그대로 써 한 비교 leaf의 NAI 입력을 만든다."""
+    scratch = job["scratch_cfg"]
+    acfg = job["asset_config"]
+    scene_num = int(job["scene_num"])
+    scene = acfg["scenes"][str(scene_num)]
+    character = copy.deepcopy(job["scene_character"])
+    # 일반 세팅은 기존 cast처럼 외형+착의를 한 캐릭터 전송값으로 쓴다.
+    # 백합은 탈의 단계가 두 값을 골라야 하므로 분리된 원문을 그대로 넘긴다.
+    if scene.get("_mode") != "백합":
+        character["female"] = _join_tags(
+            character.get("female", ""), character.get("clothed", ""))
+    base, female, male, char_negative, male_negative, width, height = (
+        build_scene(acfg, character, scratch, scene_num)
+    )
+    negative = acfg["base"].get(
+        "nsfw_negative_prompt", acfg["base"].get("negative_prompt", ""))
+    scene_negative = scene.get("negative") or ""
+    if scene_negative:
+        negative = _join_tags(negative, scene_negative)
+    people, centers, use_positions = setting_scene_people(
+        scene, female, male, char_negative, male_negative, character, scratch)
+    if plan["options"].get("include_refs"):
+        used = character_resource_config(scratch, character)
+        used, _, _ = setting_reference_config(used, scene)
+    else:
+        # 원문 id는 manifest에 보존하되 이번 실행 재료에는 붙이지 않는다.
+        used = dict(scratch)
+    if plan["options"].get("fixed_size"):
+        width = plan["options"]["width"]
+        height = plan["options"]["height"]
+    used["width"], used["height"] = int(width), int(height)
+    if use_positions:
+        used["use_coords"] = True
+    return used, base, negative, people, centers
+
+
+def comparison_character_setting_plan(cfg, options, chars, opus=None):
+    """캐릭터×선택 세팅의 실제 leaf 장수와 비용을 API 없이 계산한다."""
+    settings = comparison_settings(cfg)
+    errors = []
+    if not chars:
+        errors.append("비교할 캐릭터가 없습니다. 캐릭터 라이브러리에 먼저 저장해주세요.")
+    if not settings:
+        errors.append("선택한 세트가 있는 켜진 세팅이 없습니다.")
+    probe = {
+        "options": options,
+        "count": COMPARE_MAX_JOBS + 1,
+    }
+    total = paid_total = opus_total = eligible = 0
+    cost_cap = int(options.get("limit") or 0) or COMPARE_MAX_JOBS
+    if not errors:
+        for job in iter_character_setting_jobs(
+            cfg, probe, chars, settings=settings
+        ):
+            total += 1
+            if total <= cost_cap:
+                used, _, _, _, _ = comparison_character_setting_job_values(
+                    cfg, probe, job)
+                refs = (
+                    sum(1 for item in (used.get("char_refs") or [])
+                        if item.get("enabled"))
+                    if options.get("include_refs") else 0
+                )
+                paid = anlas_estimate(
+                    used, 1, opus=False, char_refs=refs)
+                free = anlas_estimate(
+                    used, 1, opus=True, char_refs=refs)
+                paid_total += paid["per_image"]
+                opus_total += free["per_image"]
+                eligible += int(bool(free["free_eligible"]))
+            if total > COMPARE_MAX_JOBS:
+                break
+    count = min(total, int(options.get("limit") or total))
+    if count > COMPARE_MAX_JOBS:
+        errors.append(f"한 계획은 최대 {COMPARE_MAX_JOBS:,}장까지 만들 수 있습니다.")
+    result = {
+        "ok": not errors,
+        "errors": errors,
+        "options": options,
+        "mode_label": COMPARE_MODE_LABELS["character_setting"],
+        "styles": 1,
+        "characters": len(chars),
+        "settings": len(settings),
+        "current_slots": 0,
+        "combinations": len(chars) * len(settings),
+        "seed_count": options["seed_count"],
+        "total": total,
+        "count": count,
+        "limited": count < total,
+        "free_eligible": min(eligible, count),
+        "paid_anlas_max": paid_total,
+        "opus_anlas": opus_total,
+        "expected_anlas": (
+            opus_total if opus is True
+            else paid_total if opus is False
+            else None
+        ),
+        "subscription_known": opus is not None,
+        "sample_styles": [str(cfg.get("style_name") or "현재 그림체")],
+        "sample_characters": [
+            item["_compare_name"] for item in chars[:3]
+        ],
+        "sample_settings": [item["name"] for item in settings[:3]],
+    }
+    try:
+        cell_plan = {
+            "options": dict(options, limit=0),
+            "count": 0,
+        }
+        experiment = expand_legacy_experiment_cells(
+            cfg, cell_plan, characters=chars, settings=settings)
+        result["experiment"] = {
+            "schema": experiment.get("schema"),
+            "id": experiment.get("id"),
+            "mode": experiment.get("legacy_mode"),
+            "cells": experiment.get("total", 0),
+            "total": total,
+            "pending": total,
+            "completed": 0,
+            "cell_ids": [
+                {
+                    "id": cell.get("id"),
+                    "resume_key": cell.get("legacy_resume_key"),
+                }
+                for cell in (experiment.get("cells") or [])[:10]
+            ],
+        }
+    except Exception as error:
+        result["experiment"] = {
+            "ok": False,
+            "error": redact_diagnostic_text(error),
+        }
+    return result
+
+
 def comparison_plan(cfg, raw, spec=None, opus=None):
     """실행 전에 장수와 과금 범위를 계산한다. API 호출은 하지 않는다."""
     options = normalize_comparison_options(raw, cfg)
-    styles, chars = comparison_sources(cfg, spec)
     mode = options["mode"]
+    if mode == "character_setting":
+        styles, chars = [], comparison_characters(cfg)
+    else:
+        styles, chars = comparison_sources(cfg, spec)
+    if mode == "character_setting":
+        return comparison_character_setting_plan(
+            cfg, options, chars, opus=opus)
     current_slots = [
         s for s in (cfg.get("char_slots") or [])
         if slot_prompt(s).strip() and s.get("enabled") is not False
@@ -6079,7 +6377,9 @@ def comparison_signature(cfg, plan, styles, chars):
         "characters": [
             (x["_compare_id"], x.get("female"), x.get("clothed"), x.get("negative"))
             for x in chars
-        ] if options["mode"] in ("characters", "both") else [],
+        ] if options["mode"] in ("characters", "both", "character_setting") else [],
+        "settings": comparison_settings(cfg)
+        if options["mode"] == "character_setting" else [],
     }
     return hashlib.sha256(json.dumps(
         raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -6145,6 +6445,8 @@ def iter_comparison_jobs(cfg, plan, styles, chars):
 
 
 def comparison_job_values(cfg, plan, job):
+    if plan["options"].get("mode") == "character_setting":
+        return comparison_character_setting_job_values(cfg, plan, job)
     options = plan["options"]
     style = job.get("style")
     used = comparison_style_config(cfg, style, options)
@@ -6165,6 +6467,98 @@ def comparison_job_values(cfg, plan, job):
         people, centers = active_people(
             cfg.get("char_slots") or [], cfg.get("char_centers"))
     return used, base, negative, people, centers
+
+
+def comparison_job_recipe_snapshot(
+    cfg, plan, job, used, base, negative, people, centers, seed,
+):
+    """현재 자료가 나중에 바뀌어도 한 결과를 복원할 수 있는 비밀값 없는 사본."""
+    character = job.get("character") or {}
+    setting = job.get("setting") or {}
+    if plan["options"].get("mode") == "character_setting":
+        slots = [{
+            "id": character.get("id") or character.get("_compare_id") or "",
+            "name": character.get("name") or character.get("_compare_name") or "",
+            "prompt": character.get("female", ""),
+            "outfit": character.get("clothed", ""),
+            "negative": character.get("negative", ""),
+            "variant": copy.deepcopy(character.get("variant") or {}),
+            "reference_ids": copy.deepcopy(character.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(character.get("vibe_ids") or []),
+            "enabled": True,
+        }]
+        position = character.get("position") or character.get("center") or {}
+        char_centers = [copy.deepcopy(position)] if position else []
+        source_setting = {
+            "id": setting.get("id") or setting.get("name") or "",
+            "name": setting.get("name") or setting.get("id") or "",
+            "state": copy.deepcopy(setting.get("state") or {}),
+            "scene": int(job.get("scene_num") or 0),
+            "copy": int(job.get("copy") or 1),
+        }
+    else:
+        slots = []
+        char_centers = []
+        source_setting = {}
+    include_refs = bool(plan["options"].get("include_refs"))
+    wanted_vibes = {
+        str(value) for value in (character.get("vibe_ids") or []) if value
+    }
+    wanted_refs = {
+        str(value) for value in (character.get("reference_ids") or []) if value
+    }
+    saved_vibes = [
+        copy.deepcopy(item) for item in (cfg.get("vibes") or [])
+        if include_refs and isinstance(item, dict)
+        and (
+            str(item.get("id") or "") in wanted_vibes
+            or (not wanted_vibes and item.get("enabled"))
+        )
+    ]
+    saved_refs = [
+        copy.deepcopy(item) for item in (cfg.get("char_refs") or [])
+        if include_refs and isinstance(item, dict)
+        and (
+            str(item.get("id") or "") in wanted_refs
+            or (not wanted_refs and item.get("enabled"))
+        )
+    ]
+    return {
+        "version": 2,
+        "mode": plan["options"].get("mode") or "",
+        # 사용자 원문은 resolved prompt와 별도로 보존한다.
+        "base_prompt": cfg.get("base_prompt", ""),
+        "negative_prompt": cfg.get("negative_prompt", ""),
+        "style_name": cfg.get("style_name", ""),
+        "settings": {
+            key: used.get(key) for key in COMPARE_RECIPE_SETTING_KEYS
+        },
+        "char_slots": slots,
+        "char_centers": char_centers,
+        "nai_seed": int(seed),
+        "include_refs": include_refs,
+        "vibes": saved_vibes,
+        "char_refs": saved_refs,
+        "source": {
+            "style": {},
+            "character": {
+                key: copy.deepcopy(character.get(key))
+                for key in (
+                    "id", "_compare_id", "name", "_compare_name",
+                    "female", "clothed", "negative", "variant",
+                    "reference_ids", "vibe_ids", "position",
+                )
+                if character.get(key) is not None
+            },
+            "setting": source_setting,
+        },
+        "resolved": {
+            "base_prompt": base,
+            "negative_prompt": negative,
+            "characters": copy.deepcopy(people),
+            "char_centers": copy.deepcopy(centers),
+        },
+    }
 
 
 def comparison_recipe_context(cfg, plan, styles, chars):
@@ -6210,7 +6604,10 @@ def comparison_recipe_context(cfg, plan, styles, chars):
             "negative": item.get("negative") or "",
             "source": item.get("source") or "",
         } for item in chars
-            if options.get("mode") in ("characters", "both")],
+            if options.get("mode") in (
+                "characters", "both", "character_setting")],
+        "settings": comparison_settings(cfg)
+        if options.get("mode") == "character_setting" else [],
     }
     # 기존 비교 기록 필드는 그대로 두고 같은 내용을 생성 설계도 관점에서도 남긴다.
     # 과거 기록을 읽는 코드는 영향을 받지 않고, 새 화면·챗봇 계약은 한 경계를 사용한다.
@@ -10162,6 +10559,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <label class="row" style="cursor:pointer;margin:0;">
             <input type="radio" name="cmpMode" value="both" style="width:auto;flex:none;">
             <span><b>둘 다 조합</b><br><span class="hint">그림체 × 캐릭터</span></span></label>
+          <label class="row" style="cursor:pointer;margin:0;">
+            <input type="radio" name="cmpMode" value="character_setting" style="width:auto;flex:none;">
+            <span><b>캐릭터 × 선택 세팅</b><br><span class="hint">선택 씬·단계·예약 매수까지</span></span></label>
         </div>
         <div class="row" style="margin-top:8px;">
           <div style="flex:1;min-width:220px;"><b>캐릭터 × 선택 세팅 계획</b>
@@ -11061,7 +11461,8 @@ function comparisonStore(opts){
 }
 function comparisonApply(saved){
   saved = saved || {};
-  const mode = ['styles','characters','both'].includes(saved.mode) ? saved.mode : 'styles';
+  const mode = ['styles','characters','both','character_setting'].includes(saved.mode)
+    ? saved.mode : 'styles';
   const radio = document.querySelector(`input[name="cmpMode"][value="${mode}"]`);
   if(radio) radio.checked = true;
   const w = Number(saved.width || STATE.width || 832);
@@ -11144,7 +11545,9 @@ async function comparisonPreview(){
     const r = await (await fetch('/api/compare_preview', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(opts)})).json();
     CMP_PLAN = r;
-    $('cmpCounts').textContent = `그림체 ${Number(r.styles||0).toLocaleString()} · 캐릭터 ${Number(r.characters||0).toLocaleString()}`;
+    $('cmpCounts').textContent = `그림체 ${Number(r.styles||0).toLocaleString()} · 캐릭터 ${Number(r.characters||0).toLocaleString()}`
+      + (opts.mode === 'character_setting'
+        ? ` · 선택 세팅 ${Number(r.settings||0).toLocaleString()}` : '');
     if(!r.ok){
       $('cmpSummary').innerHTML = `<span style="color:var(--danger)">${esc((r.errors||[r.error||'계산 실패']).join(' '))}</span>`;
       return;
@@ -11155,8 +11558,11 @@ async function comparisonPreview(){
         + ` (${r.current_slots.toLocaleString()}명 함께)`;
     }else if(opts.mode === 'characters'){
       formula = `현재 그림체 1개 × 캐릭터 ${r.characters.toLocaleString()}개`;
-    }else{
+    }else if(opts.mode === 'both'){
       formula = `그림체 ${r.styles.toLocaleString()}개 × 캐릭터 ${r.characters.toLocaleString()}개`;
+    }else{
+      formula = `캐릭터 ${r.characters.toLocaleString()}개 × 선택 세팅 ${Number(r.settings||0).toLocaleString()}개`
+        + ` · 실제 선택 씬·단계·예약 매수`;
     }
     if(Number(r.seed_count || 1) > 1){
       formula += ` × 시드 ${Number(r.seed_count).toLocaleString()}개`;
@@ -20208,7 +20614,10 @@ class ConfigServer:
 
         # 실행 중 화면 편집이 앞 장과 뒤 장의 비교 조건을 바꾸지 않도록 시작 시점 사본을 쓴다.
         run_cfg = json.loads(json.dumps(self.cfg, ensure_ascii=False, default=str))
-        styles, chars = comparison_sources(run_cfg, self.spec)
+        if plan["options"].get("mode") == "character_setting":
+            styles, chars = [], comparison_characters(run_cfg)
+        else:
+            styles, chars = comparison_sources(run_cfg, self.spec)
 
         def run():
             try:
@@ -22366,6 +22775,14 @@ def comparison_recipe_for_output(cfg, rel):
     ), None)
     if record is None:
         raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
+    if isinstance(record.get("recipe"), dict):
+        recipe = copy.deepcopy(record["recipe"])
+        recipe["nai_seed"] = int(record.get("seed") or recipe.get("nai_seed") or 0)
+        return {
+            "ok": True,
+            "file": wanted,
+            "recipe": recipe,
+        }
     context = progress.get("recipe_context")
     if not isinstance(context, dict):
         raise ValueError(
@@ -22692,7 +23109,11 @@ def _run_comparison(server, cfg, plan, styles, chars):
     token = cfg["token"]
     base_seed = int(progress["base_seed"])
     state = load_state()
-    jobs = iter_comparison_jobs(cfg, plan, styles, chars)
+    jobs = (
+        iter_character_setting_jobs(cfg, plan, chars)
+        if options.get("mode") == "character_setting"
+        else iter_comparison_jobs(cfg, plan, styles, chars)
+    )
     done_n = len(completed)
     run_failed = set()
     server.live.update(
@@ -22788,6 +23209,22 @@ def _run_comparison(server, cfg, plan, styles, chars):
                     "seed": seed, "width": int(used["width"]),
                     "height": int(used["height"]),
                 }
+                if options.get("mode") == "character_setting":
+                    completed[key].update({
+                        "cell_id": job.get("cell_id"),
+                        "cell_resume_key": job.get("cell_resume_key"),
+                        "setting": job.get("setting_name"),
+                        "setting_id": (
+                            (job.get("setting") or {}).get("id")
+                            or (job.get("setting") or {}).get("name")
+                        ),
+                        "scene": int(job.get("scene_num") or 0),
+                        "copy": int(job.get("copy") or 1),
+                        "recipe": comparison_job_recipe_snapshot(
+                            cfg, plan, job, used, base, negative,
+                            people, centers, seed,
+                        ),
+                    })
                 errors.pop(key, None)
                 bump_daily(state)
                 save_state(state)

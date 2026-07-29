@@ -1339,6 +1339,320 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(people, [{"prompt": "on character", "negative": ""}])
         self.assertEqual(centers, [{"x": 0.8, "y": 0.9}])
 
+    def test_character_setting_plan_uses_selected_scenes_stages_reserve_and_full_character(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update(
+            base_prompt="BASE\n1.2::weighted::",
+            negative_prompt="NEGATIVE\n||red||",
+            style_name="Current Style",
+            characters=[
+                {
+                    "id": "a", "name": "A",
+                    "female": "appearance\nline two",
+                    "clothed": "artistically transformed outfit",
+                    "negative": "character negative",
+                    "position": {"x": 0.2, "y": 0.8},
+                    "reference_ids": ["ref-a"],
+                    "vibe_ids": ["vibe-a"],
+                },
+                {
+                    "id": "b", "name": "B",
+                    "female": "second appearance",
+                    "clothed": "second outfit",
+                    "negative": "second negative",
+                },
+            ],
+            char_refs=[{
+                "id": "ref-a", "name": "Ref A", "enabled": False,
+            }],
+            vibes=[{
+                "id": "vibe-a", "name": "Vibe A", "enabled": False,
+            }],
+            setting_state={
+                "Test Setting": {
+                    "use": True,
+                    "selected": [10],
+                    "stages": [1],
+                    "reserve": {"10": 2},
+                    "opts": {"weather": "rain"},
+                    "cast": [{
+                        "name": "must remain",
+                        "prompt": "manual cast",
+                        "negative": "manual negative",
+                    }],
+                },
+            },
+        )
+        before = copy.deepcopy(cfg)
+        acfg = {
+            "base": {
+                "base_prompt": "1girl, BASE\n1.2::weighted::",
+                "nsfw_base_prompt": "1girl, 1boy, BASE\n1.2::weighted::",
+                "yuri_base_prompt": "2girls, yuri, BASE\n1.2::weighted::",
+                "negative_prompt": cfg["negative_prompt"],
+                "nsfw_negative_prompt": cfg["negative_prompt"],
+                "cfg_scale": 5.5,
+                "cfg_rescale": 0.56,
+                "sampler": "k_euler_ancestral",
+                "scheduler": "karras",
+            },
+            "_settings": {
+                "Test Setting": {
+                    "mode": "단독", "options": {}, "role": {},
+                    "opts": {"weather": "rain"}, "specs": {},
+                },
+            },
+            "scenes": {
+                "10": {
+                    "name": "Pose first", "_setting": "Test Setting",
+                    "_mode": "단독", "_num": 10, "_stage": 0,
+                    "width": 640, "height": 960,
+                    "female_prompt": "scene first",
+                },
+                "11": {
+                    "name": "Pose second", "_setting": "Test Setting",
+                    "_mode": "단독", "_num": 11, "_stage": 1,
+                    "width": 640, "height": 960,
+                    "female_prompt": "scene second",
+                },
+            },
+        }
+        with patch.object(APP, "load_asset_config", return_value=acfg):
+            plan = APP.comparison_plan(
+                cfg,
+                {
+                    "mode": "character_setting",
+                    "fixed_size": False,
+                    "same_seed": True,
+                    "seed": 123,
+                    "seed_count": 2,
+                    "include_refs": True,
+                },
+                opus=True,
+            )
+            chars = APP.comparison_characters(cfg)
+            jobs = list(APP.iter_character_setting_jobs(
+                cfg, plan, chars))
+            used, base, negative, people, centers = (
+                APP.comparison_character_setting_job_values(
+                    cfg, plan, jobs[0])
+            )
+
+        # 2 characters × selected stage 1 only × reserve 2 × 2 seeds.
+        self.assertEqual(plan["count"], 8)
+        self.assertEqual(plan["settings"], 1)
+        self.assertEqual(len(jobs), 8)
+        self.assertEqual(
+            [job["seed_index"] for job in jobs[:4]], [0, 1, 0, 1])
+        self.assertEqual(len({job["key"] for job in jobs}), 8)
+        self.assertTrue(all(job["scene_num"] == 10 for job in jobs))
+        self.assertEqual(cfg, before, "preview가 사용자 설정이나 직접 cast를 바꿨다")
+        self.assertEqual(
+            jobs[0]["scene_character"]["female"],
+            "appearance\nline two",
+        )
+        self.assertEqual(
+            jobs[0]["scene_character"]["clothed"],
+            "artistically transformed outfit",
+        )
+        self.assertEqual(
+            jobs[0]["scene_character"]["negative"],
+            "character negative",
+        )
+        self.assertEqual(base, "1girl, BASE\n1.2::weighted::")
+        self.assertEqual(negative, "NEGATIVE\n||red||")
+        self.assertIn("appearance", people[0]["prompt"])
+        self.assertIn("artistically transformed outfit", people[0]["prompt"])
+        self.assertEqual(people[0]["negative"], "character negative")
+        self.assertEqual(centers, [{"x": 0.2, "y": 0.8}])
+        self.assertTrue(used["use_coords"])
+        self.assertTrue(used["char_refs"][0]["enabled"])
+        self.assertTrue(used["vibes"][0]["enabled"])
+
+        no_refs = copy.deepcopy(plan)
+        no_refs["options"]["include_refs"] = False
+        used_without, *_ = APP.comparison_character_setting_job_values(
+            cfg, no_refs, jobs[0])
+        self.assertFalse(used_without["char_refs"][0]["enabled"])
+        self.assertFalse(used_without["vibes"][0]["enabled"])
+
+    def test_character_setting_worker_saves_manifest_and_resumes_without_mutating_cfg(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(
+                token="pst-fixture",
+                out_dir=str(root / "output"),
+                base_prompt="base original\n1.2::weight::",
+                negative_prompt="negative original\n||red||",
+                style_name="Current",
+                characters=[{
+                    "id": "a", "name": "A",
+                    "female": "appearance\nline two",
+                    "clothed": "outfit line",
+                    "negative": "character negative",
+                    "position": {"x": 0.3, "y": 0.7},
+                    "reference_ids": ["ref-a"],
+                    "vibe_ids": ["vibe-a"],
+                }],
+                char_refs=[{
+                    "id": "ref-a", "name": "Ref A", "enabled": False,
+                }],
+                vibes=[{
+                    "id": "vibe-a", "name": "Vibe A", "enabled": False,
+                }],
+                setting_state={
+                    "Test Setting": {
+                        "use": True, "selected": [10], "stages": [1],
+                        "reserve": {"10": 2}, "opts": {"weather": "rain"},
+                        "cast": [{"name": "manual", "prompt": "keep me"}],
+                    },
+                },
+                pace={"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            )
+            original = copy.deepcopy(cfg)
+            acfg = {
+                "base": {
+                    "base_prompt": "1girl, base original\n1.2::weight::",
+                    "nsfw_base_prompt": "1girl, 1boy, base original\n1.2::weight::",
+                    "yuri_base_prompt": "2girls, yuri, base original\n1.2::weight::",
+                    "negative_prompt": cfg["negative_prompt"],
+                    "nsfw_negative_prompt": cfg["negative_prompt"],
+                    "cfg_scale": 5.5, "cfg_rescale": 0.56,
+                    "sampler": "k_euler_ancestral", "scheduler": "karras",
+                },
+                "_settings": {
+                    "Test Setting": {
+                        "mode": "단독", "options": {}, "role": {},
+                        "opts": {"weather": "rain"}, "specs": {},
+                    },
+                },
+                "scenes": {
+                    "10": {
+                        "name": "Pose first", "_setting": "Test Setting",
+                        "_mode": "단독", "_num": 10, "_stage": 0,
+                        "width": 640, "height": 960,
+                        "female_prompt": "scene first",
+                    },
+                },
+            }
+            chars = APP.comparison_characters(cfg)
+            options = APP.normalize_comparison_options({
+                "mode": "character_setting",
+                "fixed_size": True, "width": 512, "height": 512,
+                "same_seed": True, "seed": 777, "seed_count": 2,
+                "include_refs": True,
+            }, cfg)
+            with patch.object(APP, "load_asset_config", return_value=acfg):
+                plan = APP.comparison_character_setting_plan(
+                    cfg, options, chars, opus=True)
+            state = {
+                "seeds": {}, "progress": {}, "daily": {},
+                "total_generated": 0,
+            }
+            server = APP.ConfigServer(cfg)
+            calls = []
+            runtime_cfgs = []
+
+            def fake_runtime(used, _token, include_refs=True):
+                runtime_cfgs.append((copy.deepcopy(used), include_refs))
+                return dict(used)
+
+            def fake_generate(_token, base, _female, _male, negative,
+                              width, height, **kw):
+                calls.append({
+                    "base": base, "negative": negative,
+                    "width": width, "height": height,
+                    "chars": copy.deepcopy(kw["chars"]),
+                    "seed": kw["seed"],
+                    "params": copy.deepcopy(kw["params"]),
+                })
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kw["seed"]
+                if len(calls) == 1:
+                    server.live.stop_req = True
+                return image
+
+            progress_file = root / "비교생성-진행.json"
+            with (
+                patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file),
+                patch.object(APP, "load_asset_config", return_value=acfg),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "runtime_generation_params",
+                             side_effect=fake_runtime),
+                patch.object(APP, "call_nai_api",
+                             side_effect=fake_generate),
+            ):
+                APP._run_comparison(server, cfg, plan, [], chars)
+                first = json.loads(progress_file.read_text(encoding="utf-8"))
+                self.assertEqual(first["status"], "stopped")
+                self.assertEqual(len(first["completed"]), 1)
+
+                server.live.stop_req = False
+                APP._run_comparison(server, cfg, plan, [], chars)
+                final = json.loads(progress_file.read_text(encoding="utf-8"))
+                record = min(
+                    final["completed"].values(),
+                    key=lambda item: item["index"],
+                )
+                restored = APP.comparison_recipe_for_output(
+                    cfg, record["file"])
+
+            self.assertEqual(cfg, original)
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(final["status"], "complete")
+            self.assertEqual(len(final["completed"]), 4)
+            self.assertNotIn(
+                "pst-fixture",
+                json.dumps(final, ensure_ascii=False),
+            )
+            self.assertEqual(calls[0]["seed"], calls[2]["seed"])
+            self.assertEqual(calls[1]["seed"], calls[3]["seed"])
+            self.assertNotEqual(calls[0]["seed"], calls[1]["seed"])
+            self.assertTrue(all(
+                (call["width"], call["height"]) == (512, 512)
+                for call in calls
+            ))
+            self.assertTrue(all(
+                "appearance" in call["chars"][0]["prompt"]
+                and "outfit line" in call["chars"][0]["prompt"]
+                for call in calls
+            ))
+            self.assertTrue(all(
+                call["chars"][0]["negative"] == "character negative"
+                for call in calls
+            ))
+            self.assertTrue(all(include for _, include in runtime_cfgs))
+            self.assertTrue(all(
+                used["char_refs"][0]["enabled"]
+                and used["vibes"][0]["enabled"]
+                for used, _ in runtime_cfgs
+            ))
+            recipe = restored["recipe"]
+            self.assertEqual(
+                recipe["base_prompt"], "base original\n1.2::weight::")
+            self.assertEqual(
+                recipe["negative_prompt"], "negative original\n||red||")
+            self.assertEqual(
+                recipe["char_slots"][0]["prompt"],
+                "appearance\nline two",
+            )
+            self.assertEqual(recipe["char_slots"][0]["outfit"], "outfit line")
+            self.assertEqual(
+                recipe["char_slots"][0]["negative"], "character negative")
+            self.assertEqual(
+                recipe["char_centers"], [{"x": 0.3, "y": 0.7}])
+            self.assertEqual(
+                recipe["source"]["setting"]["state"]["reserve"],
+                {"10": 2},
+            )
+            self.assertTrue(record["cell_resume_key"])
+            self.assertEqual(record["scene"], 10)
+            self.assertIn("resolved", recipe)
+
     def test_comparison_requires_the_exact_recounted_job_confirmation(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
         cfg["token"] = "pst-fixture"
@@ -1534,7 +1848,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_comparison_ui_keeps_the_three_choices_and_explicit_acknowledgement(self):
         page = APP.render_page()
-        for value in ("styles", "characters", "both"):
+        for value in ("styles", "characters", "both", "character_setting"):
             self.assertIn(f'name="cmpMode" value="{value}"', page)
         self.assertIn('id="cmpPlanAllChars"', page)
         self.assertIn('id="cmpPlanManual"', page)
