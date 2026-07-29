@@ -317,6 +317,138 @@ def _result_vibe_reference(source: Mapping[str, Any] | None) -> Any:
     return None
 
 
+def _apply_step_style(resolved: dict, step: dict, applied: list[str]) -> None:
+    style = deepcopy(dict(resolved["style"]))
+    _deep_merge(style, step["style_overrides"])
+    if step["style_overrides"]:
+        applied.append("style")
+    resolved["style"] = style
+
+
+def _apply_step_characters(
+    resolved: dict,
+    step: dict,
+    previous: dict,
+    applied: list[str],
+    carried: dict,
+) -> None:
+    characters = deepcopy(resolved["characters"])
+    by_id = {
+        str(item.get("id")): item
+        for item in characters
+        if isinstance(item, Mapping) and item.get("id") not in (None, "")
+    }
+    for character_id, override in step["character_overrides"].items():
+        if str(character_id) not in by_id:
+            raise ValueError(
+                f"character override refers to unknown character: {character_id}"
+            )
+        if not isinstance(override, Mapping):
+            raise TypeError("character override must be a mapping")
+        _deep_merge(by_id[str(character_id)], override)
+        applied.append(f"characters:{character_id}")
+    previous_characters = {
+        str(item.get("id")): item
+        for item in (previous.get("characters") or [])
+        if isinstance(item, Mapping) and item.get("id") not in (None, "")
+    }
+    outfit = step["outfit"]
+    if isinstance(outfit, Mapping):
+        for character_id, value in outfit.items():
+            if str(character_id) not in by_id:
+                raise ValueError(
+                    f"outfit refers to unknown character: {character_id}"
+                )
+            by_id[str(character_id)]["clothed"] = deepcopy(value)
+            applied.append(f"characters:{character_id}:clothed")
+    elif outfit is not None:
+        if len(characters) != 1:
+            raise ValueError("scalar outfit requires exactly one blueprint character")
+        characters[0]["clothed"] = deepcopy(outfit)
+        applied.append("characters:0:clothed")
+    elif step["carry"]["outfit"] and previous_characters:
+        for character_id, current in by_id.items():
+            prior = previous_characters.get(character_id)
+            if isinstance(prior, Mapping) and "clothed" in prior:
+                current["clothed"] = deepcopy(prior["clothed"])
+                carried[f"characters:{character_id}:clothed"] = "previous-result"
+    resolved["characters"] = characters
+
+
+def _apply_step_setting(
+    resolved: dict,
+    step: dict,
+    previous: dict,
+    applied: list[str],
+    carried: dict,
+) -> None:
+    setting = deepcopy(dict(resolved["setting"]))
+    scene = _mapping(setting.get("scene_values"), "setting.scene_values")
+    for field in ("include", "exclude", "rating"):
+        if step[field] is not None:
+            scene[field] = deepcopy(step[field])
+            applied.append(f"setting.scene_values.{field}")
+    if step["background"] is not None:
+        scene["background"] = deepcopy(step["background"])
+        applied.append("setting.scene_values.background")
+    elif step["carry"]["background"]:
+        prior_scene = (
+            (previous.get("setting") or {}).get("scene_values")
+            if isinstance(previous.get("setting"), Mapping) else None
+        )
+        if isinstance(prior_scene, Mapping) and "background" in prior_scene:
+            scene["background"] = deepcopy(prior_scene["background"])
+            carried["setting.scene_values.background"] = "previous-result"
+    setting["scene_values"] = scene
+    resolved["setting"] = setting
+
+
+def _apply_step_generation(
+    resolved: dict,
+    step: dict,
+    applied: list[str],
+) -> None:
+    generation = deepcopy(dict(resolved["generation"]))
+    resolution = _mapping(generation.get("resolution"), "generation.resolution")
+    _deep_merge(resolution, step["resolution"])
+    if step["resolution"]:
+        applied.append("generation.resolution")
+    generation["resolution"] = resolution
+    schedule = _mapping(generation.get("schedule"), "generation.schedule")
+    if step["seed_policy"]["mode"] != "inherit" or len(step["seed_policy"]) > 1:
+        schedule["seed_policy"] = deepcopy(step["seed_policy"])
+        applied.append("generation.schedule.seed_policy")
+    generation["schedule"] = schedule
+    resolved["generation"] = generation
+
+
+def _apply_step_vibe(
+    resolved: dict,
+    step: dict,
+    previous_result: Mapping[str, Any] | None,
+) -> tuple[dict, str]:
+    continuity = deepcopy(step["vibe_continuity"])
+    source_name = continuity["source"]
+    status = "disabled"
+    if source_name != "none":
+        source = _previous_source(previous_result, source_name)
+        reference = _result_vibe_reference(source)
+        if reference is None:
+            status = "unavailable"
+        else:
+            resources = deepcopy(dict(resolved["resources"]))
+            vibes = _list(resources.get("vibes"), "resources.vibes")
+            vibes.append({
+                "source": source_name,
+                "reference": reference,
+                "sequence_step_id": step["id"],
+            })
+            resources["vibes"] = vibes
+            resolved["resources"] = resources
+            status = "applied"
+    return continuity, status
+
+
 def resolve_sequence_step(
     base_blueprint: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -347,111 +479,14 @@ def resolve_sequence_step(
 
     applied = []
     carried = {}
-    style = deepcopy(dict(resolved["style"]))
-    _deep_merge(style, step["style_overrides"])
-    if step["style_overrides"]:
-        applied.append("style")
-    resolved["style"] = style
-
-    characters = deepcopy(resolved["characters"])
-    by_id = {
-        str(item.get("id")): item
-        for item in characters
-        if isinstance(item, Mapping) and item.get("id") not in (None, "")
-    }
-    for character_id, override in step["character_overrides"].items():
-        if str(character_id) not in by_id:
-            raise ValueError(
-                f"character override refers to unknown character: {character_id}"
-            )
-        if not isinstance(override, Mapping):
-            raise TypeError("character override must be a mapping")
-        _deep_merge(by_id[str(character_id)], override)
-        applied.append(f"characters:{character_id}")
-
     previous = _source_blueprint(_previous_source(previous_result, "previous"))
-    previous_characters = {
-        str(item.get("id")): item
-        for item in (previous.get("characters") or [])
-        if isinstance(item, Mapping) and item.get("id") not in (None, "")
-    }
-    outfit = step["outfit"]
-    if isinstance(outfit, Mapping):
-        for character_id, value in outfit.items():
-            if str(character_id) not in by_id:
-                raise ValueError(
-                    f"outfit refers to unknown character: {character_id}"
-                )
-            by_id[str(character_id)]["clothed"] = deepcopy(value)
-            applied.append(f"characters:{character_id}:clothed")
-    elif outfit is not None:
-        if len(characters) != 1:
-            raise ValueError(
-                "scalar outfit requires exactly one blueprint character"
-            )
-        characters[0]["clothed"] = deepcopy(outfit)
-        applied.append("characters:0:clothed")
-    elif step["carry"]["outfit"] and previous_characters:
-        for character_id, current in by_id.items():
-            prior = previous_characters.get(character_id)
-            if isinstance(prior, Mapping) and "clothed" in prior:
-                current["clothed"] = deepcopy(prior["clothed"])
-                carried[f"characters:{character_id}:clothed"] = "previous-result"
-    resolved["characters"] = characters
-
-    setting = deepcopy(dict(resolved["setting"]))
-    scene = _mapping(setting.get("scene_values"), "setting.scene_values")
-    for field in ("include", "exclude", "rating"):
-        if step[field] is not None:
-            scene[field] = deepcopy(step[field])
-            applied.append(f"setting.scene_values.{field}")
-    if step["background"] is not None:
-        scene["background"] = deepcopy(step["background"])
-        applied.append("setting.scene_values.background")
-    elif step["carry"]["background"]:
-        prior_scene = (
-            (previous.get("setting") or {}).get("scene_values")
-            if isinstance(previous.get("setting"), Mapping)
-            else None
-        )
-        if isinstance(prior_scene, Mapping) and "background" in prior_scene:
-            scene["background"] = deepcopy(prior_scene["background"])
-            carried["setting.scene_values.background"] = "previous-result"
-    setting["scene_values"] = scene
-    resolved["setting"] = setting
-
-    generation = deepcopy(dict(resolved["generation"]))
-    resolution = _mapping(generation.get("resolution"), "generation.resolution")
-    _deep_merge(resolution, step["resolution"])
-    if step["resolution"]:
-        applied.append("generation.resolution")
-    generation["resolution"] = resolution
-    schedule = _mapping(generation.get("schedule"), "generation.schedule")
-    if step["seed_policy"]["mode"] != "inherit" or len(step["seed_policy"]) > 1:
-        schedule["seed_policy"] = deepcopy(step["seed_policy"])
-        applied.append("generation.schedule.seed_policy")
-    generation["schedule"] = schedule
-    resolved["generation"] = generation
-
-    continuity = deepcopy(step["vibe_continuity"])
-    continuity_source = continuity["source"]
-    continuity_status = "disabled"
-    if continuity_source != "none":
-        source = _previous_source(previous_result, continuity_source)
-        reference = _result_vibe_reference(source)
-        if reference is None:
-            continuity_status = "unavailable"
-        else:
-            resources = deepcopy(dict(resolved["resources"]))
-            vibes = _list(resources.get("vibes"), "resources.vibes")
-            vibes.append({
-                "source": continuity_source,
-                "reference": reference,
-                "sequence_step_id": step["id"],
-            })
-            resources["vibes"] = vibes
-            resolved["resources"] = resources
-            continuity_status = "applied"
+    _apply_step_style(resolved, step, applied)
+    _apply_step_characters(resolved, step, previous, applied, carried)
+    _apply_step_setting(resolved, step, previous, applied, carried)
+    _apply_step_generation(resolved, step, applied)
+    continuity, continuity_status = _apply_step_vibe(
+        resolved, step, previous_result
+    )
 
     resolved["sequence"] = {
         "schema": SEQUENCE_SCHEMA,
