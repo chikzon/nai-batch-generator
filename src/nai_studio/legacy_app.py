@@ -87,10 +87,17 @@ from src.nai_studio.services.experiment_execution_bridge import (
     legacy_execution_material,
     regenerate_legacy_execution_material,
 )
+from src.nai_studio.services.blueprint_execution_bridge import (
+    single_generation_legacy_material,
+)
 from src.nai_studio.services.job_bridge import (
     make_job_command,
     project_comparison_progress,
     project_live_state,
+)
+from src.nai_studio.services.metadata_audit_adapter import (
+    MetadataAuditAdapter,
+    MetadataAuditLedgerError,
 )
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
@@ -108,6 +115,11 @@ from src.nai_studio.services.restoration_inputs import (
     pack_import_queue,
     public_collection_queue,
     public_collection_summary,
+)
+from src.nai_studio.services.result_promotion import (
+    append_promotion_events,
+    build_result_promotion,
+    new_promotion_ledger,
 )
 from src.nai_studio.services.variation_bridge import (
     character_asset_from_legacy_record,
@@ -2462,12 +2474,18 @@ def style_bundle_signature(record):
 
 
 def character_bundle_signature(record):
-    """캐릭터를 세부 태그로 쪼개지 않고 전체 positive·negative로 식별한다."""
+    """캐릭터 전체 프롬프트와 변형·참조 자원을 한 묶음으로 식별한다."""
     record = record if isinstance(record, dict) else {}
     return json.dumps({
         "prompt": str(_style_value(record, "female", "prompt", "외형") or ""),
         "outfit": str(_style_value(record, "clothed", "outfit", "착의") or ""),
         "negative": str(_style_value(record, "negative", "네거티브") or ""),
+        "variant": copy.deepcopy(record.get("variant") or {}),
+        "variants": copy.deepcopy(record.get("variants") or []),
+        "reference_ids": copy.deepcopy(
+            record.get("reference_ids") or record.get("reference_refs") or []),
+        "vibe_ids": copy.deepcopy(
+            record.get("vibe_ids") or record.get("vibe_refs") or []),
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -4835,6 +4853,138 @@ def data_storage_status():
     }
 
 
+_METADATA_AUDIT_ADAPTER = None
+_METADATA_AUDIT_ADAPTER_LOCK = threading.Lock()
+
+
+def _nai_json_metadata(value):
+    """일반 앱 자료 JSON과 NAI 생성 메타데이터 JSON을 좁게 구분한다."""
+    if not isinstance(value, dict):
+        return None
+    candidates = [value]
+    for key in ("Comment", "comment", "Description", "description", "metadata"):
+        nested = value.get(key)
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        source = " ".join(str(candidate.get(key) or "")
+                          for key in ("source", "software", "model")).casefold()
+        has_prompt = bool(
+            candidate.get("v4_prompt")
+            or candidate.get("prompt")
+            or candidate.get("description")
+        )
+        has_generation = (
+            any(candidate.get(key) is not None
+                for key in ("seed", "steps", "sampler", "scale",
+                            "noise_schedule", "ucPreset"))
+            and ("novelai" in source or isinstance(candidate.get("v4_prompt"), dict))
+        )
+        if has_prompt and has_generation:
+            return candidate
+    return None
+
+
+def _metadata_audit_inspector(payload, kind, _relative_path):
+    if kind in ("png", "webp"):
+        return extract_nai_metadata(payload, f"image/{kind}")
+    if kind == "json":
+        try:
+            value = json.loads(bytes(payload).decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return {"found": _nai_json_metadata(value) is not None}
+    return False
+
+
+def metadata_audit_adapter():
+    global _METADATA_AUDIT_ADAPTER
+    if _METADATA_AUDIT_ADAPTER is None:
+        with _METADATA_AUDIT_ADAPTER_LOCK:
+            if _METADATA_AUDIT_ADAPTER is None:
+                _METADATA_AUDIT_ADAPTER = MetadataAuditAdapter(
+                    BASE_DIR,
+                    metadata_inspector=_metadata_audit_inspector,
+                )
+    return _METADATA_AUDIT_ADAPTER
+
+
+def metadata_audit_status():
+    try:
+        result = metadata_audit_adapter().status_light()
+        return {"ok": True, **result}
+    except MetadataAuditLedgerError:
+        return {"ok": True, "empty": True}
+
+
+def metadata_audit_control(body):
+    data = json.loads(body or b"{}")
+    action = str(data.get("action") or "").strip().casefold()
+    adapter = metadata_audit_adapter()
+    if action == "start":
+        index = load_json_recover(_data_index_path())
+        result = adapter.start_light(index, chunk_size=500)
+    elif action in ("continue", "resume"):
+        result = adapter.resume_light()
+    elif action == "pause":
+        result = adapter.pause_light()
+    elif action == "retry":
+        paths = data.get("paths")
+        result = adapter.retry_light(
+            paths=paths if isinstance(paths, list) else None)
+    else:
+        raise ValueError("메타데이터 감사 동작이 올바르지 않습니다.")
+    return {"ok": True, **result}
+
+
+def metadata_audit_candidate(body):
+    """사용자가 고른 한 건만 다시 SHA 검증해 읽고, 저장 없이 복원 후보를 보여 준다."""
+    data = json.loads(body or b"{}")
+    rel = str(data.get("path") or "")
+    digest = str(data.get("sha256") or "")
+    payload = metadata_audit_adapter().read_verified(rel, digest)
+    suffix = Path(rel).suffix.casefold()
+    if suffix in (".png", ".webp"):
+        meta = extract_nai_metadata(
+            payload, "image/png" if suffix == ".png" else "image/webp")
+    elif suffix == ".json":
+        value = json.loads(payload.decode("utf-8-sig"))
+        raw = _nai_json_metadata(value)
+        if raw is None:
+            raise ValueError("선택한 JSON에서 NAI 생성 메타데이터를 찾지 못했습니다.")
+        base, negative, characters = _prompt_parts(raw)
+        params = {key: raw[key] for key in PARAM_KEYS
+                  if raw.get(key) is not None}
+        meta = {
+            "metadata_status": "ok",
+            "base": base,
+            "negative": negative,
+            "characters": characters,
+            "params": params,
+        }
+    else:
+        raise ValueError("PNG, WebP, JSON 후보만 열 수 있습니다.")
+    if meta.get("metadata_status") != "ok":
+        raise ValueError("선택한 파일의 NAI 생성 메타데이터가 더 이상 유효하지 않습니다.")
+    return {
+        "ok": True,
+        "path": rel,
+        "sha256": digest.lower(),
+        "candidate": {
+            "base": str(meta.get("base") or ""),
+            "negative": str(meta.get("negative") or ""),
+            "negative_full": str(meta.get("negative") or ""),
+            "characters": copy.deepcopy(meta.get("characters") or []),
+            "params": copy.deepcopy(meta.get("params") or {}),
+        },
+    }
+
+
 def _validate_datapack_manifest(archive):
     """v1 manifest가 있으면 쓰기 전에 파일 수·크기·내용 해시를 전부 확인한다.
 
@@ -6915,6 +7065,7 @@ def comparison_job_recipe_snapshot(
             "outfit": character.get("clothed", ""),
             "negative": character.get("negative", ""),
             "variant": copy.deepcopy(character.get("variant") or {}),
+            "variants": copy.deepcopy(character.get("variants") or []),
             "reference_ids": copy.deepcopy(character.get("reference_ids") or []),
             "vibe_ids": copy.deepcopy(character.get("vibe_ids") or []),
             "enabled": True,
@@ -6996,7 +7147,7 @@ def comparison_job_recipe_snapshot(
                 key: copy.deepcopy(character.get(key))
                 for key in (
                     "id", "_compare_id", "name", "_compare_name",
-                    "female", "clothed", "negative", "variant",
+                    "female", "clothed", "negative", "variant", "variants",
                     "reference_ids", "vibe_ids", "position",
                 )
                 if character.get(key) is not None
@@ -9058,6 +9209,7 @@ def strip_dir(cfg=None):
     d.mkdir(parents=True, exist_ok=True)
     return d
 PICKS_FILE = PROFILE_DIR / "선별.json"     # 프로필별 (생성물이 갈리므로)
+PROMOTION_LEDGER_FILE = BASE_DIR / "수집" / "승격장부.json"
 IMG_EXT = (".webp", ".png", ".jpg", ".jpeg")
 
 
@@ -11406,6 +11558,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="dataOriginsStatus" class="hint hidden" style="margin-top:7px;"></div>
         <p class="hint" style="margin-top:6px;">색인은 자료 파일의 경로·크기·SHA-256만 다시 세는
         파생 목록입니다. 원본을 옮기거나 지우지 않으며, 대용량 자료에서는 시간이 걸릴 수 있습니다.</p>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);">
+          <div class="bar" style="flex-wrap:wrap;">
+            <strong style="font-size:var(--fs-xs);">보유 자료 메타데이터 감사</strong>
+            <span class="hint">색인을 500개씩 읽어 NAI 복원 후보만 찾습니다. 원본과 설정은 바꾸지 않습니다.</span>
+            <button type="button" id="metadataAuditStart" style="margin-left:auto;">처음부터 확인</button>
+            <button type="button" id="metadataAuditContinue">다음 500개</button>
+            <button type="button" id="metadataAuditRetry">실패 재시도</button>
+          </div>
+          <div id="metadataAuditStatus" class="hint" aria-live="polite"
+            style="margin-top:7px;">감사 기록을 확인하는 중입니다.</div>
+          <div id="metadataAuditFound" class="bar"
+            style="margin-top:7px;flex-wrap:wrap;"></div>
+        </div>
       </div>
 
       <div class="card">
@@ -15141,9 +15306,13 @@ function expRecipeActions(message){
     if(!r.ok){ expRecipeActions(r.error || '그림체를 저장하지 못했습니다.'); return; }
     if(r.styles) STYLES = r.styles;
     renderPresets(); renderLibrary();
-    expRecipeActions(r.saved
+    const lineage = r.lineage && r.lineage.verified
+      ? ' · 결과 SHA·요청·설계도 계보 확인'
+      : (r.lineage && r.lineage.warning ? ' · 구형 결과라 엄격한 계보 없음' : '');
+    expRecipeActions((r.saved
       ? `그림체 '${r.names[0]}'에 베이스·네거티브·생성 설정을 함께 저장했습니다.`
-      : `같은 내용의 그림체 '${r.names[0]}'가 있어 중복 저장하지 않았습니다.`);
+      : `같은 내용의 그림체 '${r.names[0]}'가 있어 중복 저장하지 않았습니다.`)
+      + lineage);
   });
   if(hasCharacters) $('expPromoteChars').addEventListener('click', async () => {
     const count = EXP_APPLIED_RECIPE.char_slots.length;
@@ -15159,10 +15328,14 @@ function expRecipeActions(message){
     if(r.characters) STATE.characters = r.characters;
     if(r.revision != null) STATE._revision = r.revision;
     renderLibrary();
+    const lineage = r.lineage && r.lineage.verified
+      ? ' · 결과 SHA·요청·설계도 계보 확인'
+      : (r.lineage && r.lineage.warning ? ' · 구형 결과라 엄격한 계보 없음' : '');
     expRecipeActions(
       `캐릭터 ${r.saved}명 저장`
       + (r.existing ? ` · 같은 내용 ${r.existing}명은 중복 생략` : '')
       + ` (${(r.names || []).join(', ')})`
+      + lineage
     );
   });
   $('expUndoRecipe').addEventListener('click', () => {
@@ -16404,6 +16577,88 @@ if($('dataOriginsShow')) $('dataOriginsShow').addEventListener('click', async ()
       + (examples ? `<div style="margin-top:4px;">${examples}</div>` : '');
   }catch(error){ host.textContent = '출처 장부 확인 실패: ' + error; }
 });
+
+function renderMetadataAudit(r){
+  const host = $('metadataAuditStatus');
+  const found = $('metadataAuditFound');
+  if(!host || !found) return;
+  if(!r || !r.ok){
+    host.textContent = (r && r.error) || '메타데이터 감사 기록을 읽지 못했습니다.';
+    found.innerHTML = '';
+    return;
+  }
+  if(r.empty){
+    host.textContent = '아직 감사 기록이 없습니다. 자료 색인을 만든 뒤 처음부터 확인하세요.';
+    found.innerHTML = '';
+    return;
+  }
+  const s = r.summary || {};
+  const c = s.status_counts || {};
+  const labels = {
+    pending:'대기', running:'확인 중', paused:'다음 묶음 대기',
+    completed:'완료', partial:'일부 오류',
+  };
+  host.textContent = `${labels[s.status] || s.status || '대기'} · `
+    + `${Number(s.cursor||0).toLocaleString()}/${Number(s.total||0).toLocaleString()}`
+    + ` · 복원 후보 ${Number(c.found||0).toLocaleString()}`
+    + ` · 메타 없음 ${Number(c.none||0).toLocaleString()}`
+    + ` · 오류 ${Number(c.error||0).toLocaleString()}`;
+  found.innerHTML = (r.found || []).map(item =>
+    `<button type="button" data-audit-candidate="${escA(item.path)}"
+      data-audit-sha="${escA(item.sha256)}" title="원본을 다시 SHA 검증한 뒤 읽기 전용으로 확인">
+      ${esc(item.path)}</button>`).join('');
+  found.querySelectorAll('[data-audit-candidate]').forEach(button =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try{
+        const response = await fetch('/api/metadata_audit_candidate', {
+          method:'POST',
+          body:JSON.stringify({
+            path:button.dataset.auditCandidate,
+            sha256:button.dataset.auditSha,
+          }),
+        });
+        const value = await response.json();
+        if(!value.ok) throw new Error(value.error || '복원 후보를 열지 못했습니다.');
+        openApplyPicker(value.candidate);
+      }catch(error){
+        alert(error.message || String(error));
+      }finally{
+        button.disabled = false;
+      }
+    }));
+}
+async function loadMetadataAudit(){
+  try{
+    renderMetadataAudit(await (await fetch(
+      '/api/metadata_audit_status', {cache:'no-store'})).json());
+  }catch(error){
+    renderMetadataAudit({ok:false,error:'메타데이터 감사 기록 확인 실패: ' + error});
+  }
+}
+async function metadataAuditAction(action){
+  const buttons = [
+    $('metadataAuditStart'), $('metadataAuditContinue'), $('metadataAuditRetry')
+  ].filter(Boolean);
+  buttons.forEach(button => button.disabled = true);
+  try{
+    const r = await (await fetch('/api/metadata_audit_control', {
+      method:'POST', body:JSON.stringify({action}),
+    })).json();
+    renderMetadataAudit(r);
+  }catch(error){
+    renderMetadataAudit({ok:false,error:'메타데이터 감사 실행 실패: ' + error});
+  }finally{
+    buttons.forEach(button => button.disabled = false);
+  }
+}
+if($('metadataAuditStart')) $('metadataAuditStart').addEventListener(
+  'click', () => metadataAuditAction('start'));
+if($('metadataAuditContinue')) $('metadataAuditContinue').addEventListener(
+  'click', () => metadataAuditAction('continue'));
+if($('metadataAuditRetry')) $('metadataAuditRetry').addEventListener(
+  'click', () => metadataAuditAction('retry'));
+loadMetadataAudit();
 
 let PUBLIC_COLLECT_TIMER = null;
 function renderPublicCollection(r){
@@ -20596,16 +20851,22 @@ class ConfigServer:
         """① 설정만으로 단독 1장 생성 (세팅 무관 — NAI 기본 생성처럼)"""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
-        cfg = self.cfg
+        # 누른 순간의 설계도를 고정한다. 실행 중 자동 저장이나 화면 편집이 들어와도
+        # 이미 시작한 요청의 프롬프트·인물·좌표·출력 설정이 섞이지 않는다.
+        with self.config_lock:
+            cfg = copy.deepcopy(self.cfg)
         if not cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-        slots = [s for s in cfg.get("char_slots", [])
-                 if slot_prompt(s).strip() and s.get("enabled") is not False]
+        blueprint = generation_blueprint(
+            cfg, source={"kind": "single-generate"})
+        material = single_generation_legacy_material(blueprint)
+        job_cfg = copy.deepcopy(cfg)
+        job_cfg.update(material.get("config_overrides") or {})
+        call = material["call"]
         tok = self.live.try_claim(
             "단독 생성",
             "preview",
-            blueprint=generation_blueprint(
-                cfg, source={"kind": "single-generate"}),
+            blueprint=blueprint,
             payload_identity={"kind": "single", "output": "one-image"},
         )
         if tok is None:
@@ -20615,34 +20876,41 @@ class ConfigServer:
             self.live.update(status_text="단독 생성 중...", char_name="단독 생성",
                              filename="", index=1, total=1)
             try:
-                okp, why = pace_gate(cfg, self.live, "단독")   # 밴 예방 (CQA-013)
+                okp, why = pace_gate(job_cfg, self.live, "단독")   # 밴 예방 (CQA-013)
                 if not okp:
                     self.live.update(
                         status_text=why, phase="stopped", can_retry=True)
                     return
-                style = (cfg.get("base_prompt") or "").strip()
+                style = str(call.get("base_prompt") or "").strip()
                 base = style or "1girl"
-                # 켠 인물만 보낸다 (칸은 6명 넘게 둬도 된다)
-                people, ctrs = active_people(slots, cfg.get("char_centers"))
-                params = runtime_generation_params(cfg, cfg["token"])
+                people = copy.deepcopy(call.get("characters") or [])
+                ctrs = copy.deepcopy(call.get("char_centers") or [])
+                params = runtime_generation_params(job_cfg, cfg["token"])
                 state = load_state()
                 try:
                     img = call_nai_api(
                         cfg["token"], base, "", "",
-                        cfg.get("negative_prompt", ""),
-                        int(cfg.get("width", 832)), int(cfg.get("height", 1216)),
+                        call.get("negative_prompt", ""),
+                        int(call.get("width") or 832), int(call.get("height") or 1216),
                         chars=people,
-                        scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                        steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
-                        scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
-                        uc_preset=int(cfg.get("uc_preset", 3)),
-                        seed=fixed_seed(cfg), params=with_centers(params, ctrs))
+                        scale=job_cfg.get("cfg_scale", 5.5),
+                        cfg_rescale=job_cfg.get("cfg_rescale", 0.56),
+                        steps=int(job_cfg.get("steps", 28)),
+                        sampler=job_cfg.get("sampler", "k_euler_ancestral"),
+                        scheduler=job_cfg.get("scheduler", "karras"),
+                        variety=job_cfg.get("variety", False),
+                        uc_preset=int(job_cfg.get("uc_preset", 3)),
+                        seed=call.get("seed") or None,
+                        params=with_centers(params, ctrs))
                 finally:
                     pace_complete()
-                out_dir = out_sub(cfg, "단독")
+                img.nai_blueprint_fingerprint = blueprint["fingerprint"]
+                out_dir = out_sub(job_cfg, "단독")
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
-                                quality=out_clean(cfg)[2])
+                save_with_meta(
+                    img, out_dir / f"{n:04d}.webp",
+                    fmt=out_format(job_cfg), clean=_ocargs(job_cfg)[0],
+                    max_side=_ocargs(job_cfg)[1], quality=out_clean(job_cfg)[2])
                 self.live.set_image(img)
                 bump_daily(state)
                 save_state(state)
@@ -21160,6 +21428,19 @@ class ConfigServer:
             data = json.loads(body or b"{}")
             with self.config_lock:
                 self.use_latest_config()
+                promotions = None
+                lineage_error = ""
+                try:
+                    promotions = _result_promotion_records(
+                        self.cfg,
+                        data.get("path"),
+                        data.get("kind"),
+                        name=data.get("name"),
+                    )
+                except Exception as error:
+                    # 구형 비교 결과는 실행 식별자가 없을 수 있다. 자산 저장은 호환
+                    # 경로로 허용하되 계보를 꾸며 내지 않고 미확인으로 명시한다.
+                    lineage_error = redact_diagnostic_text(error)
                 result = promote_comparison_recipe_assets(
                     self.cfg,
                     data.get("path"),
@@ -21170,23 +21451,28 @@ class ConfigServer:
                 if result.get("changed_config"):
                     self.config_revision += 1
                 result["revision"] = self.config_revision
-                try:
-                    event = apply_evaluation_action({
-                        "action": "promotion",
-                        "paths": [data.get("path")],
-                        "target": (
-                            "style" if data.get("kind") == "style"
-                            else "character"
-                        ),
-                    })
-                    result["evaluation_event"] = {
-                        "appended": event.get("appended", []),
-                        "duplicate": event.get("duplicate", False),
-                    }
-                except Exception as error:
-                    # 자산 저장은 이미 끝났으므로 평가 장부 문제로 되돌리지 않는다.
-                    result["evaluation_event"] = {
-                        "error": redact_diagnostic_text(error),
+                if result.get("ok") and promotions is not None:
+                    try:
+                        result["lineage"] = _append_result_promotion_ledger(
+                            promotions)
+                        result["lineage"]["verified"] = all(
+                            item.get("lineage", {})
+                            .get("execution", {})
+                            .get("manifest_verified") is True
+                            for item in promotions
+                        )
+                    except Exception as error:
+                        result["lineage"] = {
+                            "error": redact_diagnostic_text(error),
+                            "verified": False,
+                        }
+                elif result.get("ok"):
+                    result["lineage"] = {
+                        "verified": False,
+                        "warning": (
+                            "자산은 저장했지만 이 구형 결과에는 엄격한 실행 계보가 "
+                            f"없어 승격 장부에는 넣지 않았습니다. {lineage_error}"
+                        ).strip(),
                     }
                 return result
         except Exception as e:
@@ -21992,6 +22278,11 @@ class ConfigServer:
                         self._json(server.snapshot_jobs())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/metadata_audit_status"):
+                    try:
+                        self._json(metadata_audit_status())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
                 elif self.path.startswith("/api/trash"):
@@ -22454,6 +22745,16 @@ class ConfigServer:
                             "bytes": index["bytes"],
                             "fingerprint": index["fingerprint"],
                         })
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/metadata_audit_control"):
+                    try:
+                        self._json(metadata_audit_control(body))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/metadata_audit_candidate"):
+                    try:
+                        self._json(metadata_audit_candidate(body))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/restoration_batch"):
@@ -23434,8 +23735,8 @@ def activate_comparison_run(cfg, folder):
     }
 
 
-def comparison_recipe_for_output(cfg, rel):
-    """선택한 비교 이미지가 실제로 사용한 원문·설정·캐릭터를 manifest에서 복원한다."""
+def _comparison_result_context(cfg, rel):
+    """비교 결과 한 장의 파일·manifest·정확한 작업 레코드를 함께 찾는다."""
     image_path = output_file_for_preview(cfg, rel)
     if image_path is None:
         raise ValueError("선택한 비교 결과 파일을 찾지 못했습니다.")
@@ -23447,24 +23748,41 @@ def comparison_recipe_for_output(cfg, rel):
     manifest_path = folder / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError("이 결과의 비교 manifest를 찾지 못했습니다.")
-    progress = load_json_recover(manifest_path)
+    manifest = load_json_recover(manifest_path)
+    wanted = image_path.relative_to(root).as_posix()
+    for section in ("completed", "reruns"):
+        rows = manifest.get(section)
+        if not isinstance(rows, dict):
+            continue
+        for key, record in rows.items():
+            if (isinstance(record, dict)
+                    and str(record.get("file") or "").replace("\\", "/")
+                    == wanted):
+                effective = manifest
+                if section == "reruns":
+                    effective = copy.deepcopy(manifest)
+                    effective["completed"] = {str(key): copy.deepcopy(record)}
+                return {
+                    "image_path": image_path,
+                    "file": wanted,
+                    "folder": folder,
+                    "manifest": effective,
+                    "record": copy.deepcopy(record),
+                    "job_key": str(key),
+                    "section": section,
+                }
+    raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
+
+
+def comparison_recipe_for_output(cfg, rel):
+    """선택한 비교 이미지가 실제로 사용한 원문·설정·캐릭터를 manifest에서 복원한다."""
+    context_result = _comparison_result_context(cfg, rel)
+    progress = context_result["manifest"]
     completed = progress.get("completed")
     if not isinstance(completed, dict):
         raise ValueError("비교 결과 기록 형식이 올바르지 않습니다.")
-    wanted = image_path.relative_to(root).as_posix()
-    record = next((
-        item for item in completed.values()
-        if isinstance(item, dict)
-        and str(item.get("file") or "").replace("\\", "/") == wanted
-    ), None)
-    if record is None and isinstance(progress.get("reruns"), dict):
-        record = next((
-            item for item in progress["reruns"].values()
-            if isinstance(item, dict)
-            and str(item.get("file") or "").replace("\\", "/") == wanted
-        ), None)
-    if record is None:
-        raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
+    wanted = context_result["file"]
+    record = context_result["record"]
     if isinstance(record.get("recipe"), dict):
         recipe = copy.deepcopy(record["recipe"])
         recipe["nai_seed"] = int(record.get("seed") or recipe.get("nai_seed") or 0)
@@ -23512,6 +23830,11 @@ def comparison_recipe_for_output(cfg, rel):
             "prompt": character.get("female") or "",
             "outfit": character.get("clothed") or "",
             "negative": character.get("negative") or "",
+            "variant": copy.deepcopy(character.get("variant") or {}),
+            "variants": copy.deepcopy(character.get("variants") or []),
+            "reference_ids": copy.deepcopy(
+                character.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(character.get("vibe_ids") or []),
             "enabled": True,
         }]
         char_centers = [{"x": 0.5, "y": 0.5}]
@@ -23572,6 +23895,122 @@ def _style_signature(prompt, negative, settings):
     return style_bundle_signature({
         "prompt": prompt, "negative": negative, "settings": settings,
     })
+
+
+def _comparison_result_evaluation(path, manifest, job_key):
+    """선별 장부의 현재 평가를 결과 한 장의 공통 평가 계약으로 투영한다."""
+    picks = load_picks()
+    path = str(path or "").replace("\\", "/")
+    review_state = str(
+        (picks.get("review_states") or {}).get(path) or "candidate")
+    if review_state not in ("candidate", "confirmed", "shared", "archived"):
+        review_state = "candidate"
+    return {
+        "subject": {"kind": "generation-result", "path": path},
+        "favorite": path in set(picks.get("fav") or []),
+        "rating": (picks.get("ratings") or {}).get(path),
+        "memo": str((picks.get("memos") or {}).get(path) or ""),
+        "tags": list((picks.get("tags") or {}).get(path) or []),
+        "review_state": review_state,
+        "evidence_refs": [],
+        "result_refs": [f"result:{path}"],
+        "asset_refs": [],
+        "comparison_lineage": {
+            "manifest_signature": str(manifest.get("signature") or ""),
+            "manifest_folder": str(manifest.get("folder") or ""),
+            "job_key": str(job_key or ""),
+            "mode": str(manifest.get("mode") or ""),
+        },
+    }
+
+
+def _result_promotion_records(cfg, rel, kind, name=""):
+    """새 비교 결과의 검증 가능한 계보와 명시적 자산 내용을 승격 레코드로 만든다."""
+    context = _comparison_result_context(cfg, rel)
+    restored = comparison_recipe_for_output(cfg, rel)
+    recipe = restored["recipe"]
+    record = context["record"]
+    actual_sha = hashlib.sha256(
+        context["image_path"].read_bytes()).hexdigest()
+    if actual_sha != str(record.get("content_sha256") or "").lower():
+        raise ValueError(
+            "저장된 비교 이미지가 manifest 기록 뒤 바뀌어 엄격한 계보로 승격할 수 없습니다.")
+    result = {
+        "path": context["file"],
+        "content_sha256": actual_sha,
+        "request_id": record.get("request_id"),
+        "payload_hash": record.get("payload_hash"),
+        "blueprint_fingerprint": record.get("blueprint_fingerprint"),
+    }
+    evaluation = _comparison_result_evaluation(
+        context["file"], context["manifest"], context["job_key"])
+    target = str(kind or "").strip().casefold()
+    if target == "style":
+        settings = {
+            key: value for key, value in (recipe.get("settings") or {}).items()
+            if key in COMPARE_RECIPE_SETTING_KEYS and value is not None
+        }
+        return [build_result_promotion(
+            result,
+            context["manifest"],
+            evaluation,
+            target="style",
+            name=str(name or recipe.get("style_name") or ""),
+            content={
+                "base": str(recipe.get("base_prompt") or ""),
+                "negative": str(recipe.get("negative_prompt") or ""),
+                "generation_settings": settings,
+            },
+        )]
+    if target != "characters":
+        raise ValueError("승격할 자료 종류가 올바르지 않습니다.")
+    output = []
+    slots = [
+        slot for slot in (recipe.get("char_slots") or [])
+        if isinstance(slot, dict) and slot_prompt(slot).strip()
+    ]
+    for index, slot in enumerate(slots, 1):
+        variants = copy.deepcopy(slot.get("variants") or [])
+        variant = copy.deepcopy(slot.get("variant") or {})
+        if variant and variant not in variants:
+            variants.insert(0, variant)
+        output.append(build_result_promotion(
+            result,
+            context["manifest"],
+            evaluation,
+            target="character",
+            name=str(slot.get("name") or f"비교 결과 캐릭터 {index}"),
+            content={
+                "prompt": slot_prompt(slot),
+                "appearance": str(
+                    slot.get("prompt") or slot.get("female") or ""),
+                "clothed": str(
+                    slot.get("outfit") or slot.get("clothed") or ""),
+                "negative": str(slot.get("negative") or ""),
+                "variants": variants,
+                "reference_refs": list(slot.get("reference_ids") or []),
+                "vibe_refs": list(slot.get("vibe_ids") or []),
+            },
+        ))
+    if not output:
+        raise ValueError("이 비교 결과에는 승격할 캐릭터가 없습니다.")
+    return output
+
+
+def _append_result_promotion_ledger(records):
+    ledger = new_promotion_ledger()
+    if PROMOTION_LEDGER_FILE.is_file():
+        loaded = load_json_recover(PROMOTION_LEDGER_FILE)
+        if isinstance(loaded, dict):
+            ledger = loaded
+    merged = append_promotion_events(ledger, records)
+    atomic_write_json(
+        PROMOTION_LEDGER_FILE, merged["ledger"], indent=2, keep_backup=True)
+    return {
+        "appended": list(merged.get("appended") or []),
+        "duplicates": list(merged.get("duplicates") or []),
+        "file": PROMOTION_LEDGER_FILE.relative_to(BASE_DIR).as_posix(),
+    }
 
 
 @serialized_data_write(lambda: BASE_DIR)
@@ -23667,7 +24106,13 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
         outfit = str(slot.get("outfit") or "")
         negative = str(slot.get("negative") or "")
         wanted_character = character_bundle_signature({
-            "female": prompt, "clothed": outfit, "negative": negative,
+            "female": prompt,
+            "clothed": outfit,
+            "negative": negative,
+            "variant": copy.deepcopy(slot.get("variant") or {}),
+            "variants": copy.deepcopy(slot.get("variants") or []),
+            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
         })
         same = next((
             item for item in characters
@@ -23692,6 +24137,10 @@ def promote_comparison_recipe_assets(cfg, rel, kind, name="", spec=None):
             "female": prompt,
             "clothed": outfit,
             "negative": negative,
+            "variant": copy.deepcopy(slot.get("variant") or {}),
+            "variants": copy.deepcopy(slot.get("variants") or []),
+            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
             "enabled": True,
             "folder_id": None,
             "subfolder_id": None,
@@ -23866,6 +24315,30 @@ def _rerun_selected_comparison(server, cfg, rel):
         job["cid"] = matches[0][1]
     used, base, negative, people, centers = comparison_selected_job_values(
         cfg, plan, job)
+    execution_cfg = copy.deepcopy(used)
+    execution_cfg.update({
+        "base_prompt": base,
+        "negative_prompt": negative,
+        "char_slots": [
+            {
+                "prompt": str(person.get("prompt") or ""),
+                "negative": str(person.get("negative") or ""),
+                "enabled": True,
+            }
+            for person in people if isinstance(person, dict)
+        ],
+        "char_centers": copy.deepcopy(centers),
+        "nai_seed": job["seed"],
+    })
+    execution_blueprint = generation_blueprint(
+        execution_cfg,
+        source={
+            "kind": "comparison-rerun",
+            "cell": source_key,
+            "attempt": attempt,
+        },
+        experiment={"mode": "selected_groups"},
+    )
     token = cfg["token"]
     allowed, why = pace_gate(cfg, server.live, "비교 한 셀 재실행")
     if not allowed:
@@ -23906,7 +24379,10 @@ def _rerun_selected_comparison(server, cfg, rel):
         "file": rel_saved,
         "rerun_of": source_key,
         "rerun_attempt": attempt,
-        "request_id": material.get("request_id"),
+        "content_sha256": hashlib.sha256(saved.read_bytes()).hexdigest(),
+        "request_id": str(getattr(image, "nai_request_id", "") or ""),
+        "payload_hash": str(getattr(image, "nai_payload_hash", "") or ""),
+        "blueprint_fingerprint": execution_blueprint["fingerprint"],
         "seed": job["seed"],
         "recipe": comparison_job_recipe_snapshot(
             cfg, plan, job, used, base, negative,
@@ -23976,6 +24452,35 @@ def _run_comparison(server, cfg, plan, styles, chars):
             )
         )
         seed = seed or 1
+        execution_cfg = copy.deepcopy(used)
+        execution_cfg.update({
+            "base_prompt": base,
+            "negative_prompt": negative,
+            "char_slots": [
+                {
+                    "name": f"비교 인물 {index + 1}",
+                    "prompt": str(person.get("prompt") or ""),
+                    "outfit": "",
+                    "negative": str(person.get("negative") or ""),
+                    "enabled": True,
+                }
+                for index, person in enumerate(people)
+                if isinstance(person, dict)
+            ],
+            "char_centers": copy.deepcopy(centers),
+            "nai_seed": seed,
+        })
+        execution_blueprint = generation_blueprint(
+            execution_cfg,
+            source={
+                "kind": "comparison",
+                "mode": options.get("mode"),
+                "cell": str(job.get("key") or ""),
+            },
+            experiment={
+                "mode": options.get("mode") or "comparison",
+            },
+        )
         style_label = job["style_name"]
         char_label = job["char_name"]
         seed_suffix = (
@@ -24029,6 +24534,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
                 saved = save_with_meta(
                     img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
                     max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
+                img.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
                 server.live.set_image(img)
                 rel = saved.resolve().relative_to(out_root(cfg).resolve()).as_posix()
                 completed[key] = {
@@ -24040,6 +24546,13 @@ def _run_comparison(server, cfg, plan, styles, chars):
                     "seed_index": seed_index,
                     "seed": seed, "width": int(used["width"]),
                     "height": int(used["height"]),
+                    "content_sha256": hashlib.sha256(
+                        saved.read_bytes()).hexdigest(),
+                    "request_id": str(
+                        getattr(img, "nai_request_id", "") or ""),
+                    "payload_hash": str(
+                        getattr(img, "nai_payload_hash", "") or ""),
+                    "blueprint_fingerprint": execution_blueprint["fingerprint"],
                 }
                 if options.get("mode") in ("character_setting", "selected"):
                     completed[key].update({

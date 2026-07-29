@@ -2763,7 +2763,9 @@ class RegressionTests(unittest.TestCase):
                 {"name": "기존", "prompt": "char a", "outfit": "red dress",
                  "negative": "bad hands", "enabled": True},
                 {"name": "신규", "prompt": "char b", "outfit": "blue dress",
-                 "negative": "bad feet", "enabled": True},
+                 "negative": "bad feet", "enabled": True,
+                 "variants": [{"id": "winter", "prompt": "white coat"}],
+                 "reference_ids": ["ref-b"], "vibe_ids": ["vibe-b"]},
             ],
         }
         restored = {
@@ -2815,10 +2817,73 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(cfg["characters"][1]["female"], "char b")
             self.assertEqual(cfg["characters"][1]["clothed"], "blue dress")
             self.assertEqual(cfg["characters"][1]["negative"], "bad feet")
+            self.assertEqual(
+                cfg["characters"][1]["variants"],
+                [{"id": "winter", "prompt": "white coat"}],
+            )
+            self.assertEqual(cfg["characters"][1]["reference_ids"], ["ref-b"])
+            self.assertEqual(cfg["characters"][1]["vibe_ids"], ["vibe-b"])
             self.assertEqual(len(list(char_dir.glob("*.json"))), 2)
             self.assertTrue(settings_file.is_file())
             self.assertFalse(setting["ok"])
             self.assertIn("추정", setting["error"])
+
+    def test_comparison_result_promotion_uses_saved_execution_lineage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "output"
+            run = out / "비교생성" / "run"
+            run.mkdir(parents=True)
+            image = run / "winner.webp"
+            image.write_bytes(b"saved-image")
+            rel = "비교생성/run/winner.webp"
+            recipe = {
+                "base_prompt": "style base",
+                "negative_prompt": "style negative",
+                "style_name": "winner",
+                "settings": {"cfg_scale": 5.5, "steps": 28},
+                "char_slots": [],
+            }
+            record = {
+                "file": rel,
+                "content_sha256": hashlib.sha256(
+                    image.read_bytes()).hexdigest(),
+                "request_id": "request-one",
+                "payload_hash": "b" * 64,
+                "blueprint_fingerprint": "c" * 64,
+                "style_id": "style-one",
+                "seed": 123,
+                "seed_index": 0,
+                "width": 832,
+                "height": 1216,
+                "recipe": recipe,
+            }
+            (run / "manifest.json").write_text(json.dumps({
+                "signature": "d" * 64,
+                "folder": "비교생성/run",
+                "mode": "style_character",
+                "completed": {"cell-one": record},
+            }, ensure_ascii=False), encoding="utf-8")
+            picks = root / "선별.json"
+            picks.write_text(json.dumps({
+                "picked": [rel],
+                "fav": [rel],
+                "ratings": {rel: 5},
+                "tags": {rel: ["확정"]},
+                "memos": {rel: "좋은 결과"},
+                "review_states": {rel: "confirmed"},
+            }, ensure_ascii=False), encoding="utf-8")
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["out_dir"] = str(out)
+            with patch.object(APP, "PICKS_FILE", picks):
+                promotions = APP._result_promotion_records(
+                    cfg, rel, "style", name="검증 그림체")
+
+        self.assertEqual(len(promotions), 1)
+        lineage = promotions[0]["lineage"]
+        self.assertTrue(lineage["execution"]["manifest_verified"])
+        self.assertEqual(lineage["comparison"]["job_key"], "cell-one")
+        self.assertEqual(promotions[0]["evidence"]["evaluation"]["rating"], 5)
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3974,7 +4039,7 @@ class RegressionTests(unittest.TestCase):
         source = (
             ROOT / "src" / "nai_studio" / "legacy_app.py"
         ).read_text(encoding="utf-8")
-        self.assertEqual(source.count("runtime_generation_params("), 7)
+        self.assertEqual(source.count("runtime_generation_params("), 8)
         self.assertNotIn('raw.get("source_model")', source)
         self.assertNotIn("ensure_refs(", source)
 
@@ -3986,6 +4051,29 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("window.addEventListener('unhandledrejection'", page)
         self.assertIn("fatalErrorBar", page)
         self.assertIn("새로고침", page)
+
+    def test_metadata_audit_is_in_data_storage_and_rejects_app_json(self):
+        page = APP.render_page()
+        for element_id in (
+            "metadataAuditStart",
+            "metadataAuditContinue",
+            "metadataAuditRetry",
+            "metadataAuditStatus",
+            "metadataAuditFound",
+        ):
+            self.assertIn(f'id="{element_id}"', page)
+        self.assertIsNone(APP._nai_json_metadata({
+            "title": "그림체",
+            "base": "artist one",
+            "negative": "lowres",
+            "settings": {"steps": 28},
+        }))
+        self.assertIsNotNone(APP._nai_json_metadata({
+            "source": "NovelAI Diffusion V4.5",
+            "v4_prompt": {"caption": {"base_caption": "artist one"}},
+            "seed": 123,
+            "steps": 28,
+        }))
 
     def test_studio_layout_is_default_and_classic_remains_compatible(self):
         """작업실을 기본으로 쓰되 설정 한 번으로 기존 호환 화면을 복원해야 한다."""
@@ -5177,8 +5265,8 @@ class RegressionTests(unittest.TestCase):
         source = (
             ROOT / "src" / "nai_studio" / "legacy_app.py"
         ).read_text(encoding="utf-8")
-        self.assertEqual(source.count("call_nai_api("), 7)  # definition + six callers
-        self.assertEqual(source.count("pace_complete()"), 7)  # definition + six callers
+        self.assertEqual(source.count("call_nai_api("), 8)  # definition + seven callers
+        self.assertEqual(source.count("pace_complete()"), 8)  # definition + seven callers
         self.assertNotIn(
             'time.sleep(random.uniform(pc["delay_min"], pc["delay_max"]))',
             source,
