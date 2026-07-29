@@ -4452,6 +4452,41 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("/api/evaluation_action", page)
         self.assertNotIn("const delta = 24 *", page)
 
+    def test_output_evaluation_keeps_comparison_manifest_lineage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "output"
+            run = root / "비교생성" / "run-1"
+            run.mkdir(parents=True)
+            image = run / "0001.webp"
+            image.write_bytes(b"fixture")
+            relative = image.relative_to(root).as_posix()
+            APP.atomic_write_json(run / "manifest.json", {
+                "signature": "c" * 64,
+                "mode": "both",
+                "completed": {
+                    "job-1": {
+                        "file": relative,
+                        "style_id": "style-1",
+                        "character_id": "character-1",
+                        "seed": 123,
+                        "seed_index": 0,
+                        "width": 832,
+                        "height": 1216,
+                    },
+                },
+            })
+            picks_file = Path(td) / "선별.json"
+            cfg = {"out_dir": str(root)}
+            with patch.object(APP, "PICKS_FILE", picks_file):
+                listed = APP.list_output("비교생성/run-1", cfg=cfg)
+
+        self.assertTrue(listed["ok"])
+        lineage = listed["evaluations"][0]["comparison_lineage"]
+        self.assertEqual(lineage["style_id"], "style-1")
+        self.assertEqual(lineage["character_id"], "character-1")
+        self.assertEqual(lineage["seed"], 123)
+        self.assertEqual(listed["evaluation_issues"], [])
+
     def test_structured_diagnostics_redact_secrets_paths_and_export_safe_events(self):
         raw_lines = [
             (

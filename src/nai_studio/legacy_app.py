@@ -8669,6 +8669,35 @@ def _dir_img_count(p):
     return n
 
 
+def comparison_manifests_for_output_dir(cfg, sub):
+    """현재 출력 폴더를 감싸는 비교 manifest만 안전하게 읽는다."""
+    root = out_root(cfg).resolve()
+    current = (root / str(sub or "")).resolve()
+    if not _path_is_inside(current, root):
+        return []
+    manifests = []
+    while current != root:
+        path = current / "manifest.json"
+        if path.is_file():
+            try:
+                value = load_json_recover(path)
+                if isinstance(value, dict):
+                    value = copy.deepcopy(value)
+                    value.setdefault(
+                        "folder",
+                        current.relative_to(root).as_posix(),
+                    )
+                    manifests.append(value)
+            except Exception as error:
+                log.warning(
+                    "비교 결과 계보를 읽지 못했습니다(%s): %s",
+                    path.name, error,
+                )
+            break
+        current = current.parent
+    return manifests
+
+
 def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=False):
     """생성물 뿌리 아래를 훑는다. sub 가 비면 최상위.
     저장 폴더를 바꿨으면(out_dir) 그쪽을 본다 — 탐색기와 저장이 어긋나면 안 된다.
@@ -8711,6 +8740,7 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
         offset = 0
     evaluation_projection = project_legacy_evaluations(
         picks,
+        comparison_manifests=comparison_manifests_for_output_dir(cfg, sub),
         result_records=[{"path": item["path"]} for item in files],
     )
     return {"ok": True, "dir": sub, "dirs": dirs, "files": files,
