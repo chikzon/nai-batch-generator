@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -19,6 +20,8 @@ from .metadata_audit import (
     MetadataInspector,
     canonical_metadata_audit,
     metadata_audit_bundle,
+    metadata_audit_failures,
+    metadata_audit_summary,
     new_metadata_audit,
     pause_metadata_audit,
     resume_metadata_audit,
@@ -169,6 +172,51 @@ class MetadataAuditAdapter:
         with self._lock:
             return self._load_unlocked()
 
+    @staticmethod
+    def _light_bundle(
+        state: Mapping[str, Any],
+        *,
+        failure_limit: int = 50,
+        found_offset: int = 0,
+        found_limit: int = 50,
+    ) -> dict:
+        """HTTP/UI용 경량 상태.
+
+        전체 ``items``와 전체 복원 큐를 매 조회마다 직렬화하지 않는다. 수만 개
+        자료에서도 화면에는 수치와 현재 쪽의 상대 경로·SHA만 보낸다.
+        """
+        clean = canonical_metadata_audit(state)
+        failure_limit = max(0, min(500, int(failure_limit or 0)))
+        found_offset = max(0, int(found_offset or 0))
+        found_limit = max(0, min(500, int(found_limit or 0)))
+        found = [
+            {"path": item["path"], "sha256": item["sha256"]}
+            for item in clean["items"]
+            if item["status"] == "found"
+        ]
+        return {
+            "summary": metadata_audit_summary(clean),
+            "failures": metadata_audit_failures(clean)[:failure_limit],
+            "found": found[found_offset:found_offset + found_limit],
+            "found_offset": found_offset,
+            "found_more": found_offset + found_limit < len(found),
+        }
+
+    def status_light(
+        self,
+        *,
+        failure_limit: int = 50,
+        found_offset: int = 0,
+        found_limit: int = 50,
+    ) -> dict:
+        with self._lock:
+            return self._light_bundle(
+                self._load_unlocked(),
+                failure_limit=failure_limit,
+                found_offset=found_offset,
+                found_limit=found_limit,
+            )
+
     def start(
         self,
         data_index: Mapping[str, Any],
@@ -206,6 +254,38 @@ class MetadataAuditAdapter:
             clean = self._atomic_save(state)
             return metadata_audit_bundle(clean)
 
+    def start_light(
+        self,
+        data_index: Mapping[str, Any],
+        *,
+        chunk_size: int = MAX_AUDIT_CHUNK,
+    ) -> dict:
+        if (
+            not isinstance(data_index, Mapping)
+            or data_index.get("schema") != DATA_INDEX_SCHEMA
+            or not isinstance(data_index.get("entries"), list)
+        ):
+            raise MetadataAuditAdapterError(
+                "기존 자료 색인 계약이 올바르지 않습니다."
+            )
+        ledger_relative = self.ledger_path.relative_to(
+            self.base_dir).as_posix()
+        entries = [
+            entry
+            for entry in data_index["entries"]
+            if not (
+                isinstance(entry, Mapping)
+                and str(entry.get("path") or "").replace("\\", "/")
+                == ledger_relative
+            )
+        ]
+        with self._lock:
+            clean = self._atomic_save(new_metadata_audit(
+                entries,
+                chunk_size=chunk_size,
+            ))
+            return self._light_bundle(clean)
+
     def status(self) -> dict:
         with self._lock:
             return metadata_audit_bundle(self._load_unlocked())
@@ -221,11 +301,27 @@ class MetadataAuditAdapter:
             clean = self._atomic_save(state)
             return metadata_audit_bundle(clean)
 
+    def run_chunk_light(self) -> dict:
+        with self._lock:
+            state = run_metadata_audit_chunk(
+                self._load_unlocked(),
+                reader=self._reader,
+                metadata_inspector=self.metadata_inspector,
+            )
+            clean = self._atomic_save(state)
+            return self._light_bundle(clean)
+
     def pause(self) -> dict:
         with self._lock:
             state = pause_metadata_audit(self._load_unlocked())
             clean = self._atomic_save(state)
             return metadata_audit_bundle(clean)
+
+    def pause_light(self) -> dict:
+        with self._lock:
+            clean = self._atomic_save(
+                pause_metadata_audit(self._load_unlocked()))
+            return self._light_bundle(clean)
 
     def resume(self) -> dict:
         """정지 지점에서 다음 묶음 하나를 실행하고 결과를 저장한다."""
@@ -238,6 +334,16 @@ class MetadataAuditAdapter:
             clean = self._atomic_save(state)
             return metadata_audit_bundle(clean)
 
+    def resume_light(self) -> dict:
+        with self._lock:
+            state = resume_metadata_audit(
+                self._load_unlocked(),
+                reader=self._reader,
+                metadata_inspector=self.metadata_inspector,
+            )
+            clean = self._atomic_save(state)
+            return self._light_bundle(clean)
+
     def retry(self, *, paths: Iterable[str] | None = None) -> dict:
         """전체 또는 선택 실패 항목을 같은 색인 SHA로 다시 읽어 저장한다."""
         with self._lock:
@@ -249,6 +355,27 @@ class MetadataAuditAdapter:
             )
             clean = self._atomic_save(state)
             return metadata_audit_bundle(clean)
+
+    def retry_light(self, *, paths: Iterable[str] | None = None) -> dict:
+        with self._lock:
+            state = retry_metadata_failures(
+                self._load_unlocked(),
+                reader=self._reader,
+                metadata_inspector=self.metadata_inspector,
+                paths=paths,
+            )
+            clean = self._atomic_save(state)
+            return self._light_bundle(clean)
+
+    def read_verified(self, relative_path: str, sha256: str) -> bytes:
+        """사용자가 고른 후보 한 건만 현재 색인 SHA와 대조해 읽는다."""
+        request = {"path": str(relative_path or ""), "sha256": str(sha256 or "")}
+        payload = self._reader(request)
+        if hashlib.sha256(payload).hexdigest() != request["sha256"].lower():
+            raise MetadataAuditAdapterError(
+                "색인 뒤 파일 내용이 바뀌었습니다. 색인을 다시 만드세요."
+            )
+        return payload
 
 
 __all__ = [

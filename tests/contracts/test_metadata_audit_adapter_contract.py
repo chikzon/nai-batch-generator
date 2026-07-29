@@ -268,6 +268,51 @@ class MetadataAuditAdapterContractTests(unittest.TestCase):
             adapter.start({"schema": DATA_INDEX_SCHEMA, "entries": {}})
         self.assertFalse(adapter.ledger_path.exists())
 
+    def test_light_status_never_builds_or_returns_the_full_queue(self):
+        entries = []
+        for number in range(120):
+            relative = f"owned/{number:03d}.png"
+            payload = f"image-{number}".encode()
+            self.write_owned(relative, payload)
+            entries.append(index_entry(relative, payload))
+        adapter = MetadataAuditAdapter(
+            self.base,
+            metadata_inspector=self.secret_inspector,
+        )
+        started = adapter.start_light(data_index(entries), chunk_size=50)
+        self.assertEqual(set(started), {
+            "summary", "failures", "found", "found_offset", "found_more",
+        })
+        self.assertNotIn("audit", started)
+        self.assertNotIn("restoration_queue", started)
+
+        first = adapter.run_chunk_light()
+        self.assertEqual(first["summary"]["status_counts"]["found"], 50)
+        self.assertEqual(len(first["found"]), 50)
+        self.assertFalse(any("prompt" in item for item in first["found"]))
+        page = adapter.status_light(found_offset=25, found_limit=10)
+        self.assertEqual(len(page["found"]), 10)
+        self.assertEqual(page["found"][0]["path"], "owned/025.png")
+        self.assertTrue(page["found_more"])
+        self.assert_safe(page)
+
+    def test_read_verified_reads_only_matching_owned_candidate(self):
+        payload = b"candidate"
+        self.write_owned("owned/a.webp", payload)
+        adapter = MetadataAuditAdapter(
+            self.base,
+            metadata_inspector=self.secret_inspector,
+        )
+        digest = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(
+            adapter.read_verified("owned/a.webp", digest),
+            payload,
+        )
+        with self.assertRaises(MetadataAuditAdapterError):
+            adapter.read_verified("owned/a.webp", "0" * 64)
+        with self.assertRaises(MetadataAuditPathError):
+            adapter.read_verified("../outside.webp", digest)
+
 
 if __name__ == "__main__":
     unittest.main()
