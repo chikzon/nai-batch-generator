@@ -239,6 +239,10 @@ from src.nai_studio.web.routes.catalog import (
     CatalogGetOperations,
     handle_catalog_get,
 )
+from src.nai_studio.web.routes.catalog_post import (
+    CatalogPostOperations,
+    handle_catalog_post,
+)
 from src.nai_studio.web.routes.collection_post import (
     CollectionPostOperations,
     handle_collection_post,
@@ -12788,6 +12792,14 @@ class ConfigServer:
             reference_add=server.handle_ref_add,
             reference_save=server.handle_ref_save,
         )
+        catalog_post = CatalogPostOperations(
+            style_save=server.handle_style_save,
+            normalization_save=server.handle_norm_save,
+            verify_tags=verify_tags,
+            organize_library=organize_library_items,
+            delete_styles=delete_styles,
+            restore_styles=restore_styles,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12814,6 +12826,8 @@ class ConfigServer:
                 if handle_recovery_post(self, server, recovery_post, body):
                     return
                 if handle_collection_post(self, server, collection_post, body):
+                    return
+                if handle_catalog_post(self, catalog_post, body):
                     return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
@@ -12846,16 +12860,6 @@ class ConfigServer:
                     self._json(server.handle_compare_run(body))
                 elif self.path.startswith("/api/start"):
                     self._json(server.handle_start())
-                elif self.path.startswith("/api/style_save"):
-                    self._json(server.handle_style_save(body))
-                elif self.path.startswith("/api/norm_save"):
-                    self._json(server.handle_norm_save(body))
-                elif self.path.startswith("/api/verify_tags"):
-                    try:
-                        d = json.loads(body) if body else {}
-                        self._json(verify_tags(d.get("text") or ""))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/scene_duplicate_undo"):
                     try:
                         data = json.loads(body or b"{}")
@@ -13340,27 +13344,6 @@ class ConfigServer:
                         self._json(setting_delete(d.get("name", "")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/library_organize"):
-                    try:
-                        payload = json.loads(body or b"{}")
-                        self._json(organize_library_items(payload))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/style_del"):
-                    # 몇천 건을 넣고 나면 지울 수 있어야 정리가 된다.
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(delete_styles(d.get("ids")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/style_restore"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(restore_styles(d.get("ids")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                # ⚠ style_dupes · pack_log 는 **읽기라 GET 분기**에 있다.
-                #    여기(POST)에 두면 화면의 fetch(기본 GET)가 빈 응답을 받는다.
                 elif self.path.startswith("/api/setting_dup"):
                     try:
                         d = json.loads(body or b"{}")
