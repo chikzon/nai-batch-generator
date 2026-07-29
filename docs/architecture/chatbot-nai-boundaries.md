@@ -27,6 +27,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | Anlas 비용·Opus 무료 조건 | `domain/costs.py` |
 | PNG·WebP·Stealth 메타데이터 복원 | `domain/image_metadata.py` |
 | NAI T5 토큰 계산 | `domain/tokenization.py` |
+| 캐릭터 위치 방식·좌표 검증·자동 분산 | `domain/positioning.py` |
 | 좌표·Reference·img2img를 포함한 NAI payload 조립 | `domain/nai_payload.py` |
 | 사용자 자료 잠금·원자 저장·손상 복구 | `runtime/data_files.py` |
 | 실행권·중지·진행률·미리보기 상태 | `runtime/live_state.py` |

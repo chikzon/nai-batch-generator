@@ -109,8 +109,12 @@ from src.nai_studio.domain.nai_payload import (
     variety_sigma_value,
 )
 from src.nai_studio.domain.positioning import (
+    normalize_scene_centers,
     normalize_position_mode,
     position_mode_uses_coords,
+    spread_centers,
+    with_centers,
+    with_position_mode,
 )
 from src.nai_studio.domain.restoration import summarize_restore_queue
 from src.nai_studio.domain.tokenization import (
@@ -8253,9 +8257,6 @@ def _variety_sigma_value(model, width, height, variety, p):
         model, width, height, variety, p, warn=log.warning)
 
 
-POS_GRID = [0.1, 0.3, 0.5, 0.7, 0.9]      # NAI 좌표 격자 (실제 이미지에서 이 5값만 나온다)
-
-
 def active_people(slots, centers=None, extra=None):
     """캐릭터 칸에서 **켠 인물만** 골라 (people, centers) 로 돌려준다.
     칸은 6명 넘게 둬도 되고, 보내는 것만 6명으로 자른다 (`enabled: False` 는 건너뜀).
@@ -8462,83 +8463,6 @@ def materialize_blueprint_into_config(cfg, blueprint):
     material = single_generation_legacy_material(blueprint)
     result.update(copy.deepcopy(material.get("config_overrides") or {}))
     return result
-
-
-def with_centers(cfg, ctrs):
-    """params 사본에 이 장에 쓸 좌표를 실어 준다 (원본 cfg 는 안 건드린다)."""
-    q = dict(cfg or {})
-    q["char_centers"] = ctrs
-    return q
-
-
-def with_position_mode(cfg, mode=None, use_positions=False):
-    """실행 사본에 위치 방식을 적용한다. 원본 설정과 보존 좌표는 바꾸지 않는다."""
-    q = dict(cfg or {})
-    raw = str(mode or "").strip().lower()
-    if raw in ("ai", "grid", "coordinate"):
-        q["position_mode"] = raw
-        q["use_coords"] = raw != "ai"
-    elif use_positions:
-        q["position_mode"] = "coordinate"
-        q["use_coords"] = True
-    return q
-
-
-def spread_centers(n):
-    """인물 n 명을 격자에 **겹치지 않게** 벌린 좌표.
-    한 줄은 5칸까지라 6명부터는 두 줄로 나눈다 (안 그러면 좌표가 겹쳐
-    좌표를 켜도 분리가 안 된다 — 실측에서 0.5 가 두 번 나와 잡았다).
-    2명은 실제 NAI 이미지에서 가장 흔한 0.3 / 0.7 을 쓴다."""
-    if n <= 1:
-        return [{"x": 0.5, "y": 0.5}]
-    if n == 2:
-        return [{"x": 0.3, "y": 0.5}, {"x": 0.7, "y": 0.5}]
-    rows = 1 if n <= 5 else 2
-    per = -(-n // rows)                    # 줄당 인원 (올림)
-    ys = [0.5] if rows == 1 else [0.3, 0.7]
-
-    def pick(k, total):
-        """격자 5칸에서 total 명을 고르게 — 인덱스가 겹치지 않게 고른다"""
-        if total == 1:
-            return POS_GRID[2]
-        step = 4 / (total - 1)
-        return POS_GRID[min(4, round(k * step))]
-
-    out = []
-    for i in range(n):
-        r = i // per
-        k = i % per
-        cnt = min(per, n - r * per)
-        out.append({"x": pick(k, cnt), "y": ys[min(r, len(ys) - 1)]})
-    return out
-
-
-def normalize_scene_centers(value):
-    """씬 파일에 저장할 캐릭터 위치를 검증한다.
-
-    빈 목록은 '이 씬에서는 전역 위치 설정을 따른다'는 뜻이다. 좌표가 켜진
-    씬은 NAI가 받는 0..1 범위의 x/y 쌍만 보존하며, 잘못된 자료를 조용히
-    일부만 저장하지 않고 요청 전체를 거절한다.
-    """
-    if value in (None, ""):
-        return []
-    if not isinstance(value, list):
-        raise ValueError("캐릭터 위치는 목록이어야 합니다.")
-    out = []
-    for i, center in enumerate(value[:MAX_CHARS]):
-        if not isinstance(center, dict):
-            raise ValueError(f"{i + 1}번 캐릭터 위치 형식이 잘못되었습니다.")
-        try:
-            x = float(center["x"])
-            y = float(center["y"])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            raise ValueError(f"{i + 1}번 캐릭터 위치는 x/y 숫자가 필요합니다.")
-        if not (math.isfinite(x) and math.isfinite(y)):
-            raise ValueError(f"{i + 1}번 캐릭터 위치는 유한한 숫자여야 합니다.")
-        if not (0 <= x <= 1 and 0 <= y <= 1):
-            raise ValueError(f"{i + 1}번 캐릭터 위치는 0~1 범위여야 합니다.")
-        out.append({"x": round(x, 4), "y": round(y, 4)})
-    return out
 
 
 def normalize_scene_reference_ids(value):
