@@ -1,52 +1,62 @@
 # Claude push 인계
 
-이 문서를 포함한 최신 `main` 커밋이 데스크톱 릴리스 후보다. 기능을 다시 고치거나
-조사를 반복하지 말고 아래 절차만 수행한다.
+이 문서를 포함한 최신 `main`이 데스크톱 릴리스 후보다. 기능을 다시 고치거나 외부 앱
+조사를 반복하지 말고 push와 원격 CI 확인만 한다.
 
-## 포함된 핵심 커밋
+## 최종 구현
 
-- `31c5dca` 생성 중심 작업실과 세팅 실험을 하나로 잇는다
-- `4668cd7` 작업 기록과 자료 출처 장부를 관리 화면에 잇는다
-- 이 문서를 포함한 최상단 커밋: README와 현재 인계 상태 갱신
+- 단건·자료팩·공개 수집·보유 폴더 감사를 복원 후보/증거 흐름으로 연결
+- 외형·착의·negative·variant·Reference·Vibe·좌표의 무손실 캐릭터 경로
+- 순회/동시 출연 캐스트, 캐릭터×세팅과 사용자 선택 실험
+- 클릭 시점 생성 snapshot, 직렬 실행, Job 저장·중단·재개·재실행
+- 실제 payload/이미지 SHA/request ID/blueprint 지문을 결과와 승격 장부에 연결
+- 50건 이후 메타데이터 후보 UI, 엄격 승격 실패의 구형 fallback 차단
+
+대표 커밋:
+
+- `3e379fa` 실행 설계도와 결과 계보의 손실 경계를 닫는다
+- `e277461` 승격 장부에서 서로 다른 캐릭터 내용을 보존한다
+- `523750d` 생성 설계도와 증거 감사를 실제 화면에 잇는다
+- `a0e1a7d` 선택 실험 leaf의 seed와 캐스트 계보를 고정한다
 
 ## 검증 결과
 
-- `python 검증.py`: 컴파일, 계약 10건, 아키텍처 3건, 회귀 147건 전부 통과
-- 빌드된 EXE 직접 기동: HTTP 200, 상단 생성·세팅·자료·빌더·관리 확인
-- `/api/jobs` 응답 확인
-- 토큰 접두사 검색 0건
-- 브라우저 자동화 도구가 로컬 커널 자산 오류로 열리지 않아 픽셀·스크린샷 재촬영은
-  수행하지 못했다. 이를 성공으로 바꿔 적지 않는다.
+- `python 검증.py`: 컴파일·계약·아키텍처·무과금 회귀 **165/165 통과**
+- 최신 소스와 최종 EXE: `/`, `/api/blueprint`, `/api/jobs`,
+  `/api/metadata_audit_status` HTTP 200
+- 설치본: 격리 설치 → 설치된 EXE 기동/HTTP 200 → 제거 → 레지스트리 정리
+- 개인 토큰 정규식 검사: 배포 폴더 0건. 저장소의 일치 문자열은 계약 시험용 가짜 값뿐
+- 실제 NAI 유료 호출: 이번 결함 검증에는 불필요해 사용하지 않음
+- 브라우저 자동 연결 도구는 로컬 자산 오류로 최신 스크린샷 재촬영 불가. 이를 성공으로
+  바꾸어 적지 않는다. 기존 1440·1280·390 화면 증거와 최신 JS/HTTP 검증을 사용했다.
 
 ## 로컬 산출물
 
-- `dist/NAI배치생성기/NAI배치생성기.exe`
-- `dist/NAI배치생성기-1.0.0-portable.zip`
-- `dist/NAI배치생성기-1.0.0-setup.exe`
-- `dist/NAI배치생성기-기본자료팩.zip`
+- `dist/NAI-batch-generator-1.0.0-portable-win-x64.zip`
+- `dist/NAI-batch-generator-1.0.0-datapack.zip`
+- `dist/NAI-batch-generator-1.0.0-setup.exe`
 - `dist/SHA256SUMS.txt`
 
 SHA-256:
 
 ```text
-dce8471fdea894eae387d28000962ada83d4e49c4a07e96f3889eaba9f6d7463  NAI배치생성기.exe
-e125d954866609e6a8dfb1cedce2fb69ad85a0eeded1afa1220824a40bb4ea06  NAI배치생성기-1.0.0-portable.zip
-385061fb691ec70ad1afa2d7e0de23c51182e67659251acc1e7623121a30524a  NAI배치생성기-1.0.0-setup.exe
-f18a73ed10c68ca14066f401654243912ffe25786a9c227ee8a5ab479ecff8b5  NAI배치생성기-기본자료팩.zip
+84b48292870dea3e4a1963325befaa5eeca0891ef711d30ad8ef1208e08735cc  NAI-batch-generator-1.0.0-portable-win-x64.zip
+ee49f2b09a0c6b81202480c6167ef1b1ff14852d07f8ef57607b6686bfec8467  NAI-batch-generator-1.0.0-datapack.zip
+d13cd4c42a3ccc484a3fc0882e839cf01fca926ec8e4bd49422b479d4c5cd416  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일
 
-1. `git status --short`가 비어 있는지 확인한다.
-2. `git log -3 --oneline`에서 위 구현 커밋과 최상단 인계 커밋을 확인한다.
-3. 토큰·개인 세팅·캐릭터·그림체·생성물이 추적되지 않았는지만 읽기 검사한다.
-4. 변경 없이 `git push origin main`을 실행한다.
-5. 원격 HEAD와 로컬 HEAD가 같은지, smoke CI가 통과하는지 확인해 사용자에게 보고한다.
+1. `git status --short`가 비어 있는지 확인
+2. 최신 문서 커밋과 위 구현 커밋 확인
+3. 토큰·개인 설정·캐릭터·그림체·생성물이 추적되지 않았는지 읽기 검사
+4. 변경 없이 `git push origin main`
+5. 원격 HEAD 일치와 smoke CI 결과 보고
 
 ## 하지 않을 일
 
 - 기능·테스트·문서 추가 수정
-- 기존 검증을 약화하거나 실패를 정상으로 처리
-- Release, 태그, 산출물 게시
+- 검증 약화 또는 실패 정상 처리
+- Release·태그·산출물 게시
 - 사용자 자료 이동·변환·삭제
 - 저장소 밖의 `성향 표`와 `로그 편집기` 접근
