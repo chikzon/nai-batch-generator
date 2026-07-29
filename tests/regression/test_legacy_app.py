@@ -2568,6 +2568,10 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(brief["pack_name"], "검증된 팩")
                 self.assertEqual(
                     brief["content_sha256"], manifest["content_sha256"])
+                self.assertEqual(
+                    result["restoration_queue"]["items"][0]["content_hash"],
+                    manifest["content_sha256"],
+                )
 
     def test_data_index_is_rebuildable_and_excludes_remote_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3971,6 +3975,14 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(asset["content"]["negative"], "bad anatomy")
         self.assertTrue(
             asset["content"]["generation_settings"]["quality_toggle"])
+        self.assertEqual(
+            result["style"]["content_sha256"],
+            hashlib.sha256(source.getvalue()).hexdigest(),
+        )
+        self.assertEqual(
+            result["restoration_queue"]["items"][0]["content_hash"],
+            result["style"]["content_sha256"],
+        )
 
     def test_blueprint_snapshot_exposes_rich_plan_and_token_free_assets(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
@@ -5067,6 +5079,10 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(snap["can_resume"])
             self.assertEqual(snap["cursor"], 1)
             self.assertEqual(len(snap["queue"]), 2)
+            self.assertNotIn("restoration_queue", snap)
+            restoration = manager.restoration_snapshot()
+            self.assertEqual(
+                len(restoration["restoration_queue"]["items"]), 2)
 
     def test_public_collection_detects_new_changed_unchanged_and_retries_only_failed_posts(self):
         class DummySession:

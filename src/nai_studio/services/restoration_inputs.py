@@ -517,6 +517,12 @@ def public_collection_queue(value: Mapping[str, Any]) -> dict:
                 or source_record.get("image_urls")
                 or []
             ),
+            "relations": {
+                **_record(source_record.get("relations")),
+                "evidence_refs": _json_copy(
+                    source_record.get("evidence_refs") or []
+                ),
+            },
         }
         if failure:
             status = "failed"

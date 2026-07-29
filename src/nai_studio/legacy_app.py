@@ -68,7 +68,6 @@ from src.nai_studio.runtime import (
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
     knowledge_assets_from_config,
-    restoration_queue_from_collection,
     sequence_plan_from_setting,
     style_asset_from_record,
 )
@@ -96,6 +95,13 @@ from src.nai_studio.services.prompt_bridge import (
 from src.nai_studio.services.resource_bridge import (
     export_legacy_resources,
     legacy_resource_import_plan,
+)
+from src.nai_studio.services.restoration_inputs import (
+    folder_inventory_queue,
+    image_batch_queue,
+    image_inspect_queue,
+    pack_import_queue,
+    public_collection_queue,
 )
 from src.nai_studio.services.variation_bridge import (
     character_asset_from_legacy_record,
@@ -4790,11 +4796,18 @@ def rebuild_data_index():
 def data_storage_status():
     """화면용 저장 위치와 마지막 색인 요약. 토큰·프롬프트 내용은 내보내지 않는다."""
     index = None
+    restoration = None
     path = _data_index_path()
     if path.is_file():
         try:
             loaded = load_json_recover(path)
             if isinstance(loaded, dict) and loaded.get("schema") == DATA_INDEX_SCHEMA:
+                queue = folder_inventory_queue(
+                    loaded.get("entries") or [],
+                    folder_label=PROFILE or "기본",
+                    status="indexed",
+                )
+                restoration = summarize_restore_queue(queue)
                 index = {key: loaded.get(key) for key in (
                     "generated_at", "files", "bytes", "by_root", "fingerprint")}
         except Exception:
@@ -4810,6 +4823,7 @@ def data_storage_status():
             for key in ("status", "copied", "skipped", "conflicts")
         },
         "index": index,
+        "restoration": restoration,
     }
 
 
@@ -5085,8 +5099,17 @@ def import_datapack_bytes(data, filename="", overwrite=False):
         batch["요약"] = " · ".join(report)
         rows.append(batch)
         save_pack_log(rows)
-    return {"ok": True, "added": files, "report": report,
-            "batch": batch.get("id"), "log": pack_log_brief()}
+    result = {
+        "ok": True,
+        "added": files,
+        "report": report,
+        "batch": batch.get("id"),
+        "log": pack_log_brief(),
+    }
+    queue = pack_import_queue(result, filename=filename)
+    result["restoration"] = summarize_restore_queue(queue)
+    result["restoration_queue"] = queue
+    return result
 
 
 def pack_log_brief():
@@ -8295,6 +8318,8 @@ def apply_evaluation_action(data):
         prior_decisions = picks.get("evaluation_decision_ids")
         if not isinstance(prior_decisions, list):
             prior_decisions = []
+        if action == "blind-match" and not decision_id:
+            raise ValueError("블라인드 비교 결정 식별자가 필요합니다.")
         if action == "blind-match" and decision_id in prior_decisions:
             return {
                 "ok": True,
@@ -12419,7 +12444,7 @@ async function loadJobCenter(){
     const jobActions = job => {
       if(!contracts.has(String(job.id || ''))) return [];
       const phase = String(job.phase || '');
-      if(['preparing','sending','receiving','saving'].includes(phase)){
+      if(['preparing','sending','receiving'].includes(phase)){
         return [['pause','일시정지'],['cancel','취소']];
       }
       if(phase === 'paused') return [['resume','이어가기'],['cancel','취소']];
@@ -16776,15 +16801,29 @@ function setupInspectDrop(){ bindDropZone($('comboDrop'), $('comboFile')); }
 async function inspectImages(files){
   const imgs = files.filter(f => /\.(png|webp)$/i.test(f.name));
   if(!imgs.length){ flash('PNG 또는 WebP 파일을 넣어주세요.'); return 0; }
-  let ok = 0, fail = 0, last = null;
+  let ok = 0, fail = 0, last = null, restored = [];
   for(const f of imgs){
     flash(`읽는 중... ${f.name}`);
     try{
       const r = await (await fetch('/api/inspect', {method:'POST',
         headers:{'X-Filename': encodeURIComponent(f.name), 'X-Save':'1'},
         body: await f.arrayBuffer()})).json();
+      restored.push(Object.assign({filename:f.name}, r));
       if(r.ok){ ok++; last = r.style; } else fail++;
-    }catch(e){ fail++; }
+    }catch(e){
+      fail++;
+      restored.push({ok:false, filename:f.name, error:String(e)});
+    }
+  }
+  if(restored.length > 1){
+    try{
+      const batch = await (await fetch('/api/restoration_batch', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({items:restored, cursor:restored.length, status:'completed'})})).json();
+      if(batch.ok) window.LAST_RESTORATION_BATCH = batch.restoration_queue;
+    }catch(e){
+      console.warn('다중 이미지 복원 큐를 합치지 못했습니다.', e);
+    }
   }
   flash(`${ok}개 추출 완료${fail ? `, ${fail}개는 생성 정보가 없었습니다` : ''}`);
   if(ok){
@@ -18490,9 +18529,19 @@ class PublicCollectionManager:
                 reverse=True,
             )
             data["can_retry_failed"] = bool(data["failed_items"])
-            data["restoration"] = summarize_restore_queue(
-                restoration_queue_from_collection(data))
+            queue = public_collection_queue(data)
+            data["restoration"] = summarize_restore_queue(queue)
             return data
+
+    def restoration_snapshot(self):
+        """2초 상태 polling과 분리한 전체 복원 큐. 사용자가 열 때만 만든다."""
+        with self.lock:
+            queue = public_collection_queue(copy.deepcopy(self.state))
+        return {
+            "ok": True,
+            "restoration": summarize_restore_queue(queue),
+            "restoration_queue": queue,
+        }
 
     def _fresh_job(self, *, status, stage, queue, direct_urls=None,
                    keyword=None, pages=0, max_posts=100):
@@ -18690,9 +18739,17 @@ class PublicCollectionManager:
             del errors[:-20]
             self._save_locked()
 
-    def _remember_article(self, article, digest, classification, metadata_images):
+    def _remember_article(
+        self,
+        article,
+        digest,
+        classification,
+        metadata_images,
+        evidence_refs=None,
+    ):
         url = str(article.get("source_url") or "")
         with self.lock:
+            prior = (self.state.get("articles") or {}).get(url) or {}
             self.state.setdefault("articles", {})[url] = {
                 "url": url,
                 "article_id": str(article.get("article_id") or ""),
@@ -18701,6 +18758,11 @@ class PublicCollectionManager:
                 "content_sha256": digest,
                 "image_count": len(article.get("image_urls") or []),
                 "metadata_images": int(metadata_images or 0),
+                "evidence_refs": list(
+                    evidence_refs
+                    if evidence_refs is not None
+                    else prior.get("evidence_refs") or []
+                ),
                 "last_seen": datetime.now().isoformat(timespec="seconds"),
             }
             key = {
@@ -18765,6 +18827,7 @@ class PublicCollectionManager:
             }
         classification = "changed" if previous else "new"
         found_metadata = 0
+        evidence_refs = []
         image_errors = []
         for image_index, image_url in enumerate(article.get("image_urls") or [], 1):
             if not self._checkpoint():
@@ -18790,6 +18853,16 @@ class PublicCollectionManager:
                 local_ref, created = _local_import_image(
                     data, content_type, image_url)
                 record["images"] = [local_ref]
+                record["content_sha256"] = hashlib.sha256(data).hexdigest()
+                evidence_record = evidence_from_image_record(record)
+                knowledge_asset = style_asset_from_record(
+                    record,
+                    evidence_refs=[evidence_record["id"]],
+                    lifecycle="candidate",
+                )
+                record["evidence_records"] = [evidence_record]
+                record["knowledge_asset"] = knowledge_asset
+                evidence_refs.append(evidence_record["id"])
                 filename = local_ref[6:]
                 detail = add_style(
                     record,
@@ -18818,7 +18891,12 @@ class PublicCollectionManager:
                 "error": " · ".join(image_errors),
             }
         self._remember_article(
-            article, digest, classification, found_metadata)
+            article,
+            digest,
+            classification,
+            found_metadata,
+            evidence_refs=evidence_refs,
+        )
         return {
             "ok": True, "classification": classification,
             "metadata_images": found_metadata, "article": article,
@@ -20155,13 +20233,25 @@ class ConfigServer:
             from urllib.parse import unquote
             name = Path(unquote(filename or "")).name or "붙여넣은 이미지"
             if not body:
-                return {"ok": False, "error": "이미지가 비어 있습니다."}
+                result = {"ok": False, "error": "이미지가 비어 있습니다."}
+                queue = image_inspect_queue(result, filename=name)
+                result["restoration"] = summarize_restore_queue(queue)
+                result["restoration_queue"] = queue
+                return result
             ct = "image/webp" if body[:4] == b"RIFF" else "image/png"
             m = extract_nai_metadata(body, ct)
             if m["metadata_status"] != "ok":
-                return {"ok": False, "error":
+                result = {
+                    "ok": False,
+                    "error": (
                         "이 이미지에는 NAI 생성 정보가 없습니다. "
-                        "(카톡·디스코드 등을 거치면 지워집니다 — 원본 파일을 넣어주세요)"}
+                        "(카톡·디스코드 등을 거치면 지워집니다 — 원본 파일을 넣어주세요)"
+                    ),
+                }
+                queue = image_inspect_queue(result, filename=name)
+                result["restoration"] = summarize_restore_queue(queue)
+                result["restoration_queue"] = queue
+                return result
             artists, rest = parse_artist_combo(m["base"])
             # 새 결과에는 우리가 ucPreset·qualityToggle 을 Comment JSON에 직접 기록한다.
             # 옛 NAI 파일처럼 값이 없을 때만 문구에서 역추적한다.
@@ -20186,6 +20276,7 @@ class ConfigServer:
                 # 파이썬 hash()는 프로세스마다 달라 같은 파일이 재실행 뒤 다른 id가 된다.
                 # 전체 원본 바이트의 SHA-256을 써 모든 임포트 경로에서 안정적으로 식별한다.
                 "id": f"file-{hashlib.sha256(body).hexdigest()[:20]}",
+                "content_sha256": hashlib.sha256(body).hexdigest(),
                 "title": Path(name).stem[:80], "source": "내 이미지",
                 "tab": "", "posted_at": "", "recommend": None, "views": None, "url": "",
                 "count": len(artists),
@@ -20246,14 +20337,25 @@ class ConfigServer:
                     import_info={"kind": "image", "file": name, "files": files},
                     return_detail=True,
                 )
-            return {
+            result = {
                 "ok": True, "style": rec,
                 "saved": saved.get("total") if saved else None,
                 "import": saved,
             }
+            queue = image_inspect_queue(result, filename=name)
+            result["restoration"] = summarize_restore_queue(queue)
+            result["restoration_queue"] = queue
+            return result
         except Exception as e:
             log.warning(f"메타데이터 추출 실패: {traceback.format_exc()}")
-            return {"ok": False, "error": str(e)}
+            result = {"ok": False, "error": str(e)}
+            queue = image_inspect_queue(
+                result,
+                filename=Path(str(filename or "")).name,
+            )
+            result["restoration"] = summarize_restore_queue(queue)
+            result["restoration_queue"] = queue
+            return result
 
     def handle_resource_import(self, body, filename=""):
         """Vibe 교환 문서를 기존 저장소에 비활성 자원으로 안전하게 추가."""
@@ -20950,6 +21052,11 @@ class ConfigServer:
                         self._json({"ok": True, "log": pack_log_brief()})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/public_collection_restoration"):
+                    try:
+                        self._json(PUBLIC_COLLECTION.restoration_snapshot())
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/public_collection"):
                     try:
                         self._json(PUBLIC_COLLECTION.snapshot())
@@ -21255,6 +21362,21 @@ class ConfigServer:
                             "files": index["files"],
                             "bytes": index["bytes"],
                             "fingerprint": index["fingerprint"],
+                        })
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/restoration_batch"):
+                    try:
+                        data = json.loads(body or b"{}")
+                        queue = image_batch_queue(
+                            data.get("items") or [],
+                            cursor=data.get("cursor"),
+                            status=data.get("status") or "completed",
+                        )
+                        self._json({
+                            "ok": True,
+                            "restoration": summarize_restore_queue(queue),
+                            "restoration_queue": queue,
                         })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
@@ -21782,6 +21904,18 @@ class ConfigServer:
                         r = import_datapack_bytes(
                             body, unquote(self.headers.get("X-Filename", "")),
                             overwrite="overwrite=1" in self.path)
+                        if "restoration_queue" not in r:
+                            queue = pack_import_queue(
+                                {
+                                    **r,
+                                    "archive_sha256": hashlib.sha256(body).hexdigest(),
+                                },
+                                filename=unquote(
+                                    self.headers.get("X-Filename", "")
+                                ),
+                            )
+                            r["restoration"] = summarize_restore_queue(queue)
+                            r["restoration_queue"] = queue
                         if r.get("ok"):
                             # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
                             # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
@@ -21793,7 +21927,19 @@ class ConfigServer:
                             OPTIONS.update(load_options())
                         self._json(r)
                     except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
+                        result = {"ok": False, "error": str(e)}
+                        queue = pack_import_queue(
+                            {
+                                **result,
+                                "archive_sha256": hashlib.sha256(body).hexdigest(),
+                            },
+                            filename=unquote(
+                                self.headers.get("X-Filename", "")
+                            ),
+                        )
+                        result["restoration"] = summarize_restore_queue(queue)
+                        result["restoration_queue"] = queue
+                        self._json(result)
                 elif self.path.startswith("/api/library_organize"):
                     try:
                         payload = json.loads(body or b"{}")
