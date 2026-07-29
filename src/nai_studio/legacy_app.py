@@ -10549,10 +10549,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   .sec-body.hidden{display:none;}
   .tagres{max-height:92px;overflow-y:auto;margin:4px 0;}
   /* ── 빌더: "태그 수천 개"보다 "무엇을 만드는 중인가"가 먼저 보이게 ── */
-  .builder-entry-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:13px;}
+  .builder-entry-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:13px;}
   .builder-entry{display:flex;flex-direction:column;align-items:flex-start;min-height:142px;padding:16px;
     border:1px solid var(--line);border-radius:calc(var(--radius) + 3px);background:var(--paper2);}
   .builder-entry.char{background:linear-gradient(145deg,var(--paper2),var(--accent-dim));}
+  .builder-entry.artist{background:linear-gradient(145deg,var(--paper2),color-mix(in srgb,var(--accent) 10%,var(--paper)));}
   .builder-entry .eyebrow{font-family:var(--mono);font-size:var(--fs-2xs);color:var(--accent);
     letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px;}
   .builder-entry strong{font-size:calc(var(--fs) + 1px);margin-bottom:5px;}
@@ -11196,12 +11197,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div id="studioSettingsNav" class="studio-subnav hidden" aria-label="세팅 작업 선택">
         <div class="studio-subnav-copy">
           <span class="eyebrow">Setting workspace</span>
-          <strong>골라 쓰고, 가볍게 변주하고, 필요할 때만 구조를 편집합니다</strong>
+          <strong>씬을 고르고 구조를 편집한 뒤, 빠른 변주나 비교 실험으로 이어갑니다</strong>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="세팅 작업">
           <button type="button" data-settings-work="select" role="tab">씬 고르기</button>
-          <button type="button" data-settings-work="quick" role="tab">빠른 변주</button>
           <button type="button" data-settings-work="build" role="tab">세팅 만들기</button>
+          <button type="button" data-settings-work="quick" role="tab">빠른 변주</button>
           <button type="button" data-settings-work="compare" role="tab">비교 실험</button>
         </div>
       </div>
@@ -11448,6 +11449,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <p>작가·구도·조명·화풍과 <b>네거티브·생성 설정값</b>을 한 묶음으로 보관합니다.</p>
             <button class="primary" id="bStyle">그림체 만들기</button>
           </div>
+          <div class="builder-entry artist">
+            <span class="eyebrow">Artist group</span><strong>🎨 작가 조합</strong>
+            <p>작가 수·평점·가중치·고정 순서를 정하고 균형·곡선·무작위 조합을 만듭니다.</p>
+            <button class="primary" id="bCombo">작가 조합 만들기</button>
+          </div>
           <div class="builder-entry char">
             <span class="eyebrow">Character</span><strong>👤 캐릭터 한 명</strong>
             <p>정체·외형·머리·의상·원작과 다른 변형을 고릅니다. 저장 후 캐릭터 칸에 바로 넣을 수 있습니다.</p>
@@ -11455,8 +11461,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
         <div class="builder-tools">
-          <span class="label">보조 도구</span>
-          <button id="bCombo">🎨 작가 조합 고르기</button>
+          <span class="label">프롬프트 보조</span>
+          <button id="bFrags">🎲 프롬프트 조각 관리 ↗</button>
           <button id="bNorm">📋 기존 프롬프트 자동 분류</button>
         </div>
       </div>
@@ -11469,8 +11475,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="view" id="vLibrary" style="display:none;">
+      <div id="studioLibraryNav" class="studio-subnav hidden" aria-label="자료 작업 선택">
+        <div class="studio-subnav-copy">
+          <span class="eyebrow">Library workspace</span>
+          <strong>가져온 뒤 자료실에서 정리하고, 결과를 선별·복구합니다</strong>
+        </div>
+        <div class="studio-subnav-actions" role="tablist" aria-label="자료 작업">
+          <button type="button" data-library-work="input" role="tab">자료 가져오기</button>
+          <button type="button" data-library-work="catalog" role="tab">통합 자료실</button>
+          <button type="button" data-library-work="results" role="tab">결과·선별</button>
+        </div>
+      </div>
       <div id="studioLibraryBrowse">
-      <div class="card">
+      <div class="card" id="libraryPublicCard" data-library-panel="input">
         <h2><span class="n">수집</span>공개 그림체 자료 가져오기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">결과는 공통 그림체 자료로 바로 정리</span></h2>
         <p class="hint">아카라이브 AI 그림 채널의 공개 게시글 주소를 넣거나
@@ -11512,7 +11529,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
-      <div class="card">
+      <div class="card" id="libraryResultsCard" data-library-panel="results">
         <h2><span class="n">생성물</span>탐색기 · 선별
           <span class="count" id="expCount" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-2xs);color:var(--muted);"></span></h2>
         <p class="hint">뽑아 둔 그림을 훑어보고 <b>고르는</b> 곳입니다. 그림을 누르면 크게 보이고,
@@ -11562,7 +11579,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
            탐색·선별과는 하는 일이 다르다(고르는 것이 아니라 **새로 뽑는다**. 결과도
            `output/복구/` 라는 다른 자리에 쌓이고 Anlas 도 든다). 한 카드 안에 있을 때는
            선별 도구 사이에 끼어 '이것도 고르는 기능인가' 로 읽혔다. 카드를 갈랐다. -->
-      <div class="card">
+      <div class="card" id="libraryRestoreCard" data-library-panel="results">
         <h2><span class="n">복구</span>그림체 복구 — 그 설정 그대로 다시 뽑기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">결과는 output/복구/ 에</span></h2>
         <p class="hint">그림에 박힌 <b>프롬프트·시드·설정값</b>을 읽어 그대로 다시 돌립니다.
@@ -11579,7 +11596,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="libraryPackCard" data-library-panel="input">
         <h2><span class="n">자료팩</span>자료 넣기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">후보·태그·세팅·수집물을 한 번에</span></h2>
         <p class="hint">앱 본체에는 <b>후보사전·태그·개인 세팅·수집 자료가 들어 있지 않습니다.</b>
@@ -11627,7 +11644,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="libraryBooruCard" data-library-panel="input">
         <h2><span class="n">검색</span>단부루에서 찾기
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">태그·그림체를 실제 그림에서 가져오기</span></h2>
         <p class="hint">태그로 검색해서 마음에 드는 그림의 <b>태그를 그대로 가져오거나</b>,
@@ -11647,7 +11664,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="booruGrid" class="grid4"></div>
         <div class="bar"><button id="booruMore" style="flex:1;display:none;">다음 쪽 ▾</button></div>
       </div>
-      <div class="card">
+      <div class="card" id="libraryCatalogCard" data-library-panel="catalog">
         <h2><span class="n">자료실</span>캐릭터 · 그림체 · 레시피 · 세팅 · 생성 기록</h2>
         <p class="hint">저장 위치가 달라도 모든 큰 묶음을 한곳에서 찾습니다.
         캐릭터·그림체·레시피는 통째로 가져다 쓰고, 세팅은 편집기로,
@@ -11699,7 +11716,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="libGrid" class="items" style="grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:7px;"></div>
         <div class="bar"><button type="button" id="libMore" style="flex:1;display:none;">더 보기 ▾</button></div>
       </div>
-      <div class="card" id="recipeLibraryCard">
+      <div class="card" id="recipeLibraryCard" data-library-panel="catalog">
         <h2><span class="n">레시피</span>남들의 조합 <span class="n" id="recStat" style="margin-left:auto;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);"></span></h2>
         <p class="hint">도랑위키 등에서 모은 실제 사용 프롬프트입니다. 눌러서 태그·포지티브·네거티브를 보고 내 것으로 가져오세요.</p>
         <div class="bar">
@@ -11710,7 +11727,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bar" style="margin-top:10px;"><button id="recMore" style="flex:1;">더 보기 ▾</button></div>
       </div>
 
-      <div class="card" id="charEditorCard">
+      <div class="card" id="charEditorCard" data-library-panel="catalog">
         <h2><span class="n">편집</span>캐릭터 상세
           <button type="button" id="charUndo" class="hidden" style="margin-left:auto;">↶ 최근 삭제 되돌리기</button></h2>
         <p class="hint" id="charEditMsg">복제로 의상·예술적 변형을 나누고, 삭제한 항목은 이 화면을 닫기 전 되돌릴 수 있습니다.</p>
@@ -11732,9 +11749,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <strong>설정과 안전장치, 진행 작업, 출력 도구를 나눠 봅니다</strong>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="관리 작업">
-          <button type="button" data-manage-work="environment" role="tab">환경</button>
-          <button type="button" data-manage-work="safety" role="tab">안전·복구</button>
           <button type="button" data-manage-work="jobs" role="tab">작업·진단</button>
+          <button type="button" data-manage-work="environment" role="tab">계정·화면</button>
+          <button type="button" data-manage-work="safety" role="tab">백업·복구</button>
           <button type="button" data-manage-work="tools" role="tab">출력 도구</button>
         </div>
       </div>
@@ -12316,6 +12333,7 @@ async function comparisonRunsLoad(){
 async function openComparisonFolder(folder, message='비교 결과를 선별하세요.'){
   if(!folder) return;
   STATE.ui = STATE.ui || {};
+  STATE.ui.library_work = 'results';
   setMode('library');
   arrangeStudioWorkspace();
   await expLoad(folder);
@@ -13743,9 +13761,23 @@ function bindStudioManageNav(){
   });
   if($('jobCenterRefresh')) $('jobCenterRefresh').addEventListener('click', loadJobCenter);
 }
+function bindStudioLibraryNav(){
+  const nav = $('studioLibraryNav');
+  if(!nav || nav._bound) return;
+  nav._bound = true;
+  nav.querySelectorAll('[data-library-work]').forEach(button => {
+    button.addEventListener('click', () => {
+      STATE.ui = STATE.ui || {};
+      STATE.ui.library_work = button.dataset.libraryWork;
+      arrangeStudioWorkspace();
+      save();
+    });
+  });
+}
 function arrangeStudioWorkspace(){
   if(!STATE) return;
   bindStudioSettingsNav();
+  bindStudioLibraryNav();
   bindStudioManageNav();
   const studio = (STATE.ui || {}).layout !== 'classic';
 
@@ -13784,9 +13816,26 @@ function arrangeStudioWorkspace(){
     });
   }
 
+  const libraryNav = $('studioLibraryNav');
+  const libraryWork = ['input','catalog','results'].includes(
+    (STATE.ui || {}).library_work) ? STATE.ui.library_work : 'input';
+  if(libraryNav){
+    libraryNav.classList.toggle('hidden', !studio);
+    document.querySelectorAll('[data-library-panel]').forEach(panel => {
+      panel.classList.toggle(
+        'hidden', studio && panel.dataset.libraryPanel !== libraryWork);
+    });
+    libraryNav.querySelectorAll('[data-library-work]').forEach(button => {
+      const on = button.dataset.libraryWork === libraryWork;
+      button.classList.toggle('on', on);
+      button.setAttribute('aria-selected', on ? 'true' : 'false');
+      button.tabIndex = on ? 0 : -1;
+    });
+  }
+
   const manageNav = $('studioManageNav');
   const manageWork = ['environment','safety','jobs','tools'].includes(
-    (STATE.ui || {}).manage_work) ? STATE.ui.manage_work : 'environment';
+    (STATE.ui || {}).manage_work) ? STATE.ui.manage_work : 'jobs';
   if(manageNav){
     manageNav.classList.toggle('hidden', !studio);
     document.querySelectorAll('[data-manage-panel]').forEach(panel => {
@@ -14294,7 +14343,11 @@ function renderSettings(){
       <p class="hint" style="margin:7px 0 10px;">본체와 자료는 분리되어 있습니다.
       기본자료팩을 자료 탭에 넣거나, 위의 새 세팅으로 직접 만드세요.</p>
       <button id="setGoData">기본자료팩 넣으러 가기</button></div>`;
-    $('setGoData').addEventListener('click', () => setMode('library'));
+    $('setGoData').addEventListener('click', () => {
+      STATE.ui = STATE.ui || {};
+      STATE.ui.library_work = 'input';
+      setMode('library');
+    });
   }
   SETTINGS.forEach(st => {
     const s = stState(st.name);
@@ -18219,6 +18272,8 @@ function bindWelcome(){
     if(token){ token.scrollIntoView({behavior:'smooth', block:'center'}); token.focus(); }
   });
   $('welcomePack').addEventListener('click', () => {
+    STATE.ui = STATE.ui || {};
+    STATE.ui.library_work = 'input';
     setMode('library');
     const pack = $('packDrop');
     if(pack) pack.scrollIntoView({behavior:'smooth', block:'center'});
@@ -18764,6 +18819,11 @@ function openBuilder(kind){
 $('bCombo').addEventListener('click', () => openCombos(null));
 $('bStyle').addEventListener('click', () => openBuilder('style'));
 $('bChar').addEventListener('click', () => openBuilder('char'));
+$('bFrags').addEventListener('click', () => {
+  setMode('preview');
+  const trigger = document.querySelector('[data-ovl="frags"]');
+  if(trigger) trigger.click();
+});
 
 $('bNorm').addEventListener('click', () => {
   window._mm = 'norm';

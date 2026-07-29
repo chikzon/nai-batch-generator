@@ -4244,8 +4244,8 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("if(last && imgs.length === 1) openApplyPicker(last);", page)
         self.assertNotIn("applyStyle(last)", page)
 
-    def test_studio_library_moves_one_comparison_card_and_classic_restores_it(self):
-        """비교 실험은 세팅 안에 두고 기존 화면에서도 같은 DOM 하나를 써야 한다."""
+    def test_studio_library_groups_inputs_catalog_and_results_without_duplicate_cards(self):
+        """자료 작업을 세 흐름으로 나누되 기존 화면에서는 같은 카드를 모두 보여야 한다."""
         page = APP.render_page()
         css = (
             ROOT / "src" / "nai_studio" / "web" / "static" / "studio.css"
@@ -4254,7 +4254,12 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('id="compareClassicHome"', page)
         self.assertIn('data-settings-work="compare"', page)
         self.assertNotIn('id="studioCompareHome"', page)
-        self.assertNotIn('id="studioLibraryNav"', page)
+        self.assertEqual(page.count('id="studioLibraryNav"'), 1)
+        for work in ("input", "catalog", "results"):
+            self.assertIn(f'data-library-work="{work}"', page)
+            self.assertIn(f'data-library-panel="{work}"', page)
+        self.assertIn("panel.dataset.libraryPanel !== libraryWork", page)
+        self.assertIn("libraryNav.classList.toggle('hidden', !studio)", page)
         self.assertIn("classicHome.insertAdjacentElement('afterend', card)", page)
         self.assertIn("compare: card", page)
         self.assertIn("STATE.ui.settings_work = 'compare'", page)
