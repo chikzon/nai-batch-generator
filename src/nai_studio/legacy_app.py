@@ -215,6 +215,9 @@ from src.nai_studio.services.generation_blueprint import (
     BLUEPRINT_GENERATION_KEYS,
     generation_blueprint,
 )
+from src.nai_studio.services.generation_runtime import (
+    runtime_generation_params as _prepare_runtime_references,
+)
 from src.nai_studio.services.nai_client import (
     APIError,
     AccountBannedError,
@@ -991,57 +994,16 @@ def prepare_char_refs(cfg):
 
 
 def runtime_generation_params(cfg, token, include_refs=True):
-    """현재 설정에서 한 호출에만 쓸 레퍼런스 파라미터를 만든다.
-
-    `_vibes`/`_char_refs`는 영구 설정이 아니라 전송 직전 계산값이다. 공유 cfg에
-    남기면 앞 배치의 레퍼런스가 단독·씬·복구 호출로 새므로 항상 제거한 복사본에서
-    시작한다. 메타데이터 복구는 원본에 없는 현재 레퍼런스를 덧붙이지 않는다.
-    """
-    params = dict(cfg or {})
-    params.pop("_vibes", None)
-    params.pop("_char_refs", None)
-    if not include_refs:
-        return params
-    active_vibes = [
-        item for item in (cfg.get("vibes") or [])
-        if isinstance(item, dict) and item.get("enabled")
-    ]
-    active_char_refs = [
-        item for item in (cfg.get("char_refs") or [])
-        if isinstance(item, dict) and item.get("enabled")
-    ]
-    if active_vibes and active_char_refs:
-        raise ValueError(
-            "NAI에서는 바이브와 캐릭터 레퍼런스를 동시에 사용할 수 없습니다. "
-            "둘 중 하나를 꺼주세요."
-        )
-    try:
-        encoded, strengths, ies, newly = prepare_vibes(cfg, token)
-        images, types, ref_strengths, fidelities = prepare_char_refs(cfg)
-        params["_vibes"] = {
-            "encoded": encoded,
-            "strengths": strengths,
-            "ies": ies,
-        }
-        params["_char_refs"] = {
-            "images": images,
-            "types": types,
-            "strengths": ref_strengths,
-            "fidelities": fidelities,
-        }
-        if newly:
-            log.info(f"바이브 {newly}개를 새로 인코딩했습니다.")
-    except Exception as e:
-        if any(
-            item.get("enabled") and item.get("_required")
-            for item in (cfg.get("char_refs") or [])
-            if isinstance(item, dict)
-        ):
-            raise
-        log.warning(f"레퍼런스 준비 실패 — 레퍼런스 없이 계속합니다: {e}")
-        params["_vibes"] = {}
-        params["_char_refs"] = {}
-    return params
+    """기존 호출 이름을 유지하면서 전송 직전 레퍼런스 조립을 위임한다."""
+    return _prepare_runtime_references(
+        cfg,
+        token,
+        include_refs=include_refs,
+        prepare_vibes=prepare_vibes,
+        prepare_char_refs=prepare_char_refs,
+        info=log.info,
+        warn=log.warning,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════

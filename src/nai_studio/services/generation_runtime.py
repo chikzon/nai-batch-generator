@@ -231,4 +231,68 @@ def token_response(application: Any, operations: Any, data: dict) -> dict:
     }
 
 
-__all__ = ["anlas_response", "token_response"]
+def runtime_generation_params(
+    config: dict,
+    token: str,
+    *,
+    include_refs: bool = True,
+    prepare_vibes: Any,
+    prepare_char_refs: Any,
+    info: Any,
+    warn: Any,
+) -> dict:
+    """한 NAI 호출에만 쓸 Vibe·Character Reference 파생값을 만든다."""
+    params = dict(config or {})
+    params.pop("_vibes", None)
+    params.pop("_char_refs", None)
+    if not include_refs:
+        return params
+    active_vibes = [
+        item
+        for item in (config.get("vibes") or [])
+        if isinstance(item, dict) and item.get("enabled")
+    ]
+    active_char_refs = [
+        item
+        for item in (config.get("char_refs") or [])
+        if isinstance(item, dict) and item.get("enabled")
+    ]
+    if active_vibes and active_char_refs:
+        raise ValueError(
+            "NAI에서는 바이브와 캐릭터 레퍼런스를 동시에 사용할 수 없습니다. "
+            "둘 중 하나를 꺼주세요."
+        )
+    try:
+        encoded, strengths, ies, newly = prepare_vibes(config, token)
+        images, types, ref_strengths, fidelities = prepare_char_refs(config)
+        params["_vibes"] = {
+            "encoded": encoded,
+            "strengths": strengths,
+            "ies": ies,
+        }
+        params["_char_refs"] = {
+            "images": images,
+            "types": types,
+            "strengths": ref_strengths,
+            "fidelities": fidelities,
+        }
+        if newly:
+            info(f"바이브 {newly}개를 새로 인코딩했습니다.")
+    except Exception as error:
+        if any(
+            item.get("enabled") and item.get("_required")
+            for item in (config.get("char_refs") or [])
+            if isinstance(item, dict)
+        ):
+            raise
+        warn(f"레퍼런스 준비 실패 — 레퍼런스 없이 계속합니다: {error}")
+        params["_vibes"] = {}
+        params["_char_refs"] = {}
+    return params
+
+
+__all__ = [
+    "anlas_response",
+    "runtime_generation_params",
+    "token_response",
+]
