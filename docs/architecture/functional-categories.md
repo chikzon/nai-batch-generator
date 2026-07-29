@@ -6,8 +6,8 @@
 
 | 대상 | 실측 | 분류 상태 |
 |---|---:|---|
-| 제품 Python | 74파일 · 1,098개 함수·클래스 | 디렉터리·모듈 소유권으로 전부 배정 |
-| 50줄 이상 제품 정의 | 151개 | 별도 소유 모듈 78개, `legacy_app.py` 잔존 73개 |
+| 제품 Python | 75파일 · 1,099개 함수·클래스 | 디렉터리·모듈 소유권으로 전부 배정 |
+| 50줄 이상 제품 정의 | 151개 | 별도 소유 모듈 80개, `legacy_app.py` 잔존 71개 |
 | HTTP | GET 40 · POST 74 | 생성·세팅·자료·빌더·관리·공통에 전부 배정, 누락·중복 0 |
 | 정적 DOM id | 518개 | 생성 216 · 세팅 80 · 자료 113 · 빌더 5 · 관리 78 · 공통 26 |
 | `studio.js` | 8,500줄 · 선언 함수 259개 | 화면 기능은 분류됨, 파일 분리는 미완료 |
@@ -26,14 +26,14 @@
 `domain`은 저장·HTTP를 모르고, `services`는 domain을 조립하며, `web/routes`는
 주입된 Operations만 호출한다. `legacy_app.py`는 아직 완전한 조립·호환 계층이 아니다.
 
-## `legacy_app.py`에 남은 큰 정의 73개
+## `legacy_app.py`에 남은 큰 정의 71개
 
 아래 이름은 50줄 이상 정의를 한 번씩만 배정한 목록이다.
 
 | 범주 | 잔존 정의 |
 |---|---|
 | 생성 | `runtime_generation_params`, `comparison_styles`, `normalize_comparison_selection`, `iter_selected_comparison_jobs`, `comparison_selected_plan`, `iter_character_setting_jobs`, `comparison_character_setting_plan`, `comparison_plan`, `comparison_signature`, `iter_comparison_jobs`, `comparison_job_recipe_snapshot`, `comparison_recipe_context`, `compute_pending`, `_comparison_progress_start`, `_rerun_selected_comparison`, `_run_comparison`, `_run_generation`, `handle_job_command`, `handle_generate_one`, `handle_i2i`, `handle_regen`, `handle_scene_run`, `handle_compare_run`, `handle_director`, 중첩 생성 `run` 4개 |
-| 세팅 | `migrate_legacy_selections`, `_migrate_legacy`, `import_char_files`, `sync_chars_to_files`, `normalize_cast_presets`, `validate_config_value`, `handle_blueprint_project`, `handle_save`, `handle_scene_save` |
+| 세팅 | `migrate_legacy_selections`, `_migrate_legacy`, `import_char_files`, `sync_chars_to_files`, `handle_blueprint_project`, `handle_save`, `handle_scene_save` |
 | 자료 | `search_booru`, `add_style`, `search_combos`, `organize_library_items`, `search_library`, `_merge_list_json`, `_local_image_audit`, `normalize_local_image_refs`, `rollback_local_image_normalize`, `metadata_audit_candidate`, `metadata_audit_save_candidate`, `_validate_datapack_manifest`, `preview_datapack_bytes`, `import_datapack_bytes`, `undo_datapack`, `_backup_diff_plan`, `restore_user_backup`, `trash_output_files`, `restore_trash_batch`, `list_output`, `_style_record_from_public_image`, `handle_character_variation_save`, `comparison_runs`, `comparison_recipe_for_output`, `_result_promotion_records`, `promote_comparison_recipe_assets`, `handle_compare_promote`, `handle_inspect`, `handle_ref_add`, `handle_ref_save` |
 | 빌더 | `verify_tags`, `compose_artist_workspace` |
 | 관리 | `migrate_legacy_program_data`, `ConfigServer`, `ConfigServer.start`, `main` |
@@ -61,4 +61,4 @@
 6. `studio.js`를 `core → generation → settings → library → builder → admin → bootstrap` 순으로 분리
 7. 범주별 기존 시험 후 마지막 전체 무과금 회귀·localhost·빌드 경계 검증
 
-73개 잔존 정의와 `studio.js` 분리가 남아 있으므로 구조 최적화는 **진행 중**이다.
+71개 잔존 정의와 `studio.js` 분리가 남아 있으므로 구조 최적화는 **진행 중**이다.

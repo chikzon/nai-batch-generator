@@ -54,6 +54,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | NAI 이미지 HTTP 요청·오류 분류·ZIP 응답 해석 | `services/nai_client.py` |
 | 결과 포맷·원자 저장·NAI 메타데이터 보존 | `services/result_store.py` |
 | 세팅 옵션 축·장면별 인물 프롬프트 컴파일 | `services/setting_compiler.py` |
+| 설정 숫자·해상도·캐스트·상속 값 검증 | `services/config_validation.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
 
