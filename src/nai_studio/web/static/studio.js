@@ -1,15 +1,3 @@
-let STATE = null, SAVED_STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
-let LAST_STUDIO_LAYOUT = null;
-let BLUEPRINT_INHERITANCE = {};
-let FRAGS = {};
-const RES_PRESETS = window.NAI_STUDIO_BOOTSTRAP.resolutions;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
-
-function genId(){ return Math.random().toString(36).slice(2,10); }
-function esc(s){ return String(s||'').replace(/[&<>"]/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function escA(s){ return esc(s).replace(/"/g,'&quot;'); }
-function $(id){ return document.getElementById(id); }
-
 function showStartupRecovery(notice){
   const bar = $('startupRecovery');
   if(!bar || !notice) return;

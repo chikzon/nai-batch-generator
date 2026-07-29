@@ -21,6 +21,7 @@
 - [x] 빌더: 프롬프트 조각 workflow 경계 정리
 - [x] 관리: 평가 workflow, 결과 원자 저장·메타 보존, 빌드 필수 UI 자산 계약 정리
 - [x] 공통 UI: 숨은 화면의 초기 조회를 첫 진입으로 늦추고 출력 탐색기 관찰자 수명 정리
+- [ ] 공통 UI 구조: 공통 core 첫 분리 완료, generation→settings→library→builder→admin→bootstrap 분리 남음
 - [x] 공통 기반: 전체 Python·route·DOM 분류 색인, 의존 방향, 감소 전용 구조 상한 갱신
 - [ ] 남은 `ConfigServer` 생성·세팅·자료 handler와 worker 경계 정리
 - [ ] 범주별 검증과 최종 전체 회귀

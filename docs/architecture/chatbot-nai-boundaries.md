@@ -32,7 +32,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 사용자 자료 잠금·원자 저장·손상 복구 | `runtime/data_files.py` |
 | 실행권·중지·진행률·미리보기 상태 | `runtime/live_state.py` |
 | 정적 HTML 골격·동적 bootstrap | `web/page_template.py` |
-| 화면 CSS·JavaScript 자산 | `web/static/base.css`, `studio.css`, `studio.js` |
+| 화면 CSS·JavaScript 자산 | `web/static/base.css`, `studio.css`, `studio-core.js`, `studio.js` |
 | localhost HTTP 보안·본문 제한·정적 응답·포트 기동 | `web/http_server.py` |
 | 설계도·순서·작업 상태 GET 라우트 | `web/routes/runtime.py` |
 | 자료 복구·보존 상태 GET 라우트 | `web/routes/recovery.py` |

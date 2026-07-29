@@ -58,6 +58,7 @@ UI_SOURCE = (
     APP.PAGE_TEMPLATE
     + (STATIC_UI_DIR / "base.css").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
+    + (STATIC_UI_DIR / "studio-core.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
 )
 
@@ -67,6 +68,7 @@ def rendered_ui_source():
         APP.render_page()
         + (STATIC_UI_DIR / "base.css").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
+        + (STATIC_UI_DIR / "studio-core.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
     )
 
@@ -116,9 +118,10 @@ class RegressionTests(unittest.TestCase):
 
         parser = PageAudit()
         parser.feed(APP.render_page())
-        parser.scripts.append(
-            (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
-        )
+        for name in ("studio-core.js", "studio.js"):
+            parser.scripts.append(
+                (STATIC_UI_DIR / name).read_text(encoding="utf-8")
+            )
         duplicates = sorted({
             element_id for element_id in parser.ids
             if parser.ids.count(element_id) > 1
@@ -995,6 +998,7 @@ class RegressionTests(unittest.TestCase):
             for asset, content_type in (
                 ("ui/base.css", "text/css"),
                 ("ui/studio.css", "text/css"),
+                ("ui/studio-core.js", "text/javascript"),
                 ("ui/studio.js", "text/javascript"),
             ):
                 with urllib.request.urlopen(url + asset, timeout=3) as response:
@@ -1282,6 +1286,7 @@ class RegressionTests(unittest.TestCase):
             {
                 "src/nai_studio/web/static/base.css",
                 "src/nai_studio/web/static/studio.css",
+                "src/nai_studio/web/static/studio-core.js",
                 "src/nai_studio/web/static/studio.js",
             },
         )

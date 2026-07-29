@@ -188,6 +188,7 @@ def verify(dst: Path):
         "LICENSE", "THIRD_PARTY_NOTICES.md", "t5_tokenizer.json",
         "src/nai_studio/web/static/base.css",
         "src/nai_studio/web/static/studio.css",
+        "src/nai_studio/web/static/studio-core.js",
         "src/nai_studio/web/static/studio.js",
         "태그/danbooru_e621_merged.csv",
     )

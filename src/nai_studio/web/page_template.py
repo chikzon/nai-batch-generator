@@ -1439,6 +1439,7 @@ window.addEventListener('error', event => showFatalError(event.error || event.me
 window.addEventListener('unhandledrejection', event => showFatalError(event.reason));
 window.NAI_STUDIO_BOOTSTRAP = {resolutions: __RESJSON__};
 </script>
+<script src="/ui/studio-core.js"></script>
 <script src="/ui/studio.js"></script>
 </body></html>
 """
