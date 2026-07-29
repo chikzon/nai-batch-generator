@@ -184,6 +184,7 @@ from src.nai_studio.services import (
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
     library_catalog as _library_catalog,
+    local_image_store as _local_image_store,
     output_lifecycle as _output_lifecycle,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
@@ -2884,329 +2885,69 @@ _LOCAL_IMAGE_LOCK = threading.RLock()
 _LOCAL_IMAGE_SUFFIXES = {".webp", ".png", ".jpg", ".jpeg"}
 
 
+def _local_image_paths():
+    return _local_image_store.LocalImagePaths(
+        base_dir=BASE_DIR,
+        image_cache=IMG_CACHE,
+        image_suffixes=tuple(sorted(_LOCAL_IMAGE_SUFFIXES)),
+        record_dir_name="이미지무결성기록",
+        journal_schema="nais-local-image-normalize/v1",
+    )
+
+
+def _local_image_operations():
+    """현재 원자 저장·트랜잭션·시간 함수를 주입해 기존 patch 계약을 보존한다."""
+    return _local_image_store.LocalImageOperations(
+        transaction=shared_data_transaction,
+        lock=_LOCAL_IMAGE_LOCK,
+        atomic_write_bytes=_atomic_write_bytes,
+        atomic_write_json=atomic_write_json,
+        forget_caches=forget_collection_caches,
+        now=datetime.now,
+        unix_time=time.time,
+        random_bytes=os.urandom,
+        replace_file=os.replace,
+    )
+
+
 def _collect_local_refs(value, found):
-    """JSON 어느 깊이에 있든 local: 참조의 안전한 파일명만 모은다."""
-    if isinstance(value, str) and value.startswith("local:"):
-        found.append(Path(value[6:]).name)
-    elif isinstance(value, list):
-        for item in value:
-            _collect_local_refs(item, found)
-    elif isinstance(value, dict):
-        for item in value.values():
-            _collect_local_refs(item, found)
+    return _local_image_store.collect_local_refs(value, found)
 
 
 def _local_image_audit(include_private=False):
-    """현재 자료 JSON과 로컬 이미지의 실제 바이트를 서로 대조한다.
-
-    과거 판은 PNG를 WebP로 바꾸기 *전* 바이트의 해시를 파일명으로 썼다.
-    따라서 64자리 이름과 현재 바이트 해시가 다르다는 사실만으로 손상이라 하지
-    않는다. 실제로 디코드되는지, 참조 파일이 있는지를 별도로 센다.
-    """
-    collect = BASE_DIR / "수집"
-    documents, refs, invalid_json = [], [], []
-    for path in sorted(collect.glob("*.json")) if collect.is_dir() else []:
-        try:
-            raw = path.read_bytes()
-            value = json.loads(raw.decode("utf-8-sig"))
-            names = []
-            _collect_local_refs(value, names)
-            documents.append({
-                "path": path, "raw": raw, "value": value, "refs": names,
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            })
-            refs.extend(names)
-        except (OSError, UnicodeError, json.JSONDecodeError) as e:
-            invalid_json.append({"file": path.name, "error": str(e)})
-
-    files, by_hash, unreadable = {}, {}, []
-    total_bytes = 0
-    if IMG_CACHE.is_dir():
-        for path in sorted(IMG_CACHE.iterdir()):
-            if not path.is_file() or path.suffix.lower() not in _LOCAL_IMAGE_SUFFIXES:
-                continue
-            try:
-                raw = path.read_bytes()
-                digest = hashlib.sha256(raw).hexdigest()
-                canonical = _content_image_name(path.name, raw)
-                with Image.open(io.BytesIO(raw)) as image:
-                    image.verify()
-                valid = True
-                error = ""
-            except Exception as e:
-                raw = b""
-                digest = ""
-                canonical = ""
-                valid = False
-                error = str(e)
-                unreadable.append({"file": path.name, "error": error})
-            size = path.stat().st_size
-            total_bytes += size
-            files[path.name] = {
-                "path": path, "raw": raw, "sha256": digest,
-                "canonical": canonical, "valid": valid, "size": size,
-            }
-            if digest:
-                by_hash.setdefault(digest, []).append(path.name)
-
-    unique_refs = sorted(set(refs))
-    missing = [name for name in unique_refs if name not in files]
-    unreadable_refs = [
-        name for name in unique_refs
-        if name in files and not files[name]["valid"]
-    ]
-    mapping = {
-        name: files[name]["canonical"]
-        for name in unique_refs
-        if name in files and files[name]["valid"]
-        and name != files[name]["canonical"]
-    }
-    changed_documents = sum(
-        any(name in mapping for name in doc["refs"]) for doc in documents
+    return _local_image_store._local_image_audit(
+        _local_image_paths(),
+        include_private,
     )
-    copy_names = sorted({
-        canonical for canonical in mapping.values() if canonical not in files
-    })
-    copy_bytes = sum(next(
-        files[old]["size"] for old, canonical_name in mapping.items()
-        if canonical_name == canonical
-    ) for canonical in copy_names)
-    referenced = set(unique_refs)
-    unreferenced = sorted(set(files) - referenced)
-    legacy_names = sorted(
-        name for name, info in files.items()
-        if info["valid"] and name != info["canonical"]
-    )
-    duplicate_groups = [names for names in by_hash.values() if len(names) > 1]
-    fingerprint_rows = (
-        [f"json:{doc['path'].name}:{doc['sha256']}" for doc in documents]
-        + [f"img:{name}:{info['sha256']}:{info['size']}"
-           for name, info in sorted(files.items())]
-    )
-    result = {
-        "ok": not invalid_json,
-        "files": len(files),
-        "bytes": total_bytes,
-        "references": len(refs),
-        "unique_references": len(unique_refs),
-        "missing": len(missing),
-        "unreadable": len(unreadable),
-        "unreadable_references": len(unreadable_refs),
-        "legacy_names": len(legacy_names),
-        "referenced_legacy_names": len(mapping),
-        "unreferenced": len(unreferenced),
-        "duplicate_groups": len(duplicate_groups),
-        "duplicate_extra_files": sum(len(group) - 1 for group in duplicate_groups),
-        "invalid_json": invalid_json,
-        "normalization": {
-            "references_to_change": sum(refs.count(name) for name in mapping),
-            "files_to_copy": len(copy_names),
-            "copy_bytes": copy_bytes,
-            "documents_to_change": changed_documents,
-            "blocked": bool(invalid_json or missing or unreadable_refs),
-        },
-        "samples": {
-            "missing": missing[:12],
-            "unreadable": unreadable[:12],
-            "legacy_names": legacy_names[:12],
-            "unreferenced": unreferenced[:12],
-        },
-        "fingerprint": hashlib.sha256(
-            "\n".join(fingerprint_rows).encode("utf-8")
-        ).hexdigest(),
-    }
-    if include_private:
-        result["_documents"] = documents
-        result["_files"] = files
-        result["_mapping"] = mapping
-        result["_copy_names"] = copy_names
-    return result
 
 
 def local_image_integrity():
-    """UI/API용 읽기 전용 요약. '미사용'은 삭제 가능 판정이 아님을 명시한다."""
-    result = _local_image_audit()
-    result["note"] = (
-        "과거 이름은 변환 전 해시일 수 있어 손상으로 세지 않습니다. "
-        "미사용 후보도 다른 자료팩에서 쓸 수 있으므로 자동 삭제하지 않습니다."
+    return _local_image_store.local_image_integrity(
+        _local_image_paths(),
     )
-    return result
 
 
 def _local_image_record_dir(batch):
-    return BASE_DIR / "수집" / "이미지무결성기록" / Path(str(batch)).name
+    return _local_image_store.local_image_record_dir(
+        _local_image_paths(),
+        batch,
+    )
 
 
-@serialized_data_write(lambda: BASE_DIR)
 def normalize_local_image_refs(expected_fingerprint=""):
-    """참조된 옛 이름만 실제 내용 주소로 바꾼다.
-
-    옛 이미지는 지우거나 옮기지 않는다. 새 내용 주소 파일을 만든 뒤 JSON 원본을
-    별도 기록에 보관하고 원자적으로 치환한다. 손상·누락·동시 변경이 있으면 시작
-    전에 중단한다.
-    """
-    with _LOCAL_IMAGE_LOCK:
-        audit = _local_image_audit(include_private=True)
-        if expected_fingerprint and expected_fingerprint != audit["fingerprint"]:
-            return {"ok": False, "error": "검사 뒤 자료가 바뀌었습니다. 다시 검사해 주세요."}
-        if audit["normalization"]["blocked"]:
-            return {
-                "ok": False,
-                "error": "누락·읽기 실패·잘못된 JSON이 있어 자동 정리를 중단했습니다.",
-                "audit": local_image_integrity(),
-            }
-        mapping = audit["_mapping"]
-        if not mapping:
-            return {"ok": True, "batch": "", "changed_references": 0,
-                    "changed_documents": 0, "created_files": 0}
-
-        batch = f"{int(time.time())}-{os.urandom(4).hex()}"
-        record_dir = _local_image_record_dir(batch)
-        before_dir = record_dir / "before"
-        before_dir.mkdir(parents=True, exist_ok=False)
-        records, plans, created = [], [], []
-        try:
-            # 원본과 적용 예정 해시를 먼저 기록한다. 기록이 완성되기 전에는 실제
-            # 자료 JSON을 한 바이트도 바꾸지 않는다.
-            for doc in audit["_documents"]:
-                rewritten = _rewrite_local_image_refs(doc["value"], mapping)
-                after = json.dumps(
-                    rewritten, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
-                if rewritten == doc["value"]:
-                    continue
-                backup = before_dir / doc["path"].name
-                _atomic_write_bytes(backup, doc["raw"], keep_backup=False)
-                records.append({
-                    "file": doc["path"].name,
-                    "before_sha256": doc["sha256"],
-                    "after_sha256": hashlib.sha256(after).hexdigest(),
-                })
-                plans.append((doc["path"], after))
-
-            for canonical in audit["_copy_names"]:
-                old = next(
-                    name for name, new_name in mapping.items()
-                    if new_name == canonical
-                )
-                created.append({
-                    "name": canonical,
-                    "sha256": audit["_files"][old]["sha256"],
-                    "source": old,
-                })
-
-            journal = {
-                "schema": "nais-local-image-normalize/v1",
-                "id": batch,
-                "at": datetime.now().isoformat(timespec="seconds"),
-                "status": "preparing",
-                "records": records,
-                "created": created,
-                "mapping": mapping,
-            }
-            atomic_write_json(record_dir / "journal.json", journal, indent=1,
-                              keep_backup=False)
-
-            # 안전 기록 뒤 새 이름 복사본을 만든다. 옛 이름은 계속 같은 바이트를
-            # 가리키므로 외부에 따로 둔 자료팩도 깨지지 않는다.
-            for item in created:
-                source = audit["_files"][item["source"]]
-                target = IMG_CACHE / item["name"]
-                if target.exists():
-                    if target.read_bytes() != source["raw"]:
-                        raise ValueError(f"내용 주소 충돌: {item['name']}")
-                    continue
-                _atomic_write_bytes(target, source["raw"], keep_backup=False)
-            for path, after in plans:
-                _atomic_write_bytes(path, after)
-
-            journal["status"] = "complete"
-            atomic_write_json(record_dir / "journal.json", journal, indent=1)
-        except Exception:
-            # JSON 적용 중 실패해도 원본 기록에서 되돌린다. 만들어진 이미지 복사본은
-            # 데이터 손실 방지를 위해 기록 폴더로 옮기고 삭제하지 않는다.
-            for record in records:
-                backup = before_dir / record["file"]
-                target = BASE_DIR / "수집" / record["file"]
-                if backup.exists():
-                    _atomic_write_bytes(target, backup.read_bytes())
-            failed = record_dir / "적용실패-복사본"
-            failed.mkdir(parents=True, exist_ok=True)
-            for item in created:
-                target = IMG_CACHE / item["name"]
-                if target.exists():
-                    os.replace(target, failed / item["name"])
-            raise
-        forget_collection_caches()
-        return {
-            "ok": True, "batch": batch,
-            "changed_references": audit["normalization"]["references_to_change"],
-            "changed_documents": len(records),
-            "created_files": len(created),
-            "kept_legacy_files": len(mapping),
-        }
+    return _local_image_store.normalize_local_image_refs(
+        _local_image_paths(),
+        _local_image_operations(),
+        expected_fingerprint,
+    )
 
 
-@serialized_data_write(lambda: BASE_DIR)
 def rollback_local_image_normalize(batch):
-    """정규화 직후 사용자가 다시 편집한 JSON은 덮지 않고 나머지만 복원한다."""
-    with _LOCAL_IMAGE_LOCK:
-        record_dir = _local_image_record_dir(batch)
-        journal_path = record_dir / "journal.json"
-        if not journal_path.is_file():
-            return {"ok": False, "error": "되돌릴 이미지 정리 기록을 찾지 못했습니다."}
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        if journal.get("schema") != "nais-local-image-normalize/v1":
-            return {"ok": False, "error": "알 수 없는 이미지 정리 기록입니다."}
-        if journal.get("status") == "undone":
-            return {"ok": True, "restored": 0, "skipped": 0, "already": True}
-
-        restored, skipped = 0, 0
-        for record in journal.get("records") or []:
-            target = BASE_DIR / "수집" / Path(record.get("file", "")).name
-            backup = record_dir / "before" / Path(record.get("file", "")).name
-            try:
-                current = target.read_bytes()
-                if hashlib.sha256(current).hexdigest() != record.get("after_sha256"):
-                    skipped += 1
-                    continue
-                _atomic_write_bytes(target, backup.read_bytes())
-                restored += 1
-            except OSError:
-                skipped += 1
-
-        # 복원 후 아무 JSON도 가리키지 않는 새 복사본만 기록 폴더로 옮긴다.
-        live_refs, refs_complete = [], True
-        for path in (BASE_DIR / "수집").glob("*.json"):
-            try:
-                value = json.loads(path.read_text(encoding="utf-8-sig"))
-                _collect_local_refs(value, live_refs)
-            except Exception:
-                refs_complete = False
-        live_refs = set(live_refs)
-        held_dir = record_dir / "되돌린-새이름"
-        held = 0
-        for item in journal.get("created") or []:
-            name = Path(item.get("name", "")).name
-            target = IMG_CACHE / name
-            if not refs_complete or name in live_refs or not target.is_file():
-                continue
-            try:
-                if hashlib.sha256(target.read_bytes()).hexdigest() != item.get("sha256"):
-                    continue
-                held_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(target, held_dir / name)
-                held += 1
-            except OSError:
-                pass
-        journal.update(status="undone", undone_at=datetime.now().isoformat(
-            timespec="seconds"), restored=restored, skipped=skipped,
-                       held_created=held)
-        atomic_write_json(journal_path, journal, indent=1)
-        forget_collection_caches()
-        return {"ok": True, "restored": restored, "skipped": skipped,
-                "held_created": held}
-
+    return _local_image_store.rollback_local_image_normalize(
+        _local_image_paths(),
+        _local_image_operations(),
+        batch,
+    )
 
 def forget_collection_caches():
     """자료가 늘었으니 한 번 읽고 물고 있던 것들을 놓게 한다.
