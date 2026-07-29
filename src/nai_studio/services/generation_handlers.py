@@ -1019,7 +1019,6 @@ def _i2i_started(
     plan: dict | None,
     width: int,
     height: int,
-    mask_b64: str | None,
     source_hash: str,
     expansion: dict[str, int],
 ) -> dict[str, Any]:
@@ -1039,6 +1038,56 @@ def _i2i_started(
             and plan.get("vibes")
         ),
     }
+
+
+def _claim_i2i(
+    server: Any,
+    operations: GenerationHandlerOperations,
+    job_config: dict,
+    operation: str,
+    mode: str,
+    variation_id: str,
+    source_hash: str,
+    source_size: dict,
+    expansion: dict[str, int],
+    mask_b64: str | None,
+    width: int,
+    height: int,
+) -> Any:
+    """편집 계획과 입력 지문을 실행권에 함께 고정한다."""
+    blueprint = operations.inherited_blueprint(
+        job_config,
+        source={
+            "kind": (
+                "character-variation" if variation_id
+                else "outpaint" if operation == "outpaint"
+                else "image-edit"
+            ),
+            "mode": mode,
+            "character_id": variation_id,
+            "content_hash": source_hash,
+            "source_size": source_size,
+            "expansion": expansion if operation == "outpaint" else None,
+        },
+    )
+    return server.live.try_claim(
+        mode,
+        "preview",
+        blueprint=blueprint,
+        payload_identity={
+            "kind": (
+                operation if operation == "outpaint"
+                else "inpaint" if mask_b64
+                else "img2img"
+            ),
+            "width": width,
+            "height": height,
+            "has_mask": bool(mask_b64),
+            "source_hash": source_hash,
+            "expansion": expansion if operation == "outpaint" else None,
+            "character_id": variation_id,
+        },
+    )
 
 
 def handle_i2i(
@@ -1085,46 +1134,9 @@ def handle_i2i(
     job_config, variation_name, plan, transient_reference, variation_plan = (
         variation
     )
-    blueprint = operations.inherited_blueprint(
-        job_config,
-        source={
-            "kind": (
-                "character-variation"
-                if variation_id
-                else "outpaint"
-                if operation == "outpaint"
-                else "image-edit"
-            ),
-            "mode": mode,
-            "character_id": variation_id,
-            "content_hash": source_hash,
-            "source_size": source_size,
-            "expansion": (
-                expansion if operation == "outpaint" else None
-            ),
-        },
-    )
-    token = server.live.try_claim(
-        mode,
-        "preview",
-        blueprint=blueprint,
-        payload_identity={
-            "kind": (
-                operation
-                if operation == "outpaint"
-                else "inpaint"
-                if mask_b64
-                else "img2img"
-            ),
-            "width": width,
-            "height": height,
-            "has_mask": bool(mask_b64),
-            "source_hash": source_hash,
-            "expansion": (
-                expansion if operation == "outpaint" else None
-            ),
-            "character_id": variation_id,
-        },
+    token = _claim_i2i(
+        server, operations, job_config, operation, mode, variation_id,
+        source_hash, source_size, expansion, mask_b64, width, height,
     )
     if token is None:
         return {"ok": False, "error": "이미 생성 중입니다."}
@@ -1157,7 +1169,7 @@ def handle_i2i(
     )
     return _i2i_started(
         operation, mode, variation_mode, variation_id, variation_name,
-        plan, width, height, mask_b64, source_hash, expansion,
+        plan, width, height, source_hash, expansion,
     )
 
 
