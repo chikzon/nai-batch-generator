@@ -100,11 +100,16 @@ class JobStore:
 
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        if not self.root.is_dir():
+        if self.root.exists() and not self.root.is_dir():
             raise JobStoreError("Job 저장 경로가 폴더가 아닙니다.")
         self.index_path = self.root / "index.json"
         self._lock = threading.RLock()
+
+    def _ensure_root(self) -> None:
+        """조회는 디스크를 바꾸지 않고, 첫 실제 저장 직전에만 폴더를 만든다."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not self.root.is_dir():
+            raise JobStoreError("Job 저장 경로가 폴더가 아닙니다.")
 
     def _job_path(self, job_id: str) -> Path:
         identifier = str(job_id or "")
@@ -148,6 +153,7 @@ class JobStore:
             os.close(descriptor)
 
     def _replace_bytes(self, path: Path, payload: bytes) -> None:
+        self._ensure_root()
         temp = path.with_name(
             f".{path.name}.{os.getpid()}.{threading.get_ident()}."
             f"{uuid.uuid4().hex}.tmp")

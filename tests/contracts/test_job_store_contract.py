@@ -57,6 +57,14 @@ class JobStoreContractTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_empty_read_does_not_create_a_store_directory(self):
+        root = self.root / "not-created-yet"
+        store = JobStore(root)
+        self.assertEqual(store.list(), [])
+        self.assertFalse(root.exists())
+        store.save(make_job())
+        self.assertTrue(root.is_dir())
+
     def test_save_get_list_and_restart_keep_valid_snapshots(self):
         first = make_job()
         second = make_job("job-two", "req-two")
