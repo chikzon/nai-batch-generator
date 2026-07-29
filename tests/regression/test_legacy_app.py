@@ -3800,19 +3800,31 @@ class RegressionTests(unittest.TestCase):
             patch.object(
                 APP,
                 "prepare_char_refs",
-                return_value=(["fresh-ref"], ["character&style"], [0.6], [0.5]),
+                return_value=([], [], [], []),
             ),
         ):
             params = APP.runtime_generation_params(cfg, "pst-test")
 
         self.assertEqual(params["_vibes"]["encoded"], ["fresh-vibe"])
-        self.assertEqual(params["_char_refs"]["images"], ["fresh-ref"])
+        self.assertEqual(params["_char_refs"]["images"], [])
         self.assertEqual(cfg["_vibes"]["encoded"], ["stale-vibe"])
         self.assertEqual(cfg["_char_refs"]["images"], ["stale-ref"])
 
         restored = APP.runtime_generation_params(cfg, "pst-test", include_refs=False)
         self.assertNotIn("_vibes", restored)
         self.assertNotIn("_char_refs", restored)
+
+        both = {
+            "vibes": [{"id": "vibe", "enabled": True}],
+            "char_refs": [{"id": "ref", "enabled": True}],
+        }
+        with self.assertRaisesRegex(ValueError, "동시에 사용할 수 없습니다"):
+            APP.runtime_generation_params(both, "pst-test")
+        with self.assertRaisesRegex(ValueError, "동시에 사용할 수 없습니다"):
+            APP._ref_fields({
+                "_vibes": {"encoded": ["vibe"], "strengths": [0.6]},
+                "_char_refs": {"images": ["ref"]},
+            })
 
     def test_restore_model_mapping_ignores_source_build_hash_digits(self):
         fallback = "nai-diffusion-4-5-curated"
@@ -5065,7 +5077,7 @@ class RegressionTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("다른 NAI 작업", result["error"])
 
-    def test_vibe_and_character_references_reach_actual_payload_in_aligned_arrays(self):
+    def test_vibe_and_character_references_reach_separate_aligned_payloads(self):
         png = io.BytesIO()
         Image.new("RGB", (2, 2), "white").save(png, "PNG")
         zipped = io.BytesIO()
@@ -5083,13 +5095,17 @@ class RegressionTests(unittest.TestCase):
             payloads.append(json)
             return Response()
 
-        params = {
-            "model": "nai-diffusion-4-5-full",
+        common = {"model": "nai-diffusion-4-5-full"}
+        vibe_params = {
+            **common,
             "_vibes": {
                 "encoded": ["vibe-a", "vibe-b"],
                 "strengths": [0.4, 0.9],
                 "ies": [0.3, 0.8],
             },
+        }
+        reference_params = {
+            **common,
             "_char_refs": {
                 "images": ["char-a", "char-b"],
                 "types": ["character", "character&style"],
@@ -5097,49 +5113,62 @@ class RegressionTests(unittest.TestCase):
                 "fidelities": [0.25, 1.0],
             },
         }
-        with (
-            patch.object(APP.requests, "post", side_effect=fake_post),
-            self.assertLogs(APP.log, level="WARNING"),
-        ):
+        with patch.object(APP.requests, "post", side_effect=fake_post):
             APP.call_nai_api(
                 "pst-fixture", "base", "", "", "negative", 832, 1216,
-                seed=1, params=params,
+                seed=1, params=vibe_params,
+            )
+            APP.call_nai_api(
+                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                seed=1, params=reference_params,
             )
 
-        self.assertEqual(len(payloads), 1)
-        sent = payloads[0]["parameters"]
-        self.assertEqual(sent["reference_image_multiple"], ["vibe-a", "vibe-b"])
-        self.assertEqual(sent["reference_strength_multiple"], [0.4, 0.9])
+        self.assertEqual(len(payloads), 2)
+        vibe_sent = payloads[0]["parameters"]
+        self.assertEqual(vibe_sent["reference_image_multiple"], ["vibe-a", "vibe-b"])
+        self.assertEqual(vibe_sent["reference_strength_multiple"], [0.4, 0.9])
         self.assertEqual(
-            sent["reference_information_extracted_multiple"], [0.3, 0.8]
+            vibe_sent["reference_information_extracted_multiple"], [0.3, 0.8]
         )
-        self.assertTrue(sent["normalize_reference_strength_multiple"])
-        self.assertEqual(sent["director_reference_images"], ["char-a", "char-b"])
+        self.assertTrue(vibe_sent["normalize_reference_strength_multiple"])
+        self.assertNotIn("director_reference_images", vibe_sent)
+
+        reference_sent = payloads[1]["parameters"]
+        self.assertNotIn("reference_image_multiple", reference_sent)
+        self.assertEqual(
+            reference_sent["director_reference_images"], ["char-a", "char-b"]
+        )
         self.assertEqual(
             [
                 item["caption"]["base_caption"]
-                for item in sent["director_reference_descriptions"]
+                for item in reference_sent["director_reference_descriptions"]
             ],
             ["character", "character&style"],
         )
         self.assertEqual(
-            sent["director_reference_information_extracted"], [1.0, 1.0]
+            reference_sent["director_reference_information_extracted"], [1.0, 1.0]
         )
-        self.assertEqual(sent["director_reference_strength_values"], [0.0, 2.0])
         self.assertEqual(
-            sent["director_reference_secondary_strength_values"], [0.75, 0.0]
+            reference_sent["director_reference_strength_values"], [0.0, 2.0]
+        )
+        self.assertEqual(
+            reference_sent["director_reference_secondary_strength_values"],
+            [0.75, 0.0],
         )
         for key in (
             "reference_image_multiple",
             "reference_strength_multiple",
             "reference_information_extracted_multiple",
+        ):
+            self.assertEqual(len(vibe_sent[key]), 2, key)
+        for key in (
             "director_reference_images",
             "director_reference_descriptions",
             "director_reference_information_extracted",
             "director_reference_strength_values",
             "director_reference_secondary_strength_values",
         ):
-            self.assertEqual(len(sent[key]), 2, key)
+            self.assertEqual(len(reference_sent[key]), 2, key)
 
         cfg = {
             "vibes": [

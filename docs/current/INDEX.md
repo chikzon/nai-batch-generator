@@ -14,6 +14,10 @@
    - [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)
 6. 과거 릴리스 후보와 Claude push 인계
    - [CLAUDE_PUSH_HANDOFF.md](CLAUDE_PUSH_HANDOFF.md)
+7. 실제 NAI 호출·비용·성능·흡수 상태
+   - [LIVE_NAI_VERIFICATION_2026-07-29.md](LIVE_NAI_VERIFICATION_2026-07-29.md)
+8. 작업 파일·비교 프로그램 위치와 링크
+   - [WORKSPACE_AND_REFERENCES.md](WORKSPACE_AND_REFERENCES.md)
 
 과거 문서와 archive 자료는 역사·증거이며 현재 지시보다 우선하지 않는다. 문서가
 충돌하면 최신 사용자 지시와 `NEXT_TASK.md`를 우선한다. push 인계서는 현재

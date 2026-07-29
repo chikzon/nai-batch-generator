@@ -1,7 +1,8 @@
 # Claude push 인계
 
-이 문서를 포함한 최신 `main`이 데스크톱 릴리스 후보다. 기능을 다시 고치거나 외부 앱
-조사를 반복하지 말고 push와 원격 CI 확인만 한다.
+최신 `main`은 실제 NAI 검증까지 끝난 안정 기준점이지만, 외부 기능 재감사에서
+Outpaint 등 남은 데스크톱 항목이 확인됐다. 사용자가 현재 기준점을 먼저 공개하라고
+명시하지 않는 한 **아직 push하지 않는다.** 다음 작업은 `NEXT_TASK.md` 한 건씩 진행한다.
 
 ## 최종 구현
 
@@ -23,6 +24,7 @@
 
 대표 커밋:
 
+- `0f4917d` 실제 NAI 비용과 레퍼런스 동작을 검증한다
 - `9f39a59` 생성 설계도 흐름과 데스크톱 작업실을 완성한다
 - `3e379fa` 실행 설계도와 결과 계보의 손실 경계를 닫는다
 - `e277461` 승격 장부에서 서로 다른 캐릭터 내용을 보존한다
@@ -38,7 +40,8 @@
 - 실제 브라우저: 1600×1000·390×844 가로 넘침 0, 편집 도구 겹침 0,
   위치 모드·키보드 이동·캐스트 지연 렌더·결과 도구·클래식 호환 확인
 - 개인 토큰 정규식 검사: 배포 폴더 0건. 저장소의 일치 문자열은 계약 시험용 가짜 값뿐
-- 실제 NAI 유료 호출: 이번 결함 검증에는 불필요해 사용하지 않음
+- 실제 NAI: 생성 5회와 Vibe 인코딩 1회 성공. 예상 27 Anlas와 실제 감소
+  27 Anlas 일치. AI 자동·좌표·29 steps·Vibe·Precise Reference 확인
 - 앱 내 브라우저 연결은 로컬 자산 경로 오류로 실패했으나 설치된 Playwright로 실제
   Chromium 조작과 최신 1600·390 스크린샷 촬영을 완료
 
@@ -52,18 +55,18 @@
 SHA-256:
 
 ```text
-26ba41886d0eaaf6fb3225fc4c041a00cd3ea99ca93b700c109013f28a795598  NAI-batch-generator-1.0.0-portable-win-x64.zip
-2df64cd2eda8cb7f0622209c38e76a92a412ed3f13fd4cf650a1b204e909f764  NAI-batch-generator-1.0.0-datapack.zip
-916baf5a75a1a3a0840e91de16319bb0bd2d2169a8e7f026db45a337302b6689  NAI-batch-generator-1.0.0-setup.exe
+48c1397bd2e4df6c3f42fb8a2d51c1a5ba0f8f7ab3919c79727d69052aa70d6b  NAI-batch-generator-1.0.0-portable-win-x64.zip
+66f3b98ec1b6ea36435ab2c04131412bce7dc094f536865d89e3ffc3c0ac94a05  NAI-batch-generator-1.0.0-datapack.zip
+c7ed6bcc60e3e0496348add02f27ce4abf7353bfb11365304437741407f70360  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일
 
-1. `git status --short`가 비어 있는지 확인
-2. 최신 문서 커밋과 위 구현 커밋 확인
-3. 토큰·개인 설정·캐릭터·그림체·생성물이 추적되지 않았는지 읽기 검사
-4. 변경 없이 `git push origin main`
-5. 원격 HEAD 일치와 smoke CI 결과 보고
+1. 지금은 push하지 않고 `docs/current/NEXT_TASK.md`와 실제 NAI 검증 문서를 읽는다.
+2. 남은 데스크톱 작업이 끝났거나 사용자가 현재 기준점 공개를 명시했을 때만
+   `git status --short`가 비어 있는지 확인한다.
+3. 토큰·개인 설정·캐릭터·그림체·생성물이 추적되지 않았는지 읽기 검사한다.
+4. 사용자 지시 뒤 변경 없이 `git push origin main`하고 원격 HEAD·smoke CI를 확인한다.
 
 ## 하지 않을 일
 

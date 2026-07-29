@@ -1,9 +1,8 @@
 # 크레딧 · 참고한 것들
 
-이 프로그램은 다른 프로젝트의 **기능과 사용 목적, 작업 흐름을 참고해 별도로 구현**했다.
-확인한 범위(소스 대조·구조 비교)에서 다른 프로젝트 코드를 직접 가져다 쓴 정황은 찾지 못했다 —
-이쪽은 파이썬 단일 파일이고 비교 대상은 Electron/Tauri + TypeScript 로 구조가 다르다.
-아래에 무엇을 어떻게 참고했는지 구분해 적는다.
+이 프로그램은 아래 프로젝트의 기능 목적·작업 흐름·실제 NAI 요청 방식을 참고해
+현재 앱의 생성 설계도·세팅·자료·실행 계층에 맞게 구현했다. 현재 코드는 Python
+진입점과 `src/nai_studio`의 도메인·서비스·실행 모듈로 구성된다.
 
 ---
 
@@ -18,15 +17,29 @@
 | [IZTACIYU/NAIS2-Forge](https://github.com/IZTACIYU/NAIS2-Forge) | 캐릭터 카드의 **의상 칸 분리** · 카드 부분 접기 |
 | [JaCha00/nais_blue](https://github.com/JaCha00/nais_blue) | 디자인 토큰을 문서로 먼저 정의하는 방식 · 미출하 기능을 문서에 정직하게 표기하는 방식 · **단부루 `tags.json` 으로 프롬프트 태그를 검증한다는 착안**(태그 개수 제한이 없는 경로) |
 | NAIS3-MM 1.1.1 (배포본) | 휴식 스케줄러(밴 예방) · 완료 알림 · 선별/비교함 · 라이브러리 가상 폴더 · **UC 프리셋·퀄리티 태그를 이미지 문구에서 역추적한다는 착안** · 내장 브라우저의 홈이 단부루 **미러 도메인**이라는 힌트 |
+| [Dd154663/SDStudio](https://github.com/Dd154663/SDStudio) | 프로젝트·템플릿·캐릭터×세팅·테마 구조 · Reference와 Vibe의 상호 배타 처리 |
+| [okawaritsuika/NAImakeArtistGroup](https://github.com/okawaritsuika/NAImakeArtistGroup) | 공개자료 수집·중단·재개·변경 추적 · 작가 가중치·고정 작가·후보 상태 |
+| [Rlag1998/novelai-artist-elo](https://github.com/Rlag1998/novelai-artist-elo) | 이름을 가린 비교·ELO·조합 평가 |
+| [DEX-1101/NovelAI-Prompt-Tools](https://github.com/DEX-1101/NovelAI-Prompt-Tools) | 프롬프트 가중치·자동완성·부분 편집 흐름 |
+| [DNT-LAB/NAIA2.0](https://github.com/DNT-LAB/NAIA2.0/releases) | 생성 Queue·Sequence·실험 축·캐릭터 Variation·Vibe 묶음 |
 | [bedovyy/ComfyUI_NAIDGenerator](https://github.com/bedovyy/ComfyUI_NAIDGenerator) | **캐릭터 레퍼런스 참조 이미지를 허용 캔버스로 레터박싱**해야 한다는 결정적 힌트 |
+| [raspie10032/ComfyUI_RS_NAI_API_Request](https://github.com/raspie10032/ComfyUI_RS_NAI_API_Request) | 공간 캐릭터·Inpaint 요청 구조 |
+| [wattah1002/novelai-batch-image-generator](https://github.com/wattah1002/novelai-batch-image-generator) | 직렬 배치·Seed·반복·결과 기록 |
+| [Pan-qwq/NAI-WorldPainter](https://github.com/Pan-qwq/NAI-WorldPainter) | Queue·History·Preset 작업 흐름 |
+| [wfjsw/danbooru-diffusion-prompt-builder](https://github.com/wfjsw/danbooru-diffusion-prompt-builder) | 태그 후보·프롬프트 조립 UI |
+| [도랑 위키](https://wiki.dorang.uk/webwiki/#/assets) | 레시피 검색·분류·원격 이미지 지연 로드 |
 
 ⚠ 기능이 비슷한 것은 **NAI API 를 쓰는 방식이 같아서 자연스럽게 겹치는 부분**도 있다.
 위 목록은 "참고한 사실"을 밝히는 것이며, 코드 파생 관계를 주장하는 것이 아니다.
 
-## 안 가져온 것 (의도적)
+## 아직 없거나 별도 단계인 것
 
-프롬프트 메모장 · 스트리밍 미리보기(대량 배치엔 쓸모가 적다) ·
-자동 업데이트 · Electron/Tauri 껍데기(단일 파일 배포를 지키기 위해) · 다국어(한국어 전용).
+스마트폰 앱·PC 연동 · Outpaint · 자동 업데이트 · 스트리밍 중간 미리보기 ·
+blue식 시각적 3-way 충돌 해결 · SDStudio식 프로젝트 계층 편집 ·
+MM식 완전한 6칸 Organizer · 범용 조건 DSL · 다국어 UI.
+
+Electron/Tauri/ComfyUI graph, Marketplace·R2·일반 웹브라우저, NAI 밖 생성 백엔드는
+현재 독립 Windows NAI 작업실의 목적과 겹치지 않아 제품 구조 자체를 복제하지 않는다.
 
 ---
 

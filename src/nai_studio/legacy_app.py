@@ -1659,6 +1659,19 @@ def runtime_generation_params(cfg, token, include_refs=True):
     params.pop("_char_refs", None)
     if not include_refs:
         return params
+    active_vibes = [
+        item for item in (cfg.get("vibes") or [])
+        if isinstance(item, dict) and item.get("enabled")
+    ]
+    active_char_refs = [
+        item for item in (cfg.get("char_refs") or [])
+        if isinstance(item, dict) and item.get("enabled")
+    ]
+    if active_vibes and active_char_refs:
+        raise ValueError(
+            "NAI에서는 바이브와 캐릭터 레퍼런스를 동시에 사용할 수 없습니다. "
+            "둘 중 하나를 꺼주세요."
+        )
     try:
         encoded, strengths, ies, newly = prepare_vibes(cfg, token)
         images, types, ref_strengths, fidelities = prepare_char_refs(cfg)
@@ -8373,11 +8386,10 @@ def _ref_fields(p):
     refs = p.get("_char_refs") or {}
     imgs = refs.get("images") or []
     if imgs and enc:
-        # SDStudio 는 V4.5 에서 캐릭레퍼가 있으면 바이브를 무효화하고 UI 도 잠근다.
-        # NAI 가 400 을 주는지 품질만 떨어지는지는 **검증하지 못했다** — 막지 않고 알리기만 한다
-        # (사용자가 일부러 같이 쓸 수 있다). SDS-C
-        log.warning(f"바이브 {len(enc)}개와 캐릭터 레퍼런스 {len(imgs)}개를 함께 보냅니다 — "
-                    "다른 앱은 이 조합을 막습니다. 결과가 이상하면 하나만 켜 보세요.")
+        raise ValueError(
+            "NAI에서는 바이브와 캐릭터 레퍼런스를 동시에 사용할 수 없습니다. "
+            "둘 중 하나를 꺼주세요."
+        )
     if imgs:
         out["director_reference_images"] = imgs
         # 설명은 **v4 프롬프트와 같은 모양의 객체**다 (문자열이 아니다).
@@ -13320,7 +13332,14 @@ function renderRefs(){
   const list = k => k === 'vibe' ? (STATE.vibes = STATE.vibes || [])
                                  : (STATE.char_refs = STATE.char_refs || []);
   document.querySelectorAll('[data-ren]').forEach(c => c.addEventListener('change', () => {
-    const [k, i] = c.dataset.ren.split('|'); list(k)[+i].enabled = c.checked; saveRefs();
+    const [k, i] = c.dataset.ren.split('|');
+    const other = k === 'vibe' ? 'cref' : 'vibe';
+    if(c.checked && list(other).some(item => item && item.enabled)){
+      c.checked = false;
+      flash('NAI에서는 바이브와 캐릭터 레퍼런스를 동시에 사용할 수 없습니다. 먼저 다른 쪽을 꺼주세요.');
+      return;
+    }
+    list(k)[+i].enabled = c.checked; saveRefs();
   }));
   document.querySelectorAll('[data-rf]').forEach(el => el.addEventListener('change', () => {
     const [k, i, f] = el.dataset.rf.split('|');
