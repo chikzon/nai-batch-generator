@@ -16,6 +16,10 @@ STATIC_ASSETS = {
     "/ui/base.css": ("base.css", "text/css; charset=utf-8"),
     "/ui/studio.css": ("studio.css", "text/css; charset=utf-8"),
     "/ui/studio-core.js": ("studio-core.js", "text/javascript; charset=utf-8"),
+    "/ui/studio-generation.js": (
+        "studio-generation.js",
+        "text/javascript; charset=utf-8",
+    ),
     "/ui/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
 }
 

@@ -79,9 +79,14 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
         self.assertLessEqual(len(template), 100_000)
         self.assertNotIn("<style>", template)
         self.assertIn('src="/ui/studio-core.js"', template)
+        self.assertIn('src="/ui/studio-generation.js"', template)
         self.assertIn('src="/ui/studio.js"', template)
         self.assertLess(
             template.index('src="/ui/studio-core.js"'),
+            template.index('src="/ui/studio-generation.js"'),
+        )
+        self.assertLess(
+            template.index('src="/ui/studio-generation.js"'),
             template.index('src="/ui/studio.js"'),
         )
 
