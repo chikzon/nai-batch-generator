@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import ast
 import sys
 import unittest
 from pathlib import Path
@@ -52,6 +53,30 @@ class PublicCollectionBoundaryTests(unittest.TestCase):
         self.assertIsNot(
             legacy_app.PublicCollectionManager, PublicCollectionManager
         )
+
+
+class LegacyGrowthBoundaryTests(unittest.TestCase):
+    def test_transport_and_template_do_not_grow_back_into_monoliths(self):
+        source_path = ROOT / "src" / "nai_studio" / "legacy_app.py"
+        source = source_path.read_text(encoding="utf-8")
+        self.assertLessEqual(len(source.splitlines()), 15_000)
+
+        tree = ast.parse(source)
+        sizes = {
+            node.name: node.end_lineno - node.lineno + 1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"do_GET", "do_POST"}
+        }
+        self.assertLessEqual(sizes["do_GET"], 40)
+        self.assertLessEqual(sizes["do_POST"], 40)
+
+        template = (
+            ROOT / "src" / "nai_studio" / "web" / "page_template.py"
+        ).read_text(encoding="utf-8")
+        self.assertLessEqual(len(template), 100_000)
+        self.assertNotIn("<style>", template)
+        self.assertIn('src="/ui/studio.js"', template)
 
 
 if __name__ == "__main__":
