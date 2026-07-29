@@ -186,6 +186,7 @@ from src.nai_studio.services import (
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
     output_lifecycle as _output_lifecycle,
+    style_store as _style_store,
     user_backup_store as _user_backup_store,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
@@ -1418,30 +1419,7 @@ _STYLE_TX_LOCK = threading.RLock()
 # 그림체는 저장 위치나 입력 경로가 달라도 아래 생성 설정까지 포함한 한 묶음이다.
 # 수집 JSON의 NAI 메타 이름(scale/noise_schedule)과 사용자 그림체 파일의 화면 설정
 # 이름(cfg_scale/scheduler)을 같은 열쇠로 맞춘다.
-STYLE_BUNDLE_SETTING_KEYS = (
-    "model", "width", "height", "cfg_scale", "cfg_rescale", "steps",
-    "sampler", "scheduler", "variety", "uc_preset", "quality_toggle",
-    "smea", "smea_dyn", "dynamic_thresholding", "uncond_scale",
-    "controlnet_strength", "prefer_brownian",
-    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
-    "position_mode",
-)
-_STYLE_SETTING_ALIASES = {
-    "cfg_scale": ("cfg_scale", "scale"),
-    "scheduler": ("scheduler", "noise_schedule"),
-    "variety": ("variety", "variety_plus", "skip_cfg_above_sigma"),
-    "smea": ("smea", "sm"),
-    "smea_dyn": ("smea_dyn", "sm_dyn"),
-}
-_STYLE_INT_SETTINGS = {"width", "height", "steps", "uc_preset"}
-_STYLE_FLOAT_SETTINGS = {
-    "cfg_scale", "cfg_rescale", "uncond_scale", "controlnet_strength",
-}
-_STYLE_BOOL_SETTINGS = {
-    "variety", "quality_toggle", "smea", "smea_dyn",
-    "dynamic_thresholding", "prefer_brownian",
-    "deliberate_euler_ancestral_bug", "legacy_v3_extend", "use_coords",
-}
+STYLE_BUNDLE_SETTING_KEYS = _style_store.STYLE_SETTING_KEYS
 
 
 def _style_value(record, *names):
@@ -1451,60 +1429,38 @@ def _style_value(record, *names):
     return None
 
 
+def _style_store_paths():
+    return _style_store.StyleStorePaths(
+        style_file=STYLE_FILE,
+        transaction_root=STYLE_FILE.parent.parent,
+    )
+
+
+def _style_store_operations():
+    """현재 저장·모델·Undo 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
+    return _style_store.StyleStoreOperations(
+        transaction=shared_data_transaction,
+        lock=_STYLE_TX_LOCK,
+        load_rows=load_combos,
+        atomic_write_json=atomic_write_json,
+        normalize_model=model_id_from_metadata,
+        forget_caches=forget_collection_caches,
+        record_import_batch=record_import_batch,
+    )
+
+
 def canonical_style_settings(record):
-    """수집 메타·사용자 그림체·비교 레시피의 설정 이름을 한 규격으로 맞춘다."""
-    record = record if isinstance(record, dict) else {}
-    raw = (_style_value(record, "settings", "설정", "params") or {})
-    raw = raw if isinstance(raw, dict) else {}
-    out = {}
-    for key in STYLE_BUNDLE_SETTING_KEYS:
-        names = _STYLE_SETTING_ALIASES.get(key, (key,))
-        value = next((raw[name] for name in names
-                      if name in raw and raw[name] is not None), None)
-        if value is None:
-            continue
-        try:
-            if key in _STYLE_INT_SETTINGS:
-                value = int(value)
-            elif key in _STYLE_FLOAT_SETTINGS:
-                value = float(value)
-            elif key in _STYLE_BOOL_SETTINGS:
-                value = (value.strip().lower() in ("1", "true", "yes", "on")
-                         if isinstance(value, str) else bool(value))
-            elif key == "model":
-                value = model_id_from_metadata(
-                    value, str(value or "nai-diffusion-4-5-full"))
-            else:
-                value = str(value)
-        except (TypeError, ValueError, OverflowError):
-            value = str(value)
-        out[key] = value
-    return out
+    return _style_store.canonical_style_settings(
+        _style_store_operations(),
+        record,
+    )
 
 
 def style_bundle_signature(record):
-    """그림체의 베이스+네거티브+생성 설정 불가분 묶음을 식별한다."""
-    record = record if isinstance(record, dict) else {}
-    prompt = _style_value(record, "base", "prompt", "프롬프트")
-    if prompt in (None, ""):
-        prompt = record.get("combo") or ""
-    negative = _style_value(record, "negative", "네거티브") or ""
-    settings = canonical_style_settings(record)
-    if not (str(prompt or "") or str(negative or "") or settings):
-        fallback = {
-            "artists": record.get("artists") or [],
-            "combo": record.get("combo") or "",
-            "seed": (record.get("params") or {}).get("seed")
-                if isinstance(record.get("params"), dict) else None,
-        }
-        return json.dumps(
-            {"legacy": fallback}, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"), default=str)
-    return json.dumps(
-        {"prompt": str(prompt or ""), "negative": str(negative or ""),
-         "settings": settings},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-
+    return _style_store.style_bundle_signature(
+        _style_store_operations(),
+        record,
+    )
 
 def character_bundle_signature(record):
     """캐릭터 전체 프롬프트와 변형·참조 자원을 한 묶음으로 식별한다."""
@@ -1529,48 +1485,7 @@ def _style_row_digest(row):
 
 
 def _merge_style_evidence(existing, incoming):
-    """같은 묶음의 새 이미지·출처만 더하고 기존 원문과 설정은 덮지 않는다."""
-    merged = copy.deepcopy(existing)
-    old_images = list(merged.get("images") or [])
-    for image in incoming.get("images") or []:
-        if image not in old_images:
-            old_images.append(image)
-    if old_images:
-        merged["images"] = old_images
-    evidence = list(merged.get("evidence") or [])
-    item = {
-        key: copy.deepcopy(incoming.get(key))
-        for key in ("title", "source", "url", "posted_at", "images")
-        if incoming.get(key) not in (None, "", [])
-    }
-    if item:
-        marker = json.dumps(
-            item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            default=str)
-        known = {
-            json.dumps(x, ensure_ascii=False, sort_keys=True,
-                       separators=(",", ":"), default=str)
-            for x in evidence if isinstance(x, dict)
-        }
-        if marker not in known:
-            evidence.append(item)
-    if evidence:
-        merged["evidence"] = evidence
-    evidence_records = list(merged.get("evidence_records") or [])
-    known_records = {
-        str(item.get("id") or "")
-        for item in evidence_records if isinstance(item, dict)
-    }
-    for record in incoming.get("evidence_records") or []:
-        if not isinstance(record, dict):
-            continue
-        record_id = str(record.get("id") or "")
-        if record_id and record_id not in known_records:
-            evidence_records.append(copy.deepcopy(record))
-            known_records.add(record_id)
-    if evidence_records:
-        merged["evidence_records"] = evidence_records
-    return merged
+    return _style_store.merge_style_evidence(existing, incoming)
 
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
@@ -1651,71 +1566,14 @@ def load_combos():
     return _COMBOS["rows"]
 
 
-@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def add_style(rec, import_info=None, return_detail=False):
-    """큰 그림체 묶음을 비파괴 임포트한다.
-
-    같은 묶음은 기존 레코드를 갈아치우지 않고 새 이미지·출처 근거만 더한다.
-    import_info가 있으면 단건 이미지도 자료팩처럼 독립적으로 되돌릴 판을 남긴다.
-    """
-    with _STYLE_TX_LOCK:
-        # 다른 실행본이 먼저 저장했을 수 있으므로 프로세스 잠금을 얻은 뒤 캐시가
-        # 아니라 디스크 최신판에서 시작한다.
-        forget_collection_caches()
-        rows = list(load_combos())
-        wanted = style_bundle_signature(rec)
-        action, changed, before, row_key = "added", True, None, ""
-        for i, r in enumerate(rows):
-            if not isinstance(r, dict) or style_bundle_signature(r) != wanted:
-                continue
-            before = copy.deepcopy(r)
-            merged = _merge_style_evidence(r, rec)
-            changed = merged != r
-            if changed:
-                rows[i] = merged
-                action = "updated"
-            else:
-                action = "existing"
-            row_key, _ = _row_key(r, "id")
-            rec = rows[i]
-            break
-        else:
-            rec = copy.deepcopy(rec)
-            if not rec.get("id"):
-                rec["id"] = "style-" + hashlib.sha256(
-                    wanted.encode("utf-8")).hexdigest()[:20]
-            row_key, _ = _row_key(rec, "id")
-            rows.insert(0, rec)
-
-        if changed:
-            STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(STYLE_FILE, rows, indent=None)
-        batch_id = None
-        if changed and isinstance(import_info, dict):
-            batch = {
-                "kind": str(import_info.get("kind") or "import"),
-                "file": str(import_info.get("file") or "자료"),
-                "lists": {}, "files": copy.deepcopy(import_info.get("files") or {}),
-                "installed": [], "list_updates": [], "요약": "",
-            }
-            if before is None:
-                batch["lists"] = {"그림체.json": [row_key]}
-                batch["요약"] = "그림체: 새 묶음 1건"
-            else:
-                batch["list_updates"] = [{
-                    "stem": "그림체.json", "key": row_key,
-                    "before": before, "after_sha256": _style_row_digest(rec),
-                }]
-                batch["요약"] = "그림체: 같은 묶음에 새 근거를 더함"
-            batch_id = record_import_batch(batch)
-        if changed:
-            forget_collection_caches()
-        detail = {
-            "total": len(rows), "action": action, "changed": changed,
-            "id": rec.get("id"), "batch": batch_id,
-        }
-        return detail if return_detail else len(rows)
-
+    return _style_store.add_style(
+        _style_store_paths(),
+        _style_store_operations(),
+        rec,
+        import_info,
+        return_detail,
+    )
 
 # ── 그림체 정리 ────────────────────────────────────────────────────────────
 # 자료를 몇천 건 넣고 나면 **지울 수 있어야** 정리가 된다. 여기까지 없었다 —
