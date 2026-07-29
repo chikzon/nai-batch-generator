@@ -5124,6 +5124,7 @@ def undo_datapack(batch_id, cfg=None):
         return {"ok": False, "error": "그 기록을 못 찾았습니다."}
     lists, dirs = _datapack_lists(), _datapack_dirs()
     said = []
+    failures = []
     for update in reversed(hit.get("list_updates") or []):
         stem = str(update.get("stem") or "")
         spot = lists.get(stem)
@@ -5156,6 +5157,7 @@ def undo_datapack(batch_id, cfg=None):
             said.append(f"{stem}: 임포트 전 묶음으로 복구")
         except Exception as e:
             log.warning(f"임포트 목록 갱신 되돌리기 실패: {e}")
+            failures.append(f"{stem}: 목록 갱신 복구 실패")
     for stem, keys in (hit.get("lists") or {}).items():
         spot = lists.get(stem)
         if not spot or not keys:
@@ -5165,7 +5167,9 @@ def undo_datapack(batch_id, cfg=None):
             continue
         try:
             old = load_json_recover(path)
-        except Exception:
+        except Exception as e:
+            log.warning(f"임포트 목록 삭제 되돌리기 실패: {e}")
+            failures.append(f"{stem}: 목록 삭제 실패")
             continue
         drop = set(map(str, keys))
         kept = [x for x in old
@@ -5187,8 +5191,9 @@ def undo_datapack(batch_id, cfg=None):
                     # 같은 폴더의 목록 밖 백업에서 원본 파일을 되찾을 수 있다.
                     recoverable_remove(p, label="자료팩되돌리기")
                     gone += 1
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"자료팩 파일 되돌리기 실패: {e}")
+                failures.append(f"{d}/{nm}: 파일 이동 실패")
         if gone:
             said.append(f"{d}: {gone}개 지움")
     for item in reversed(hit.get("installed") or []):
@@ -5211,11 +5216,16 @@ def undo_datapack(batch_id, cfg=None):
                     _atomic_write_bytes(dest, backup.read_bytes())
                     backup.unlink()
                     said.append(f"{rel.as_posix()}: 이전 자료 복구")
+                else:
+                    failures.append(f"{rel.as_posix()}: 이전 자료 백업 없음")
             else:
                 recoverable_remove(dest, label="자료팩되돌리기")
                 said.append(f"{rel.as_posix()}: 가져온 파일 뺌")
         except Exception as e:
             log.warning(f"자료팩 전체파일 되돌리기 실패: {e}")
+            failures.append(
+                f"{Path(item.get('path', '')).as_posix()}: 전체파일 복구 실패"
+            )
     changed_config = False
     char_records = hit.get("characters") or []
     if cfg is not None and char_records:
@@ -5246,8 +5256,17 @@ def undo_datapack(batch_id, cfg=None):
     #   이미 겹쳐 있는 옛 기록(위 참조)에서는 손대지도 않은 판의 기록까지 사라져
     #   그 자료를 **영영 되돌릴 수 없게** 됐다. 객체로 견주면 옛 기록도 한 번에 한 판씩
     #   차례로 되돌릴 수 있다.
-    save_pack_log([b for b in rows if b is not hit])
     forget_collection_caches()
+    if failures:
+        return {
+            "ok": False,
+            "partial": bool(said),
+            "error": "일부 항목을 되돌리지 못했습니다. 같은 기록으로 다시 시도할 수 있습니다.",
+            "report": said + failures,
+            "log": pack_log_brief(),
+            "changed_config": changed_config,
+        }
+    save_pack_log([b for b in rows if b is not hit])
     return {"ok": True, "report": said or ["되돌릴 것이 없었습니다"],
             "log": pack_log_brief(), "changed_config": changed_config}
 
@@ -5401,12 +5420,11 @@ def _backup_merge_secrets(logical, raw, target):
     if logical != "profile/설정.json":
         return raw
     incoming = json.loads(raw.decode("utf-8"))
+    if not isinstance(incoming, dict):
+        raise ValueError("복원할 설정의 최상위 값은 JSON 객체여야 합니다.")
     current = {}
     if target.is_file():
-        try:
-            current = load_json_recover(target)
-        except Exception:
-            pass
+        current = load_settings_recover(target)
     for key in BACKUP_SECRET_KEYS:
         if key in current:
             incoming[key] = current[key]
@@ -10595,12 +10613,7 @@ class ConfigServer:
             if not str(key).startswith("_")
         }
         if SETTINGS_FILE.is_file():
-            try:
-                loaded = load_json_recover(SETTINGS_FILE)
-                if isinstance(loaded, dict):
-                    latest = loaded
-            except Exception:
-                pass
+            latest = load_settings_recover(SETTINGS_FILE)
         merged = dict(DEFAULT_CONFIG)
         merged.update(latest)
         merged.update(runtime)

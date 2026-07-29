@@ -2968,6 +2968,9 @@ class RegressionTests(unittest.TestCase):
                 patch.object(Path, "read_text", new=guarded_read_text),
                 patch.object(APP, "STARTUP_RECOVERY_NOTICE", None),
             ):
+                server = APP.ConfigServer(copy.deepcopy(APP.DEFAULT_CONFIG))
+                with self.assertRaises(PermissionError):
+                    server.latest_config_from_disk()
                 with self.assertRaises(PermissionError):
                     APP.load_or_init_config()
                 self.assertIsNone(APP.STARTUP_RECOVERY_NOTICE)
@@ -3429,6 +3432,17 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(restored_cfg["base_prompt"], "backup prompt")
                 self.assertEqual(restored_cfg["token"], "pst-current")
                 self.assertEqual(restored_cfg["out_dir"], str(root / "output"))
+                with (
+                    patch.object(
+                        APP,
+                        "load_settings_recover",
+                        side_effect=PermissionError("fixture: settings locked"),
+                    ),
+                    self.assertRaises(PermissionError),
+                ):
+                    APP._backup_merge_secrets(
+                        "profile/설정.json", b"{}", settings_file
+                    )
 
                 # 복원 뒤 사용자가 다시 편집한 파일은 되돌리기가 덮어쓰면 안 된다.
                 char_file.write_text(
@@ -3824,6 +3838,18 @@ class RegressionTests(unittest.TestCase):
                     "세팅/시험.json", "캐릭터/시험.json", "태그/시험.csv",
                 ):
                     self.assertTrue((root / rel).exists(), rel)
+                with patch.object(
+                    APP,
+                    "recoverable_remove",
+                    side_effect=PermissionError("fixture: file locked"),
+                ):
+                    partial = APP.undo_datapack(result["batch"])
+                self.assertFalse(partial["ok"])
+                self.assertIn("partial", partial)
+                self.assertTrue(any(
+                    row.get("id") == result["batch"]
+                    for row in APP.load_pack_log()
+                ))
                 undone = APP.undo_datapack(result["batch"])
                 self.assertTrue(undone["ok"])
                 for rel in (
