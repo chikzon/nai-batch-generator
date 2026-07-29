@@ -59,7 +59,9 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
     def test_transport_and_template_do_not_grow_back_into_monoliths(self):
         source_path = ROOT / "src" / "nai_studio" / "legacy_app.py"
         source = source_path.read_text(encoding="utf-8")
-        self.assertLessEqual(len(source.splitlines()), 15_000)
+        # 이미 밖으로 옮긴 책임이 다시 들어오는 것만 막는 감소 전용 상한이다.
+        # 다음 구조 추출 때 현재 baseline에 맞춰 함께 낮춘다.
+        self.assertLessEqual(len(source.splitlines()), 14_750)
 
         tree = ast.parse(source)
         sizes = {
