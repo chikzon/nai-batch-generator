@@ -1,15 +1,15 @@
 # Claude push 인계
 
-현재 기능 코드 기준은 `76c7f62`, 전체 검증 기준은 `846ded8`이다.
-앞선 구현과 인계 커밋은 원격에 반영됐다. 다음 세션의 휴리스틱·검증 제한 규칙
-커밋 하나만 로컬 `main`이 `origin/main`보다 앞선다.
+현재 릴리스 후보 코드 기준은 `072965d`다. 앞선 구현과 UI 개편은 원격
+`344be59`까지 반영됐고, 이 인계 문서 커밋까지 포함하면 로컬 `main`은
+`origin/main`보다 3커밋 앞선다.
 Outpaint 실제 NAI 검증, 백업·자료팩 선택 복원,
 프로젝트 공통 설계도, 캐릭터 이미지 시험·variation, 작가 조합 성능 개선까지
 포함한다.
 
-**사용자가 이번에는 소스 push를 지시했다.** 아래 절차로 `main`만 push한다.
-`dist/`는 최신 UI보다 오래됐으므로 Release·태그·산출물 게시에는 사용하지 않는다.
-포터블·설치본 재빌드와 설치·제거 검증은 별도 작업이다.
+**사용자가 오래된 공개 Release 문제 해결을 지시했다.** 아래 절차로 `main`을
+push하고 smoke CI가 통과한 뒤에만 `v1.1.0` 태그를 push한다. 태그 workflow가
+GitHub 러너에서 산출물을 다시 만들고 새 Release를 게시한다.
 
 ## Claude가 실행할 push 절차
 
@@ -30,9 +30,17 @@ git rev-parse origin/main
 - `디자인 시스템.html`, `출력 테마 디자인 가이드.html`은 사용자가 둔 참고 원본이며
   현재 untracked다. `git add -A`로 임의 포함하거나 삭제하지 않는다.
 - push 뒤 `HEAD`와 `origin/main` 해시가 같아야 한다.
-- GitHub Actions가 시작되면 최종 상태를 확인한다.
-- CI 실패 시 Release·태그를 만들지 말고 실패 단계와 로그 근거만 보고한다.
-- 강제 push, rebase, reset, 새 커밋, Release, 태그 생성은 하지 않는다.
+- smoke GitHub Actions가 시작되면 최종 성공을 확인한다.
+- smoke CI 실패 시 태그를 만들지 말고 실패 단계와 로그 근거만 보고한다.
+- smoke CI 성공 뒤 현재 HEAD에 `v1.1.0` 태그가 없는 것을 확인하고 다음만 실행한다.
+
+```powershell
+git tag -a v1.1.0 -m "NAI 배치 생성기 1.1.0"
+git push origin v1.1.0
+```
+
+- `build-release` workflow 성공과 Release 첨부파일 4개를 확인한다.
+- 강제 push, rebase, reset, 새 커밋, 기존 `v1.0.0` 태그 변경은 하지 않는다.
 
 ## 최종 구현
 
@@ -91,7 +99,7 @@ git rev-parse origin/main
 ## 검증 결과
 
 - 전체 `python 검증.py`: 계약 **10/10**, 모듈 경계 **3/3**, 무과금 회귀
-  **171/171** (`846ded8` 기준)
+  **171/171** (`072965d`와 같은 코드 기준)
 - 현재 UI 커밋: 렌더 JS·중복 id 1/1, 작업실 회귀 4/4, Python 구문,
   데스크톱·390px 브라우저 스모크 통과
 - 전체 검증 전후 운영 `생성.log` 크기·수정 시각 동일
@@ -119,37 +127,46 @@ git rev-parse origin/main
 - 앱 내 브라우저 연결은 로컬 자산 경로 오류로 실패했으나 설치된 Playwright로 실제
   Chromium 조작과 최신 1600·390 스크린샷 촬영을 완료
 
-## 로컬 산출물 — 현재 HEAD보다 오래됨
+## 1.1.0 로컬 릴리스 후보
 
-- `dist/NAI-batch-generator-1.0.0-portable-win-x64.zip`
-- `dist/NAI-batch-generator-1.0.0-datapack.zip`
-- `dist/NAI-batch-generator-1.0.0-setup.exe`
+- `dist/NAI-batch-generator-1.1.0-portable-win-x64.zip`
+- `dist/NAI-batch-generator-1.1.0-datapack.zip`
+- `dist/NAI-batch-generator-1.1.0-setup.exe`
 - `dist/SHA256SUMS.txt`
 
-아래 해시는 2026-07-29 19:43 산출물의 역사 기록이다. `b72666f`, `4535f06`,
-`ec7df63`, `15f3b7e`, `c3ee751`을 포함하지 않으므로 Release에 사용하지 않는다.
+`072965d`와 같은 코드·자산으로 2026-07-29 22:10에 로컬 빌드했다. GitHub
+Release에는 이 파일을 수동 업로드하지 않고 태그 workflow가 깨끗한 러너에서 다시
+만든 파일을 사용한다.
 
 SHA-256:
 
 ```text
-9e5b9e8d5efc0648ab9b25d8c9d5666ea0356409d4f544fc5201afb0212b7b3d  NAI-batch-generator-1.0.0-portable-win-x64.zip
-3de3280aa7c5e9ffed055567e61f1a4153266726c88767c96b1b13df1b5b536a  NAI-batch-generator-1.0.0-datapack.zip
-9f17aafe8341da0366ce46455335b4483f2b5e2b427237b8a825ce83e2c85b36  NAI-batch-generator-1.0.0-setup.exe
+3864C4C7E28173DFC6E4337D93BD0950AEC7F0D478FC57B5C014BADB1AED3F73  NAI-batch-generator-1.1.0-portable-win-x64.zip
+8166BFFA48CABC9082D3F1072BBB2799B3A9DA461642EB65C0A1A3C776147825  NAI-batch-generator-1.1.0-datapack.zip
+78D41827CAC8AFB5589A70514E37B3612C86BDC47DB79DE10552434F904BA6B6  NAI-batch-generator-1.1.0-setup.exe
 ```
+
+검증:
+
+- `python 검증.py`: 계약 10/10, 모듈 경계 3/3, 회귀 171/171
+- 포터블 EXE: 격리 데이터 경로 기동, `/`·`/ui/studio.css` HTTP 200
+- 설치본: 격리 경로 설치 exit 0, 설치 EXE HTTP 200, 파일·제품 버전 1.1.0
+- 제거: exit 0, 프로그램 폴더 제거, 사용자 데이터 유지
+- 본체에 사용자 토큰·설정·상태·생성 로그·선별 자료 0건
+- workflow YAML과 Python 구문 정상
 
 ## Claude가 할 일
 
-1. 지금은 push하지 않고 `docs/current/NEXT_TASK.md`를 끝낸다.
-2. 현재 HEAD로 포터블·자료팩·설치본을 다시 만들고 Python 없는 기동·설치·제거를
-   재검증한다.
-3. `git status --short`, 전체 검증, 산출물 SHA, 토큰·개인 자료 0건을 확인해 이
-   문서를 다시 갱신한다.
-4. 사용자 지시 뒤 변경 없이 `git push origin main`하고 원격 HEAD·smoke CI를 확인한다.
+1. 추적 파일 변경 0건과 untracked 디자인 가이드 2개 보존을 확인한다.
+2. `main`을 push하고 원격 HEAD 일치와 smoke CI 성공을 확인한다.
+3. smoke 성공 뒤에만 `v1.1.0` 태그를 push한다.
+4. `build-release` 성공과 새 Release의 setup·portable·datapack·SHA256SUMS를 확인한다.
 
 ## 하지 않을 일
 
 - 기능·테스트·문서 추가 수정
 - 검증 약화 또는 실패 정상 처리
-- Release·태그·산출물 게시
+- 기존 `v1.0.0` Release·태그 수정 또는 삭제
+- 로컬의 옛 1.0.0 산출물 업로드
 - 사용자 자료 이동·변환·삭제
 - 저장소 밖의 `성향 표`와 `로그 편집기` 접근
