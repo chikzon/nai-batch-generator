@@ -37,7 +37,6 @@ import webbrowser
 import zipfile
 import zlib
 from datetime import date, datetime
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -96,7 +95,6 @@ from src.nai_studio.domain.nai_payload import (
     V3_ONLY,
     V4_ONLY,
     annotate_nai_comment,
-    build_nai_payload,
     fixed_seed,
     image_to_image_fields,
     is_v4_model,
@@ -204,6 +202,14 @@ from src.nai_studio.services.character_runtime import (
 from src.nai_studio.services.generation_blueprint import (
     BLUEPRINT_GENERATION_KEYS,
     generation_blueprint,
+)
+from src.nai_studio.services.nai_client import (
+    APIError,
+    AccountBannedError,
+    AuthError,
+    RateLimitError,
+    request_nai_image,
+    retry_after_seconds,
 )
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
@@ -7378,43 +7384,6 @@ def comparison_recipe_context(cfg, plan, styles, chars):
     return context
 
 
-class RateLimitError(Exception):
-    def __init__(self, message, retry_after=60):
-        super().__init__(message)
-        self.retry_after = max(1.0, min(float(retry_after or 60), 600.0))
-
-
-class AccountBannedError(Exception):
-    pass
-
-
-class AuthError(Exception):
-    pass
-
-
-class APIError(Exception):
-    def __init__(self, message, status_code=None, retryable=False):
-        super().__init__(message)
-        self.status_code = status_code
-        self.retryable = bool(retryable)
-
-
-def retry_after_seconds(value, default=60):
-    """Retry-After의 초/HTTP-date 두 형식을 읽고 비정상 값은 안전한 기본값으로."""
-    text = str(value or "").strip()
-    if not text:
-        return float(default)
-    try:
-        return max(1.0, min(float(text), 600.0))
-    except ValueError:
-        try:
-            when = parsedate_to_datetime(text)
-            now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
-            return max(1.0, min((when - now).total_seconds(), 600.0))
-        except (TypeError, ValueError, OverflowError):
-            return float(default)
-
-
 class FatalStopError(Exception):
     """계정 정지/인증 오류 등 프로그램 자체를 완전히 끝내야 하는 경우."""
     pass
@@ -8178,74 +8147,13 @@ def call_nai_api(
     params=None,
     chars=None,
 ):
-    """params: 설정.json 의 고급 파라미터 dict (없으면 기존 기본값 그대로)
-    chars: 인물 목록 [{prompt, negative}, …] (최대 6명)"""
-    p = dict(params or {})
-    # ── 전처리 순서: 주석 제거 → 조각 치환 → 정규화 ──────────────────
-    # ⚠ 이 순서와 대상 목록이 중요하다 (CQA-004·005):
-    #   ① 주석을 **먼저** 지워야 메모 속 `<*이름>` 이 순번을 헛되이 소비하지 않는다.
-    #   ② `chars=` 로 온 인물 칸도 함께 풀어야 한다 — 예전엔 base/negative 와
-    #      옛 female/male 인자만 풀어서 캐릭터 칸의 조각이 그대로 NAI 로 나갔다.
-    #   ③ 한 이미지의 모든 칸을 **한 번의 resolve_fragments** 로 처리해야
-    #      `<*이름>` 순번이 칸마다 따로 돌지 않는다.
-    chars_list = []
-    if chars:
-        for c in chars:
-            if isinstance(c, dict):
-                chars_list.append([c.get("prompt", ""), c.get("negative", "")])
-            else:
-                pair = (list(c) + ["", ""])[:2]
-                chars_list.append([pair[0], pair[1]])
-    fixed = [strip_comment_lines(x) for x in (base_prompt, negative)]
-    flat_chars = [strip_comment_lines(x) for pair in chars_list for x in pair]
-    if p.get("use_fragments", True):
-        resolved, counters = resolve_fragments(fixed + flat_chars,
-                                               counters=p.get("_frag_counters"))
-        fixed, flat_chars = list(resolved[:2]), list(resolved[2:])
-        if p.get("_frag_counters") is not None:
-            p["_frag_counters"].update(counters)     # 호출자가 이어서 쓴다
-    # 숫자로 끝나는 태그가 `::` 에 붙으면 NAI 가 그 숫자를 새 가중치로 읽어
-    # 묶음이 닫히지 않는다 (`2::tag_number_37::` → 37 이 가중치가 됨).
-    # 닫는 `::` 앞에 공백을 넣어 원래 의도대로 전달한다. **캐릭터 칸도 똑같이.**
-    base_prompt, negative = [normalize_prompt(x) for x in fixed]
-    flat_chars = [normalize_prompt(x) for x in flat_chars]
-    for i in range(len(chars_list)):
-        chars_list[i] = [flat_chars[i * 2], flat_chars[i * 2 + 1]]
-    if seed is None:
-        seed = random.randint(0, 2**32 - 1)
-    model = p.get("model") or "nai-diffusion-4-5-full"
-    if p.get("quality_toggle"):
-        base_prompt = merge_quality_suffix(base_prompt, model)
-    # UC 프리셋도 여기서 합친다 — 숫자만 보내면 NAI 가 무시한다(실측 픽셀차 0.00).
-    # 이미 붙어 있으면 그대로 두므로 그림에서 읽어 온 네거티브도 이중이 되지 않는다.
-    negative = merge_uc_preset(negative, model, p.get("uc_preset"))
-
-    # 차단해 둔 작가가 실제로 나가는 프롬프트에 있으면 알린다 (R5-01).
-    # 막지는 않는다 — 사용자가 일부러 넣었을 수 있다. 다만 모르고 나가지는 않게.
-    try:
-        blocked = blocked_artists_in(base_prompt)
-        if blocked:
-            log.warning(f"⛔ 차단해 둔 작가가 프롬프트에 있습니다: {', '.join(blocked)}")
-    except Exception:
-        pass
-
-    # 레거시 입력 모양만 여기서 인물 목록으로 바꾸고, 좌표·Reference·img2img와
-    # 최종 JSON 조립은 domain.nai_payload의 공통 계약에 맡긴다.
-    people = []
-    # 위에서 주석 제거·조각 치환·정규화를 마친 값이다 (CQA-004·005)
-    for caption, character_negative in chars_list:
-        if (caption or "").strip():
-            people.append((caption, character_negative or ""))
-    if len(people) > MAX_CHARS:
-        log.warning(f"인물이 {len(people)}명인데 NAI 는 {MAX_CHARS}명까지입니다 — "
-                    f"뒤쪽 {len(people)-MAX_CHARS}명은 보내지 않습니다.")
-        people = people[:MAX_CHARS]
-    payload, _payload_context = build_nai_payload(
-        base_prompt=base_prompt,
-        negative_prompt=negative,
-        people=people,
-        width=width,
-        height=height,
+    """기존 호출 계약을 유지하며 NAI 통신 서비스에 런타임 의존성을 연결한다."""
+    return request_nai_image(
+        token,
+        base_prompt,
+        negative,
+        width,
+        height,
         scale=scale,
         cfg_rescale=cfg_rescale,
         steps=steps,
@@ -8254,49 +8162,13 @@ def call_nai_api(
         uc_preset=uc_preset,
         seed=seed,
         variety=variety,
-        params=p,
-        warn=log.warning,
-        info=log.info,
+        params=params,
+        chars=chars,
+        fragment_resolver=resolve_fragments,
+        blocked_artist_finder=blocked_artists_in,
+        endpoint=NAI_API_URL,
+        max_characters=MAX_CHARS,
     )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/x-zip-compressed",
-    }
-    request_id = f"nai-request-{uuid.uuid4().hex}"
-    payload_hash = fingerprint_payload(payload)
-    resp = requests.post(NAI_API_URL, json=payload, headers=headers, timeout=120)
-    if resp.status_code == 429:
-        wait = retry_after_seconds(resp.headers.get("Retry-After"), 60)
-        raise RateLimitError(f"429 Too Many Requests — {wait:g}초 뒤 재시도", wait)
-    if resp.status_code == 403:
-        raise AccountBannedError("403 Forbidden — 계정 보호를 위해 즉시 중단합니다.")
-    if resp.status_code == 401:
-        raise AuthError("401 — 토큰이 만료되었거나 잘못되었습니다.")
-    if resp.status_code != 200:
-        raise APIError(
-            f"HTTP {resp.status_code}: {resp.text[:200]}",
-            status_code=resp.status_code,
-            retryable=(resp.status_code == 408 or resp.status_code >= 500),
-        )
-
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-        raw = zf.read(zf.namelist()[0])
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    # NAI가 돌려준 원본 메타데이터를 이미지에 붙여 둔다.
-    # 저장할 때 WebP EXIF 로 심어서, 나중에 그림만 보고도 시드·설정을 되찾을 수 있게 한다.
-    chunks = png_text_chunks(raw)
-    img.nai_seed = seed
-    img.nai_request_id = request_id
-    img.nai_payload_hash = payload_hash
-    img.nai_comment = annotate_nai_comment(
-        next((chunks[k] for k in chunks if k.lower() == "comment"), ""),
-        p.get("quality_toggle", False),
-        uc_preset,
-        request_id=request_id,
-        payload_hash=payload_hash,
-    )
-    return img
 
 
 def out_format(cfg):

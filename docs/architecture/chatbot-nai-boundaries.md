@@ -50,6 +50,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 캐릭터 슬롯·Variant·Cast·활성 인물 투영 | `services/character_runtime.py` |
 | 현재 설정·자료·출력의 생성 설계도 투영 | `services/generation_blueprint.py` |
+| NAI 이미지 HTTP 요청·오류 분류·ZIP 응답 해석 | `services/nai_client.py` |
 | 세팅 옵션 축·장면별 인물 프롬프트 컴파일 | `services/setting_compiler.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
