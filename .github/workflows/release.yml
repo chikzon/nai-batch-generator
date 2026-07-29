@@ -23,6 +23,17 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
+      - name: Resolve and verify release version
+        id: release_meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = python -c "from tools.build.app import APP_VERSION; print(APP_VERSION)"
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$ver") {
+            throw "tag ${{ github.ref_name }} does not match app version v$ver"
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Install runtime and build dependencies
         shell: pwsh
         run: |
@@ -69,7 +80,7 @@ jobs:
           #   GitHub 이 글자를 점으로 뭉개서 `NAI배치생성기-기본자료팩.zip` 이
           #   `NAI.-.zip` 이 된다 — 무엇인지 알 수 없고 SHA256SUMS 와도 어긋난다.
           #   (v1.0.0 첫 게시에서 실제로 그렇게 나왔다.)
-          $ver = "1.0.0"
+          $ver = "${{ steps.release_meta.outputs.version }}"
           $rename = [ordered]@{
             $portable                        = "NAI-batch-generator-$ver-portable-win-x64.zip"
             "dist/NAI배치생성기-기본자료팩.zip" = "NAI-batch-generator-$ver-datapack.zip"
@@ -95,9 +106,9 @@ jobs:
           name: NAI-batch-generator-Windows-x64
           if-no-files-found: error
           path: |
-            dist/NAI-batch-generator-1.0.0-portable-win-x64.zip
-            dist/NAI-batch-generator-1.0.0-datapack.zip
-            dist/NAI-batch-generator-1.0.0-setup.exe
+            dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-portable-win-x64.zip
+            dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-datapack.zip
+            dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-setup.exe
             dist/SHA256SUMS.txt
 
       - name: Publish GitHub Release
@@ -107,9 +118,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" `
-            "dist/NAI-batch-generator-1.0.0-portable-win-x64.zip" `
-            "dist/NAI-batch-generator-1.0.0-datapack.zip" `
-            "dist/NAI-batch-generator-1.0.0-setup.exe" `
+            "dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-portable-win-x64.zip" `
+            "dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-datapack.zip" `
+            "dist/NAI-batch-generator-${{ steps.release_meta.outputs.version }}-setup.exe" `
             "dist/SHA256SUMS.txt" `
             --title "NAI 배치 생성기 ${{ github.ref_name }}" `
             --generate-notes

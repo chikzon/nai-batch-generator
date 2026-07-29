@@ -13,9 +13,9 @@ Windows용 비공식 보조 프로그램입니다.
 
 | 파일 | 누구에게 알맞은가 |
 | --- | --- |
-| `NAI-batch-generator-1.0.0-setup.exe` | 일반 사용자 권장. 설치·제거가 가능한 Windows x64 설치본 |
-| `NAI-batch-generator-1.0.0-portable-win-x64.zip` | 설치하지 않고 원하는 폴더에서 쓰려는 사용자 |
-| `NAI-batch-generator-1.0.0-datapack.zip` | 빌더 후보와 태그 검색·자동완성을 함께 쓰려는 사용자 |
+| `NAI-batch-generator-1.1.0-setup.exe` | 일반 사용자 권장. 설치·제거가 가능한 Windows x64 설치본 |
+| `NAI-batch-generator-1.1.0-portable-win-x64.zip` | 설치하지 않고 원하는 폴더에서 쓰려는 사용자 |
+| `NAI-batch-generator-1.1.0-datapack.zip` | 빌더 후보와 태그 검색·자동완성을 함께 쓰려는 사용자 |
 | `SHA256SUMS.txt` | 받은 파일이 Release 원본과 같은지 확인할 때 사용 |
 
 받은 파일 이름은 영문입니다. 프로그램을 설치·실행하면 화면과 폴더 이름은 한국어입니다.
