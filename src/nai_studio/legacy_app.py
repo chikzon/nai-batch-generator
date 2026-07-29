@@ -185,6 +185,7 @@ from src.nai_studio.services import (
     datapack_store as _datapack_store,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
+    metadata_candidate_store as _metadata_candidate_store,
     output_lifecycle as _output_lifecycle,
     style_store as _style_store,
     user_backup_store as _user_backup_store,
@@ -3070,162 +3071,43 @@ def metadata_audit_control(body):
     return {"ok": True, **result}
 
 
+def _metadata_candidate_paths():
+    return _metadata_candidate_store.MetadataCandidatePaths(
+        base_dir=BASE_DIR,
+    )
+
+
+def _metadata_candidate_operations():
+    """현재 감사 singleton과 복원·그림체 저장 경계를 호출 때 주입해 patch를 보존한다."""
+    return _metadata_candidate_store.MetadataCandidateOperations(
+        adapter_for_paths=lambda _paths: metadata_audit_adapter(),
+        extract_nai_metadata=extract_nai_metadata,
+        nai_json_metadata=_nai_json_metadata,
+        prompt_parts=_prompt_parts,
+        param_keys=tuple(PARAM_KEYS),
+        image_inspect_queue=image_inspect_queue,
+        redact_diagnostic_text=redact_diagnostic_text,
+        parse_artist_combo=parse_artist_combo,
+        style_asset_from_record=style_asset_from_record,
+        add_style=add_style,
+    )
+
+
 def metadata_audit_candidate(body, *, include_raw=False):
-    """사용자가 고른 한 건만 다시 SHA 검증해 읽고, 저장 없이 복원 후보를 보여 준다."""
-    data = json.loads(body or b"{}")
-    rel = str(data.get("path") or "")
-    digest = str(data.get("sha256") or "")
-    payload = metadata_audit_adapter().read_verified(rel, digest)
-    suffix = Path(rel).suffix.casefold()
-    if suffix in (".png", ".webp"):
-        meta = extract_nai_metadata(
-            payload, "image/png" if suffix == ".png" else "image/webp")
-    elif suffix == ".json":
-        value = json.loads(payload.decode("utf-8-sig"))
-        raw = _nai_json_metadata(value)
-        if raw is None:
-            raise ValueError("선택한 JSON에서 NAI 생성 메타데이터를 찾지 못했습니다.")
-        base, negative, characters = _prompt_parts(raw)
-        params = {key: raw[key] for key in PARAM_KEYS
-                  if raw.get(key) is not None}
-        meta = {
-            "metadata_status": "ok",
-            "base": base,
-            "negative": negative,
-            "characters": characters,
-            "params": params,
-            "raw": raw,
-        }
-    else:
-        raise ValueError("PNG, WebP, JSON 후보만 열 수 있습니다.")
-    if meta.get("metadata_status") != "ok":
-        raise ValueError("선택한 파일의 NAI 생성 메타데이터가 더 이상 유효하지 않습니다.")
-    candidate = {
-        "base": str(meta.get("base") or ""),
-        "negative": str(meta.get("negative") or ""),
-        "negative_full": str(meta.get("negative") or ""),
-        "characters": copy.deepcopy(meta.get("characters") or []),
-        "params": copy.deepcopy(meta.get("params") or {}),
-    }
-    safe_preview = image_inspect_queue(
-        {
-            "ok": True,
-            "style": {
-                **candidate,
-                "metadata_raw": copy.deepcopy(meta.get("raw") or {}),
-            },
-        },
-        filename=redact_diagnostic_text(Path(rel).name),
+    return _metadata_candidate_store.metadata_audit_candidate(
+        _metadata_candidate_paths(),
+        _metadata_candidate_operations(),
+        body,
+        include_raw=include_raw,
     )
-    safe_actual = (
-        safe_preview["items"][0]["result"]["evidence_candidate"]
-        .get("actual_generation") or {}
-    )
-    candidate.update({
-        "base": str(safe_actual.get("base") or ""),
-        "negative": str(safe_actual.get("negative") or ""),
-        "negative_full": str(safe_actual.get("negative") or ""),
-        "characters": copy.deepcopy(safe_actual.get("characters") or []),
-        "params": copy.deepcopy(safe_actual.get("settings") or {}),
-    })
-    if include_raw:
-        candidate["metadata_raw"] = copy.deepcopy(meta.get("raw") or {})
-    return {
-        "ok": True,
-        "path": rel,
-        "sha256": digest.lower(),
-        "candidate": candidate,
-    }
 
 
 def metadata_audit_save_candidate(body):
-    """검증된 후보 한 건을 사용자가 명시적으로 고른 때만 그림체 자료로 저장한다."""
-    result = metadata_audit_candidate(body, include_raw=True)
-    candidate = result["candidate"]
-    rel = result["path"]
-    digest = result["sha256"]
-    artists, rest = parse_artist_combo(candidate.get("base") or "")
-    record = {
-        "id": f"audit-{digest[:20]}",
-        "content_sha256": digest,
-        "title": f"복원 후보 {digest[:12]}",
-        "source": "보유 자료 감사",
-        "tab": "",
-        "posted_at": "",
-        "recommend": None,
-        "views": None,
-        "url": "",
-        "count": len(artists),
-        "combo": ", ".join(
-            f"{weight:g}::artist:{name}::"
-            if weight is not None else f"artist:{name}"
-            for weight, name in artists
-        ),
-        "artists": [name for _, name in artists],
-        "weights": {
-            name: (weight if weight is not None else 1.0)
-            for weight, name in artists
-        },
-        "base": str(candidate.get("base") or ""),
-        "rest": ", ".join(rest),
-        "negative": str(candidate.get("negative") or ""),
-        "negative_full": str(candidate.get("negative_full") or ""),
-        "characters": copy.deepcopy(candidate.get("characters") or []),
-        "metadata_raw": copy.deepcopy(candidate.get("metadata_raw") or {}),
-        "params": copy.deepcopy(candidate.get("params") or {}),
-        "images": [],
-    }
-    safe_queue = image_inspect_queue(
-        {"ok": True, "style": record},
-        filename=redact_diagnostic_text(Path(rel).name),
+    return _metadata_candidate_store.metadata_audit_save_candidate(
+        _metadata_candidate_paths(),
+        _metadata_candidate_operations(),
+        body,
     )
-    evidence_record = copy.deepcopy(
-        safe_queue["items"][0]["result"]["evidence_candidate"])
-    safe_actual = evidence_record.get("actual_generation") or {}
-    record["base"] = str(safe_actual.get("base") or "")
-    record["negative"] = str(safe_actual.get("negative") or "")
-    record["negative_full"] = record["negative"]
-    record["characters"] = copy.deepcopy(
-        safe_actual.get("characters") or [])
-    record["params"] = copy.deepcopy(safe_actual.get("settings") or {})
-    safe_artists, safe_rest = parse_artist_combo(record["base"])
-    record["combo"] = ", ".join(
-        f"{weight:g}::artist:{name}::"
-        if weight is not None else f"artist:{name}"
-        for weight, name in safe_artists
-    )
-    record["artists"] = [name for _, name in safe_artists]
-    record["weights"] = {
-        name: (weight if weight is not None else 1.0)
-        for weight, name in safe_artists
-    }
-    record["count"] = len(safe_artists)
-    record["rest"] = ", ".join(safe_rest)
-    record["metadata_raw"] = copy.deepcopy(
-        evidence_record.get("raw_metadata") or {})
-    record["evidence_records"] = [evidence_record]
-    record["knowledge_asset"] = style_asset_from_record(
-        record,
-        evidence_refs=[evidence_record["id"]],
-        lifecycle="candidate",
-    )
-    saved = add_style(
-        record,
-        import_info={
-            "kind": "metadata-audit",
-            "file": f"자료색인 후보 {digest[:12]}",
-        },
-        return_detail=True,
-    )
-    return {
-        "ok": True,
-        "sha256": digest,
-        "import": {
-            key: saved.get(key)
-            for key in ("action", "total", "batch", "changed", "id")
-        },
-    }
-
 
 def folder_inventory_page(offset=0, limit=50):
     """대형 자료 색인을 한 번에 펼치지 않고 공통 복원 큐 계약으로 나눠 보여 준다."""
