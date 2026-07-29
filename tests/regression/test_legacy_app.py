@@ -3377,14 +3377,116 @@ class RegressionTests(unittest.TestCase):
         page = APP.PAGE_TEMPLATE
         for element_id in (
             "backupCard", "backupExport", "backupChoose", "backupFile",
-            "backupRestore", "backupRollback", "backupMsg",
+            "backupRestore", "backupRollback", "backupMsg", "backupDiff",
+            "backupSelectAll", "backupSelectNone", "backupDiffList",
         ):
             self.assertIn(f'id="{element_id}"', page)
-        self.assertIn("X-Backup-SHA256", page)
+        self.assertIn("diff_fingerprint:BACKUP_DIFF", page)
+        self.assertIn("selected})", page)
         self.assertIn("sessionStorage.setItem('naisBackupRollback'", page)
         self.assertIn("sessionStorage.getItem('naisBackupRollback')", page)
         self.assertIn("sessionStorage.removeItem('naisBackupRollback')", page)
         self.assertGreaterEqual(page.count("setTimeout(() => location.reload(), 700)"), 2)
+
+    def test_whole_backup_selectively_restores_one_json_field_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            char_dir = root / "캐릭터"
+            char_dir.mkdir()
+            target = char_dir / "A.json"
+            incoming = {
+                "id": "a", "외형": "red hair",
+                "outfit": "blue dress", "negative": "bad hands",
+                "variants": [
+                    {"id": "default", "prompt": "smile"},
+                    {"id": "winter", "prompt": "winter coat"},
+                ],
+            }
+            current = {
+                "id": "a", "외형": "black hair",
+                "outfit": "red coat", "negative": "lowres",
+                "variants": [
+                    {"id": "default", "prompt": "neutral"},
+                    {"id": "summer", "prompt": "swimsuit"},
+                ],
+            }
+            target.write_text(json.dumps(current, ensure_ascii=False),
+                              encoding="utf-8")
+            raw = json.dumps(incoming, ensure_ascii=False).encode("utf-8")
+            manifest = {
+                "schema": APP.BACKUP_SCHEMA,
+                "created_at": "2026-07-29T19:00:00",
+                "profile": "기본",
+                "files": [{
+                    "path": "common/캐릭터/A.json",
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }],
+            }
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False))
+                archive.writestr("data/common/캐릭터/A.json", raw)
+            blob = payload.getvalue()
+
+            with (
+                patch.object(APP, "BASE_DIR", root),
+                patch.object(APP, "PROFILE_DIR", root),
+            ):
+                preview = APP.preview_user_backup(blob)
+                by_pointer = {
+                    change["pointer"]: change
+                    for change in preview["changes"]
+                }
+                self.assertEqual(set(by_pointer), {
+                    "/negative", "/outfit", "/외형",
+                    "/variants/@id=default/prompt",
+                    "/variants/@id=summer",
+                    "/variants/@id=winter",
+                })
+                self.assertFalse(by_pointer["/outfit"]["base_available"])
+                selected = by_pointer["/outfit"]["id"]
+                result = APP.restore_user_backup(
+                    blob,
+                    preview["sha256"],
+                    selected=[selected],
+                    expected_diff=preview["diff_fingerprint"],
+                )
+                restored = json.loads(target.read_text(encoding="utf-8"))
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["selected"], 1)
+                self.assertEqual(restored["outfit"], "blue dress")
+                self.assertEqual(restored["외형"], "black hair")
+                self.assertEqual(restored["negative"], "lowres")
+
+                rolled = APP.rollback_user_backup(result["batch"])
+                self.assertTrue(rolled["ok"], rolled)
+                self.assertEqual(
+                    json.loads(target.read_text(encoding="utf-8")),
+                    current,
+                )
+
+                stale_preview = APP.preview_user_backup(blob)
+                stale_choice = next(
+                    change["id"] for change in stale_preview["changes"]
+                    if change["pointer"] == "/outfit")
+                target.write_text(json.dumps({
+                    **current, "outfit": "edited after preview",
+                }, ensure_ascii=False), encoding="utf-8")
+                conflict = APP.restore_user_backup(
+                    blob,
+                    stale_preview["sha256"],
+                    selected=[stale_choice],
+                    expected_diff=stale_preview["diff_fingerprint"],
+                )
+                self.assertFalse(conflict["ok"])
+                self.assertTrue(conflict["conflict"])
+                self.assertEqual(
+                    json.loads(target.read_text(encoding="utf-8"))["outfit"],
+                    "edited after preview",
+                )
 
     def test_local_image_audit_separates_legacy_names_from_damage(self):
         with tempfile.TemporaryDirectory() as td:

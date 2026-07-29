@@ -1,6 +1,7 @@
 # Claude push 인계
 
-최신 로컬 `main`은 Outpaint 실제 NAI 검증과 최신 설치본 빌드까지 끝난 기준점이다.
+최신 로컬 `main`은 Outpaint 실제 NAI 검증과 사용자 백업 선택 복원까지 끝난
+기준점이다.
 사용자가 현재 기준점을 먼저 공개하라고 명시하지 않는 한 **아직 push하지 않는다.**
 다음 작업은 `NEXT_TASK.md` 한 건씩 진행한다.
 
@@ -23,6 +24,9 @@
   실패한 결과를 완료로 오인하거나 같은 유료 요청을 즉시 반복하지 않음
 - 50건 이후 메타데이터 후보 UI, strict 키가 하나라도 있는 손상 결과의 구형 fallback
   차단. strict 식별자가 전혀 없는 진짜 구형 결과만 자산 저장 호환·장부 미기록
+- 전체 사용자 백업을 그림체·캐릭터·설정·프로필의 JSON 항목까지 나눠 현재값과
+  들어오는 값으로 비교. 아무것도 미리 덮지 않고 사용자가 고른 조각만 적용하며,
+  미리보기 뒤 자료가 바뀌면 적용을 거부하고 기존 복원 기록으로 전체 되돌리기
 
 대표 커밋:
 
@@ -36,7 +40,7 @@
 ## 검증 결과
 
 - `python 검증.py`: 계약 **10/10**, 모듈 경계 **3/3**, 무과금 회귀
-  **169/169 통과**
+  **170/170 통과**
 - 최종 EXE 직접 기동: `/`, `/ui/studio.css` HTTP 200. 최신 위치 UI와
   프롬프트 도구 마크업 포함 확인
 - 실제 브라우저: 1600×1000·390×844 가로 넘침 0, 편집 도구 겹침 0,
@@ -46,6 +50,9 @@
   실제 감소 27 Anlas 일치. 추가 Outpaint 1회는 예상 2 Anlas로 256×256 원본을
   384×256으로 확장해 성공
 - 최신 EXE 직접 기동: HTTP 200, Outpaint 화면·최근 결과 전달 버튼 포함 확인
+- 소스 서버 HTTP 왕복: 선택 복원 미리보기에서 충돌 1건 검출, 0개 선택 적용 시
+  변경 0건. 실제 임시 파일 시험은 한 JSON 항목만 교체·되돌리기·미리보기 후
+  외부 변경 충돌 거부까지 통과
 - 앱 내 브라우저 연결은 로컬 자산 경로 오류로 실패했으나 설치된 Playwright로 실제
   Chromium 조작과 최신 1600·390 스크린샷 촬영을 완료
 
@@ -59,9 +66,9 @@
 SHA-256:
 
 ```text
-dc5add0eb15c625ffc81c7119ffb728f98af37b8d8ca178b14673d0d15361f21  NAI-batch-generator-1.0.0-portable-win-x64.zip
-90c0eb677984c58583187315a4af0b98414edd666e4e663eec49324952cc0902  NAI-batch-generator-1.0.0-datapack.zip
-71298fa2fc54a0bc27e5d884ab459cd162ebb6c4ea6589e3a267c5eca0925f74  NAI-batch-generator-1.0.0-setup.exe
+f67e113e32bb37da99e2b57a4e16ace457ac5570bae162eb2a6a2d457d7c3a92  NAI-batch-generator-1.0.0-portable-win-x64.zip
+498ccf6d15991581e428dadd7b42cc8c644851e119ccc687e9ed07e625dd4f33  NAI-batch-generator-1.0.0-datapack.zip
+c8db5843cdd7c608dcf6fdd5de2b369f6b5f59771838bc487e1a51c404a04574  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일

@@ -5809,37 +5809,255 @@ def _backup_merge_secrets(logical, raw, target):
     return json.dumps(incoming, ensure_ascii=False, indent=1).encode("utf-8")
 
 
-def preview_user_backup(blob):
-    manifest, payloads, archive_sha = _read_user_backup(blob)
-    counts = {"새 파일": 0, "바뀔 파일": 0, "같은 파일": 0}
-    total = 0
-    for logical, raw in payloads.items():
-        target = _backup_destination(logical)
-        wanted = _backup_merge_secrets(logical, raw, target)
-        total += len(wanted)
-        if not target.exists():
-            counts["새 파일"] += 1
-        elif target.read_bytes() == wanted:
-            counts["같은 파일"] += 1
+_BACKUP_MISSING = object()
+
+
+def _backup_list_key(current, incoming):
+    """목록을 통째로 덮지 않고 자산별로 비교할 수 있는 안정 열쇠를 찾는다."""
+    lists = [value for value in (current, incoming) if isinstance(value, list)]
+    rows = [item for value in lists for item in value]
+    if not rows or not all(isinstance(item, dict) for item in rows):
+        return ""
+    for key in ("id", "이름", "name", "title", "seed"):
+        values_by_list = [
+            [str(item.get(key, "")).strip() for item in value]
+            for value in lists
+        ]
+        if all(
+            all(values) and len(values) == len(set(values))
+            for values in values_by_list
+        ):
+            return key
+    return ""
+
+
+def _backup_pointer(tokens):
+    parts = []
+    for token in tokens:
+        if token[0] == "key":
+            parts.append(str(token[1]).replace("~", "~0").replace("/", "~1"))
         else:
-            counts["바뀔 파일"] += 1
-    return {"ok": True, "sha256": archive_sha, "files": len(payloads),
-            "bytes": total, "counts": counts, "created_at": manifest.get("created_at"),
-            "profile": manifest.get("profile"), "excluded": manifest.get("excluded") or []}
+            parts.append(
+                f"@{token[1]}={str(token[2]).replace('~', '~0').replace('/', '~1')}")
+    return "/" + "/".join(parts) if parts else "/"
 
 
-@serialized_data_write(lambda: BASE_DIR)
-def restore_user_backup(blob, expected_sha=""):
+def _backup_collect_changes(current, incoming, tokens=()):
+    if current is not _BACKUP_MISSING and incoming is not _BACKUP_MISSING:
+        if current == incoming:
+            return []
+        if isinstance(current, dict) and isinstance(incoming, dict):
+            changes = []
+            for key in sorted(set(current) | set(incoming), key=str):
+                changes.extend(_backup_collect_changes(
+                    current.get(key, _BACKUP_MISSING),
+                    incoming.get(key, _BACKUP_MISSING),
+                    tokens + (("key", key),),
+                ))
+            return changes
+        if isinstance(current, list) and isinstance(incoming, list):
+            key = _backup_list_key(current, incoming)
+            if key:
+                before = {str(item[key]): item for item in current}
+                after = {str(item[key]): item for item in incoming}
+                changes = []
+                for value in sorted(set(before) | set(after)):
+                    changes.extend(_backup_collect_changes(
+                        before.get(value, _BACKUP_MISSING),
+                        after.get(value, _BACKUP_MISSING),
+                        tokens + (("item", key, value),),
+                    ))
+                return changes
+    return [{
+        "tokens": tokens,
+        "current_exists": current is not _BACKUP_MISSING,
+        "incoming_exists": incoming is not _BACKUP_MISSING,
+        "current": None if current is _BACKUP_MISSING else copy.deepcopy(current),
+        "incoming": None if incoming is _BACKUP_MISSING else copy.deepcopy(incoming),
+    }]
+
+
+def _backup_apply_change(value, change, depth=0):
+    """선택한 JSON 조각 하나만 현재값 사본에 적용한다."""
+    tokens = change["tokens"]
+    exists = change["incoming_exists"]
+    incoming = copy.deepcopy(change["incoming"])
+    if depth >= len(tokens):
+        return incoming if exists else _BACKUP_MISSING
+    token = tokens[depth]
+    if token[0] == "key":
+        obj = copy.deepcopy(value) if isinstance(value, dict) else {}
+        key = token[1]
+        child = obj.get(key, _BACKUP_MISSING)
+        replaced = _backup_apply_change(child, change, depth + 1)
+        if replaced is _BACKUP_MISSING:
+            obj.pop(key, None)
+        else:
+            obj[key] = replaced
+        return obj
+    rows = copy.deepcopy(value) if isinstance(value, list) else []
+    field, wanted = token[1], str(token[2])
+    index = next((
+        i for i, item in enumerate(rows)
+        if isinstance(item, dict) and str(item.get(field, "")) == wanted
+    ), None)
+    child = rows[index] if index is not None else _BACKUP_MISSING
+    replaced = _backup_apply_change(child, change, depth + 1)
+    if replaced is _BACKUP_MISSING:
+        if index is not None:
+            rows.pop(index)
+    elif index is None:
+        rows.append(replaced)
+    else:
+        rows[index] = replaced
+    return rows
+
+
+def _backup_diff_plan(blob):
     manifest, payloads, archive_sha = _read_user_backup(blob)
-    if expected_sha and expected_sha != archive_sha:
-        return {"ok": False, "error": "미리보기한 백업과 복원할 백업이 다릅니다."}
-    batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
-    journal = PROFILE_DIR / "복원기록" / batch
-    operations = []
+    declared = {
+        str(item.get("path") or ""): item
+        for item in (manifest.get("files") or [])
+    }
+    plans, counts, total = [], {"새 파일": 0, "바뀔 파일": 0, "같은 파일": 0}, 0
     for logical, raw in sorted(payloads.items()):
         target = _backup_destination(logical)
         wanted = _backup_merge_secrets(logical, raw, target)
+        current_raw = target.read_bytes() if target.is_file() else None
+        total += len(wanted)
+        if current_raw == wanted:
+            counts["같은 파일"] += 1
+            continue
+        status = "새 파일" if current_raw is None else "바뀔 파일"
+        counts[status] += 1
+        incoming_value = current_value = _BACKUP_MISSING
+        json_mode = False
+        try:
+            incoming_value = json.loads(wanted.decode("utf-8"))
+            current_value = (
+                json.loads(current_raw.decode("utf-8"))
+                if current_raw is not None else _BACKUP_MISSING)
+            json_mode = True
+        except (UnicodeError, json.JSONDecodeError, AttributeError):
+            pass
+        changes = (
+            _backup_collect_changes(current_value, incoming_value)
+            if json_mode and current_raw is not None else [{
+                "tokens": (),
+                "current_exists": current_raw is not None,
+                "incoming_exists": True,
+                "current": ({
+                    "bytes": len(current_raw),
+                    "sha256": hashlib.sha256(current_raw).hexdigest(),
+                } if current_raw is not None else None),
+                "incoming": {
+                    "bytes": len(wanted),
+                    "sha256": hashlib.sha256(wanted).hexdigest(),
+                },
+            }]
+        )
+        current_sha = hashlib.sha256(current_raw or b"").hexdigest()
+        incoming_sha = hashlib.sha256(wanted).hexdigest()
+        base_sha = str((declared.get(logical) or {}).get("base_sha256") or "")
+        for change in changes:
+            pointer = _backup_pointer(change["tokens"])
+            change_id = hashlib.sha256(
+                f"{archive_sha}\0{logical}\0{pointer}\0{current_sha}\0{incoming_sha}"
+                .encode("utf-8")
+            ).hexdigest()
+            plans.append({
+                **change,
+                "id": change_id,
+                "logical": logical,
+                "pointer": pointer,
+                "file_status": status,
+                "json": json_mode,
+                "current_sha256": current_sha,
+                "incoming_sha256": incoming_sha,
+                "base_sha256": base_sha,
+                "target": target,
+                "wanted_raw": wanted,
+                "current_raw": current_raw,
+            })
+    fingerprint = hashlib.sha256(
+        "\n".join(item["id"] for item in plans).encode("ascii")
+    ).hexdigest()
+    return manifest, payloads, archive_sha, plans, counts, total, fingerprint
+
+
+def _backup_change_public(change):
+    if change["current_exists"] and change["incoming_exists"]:
+        action = "변경"
+    elif change["incoming_exists"]:
+        action = "추가"
+    else:
+        action = "제거"
+    return {
+        key: copy.deepcopy(change[key])
+        for key in (
+            "id", "logical", "pointer", "file_status", "json",
+            "current_exists", "incoming_exists", "current", "incoming",
+            "current_sha256", "incoming_sha256", "base_sha256",
+        )
+    } | {
+        "action": action,
+        "base_available": bool(change.get("base_sha256")),
+    }
+
+
+def preview_user_backup(blob):
+    (manifest, payloads, archive_sha, plans, counts,
+     total, fingerprint) = _backup_diff_plan(blob)
+    return {"ok": True, "sha256": archive_sha, "files": len(payloads),
+            "bytes": total, "counts": counts, "created_at": manifest.get("created_at"),
+            "profile": manifest.get("profile"), "excluded": manifest.get("excluded") or [],
+            "diff_fingerprint": fingerprint,
+            "changes": [_backup_change_public(change) for change in plans]}
+
+
+@serialized_data_write(lambda: BASE_DIR)
+def restore_user_backup(blob, expected_sha="", selected=None, expected_diff=""):
+    (manifest, payloads, archive_sha, plans, _counts,
+     _total, diff_fingerprint) = _backup_diff_plan(blob)
+    if expected_sha and expected_sha != archive_sha:
+        return {"ok": False, "error": "미리보기한 백업과 복원할 백업이 다릅니다."}
+    if expected_diff and expected_diff != diff_fingerprint:
+        return {"ok": False, "conflict": True,
+                "error": "검사 뒤 현재 자료가 바뀌었습니다. 백업을 다시 검사해 주세요."}
+    selected_ids = None if selected is None else set(map(str, selected))
+    by_id = {item["id"]: item for item in plans}
+    if selected_ids is not None:
+        unknown = selected_ids - set(by_id)
+        if unknown:
+            return {"ok": False, "conflict": True,
+                    "error": "검사 뒤 충돌 항목이 바뀌었습니다. 백업을 다시 검사해 주세요."}
+        if not selected_ids:
+            return {"ok": True, "batch": "", "changed": 0,
+                    "files": len(payloads), "selected": 0}
+    chosen = plans if selected_ids is None else [
+        by_id[item_id] for item_id in selected_ids]
+    grouped = {}
+    for change in chosen:
+        grouped.setdefault(change["logical"], []).append(change)
+
+    batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    journal = PROFILE_DIR / "복원기록" / batch
+    operations = []
+    for logical, changes in sorted(grouped.items()):
+        target = _backup_destination(logical)
         old = target.read_bytes() if target.is_file() else None
+        if len(changes) == 1 and not changes[0]["tokens"]:
+            wanted = changes[0]["wanted_raw"]
+        else:
+            try:
+                value = json.loads(old.decode("utf-8")) if old is not None else {}
+            except (UnicodeError, json.JSONDecodeError) as e:
+                return {"ok": False, "error": f"{logical} 현재 JSON을 읽지 못했습니다: {e}"}
+            for change in sorted(changes, key=lambda item: item["pointer"]):
+                value = _backup_apply_change(value, change)
+            if value is _BACKUP_MISSING:
+                continue
+            wanted = json.dumps(value, ensure_ascii=False, indent=1).encode("utf-8")
         if old == wanted:
             continue
         op = {"path": logical, "new": old is None,
@@ -5869,7 +6087,7 @@ def restore_user_backup(blob, expected_sha=""):
     atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
     forget_collection_caches()
     return {"ok": True, "batch": batch, "changed": len(operations),
-            "files": len(payloads)}
+            "files": len(payloads), "selected": len(chosen)}
 
 
 @serialized_data_write(lambda: BASE_DIR)
@@ -12183,6 +12401,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button type="button" id="backupRollback" class="hidden">↶ 방금 복원 되돌리기</button>
         </div>
         <div id="backupMsg" class="hint" style="margin-top:8px;"></div>
+        <div id="backupDiff" class="hidden" style="margin-top:8px;">
+          <div class="bar" style="margin-bottom:7px;">
+            <button type="button" id="backupSelectAll">들어오는 변경 전부 선택</button>
+            <button type="button" id="backupSelectNone">선택 해제</button>
+            <span class="n" id="backupSelectedCount">0개 선택</span>
+          </div>
+          <div id="backupDiffList" class="items"
+               style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:7px;"></div>
+          <button type="button" id="backupDiffMore" class="hidden" style="width:100%;margin-top:7px;">더 보기</button>
+        </div>
       </div>
 
       <div class="card" id="trashCard" data-manage-panel="safety">
@@ -12865,7 +13093,53 @@ function bindComparison(){
 }
 
 /* ── 내 자료 전체 백업 ─────────────────────────────────────────────── */
-let BACKUP_FILE = null, BACKUP_SHA = '', BACKUP_BATCH = '';
+let BACKUP_FILE = null, BACKUP_SHA = '', BACKUP_BATCH = '',
+  BACKUP_DIFF = '', BACKUP_CHANGES = [], BACKUP_SHOW = 0;
+function backupValue(value, exists){
+  if(!exists) return '<span class="hint">없음</span>';
+  let text;
+  try{ text = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+  catch(e){ text = String(value); }
+  return `<pre style="max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:4px 0 0;">${esc(text)}</pre>`;
+}
+function backupSelection(){
+  return BACKUP_CHANGES.filter(change => change.selected).map(change => change.id);
+}
+function backupSelectionPaint(){
+  const selected = backupSelection().length;
+  $('backupSelectedCount').textContent = `${selected.toLocaleString()}개 선택`;
+  $('backupRestore').disabled = !BACKUP_FILE || !BACKUP_SHA || !selected;
+}
+function backupDiffPaint(reset=false){
+  if(reset){ BACKUP_SHOW = 0; $('backupDiffList').innerHTML = ''; }
+  const start = BACKUP_SHOW;
+  const end = Math.min(BACKUP_CHANGES.length, start + 120);
+  for(let i=start; i<end; i++){
+    const change = BACKUP_CHANGES[i];
+    const card = document.createElement('label');
+    card.className = 'row';
+    card.style.cssText = 'display:block;margin:0;cursor:pointer;';
+    card.innerHTML = `<div class="bar">
+      <input type="checkbox" data-backup-change="${escA(change.id)}" style="width:auto;flex:none;"
+        ${change.selected?'checked':''}>
+      <b>${esc(change.logical)}</b><span class="tag">${esc(change.action)}</span></div>
+      <div class="hint">${esc(change.pointer)} · ${esc(change.file_status)}`
+      + (change.base_available
+        ? ` · 공통 기준 ${esc(String(change.base_sha256).slice(0,12))}`
+        : ' · 공통 기준 미제공') + `</div>
+      <details><summary>현재값</summary>${backupValue(change.current, change.current_exists)}</details>
+      <details><summary>들어오는 값</summary>${backupValue(change.incoming, change.incoming_exists)}</details>`;
+    card.querySelector('input').addEventListener('change', event => {
+      change.selected = event.target.checked; backupSelectionPaint();
+    });
+    $('backupDiffList').appendChild(card);
+  }
+  BACKUP_SHOW = end;
+  $('backupDiffMore').classList.toggle('hidden', end >= BACKUP_CHANGES.length);
+  $('backupDiffMore').textContent =
+    `더 보기 (${Math.max(0, BACKUP_CHANGES.length-end).toLocaleString()}개 남음)`;
+  backupSelectionPaint();
+}
 function bindUserBackup(){
   if(!$('backupCard') || $('backupCard')._bound) return;
   $('backupCard')._bound = true;
@@ -12886,8 +13160,9 @@ function bindUserBackup(){
     const file = $('backupFile').files[0];
     $('backupFile').value = '';
     if(!file) return;
-    BACKUP_FILE = file; BACKUP_SHA = '';
+    BACKUP_FILE = file; BACKUP_SHA = ''; BACKUP_DIFF = ''; BACKUP_CHANGES = [];
     $('backupRestore').disabled = true;
+    $('backupDiff').classList.add('hidden');
     $('backupMsg').textContent = '백업의 경로·크기·내용 해시를 검사하는 중입니다.';
     try{
       const r = await (await fetch('/api/backup_preview', {method:'POST',
@@ -12895,23 +13170,31 @@ function bindUserBackup(){
         body:await file.arrayBuffer()})).json();
       if(!r.ok){ $('backupMsg').textContent = r.error || '백업 검사 실패'; return; }
       BACKUP_SHA = r.sha256;
+      BACKUP_DIFF = r.diff_fingerprint || '';
+      BACKUP_CHANGES = (r.changes || []).map(change =>
+        Object.assign({selected:false}, change));
       const c = r.counts || {};
       $('backupMsg').innerHTML =
         `<b>${Number(r.files||0).toLocaleString()}개 · ${(Number(r.bytes||0)/1048576).toFixed(1)}MB</b>`
         + ` — 새 파일 ${Number(c['새 파일']||0).toLocaleString()} · 바뀔 파일 ${Number(c['바뀔 파일']||0).toLocaleString()}`
         + ` · 같은 파일 ${Number(c['같은 파일']||0).toLocaleString()}`
-        + `<br>백업 시점 ${esc(r.created_at||'?')} · 토큰·생성물·원격 캐시는 복원하지 않습니다.`;
-      $('backupRestore').disabled = false;
+        + `<br>충돌 조각 ${BACKUP_CHANGES.length.toLocaleString()}개 · 백업 시점 ${esc(r.created_at||'?')}`
+        + ` · 토큰·생성물·원격 캐시는 복원하지 않습니다.`;
+      $('backupDiff').classList.toggle('hidden', !BACKUP_CHANGES.length);
+      backupDiffPaint(true);
     }catch(e){ $('backupMsg').textContent = '백업 검사 실패: ' + e; }
   });
   $('backupRestore').addEventListener('click', async () => {
-    if(!BACKUP_FILE || !BACKUP_SHA) return;
-    if(!confirm('검사한 백업으로 같은 이름의 자료를 바꿀까요?\\n현재 파일은 복원 기록에 보존되며 바로 되돌릴 수 있습니다.')) return;
+    const selected = backupSelection();
+    if(!BACKUP_FILE || !BACKUP_SHA || !selected.length) return;
+    if(!confirm(`선택한 ${selected.length}개 변경만 적용할까요?\\n현재 파일은 복원 기록에 보존되며 바로 되돌릴 수 있습니다.`)) return;
     $('backupRestore').disabled = true;
     $('backupMsg').textContent = '기존 파일을 복원 기록에 보존한 뒤 적용하는 중입니다.';
     try{
       const r = await (await fetch('/api/backup_restore', {method:'POST',
-        headers:{'X-Backup-SHA256':BACKUP_SHA}, body:await BACKUP_FILE.arrayBuffer()})).json();
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({sha256:BACKUP_SHA, diff_fingerprint:BACKUP_DIFF,
+          selected})})).json();
       if(!r.ok){ $('backupMsg').textContent = r.error || '복원 실패'; $('backupRestore').disabled=false; return; }
       BACKUP_BATCH = r.batch || '';
       if(BACKUP_BATCH) sessionStorage.setItem('naisBackupRollback', BACKUP_BATCH);
@@ -12920,6 +13203,15 @@ function bindUserBackup(){
       setTimeout(() => location.reload(), 700);
     }catch(e){ $('backupMsg').textContent = '복원 실패: ' + e; $('backupRestore').disabled=false; }
   });
+  $('backupSelectAll').addEventListener('click', () => {
+    BACKUP_CHANGES.forEach(change => { change.selected = true; });
+    backupDiffPaint(true);
+  });
+  $('backupSelectNone').addEventListener('click', () => {
+    BACKUP_CHANGES.forEach(change => { change.selected = false; });
+    backupDiffPaint(true);
+  });
+  $('backupDiffMore').addEventListener('click', () => backupDiffPaint(false));
   $('backupRollback').addEventListener('click', async () => {
     if(!BACKUP_BATCH) return;
     const r = await (await fetch('/api/backup_rollback', {method:'POST',
@@ -21606,6 +21898,10 @@ class ConfigServer:
         self.anlas_balance_cache = None
         self.anlas_balance_token_key = None
         self.pending_batch_config = None
+        # 백업 원문은 디스크에 임시 저장하지 않고 마지막 검사본 한 개만 메모리에 둔다.
+        # 선택 복원 요청은 SHA와 diff 지문이 모두 맞을 때만 이 바이트를 사용한다.
+        self.backup_preview_blob = None
+        self.backup_preview_sha256 = ""
 
     def latest_config_from_disk(self):
         """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
@@ -23892,14 +24188,40 @@ class ConfigServer:
                 body = self.rfile.read(length) if length else b""
                 if self.path.startswith("/api/backup_preview"):
                     try:
-                        self._json(preview_user_backup(body))
+                        result = preview_user_backup(body)
+                        if result.get("ok"):
+                            server.backup_preview_blob = bytes(body)
+                            server.backup_preview_sha256 = str(result.get("sha256") or "")
+                        self._json(result)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/backup_restore"):
                     try:
-                        result = restore_user_backup(
-                            body, self.headers.get("X-Backup-SHA256", ""))
+                        content_type = self.headers.get("Content-Type", "")
+                        if "application/json" in content_type:
+                            request = json.loads(body or b"{}")
+                            expected_sha = str(request.get("sha256") or "")
+                            if (not server.backup_preview_blob
+                                    or expected_sha != server.backup_preview_sha256):
+                                result = {
+                                    "ok": False,
+                                    "error": "검사한 백업 원문이 메모리에 없습니다. 다시 검사해 주세요.",
+                                }
+                            else:
+                                result = restore_user_backup(
+                                    server.backup_preview_blob,
+                                    expected_sha,
+                                    selected=request.get("selected") or [],
+                                    expected_diff=str(
+                                        request.get("diff_fingerprint") or ""),
+                                )
+                        else:
+                            # 구형 화면·API 호환: ZIP 본문을 보내면 전체 복원한다.
+                            result = restore_user_backup(
+                                body, self.headers.get("X-Backup-SHA256", ""))
                         if result.get("ok"):
+                            server.backup_preview_blob = None
+                            server.backup_preview_sha256 = ""
                             fresh = load_json_recover(SETTINGS_FILE)
                             merged = dict(DEFAULT_CONFIG)
                             merged.update(fresh if isinstance(fresh, dict) else {})
