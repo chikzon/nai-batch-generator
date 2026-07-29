@@ -1776,6 +1776,37 @@ class RegressionTests(unittest.TestCase):
             [job["seed"] for job in independent_jobs],
             [100 + index * 100003 for index in range(8)],
         )
+
+        two_scene_leaves = [
+            ({"female": "cast prompt"}, "cast-a", 10, 1),
+            ({"female": "cast prompt"}, "cast-a", 11, 1),
+        ]
+        same_seed_leaf_plan = dict(plan, count=4)
+        independent_leaf_plan = dict(independent_plan, count=4)
+        with (
+            patch.object(APP, "load_asset_config", return_value=acfg),
+            patch.object(APP, "compute_pending",
+                         return_value=two_scene_leaves),
+        ):
+            same_seed_leaf_jobs = list(APP.iter_selected_comparison_jobs(
+                cfg, same_seed_leaf_plan, styles, chars, settings=settings,
+                runtime_base_seed=100))
+            independent_leaf_jobs = list(APP.iter_selected_comparison_jobs(
+                cfg, independent_leaf_plan, styles, chars, settings=settings,
+                runtime_base_seed=100))
+        self.assertEqual(
+            [job["seed"] for job in same_seed_leaf_jobs],
+            [100, 100, 100103, 100103],
+        )
+        self.assertEqual(
+            [job["seed"] for job in independent_leaf_jobs],
+            [100, 100103, 200106, 300109],
+        )
+        self.assertEqual(
+            [(job["cid"], job["scene_num"]) for job in independent_leaf_jobs],
+            [("cast-a", 10), ("cast-a", 11),
+             ("cast-a", 10), ("cast-a", 11)],
+        )
         self.assertEqual(cfg, before)
 
     def test_selected_worker_resumes_and_reruns_one_canonical_cell_without_token_persistence(self):
@@ -1882,6 +1913,124 @@ class RegressionTests(unittest.TestCase):
                 [call["seed"] for call in calls[:4]],
                 [77, 100080, 77, 100080],
             )
+
+    def test_selected_setting_records_and_reruns_the_exact_cast_leaf(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update(
+                token="pst-fixture",
+                out_dir=str(root / "output"),
+                setting_state={
+                    "Setting A": {
+                        "use": True, "selected": [10], "stages": [1],
+                        "reserve": {"10": 1},
+                    },
+                },
+                pace={"delay_min": 0, "delay_max": 0, "daily_cap": 100},
+            )
+            settings = APP.comparison_settings(cfg)
+            options = APP.normalize_comparison_options({
+                "mode": "selected",
+                "fixed_size": True, "width": 512, "height": 512,
+                "same_seed": False, "seed": 77, "seed_count": 1,
+                "selection": {"settings": ["Setting A"]},
+            }, cfg)
+            acfg = {
+                "base": {"negative_prompt": ""},
+                "scenes": {"10": {"name": "Scene"}},
+            }
+            leaves = [
+                ({"prompt": "cast-a prompt"}, "cast-a", 10, 1),
+                ({"prompt": "cast-b prompt"}, "cast-b", 10, 1),
+            ]
+
+            def fake_pending(*_args, **_kwargs):
+                return copy.deepcopy(leaves)
+
+            def fake_values(_cfg, _plan, job):
+                used = copy.deepcopy(job["scratch_cfg"])
+                used.update(
+                    width=512, height=512, cfg_scale=5.5,
+                    cfg_rescale=0.56, steps=28,
+                    sampler="k_euler_ancestral", scheduler="karras",
+                    variety=False, uc_preset=4,
+                )
+                prompt = job["scene_character"]["prompt"]
+                return (
+                    used, "base", "negative",
+                    [{"prompt": prompt, "negative": ""}],
+                    [{"x": 0.5, "y": 0.5}],
+                )
+
+            calls = []
+
+            def fake_generate(_token, base, _female, _male, negative,
+                              width, height, **kwargs):
+                calls.append({
+                    "base": base,
+                    "negative": negative,
+                    "chars": copy.deepcopy(kwargs["chars"]),
+                    "seed": kwargs["seed"],
+                })
+                image = Image.new("RGB", (4, 4), "white")
+                image.nai_seed = kwargs["seed"]
+                return image
+
+            state = {
+                "seeds": {}, "progress": {}, "daily": {},
+                "total_generated": 0,
+            }
+            progress_file = root / "selected-progress.json"
+            server = APP.ConfigServer(cfg)
+            with (
+                patch.object(APP, "COMPARE_PROGRESS_FILE", progress_file),
+                patch.object(APP, "load_asset_config", return_value=acfg),
+                patch.object(APP, "compute_pending",
+                             side_effect=fake_pending),
+                patch.object(APP, "comparison_selected_job_values",
+                             side_effect=fake_values),
+                patch.object(APP, "load_state", return_value=state),
+                patch.object(APP, "save_state", return_value=None),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api",
+                             side_effect=fake_generate),
+            ):
+                plan = APP.comparison_selected_plan(
+                    cfg, options, [], [], settings, opus=True)
+                self.assertEqual(plan["count"], 2)
+                APP._run_comparison(server, cfg, plan, [], [])
+                complete = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
+                records = sorted(
+                    complete["completed"].values(),
+                    key=lambda item: item["index"])
+                source = next(
+                    item for item in records if item["cid"] == "cast-b")
+                APP._rerun_selected_comparison(
+                    server, cfg, source["file"])
+                rerun = json.loads(
+                    progress_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [(item["cid"], item["cast_id"]) for item in records],
+                [("cast-a", "cast-a"), ("cast-b", "cast-b")],
+            )
+            self.assertEqual(
+                [item["seed"] for item in records],
+                [77, 100080],
+            )
+            self.assertEqual(
+                records[1]["recipe"]["source"]["setting"]["cid"],
+                "cast-b",
+            )
+            self.assertEqual(len(rerun["reruns"]), 1)
+            rerun_record = next(iter(rerun["reruns"].values()))
+            self.assertEqual(rerun_record["cid"], "cast-b")
+            self.assertEqual(rerun_record["seed"], source["seed"])
+            self.assertEqual(
+                calls[-1]["chars"][0]["prompt"], "cast-b prompt")
 
     def test_comparison_requires_the_exact_recounted_job_confirmation(self):
         cfg = copy.deepcopy(APP.DEFAULT_CONFIG)

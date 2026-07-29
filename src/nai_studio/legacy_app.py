@@ -6118,6 +6118,21 @@ def _comparison_selected_cfg(cfg, material):
     return scratch
 
 
+def _selected_comparison_leaf_seed(
+    options, runtime_base_seed, seed_index, leaf_index, canonical_seed,
+):
+    """선택 실험의 실제 실행 leaf마다 비교 가능한 결정적 seed를 만든다."""
+    if runtime_base_seed is None:
+        return canonical_seed
+    offset = (
+        int(seed_index)
+        if options.get("same_seed", True)
+        else max(0, int(leaf_index) - 1)
+    )
+    seed = (int(runtime_base_seed) + offset * 100003) & 0xffffffff
+    return seed or 1
+
+
 def iter_selected_comparison_jobs(
     cfg, plan, styles, chars, settings=None, runtime_base_seed=None,
 ):
@@ -6174,9 +6189,13 @@ def iter_selected_comparison_jobs(
                 yield dict(
                     common,
                     index=made,
+                    seed=_selected_comparison_leaf_seed(
+                        plan["options"], runtime_base_seed,
+                        common["seed_index"], made, common.get("seed")),
                     key=_comparison_id(
                         "job", "selected", material.get("resume_key"),
                         str(cid), int(scene_num), int(copy_num)),
+                    cid=str(cid),
                     asset_config=acfg,
                     scene_character=copy.deepcopy(derived),
                     scene_num=int(scene_num),
@@ -6189,6 +6208,9 @@ def iter_selected_comparison_jobs(
             yield dict(
                 common,
                 index=made,
+                seed=_selected_comparison_leaf_seed(
+                    plan["options"], runtime_base_seed,
+                    common["seed_index"], made, common.get("seed")),
                 key=str(material.get("resume_key") or cell.get("id") or ""),
             )
 
@@ -6914,6 +6936,7 @@ def comparison_job_recipe_snapshot(
             "id": setting.get("id") or setting.get("name") or "",
             "name": setting.get("name") or setting.get("id") or "",
             "state": copy.deepcopy(setting.get("state") or {}),
+            "cid": str(job.get("cid") or ""),
             "scene": int(job.get("scene_num") or 0),
             "copy": int(job.get("copy") or 1),
         } if setting else {}
@@ -23822,21 +23845,25 @@ def _rerun_selected_comparison(server, cfg, rel):
         "setting_name": source.get("setting") or "",
         "seed_index": int(source.get("seed_index") or 0),
         "seed": int(source.get("seed") or material.get("seed") or 1),
+        "cid": str(source.get("cid") or source.get("cast_id") or ""),
         "scene_num": int(source.get("scene") or 0),
         "copy": int(source.get("copy") or 1),
     }
     if isinstance(job["setting"], dict) and job["scene_num"]:
         acfg = load_asset_config(scratch)
-        match = next((
-            derived for derived, _cid, scene_num, copy_num in compute_pending(
+        matches = [
+            (derived, str(cid))
+            for derived, cid, scene_num, copy_num in compute_pending(
                 scratch, acfg, {}, set())
             if int(scene_num) == job["scene_num"]
             and int(copy_num) == job["copy"]
-        ), None)
-        if match is None:
+            and (not job["cid"] or str(cid) == job["cid"])
+        ]
+        if len(matches) != 1:
             raise ValueError("선택했던 세팅 씬을 현재 자료에서 찾지 못했습니다.")
         job["asset_config"] = acfg
-        job["scene_character"] = copy.deepcopy(match)
+        job["scene_character"] = copy.deepcopy(matches[0][0])
+        job["cid"] = matches[0][1]
     used, base, negative, people, centers = comparison_selected_job_values(
         cfg, plan, job)
     token = cfg["token"]
@@ -24032,6 +24059,8 @@ def _run_comparison(server, cfg, plan, styles, chars):
                     })
                     if options.get("mode") == "selected":
                         cell = job.get("canonical_cell") or {}
+                        completed[key]["cid"] = str(job.get("cid") or "")
+                        completed[key]["cast_id"] = str(job.get("cid") or "")
                         completed[key]["canonical_cell"] = {
                             name: copy.deepcopy(cell.get(name))
                             for name in (
