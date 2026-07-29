@@ -36,6 +36,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 자료 복구·보존 상태 GET 라우트 | `web/routes/recovery.py` |
 | 자료실·빌더 검색 GET 라우트 | `web/routes/catalog.py` |
 | 비교·실시간 생성 상태 GET 라우트 | `web/routes/generation.py` |
+| 이미지·내보내기·진단·HTML GET 라우트 | `web/routes/assets.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
@@ -47,7 +48,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 
 점진 분리는 **완료되지 않았다**. 다음 큰 경계가 `legacy_app.py`에 남아 있다.
 
-- `ConfigServer`: API endpoint 조정과 HTTP handler
+- `ConfigServer`: POST API endpoint 조정
 - 자료실 검색·그림체·작가 평가·태그 자동완성
 - 세팅·자료팩·전체 백업·휴지통
 - 비교 계획·결과 승격·재실행

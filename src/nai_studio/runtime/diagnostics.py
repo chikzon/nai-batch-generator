@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from pathlib import Path
 
 
 _DIAG_LINE_RE = re.compile(
@@ -116,9 +117,47 @@ def diagnostic_event_line(event):
     )
 
 
+def diagnostic_snapshot(log_file, *, limit=300, errors_only=False):
+    """로그 원문을 노출하지 않고 redacted 사건 목록만 반환한다."""
+    path = Path(log_file)
+    if not path.exists():
+        return {
+            "ok": True,
+            "schema": "nais-diagnostics/v1",
+            "lines": [],
+            "events": [],
+            "errors": 0,
+        }
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        return {"ok": False, "error": redact_diagnostic_text(exc)}
+    events = parse_diagnostic_lines(lines)
+    errors = sum(
+        1
+        for event in events
+        if event["level"] in ("WARNING", "ERROR", "CRITICAL")
+    )
+    if errors_only:
+        events = [
+            event
+            for event in events
+            if event["level"] in ("WARNING", "ERROR", "CRITICAL")
+        ]
+    events = events[-max(10, min(2000, int(limit))):]
+    return {
+        "ok": True,
+        "schema": "nais-diagnostics/v1",
+        "lines": [diagnostic_event_line(event) for event in events],
+        "events": events,
+        "errors": errors,
+    }
+
+
 __all__ = [
     "diagnostic_category",
     "diagnostic_event_line",
+    "diagnostic_snapshot",
     "parse_diagnostic_lines",
     "redact_diagnostic_text",
 ]

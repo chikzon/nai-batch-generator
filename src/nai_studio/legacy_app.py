@@ -136,6 +136,7 @@ from src.nai_studio.runtime import (
 from src.nai_studio.runtime.diagnostics import (
     diagnostic_category,
     diagnostic_event_line,
+    diagnostic_snapshot,
     parse_diagnostic_lines,
     redact_diagnostic_text,
 )
@@ -230,6 +231,10 @@ from src.nai_studio.web.http_server import (
     start_http_server,
 )
 from src.nai_studio.web.page_template import PAGE_TEMPLATE
+from src.nai_studio.web.routes.assets import (
+    AssetGetOperations,
+    handle_asset_get,
+)
 from src.nai_studio.web.routes.catalog import (
     CatalogGetOperations,
     handle_catalog_get,
@@ -12704,6 +12709,24 @@ class ConfigServer:
             comparison_runs=lambda cfg: comparison_runs(cfg),
             comparison_progress=lambda cfg: comparison_progress_summary(cfg),
         )
+        asset_get = AssetGetOperations(
+            vibe_dir=VIBE_DIR,
+            mime=MIME,
+            output_preview=lambda cfg, rel: output_file_for_preview(cfg, rel),
+            output_list=lambda *args, **kwargs: list_output(*args, **kwargs),
+            setting_thumbs=lambda name, cfg: setting_thumbs(name, cfg),
+            resource_export=lambda cfg: export_legacy_resources(
+                cfg, file_index=resource_file_index(cfg)
+            ),
+            backup_export=lambda cfg: export_user_backup(cfg),
+            fragments_export=lambda: export_fragments_zip(),
+            settings_export=lambda names: export_settings_zip(names),
+            cached_image=lambda url: fetch_cached_image(url),
+            diagnostics=lambda limit, errors_only: diagnostic_snapshot(
+                LOG_FILE, limit=limit, errors_only=errors_only
+            ),
+            render_page=lambda: render_page(),
+        )
         recovery_get = RecoveryGetOperations(
             metadata_audit=lambda offset, limit: metadata_audit_status(
                 found_offset=offset, found_limit=limit
@@ -12733,171 +12756,10 @@ class ConfigServer:
                     return
                 if handle_generation_get(self, server, generation_get):
                     return
-                if self.path.startswith("/refimg"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    rid = Path(q.get("id", [""])[0]).name        # 경로 탈출 차단
-                    kind = q.get("kind", ["vibe"])[0]
-                    f = VIBE_DIR / (f"{rid}.ref.png" if kind == "cref" else f"{rid}.png")
-                    if not (rid and f.exists() and f.is_file()):
-                        self.send_response(404); self.end_headers(); return
-                    data = f.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.send_header("Cache-Control", "max-age=3600")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                elif self.path.startswith("/setout"):
-                    # 세트 대표 썸네일 — output/ 아래만, 경로 탈출·휴지통 접근 차단
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    rel = unquote(q.get("p", [""])[0])
-                    f = output_file_for_preview(server.cfg, rel)
-                    if f is None:
-                        self.send_response(404); self.end_headers(); return
-                    data = f.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", MIME.get(f.suffix.lower(), "image/webp"))
-                    self.send_header("Cache-Control", "max-age=60")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                elif self.path.startswith("/api/out_list"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json(list_output(
-                            unquote(q.get("dir", [""])[0]), server.cfg,
-                            limit=int(q.get("limit", ["0"])[0]),
-                            offset=int(q.get("offset", ["0"])[0]),
-                            only_pick=q.get("only_pick", [""])[0] in ("1", "true"),
-                            only_fav=q.get("only_fav", [""])[0] in ("1", "true")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/setting_thumbs"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json({"ok": True,
-                                    "thumbs": setting_thumbs(unquote(q.get("name", [""])[0]), server.cfg)})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/ref_bundle_export"):
-                    try:
-                        blob = export_legacy_resources(
-                            server.cfg,
-                            file_index=resource_file_index(server.cfg),
-                        )
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)}); return
-                    self.send_response(200)
-                    self.send_header(
-                        "Content-Type", "application/json; charset=utf-8")
-                    self.send_header(
-                        "Content-Disposition",
-                        'attachment; filename="nai-resources.naiv4vibebundle"')
-                    self.send_header("Content-Length", str(len(blob)))
-                    self.end_headers()
-                    self.wfile.write(blob)
-                elif self.path.startswith("/api/backup_export"):
-                    try:
-                        blob = export_user_backup(server.cfg)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)}); return
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Disposition",
-                                     'attachment; filename="nais-user-backup.zip"')
-                    self.send_header("Content-Length", str(len(blob)))
-                    self.end_headers()
-                    self.wfile.write(blob)
-                elif self.path.startswith("/api/frag_export"):
-                    try:
-                        blob = export_fragments_zip()
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)}); return
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Disposition", 'attachment; filename="fragments.zip"')
-                    self.send_header("Content-Length", str(len(blob)))
-                    self.end_headers()
-                    self.wfile.write(blob)
-                elif self.path.startswith("/api/setting_export"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    names = [n for n in (unquote(x) for x in q.get("name", [])) if n]
-                    try:
-                        blob = export_settings_zip(names or None)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)}); return
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Disposition",
-                                     'attachment; filename="settings.zip"')
-                    self.send_header("Content-Length", str(len(blob)))
-                    self.end_headers()
-                    self.wfile.write(blob)
-                elif self.path.startswith("/img"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    data, ctype = fetch_cached_image(unquote(q.get("u", [""])[0]))
-                    if not data:
-                        self.send_response(404); self.end_headers(); return
-                    self.send_response(200)
-                    self.send_header("Content-Type", ctype or "image/webp")
-                    self.send_header("Cache-Control", "max-age=86400")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                elif self.path.startswith("/api/diag"):
-                    # 진단 — raw 로그는 절대 내보내지 않고 redacted 구조화 이벤트만 돌려준다.
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        n = max(10, min(2000, int(q.get("n", ["300"])[0])))
-                    except (TypeError, ValueError):
-                        n = 300
-                    err_only = q.get("err", [""])[0] in ("1", "true")
-                    try:
-                        if not LOG_FILE.exists():
-                            self._json({
-                                "ok": True, "schema": "nais-diagnostics/v1",
-                                "lines": [], "events": [], "errors": 0,
-                            }); return
-                        raw = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-                        events = parse_diagnostic_lines(raw)
-                        errs = sum(
-                            1 for event in events
-                            if event["level"] in ("WARNING", "ERROR", "CRITICAL")
-                        )
-                        if err_only:
-                            events = [
-                                event for event in events
-                                if event["level"] in ("WARNING", "ERROR", "CRITICAL")
-                            ]
-                        events = events[-n:]
-                        self._json({
-                            "ok": True,
-                            "schema": "nais-diagnostics/v1",
-                            "lines": [diagnostic_event_line(event) for event in events],
-                            "events": events,
-                            "errors": errs,
-                        })
-                    except Exception as e:
-                        self._json({
-                            "ok": False,
-                            "error": redact_diagnostic_text(e),
-                        })
-                elif self.path == "/" or self.path.startswith("/?"):
-                    body = render_page().encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(404); self.end_headers()
+                if handle_asset_get(self, server, asset_get):
+                    return
+                self.send_response(404)
+                self.end_headers()
 
             def do_POST(self):
                 body = self._read_post_body()
