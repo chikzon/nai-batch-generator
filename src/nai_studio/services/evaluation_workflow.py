@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -18,6 +19,214 @@ PICK_FIELDS = (
     "memos",
     "review_states",
 )
+
+
+def normalize_picks(data: dict) -> dict:
+    """선별 장부 값을 작고 유한한 JSON 값으로 정규화한다."""
+    data = dict(data or {})
+    for key in ("picked", "fav"):
+        data[key] = list(dict.fromkeys(
+            str(path).replace("\\", "/")
+            for path in (data.get(key) or [])
+            if str(path).strip()
+        ))
+    folders = {}
+    for name, paths in (data.get("folders") or {}).items():
+        clean_name = str(name).strip()[:40]
+        if not clean_name or not isinstance(paths, list):
+            continue
+        folders[clean_name] = list(dict.fromkeys([
+            *folders.get(clean_name, []),
+            *(
+                str(path).replace("\\", "/")
+                for path in paths
+                if str(path).strip()
+            ),
+        ]))
+    data["folders"] = folders
+    data["ranks"] = {
+        str(path).replace("\\", "/"): max(1, int(rank))
+        for path, rank in (data.get("ranks") or {}).items()
+        if str(path).strip() and str(rank).lstrip("-").isdigit()
+    }
+    data["ratings"] = {
+        str(path).replace("\\", "/"): max(1, min(5, int(score)))
+        for path, score in (data.get("ratings") or {}).items()
+        if (
+            str(path).strip()
+            and str(score).isdigit()
+            and int(score) > 0
+        )
+    }
+    elo = {}
+    for path, score in (data.get("elo") or {}).items():
+        try:
+            number = float(score)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if str(path).strip() and math.isfinite(number):
+            elo[str(path).replace("\\", "/")] = round(
+                max(0.0, min(3000.0, number)), 1
+            )
+    data["elo"] = elo
+    data["elo_matches"] = {
+        str(path).replace("\\", "/"): max(
+            0, min(1_000_000, int(count))
+        )
+        for path, count in (data.get("elo_matches") or {}).items()
+        if str(path).strip() and str(count).isdigit()
+    }
+    tags = {}
+    for path, values in (data.get("tags") or {}).items():
+        if not str(path).strip() or not isinstance(values, list):
+            continue
+        cleaned = list(dict.fromkeys(
+            str(tag).strip()[:40]
+            for tag in values
+            if str(tag).strip()
+        ))[:12]
+        if cleaned:
+            tags[str(path).replace("\\", "/")] = cleaned
+    data["tags"] = tags
+    data["memos"] = {
+        str(path).replace("\\", "/"): str(memo)
+        for path, memo in (data.get("memos") or {}).items()
+        if str(path).strip() and isinstance(memo, str) and memo
+    }
+    allowed_states = {"candidate", "confirmed", "shared", "archived"}
+    data["review_states"] = {
+        str(path).replace("\\", "/"): str(state)
+        for path, state in (data.get("review_states") or {}).items()
+        if str(path).strip() and str(state) in allowed_states
+    }
+    return data
+
+
+def apply_evaluation_action_workflow(
+    data: dict,
+    *,
+    lock: Any,
+    load_picks: Any,
+    save_picks: Any,
+    project_evaluations: Any,
+    blind_event: Any,
+    fixed_board_event: Any,
+    lifecycle_event: Any,
+    promotion_event: Any,
+    append_events: Any,
+) -> dict:
+    """평가 결정을 선별 장부와 append-only 사건에 한 번에 기록한다."""
+    data = data if isinstance(data, dict) else {}
+    action = str(data.get("action") or "")
+    with lock:
+        picks = load_picks()
+        decision_id = str(data.get("decision_id") or "").strip()
+        prior_decisions = picks.get("evaluation_decision_ids")
+        if not isinstance(prior_decisions, list):
+            prior_decisions = []
+        if action == "blind-match" and not decision_id:
+            raise ValueError("블라인드 비교 결정 식별자가 필요합니다.")
+        if action == "blind-match" and decision_id in prior_decisions:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "appended": [],
+                "picks": {
+                    "elo": picks.get("elo", {}),
+                    "elo_matches": picks.get("elo_matches", {}),
+                    "folders": picks.get("folders", {}),
+                    "review_states": picks.get("review_states", {}),
+                },
+            }
+        paths = [
+            str(value or "").replace("\\", "/")
+            for value in (data.get("paths") or [])
+            if str(value or "").strip()
+        ]
+        projection = project_evaluations(
+            picks,
+            result_records=[{"path": path} for path in paths],
+        )
+        by_path = {
+            str((item.get("subject") or {}).get("path") or ""): item
+            for item in projection["evaluations"]
+        }
+        events = []
+        if action == "blind-match":
+            if len(paths) != 2 or paths[0] == paths[1]:
+                raise ValueError(
+                    "블라인드 비교에는 서로 다른 결과 두 개가 필요합니다."
+                )
+            events.append(blind_event(
+                by_path[paths[0]],
+                by_path[paths[1]],
+                outcome=str(data.get("outcome") or "first"),
+                k_factor=24,
+            ))
+            for path, values in (
+                events[0].get("payload", {}).get(
+                    "legacy_projection"
+                )
+                or {}
+            ).items():
+                picks.setdefault("elo", {})[path] = values["elo"]
+                picks.setdefault("elo_matches", {})[path] = values[
+                    "elo_matches"
+                ]
+        elif action == "fixed-board":
+            if not paths:
+                raise ValueError("고정 비교판에는 결과가 필요합니다.")
+            board = str(data.get("board") or "").strip()[:40]
+            member = bool(data.get("member", True))
+            events = [
+                fixed_board_event(by_path[path], board, member=member)
+                for path in paths
+            ]
+            members = picks.setdefault("folders", {}).setdefault(
+                board, []
+            )
+            if member:
+                members[:] = list(dict.fromkeys([*members, *paths]))
+            else:
+                picks["folders"][board] = [
+                    item for item in members if item not in set(paths)
+                ]
+        elif action == "lifecycle":
+            if len(paths) != 1:
+                raise ValueError("생명주기 변경에는 결과 한 개가 필요합니다.")
+            state = str(data.get("state") or "")
+            events.append(lifecycle_event(by_path[paths[0]], state))
+            picks.setdefault("review_states", {})[paths[0]] = state
+        elif action == "promotion":
+            if len(paths) != 1:
+                raise ValueError("승격 제안에는 결과 한 개가 필요합니다.")
+            events.append(
+                promotion_event(
+                    by_path[paths[0]], str(data.get("target") or "")
+                )
+            )
+        else:
+            raise ValueError("지원하지 않는 평가 작업입니다.")
+        if action == "blind-match" and decision_id:
+            picks["evaluation_decision_ids"] = [
+                *prior_decisions,
+                decision_id,
+            ]
+        appended = append_events(picks, events)
+        saved = save_picks(appended["picks"])
+    return {
+        "ok": True,
+        "event": events[0] if len(events) == 1 else None,
+        "events": events,
+        "appended": appended["appended"],
+        "duplicate": bool(appended["duplicates"]),
+        "picks": {
+            "elo": saved.get("elo", {}),
+            "elo_matches": saved.get("elo_matches", {}),
+            "folders": saved.get("folders", {}),
+            "review_states": saved.get("review_states", {}),
+        },
+    }
 
 
 def save_picks_workflow(operations: Any, data: dict) -> dict:
@@ -111,7 +320,9 @@ def strip_metadata_workflow(
 
 
 __all__ = [
+    "apply_evaluation_action_workflow",
     "delete_outputs_workflow",
+    "normalize_picks",
     "save_mosaic_workflow",
     "save_picks_workflow",
     "strip_metadata_workflow",

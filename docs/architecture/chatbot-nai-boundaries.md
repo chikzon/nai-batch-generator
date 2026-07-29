@@ -43,6 +43,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 자료팩·공개자료·Reference 임포트 POST 라우트 | `web/routes/collection_post.py` |
 | 자료실·그림체 정리 POST 라우트 | `web/routes/catalog_post.py` |
 | 작가 평가·결과 선별 POST 라우트 | `web/routes/evaluation_post.py` |
+| 평가 정규화·결정 기록·결과 정리 workflow | `services/evaluation_workflow.py` |
 | 프롬프트 조각 POST 라우트 | `web/routes/fragments_post.py` |
 | 세팅·장면 편집 POST 라우트 | `web/routes/settings_post.py` |
 | 생성·비교·이미지 도구 POST 라우트 | `web/routes/generation_post.py` |

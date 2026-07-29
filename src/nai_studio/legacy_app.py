@@ -170,6 +170,10 @@ from src.nai_studio.services.evaluation_bridge import (
     project_legacy_evaluations,
     promotion_event,
 )
+from src.nai_studio.services.evaluation_workflow import (
+    apply_evaluation_action_workflow,
+    normalize_picks,
+)
 from src.nai_studio.services.experiment_bridge import (
     expand_legacy_experiment_cells,
 )
@@ -8222,78 +8226,6 @@ def load_picks():
     }
 
 
-def normalize_picks(d):
-    """선별 이름표를 작은 JSON 값으로 제한해 손상·무한 증식을 막는다."""
-    d = dict(d or {})
-    for key in ("picked", "fav"):
-        d[key] = list(dict.fromkeys(
-            str(path).replace("\\", "/") for path in (d.get(key) or [])
-            if str(path).strip()
-        ))
-    clean_folders = {}
-    for name, paths in (d.get("folders") or {}).items():
-        clean_name = str(name).strip()[:40]
-        if not clean_name or not isinstance(paths, list):
-            continue
-        # 긴 이름 둘이 같은 40자 이름으로 정리되어도 먼저 저장한 후보를 잃지 않는다.
-        clean_folders[clean_name] = list(dict.fromkeys([
-            *clean_folders.get(clean_name, []),
-            *(
-                str(path).replace("\\", "/") for path in paths
-                if str(path).strip()
-            ),
-        ]))
-    d["folders"] = clean_folders
-    d["ranks"] = {
-        str(path).replace("\\", "/"): max(1, int(rank))
-        for path, rank in (d.get("ranks") or {}).items()
-        if str(path).strip() and str(rank).lstrip("-").isdigit()
-    }
-    d["ratings"] = {
-        str(path).replace("\\", "/"): max(1, min(5, int(score)))
-        for path, score in (d.get("ratings") or {}).items()
-        if str(path).strip() and str(score).isdigit() and int(score) > 0
-    }
-    clean_elo = {}
-    for path, score in (d.get("elo") or {}).items():
-        try:
-            number = float(score)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if str(path).strip() and math.isfinite(number):
-            clean_elo[str(path).replace("\\", "/")] = round(
-                max(0.0, min(3000.0, number)), 1)
-    d["elo"] = clean_elo
-    d["elo_matches"] = {
-        str(path).replace("\\", "/"): max(0, min(1_000_000, int(count)))
-        for path, count in (d.get("elo_matches") or {}).items()
-        if str(path).strip() and str(count).isdigit()
-    }
-    clean_tags = {}
-    for path, tags in (d.get("tags") or {}).items():
-        if not str(path).strip() or not isinstance(tags, list):
-            continue
-        cleaned = list(dict.fromkeys(
-            str(tag).strip()[:40] for tag in (tags or [])
-            if str(tag).strip()
-        ))[:12]
-        if cleaned:
-            clean_tags[str(path).replace("\\", "/")] = cleaned
-    d["tags"] = clean_tags
-    d["memos"] = {
-        str(path).replace("\\", "/"): str(memo)
-        for path, memo in (d.get("memos") or {}).items()
-        if str(path).strip() and isinstance(memo, str) and memo
-    }
-    allowed_states = {"candidate", "confirmed", "shared", "archived"}
-    d["review_states"] = {
-        str(path).replace("\\", "/"): str(state)
-        for path, state in (d.get("review_states") or {}).items()
-        if str(path).strip() and str(state) in allowed_states
-    }
-    return d
-
-
 def save_picks(d):
     cleaned = normalize_picks(d)
     atomic_write_json(PICKS_FILE, cleaned, indent=1)
@@ -8301,104 +8233,19 @@ def save_picks(d):
 
 
 def apply_evaluation_action(data):
-    """결과 평가 결정을 기존 선별 장부와 append-only 사건으로 함께 남긴다."""
-    data = data if isinstance(data, dict) else {}
-    action = str(data.get("action") or "")
-    with _JSON_IO_LOCK:
-        picks = load_picks()
-        decision_id = str(data.get("decision_id") or "").strip()
-        prior_decisions = picks.get("evaluation_decision_ids")
-        if not isinstance(prior_decisions, list):
-            prior_decisions = []
-        if action == "blind-match" and not decision_id:
-            raise ValueError("블라인드 비교 결정 식별자가 필요합니다.")
-        if action == "blind-match" and decision_id in prior_decisions:
-            return {
-                "ok": True,
-                "duplicate": True,
-                "appended": [],
-                "picks": {
-                    "elo": picks.get("elo", {}),
-                    "elo_matches": picks.get("elo_matches", {}),
-                    "folders": picks.get("folders", {}),
-                    "review_states": picks.get("review_states", {}),
-                },
-            }
-        paths = [
-            str(value or "").replace("\\", "/")
-            for value in (data.get("paths") or [])
-            if str(value or "").strip()
-        ]
-        projection = project_legacy_evaluations(
-            picks,
-            result_records=[{"path": path} for path in paths],
-        )
-        by_path = {
-            str((item.get("subject") or {}).get("path") or ""): item
-            for item in projection["evaluations"]
-        }
-        events = []
-        if action == "blind-match":
-            if len(paths) != 2 or paths[0] == paths[1]:
-                raise ValueError("블라인드 비교에는 서로 다른 결과 두 개가 필요합니다.")
-            events.append(blind_match_event(
-                by_path[paths[0]],
-                by_path[paths[1]],
-                outcome=str(data.get("outcome") or "first"),
-                k_factor=24,
-            ))
-            event = events[0]
-            for path, values in (
-                event.get("payload", {}).get("legacy_projection") or {}
-            ).items():
-                picks.setdefault("elo", {})[path] = values["elo"]
-                picks.setdefault("elo_matches", {})[path] = values["elo_matches"]
-        elif action == "fixed-board":
-            if not paths:
-                raise ValueError("고정 비교판에는 결과가 필요합니다.")
-            board = str(data.get("board") or "").strip()[:40]
-            member = bool(data.get("member", True))
-            events = [
-                fixed_board_event(by_path[path], board, member=member)
-                for path in paths
-            ]
-            members = picks.setdefault("folders", {}).setdefault(board, [])
-            if member:
-                members[:] = list(dict.fromkeys([*members, *paths]))
-            else:
-                picks["folders"][board] = [
-                    item for item in members if item not in set(paths)]
-        elif action == "lifecycle":
-            if len(paths) != 1:
-                raise ValueError("생명주기 변경에는 결과 한 개가 필요합니다.")
-            state = str(data.get("state") or "")
-            events.append(lifecycle_event(by_path[paths[0]], state))
-            picks.setdefault("review_states", {})[paths[0]] = state
-        elif action == "promotion":
-            if len(paths) != 1:
-                raise ValueError("승격 제안에는 결과 한 개가 필요합니다.")
-            events.append(promotion_event(
-                by_path[paths[0]], str(data.get("target") or "")))
-        else:
-            raise ValueError("지원하지 않는 평가 작업입니다.")
-        if action == "blind-match" and decision_id:
-            picks["evaluation_decision_ids"] = [
-                *prior_decisions, decision_id]
-        appended = append_evaluation_events(picks, events)
-        saved = save_picks(appended["picks"])
-    return {
-        "ok": True,
-        "event": events[0] if len(events) == 1 else None,
-        "events": events,
-        "appended": appended["appended"],
-        "duplicate": bool(appended["duplicates"]),
-        "picks": {
-            "elo": saved.get("elo", {}),
-            "elo_matches": saved.get("elo_matches", {}),
-            "folders": saved.get("folders", {}),
-            "review_states": saved.get("review_states", {}),
-        },
-    }
+    """레거시 저장 위치를 평가 workflow에 연결하는 호환 어댑터."""
+    return apply_evaluation_action_workflow(
+        data,
+        lock=_JSON_IO_LOCK,
+        load_picks=load_picks,
+        save_picks=save_picks,
+        project_evaluations=project_legacy_evaluations,
+        blind_event=blind_match_event,
+        fixed_board_event=fixed_board_event,
+        lifecycle_event=lifecycle_event,
+        promotion_event=promotion_event,
+        append_events=append_evaluation_events,
+    )
 
 
 TRASH_DIR_NAME = ".NAI-휴지통"
