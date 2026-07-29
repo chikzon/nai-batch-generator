@@ -180,6 +180,7 @@ from src.nai_studio.services.experiment_bridge import (
 from src.nai_studio.services import (
     artist_workspace as _artist_workspace,
     catalog_search as _catalog_search,
+    character_storage as _character_storage,
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
     library_catalog as _library_catalog,
@@ -655,55 +656,10 @@ def migrate_char_slots(cfg):
 
 
 def migrate_legacy_selections(cfg):
-    """구 cfg 키(selected_*/테마/남자·파트너 역)를 세팅 구조로 1회 이전"""
-    if cfg.get("_settings_migrated"):
-        # DEFAULT_CONFIG에 이전용 키가 남아 있어 병합할 때마다 빈 male_prompt가
-        # 되살아났다. 화면은 이 폐기 키를 저장하려다 모든 모달에 경고를 띄웠다.
-        cfg.pop("male_prompt", None)
-        cfg.pop("male_outfit", None)
-        return
-    ss = cfg.setdefault("setting_state", {})
-    if cfg.get("selected_positions") is not None:
-        ss.setdefault("남녀 체위", {})["selected"] = cfg.pop("selected_positions", [])
-        ss["남녀 체위"].setdefault("opts", {})
-        for old, new in (("location_theme", "장소테마"), ("time_of_day", "시간대"),
-                         ("expression_arc", "표정진행"), ("male_wear", "남자옷")):
-            if cfg.get(old):
-                ss["남녀 체위"]["opts"][new] = cfg.pop(old)
-            else:
-                cfg.pop(old, None)
-    if cfg.get("selected_expressions") is not None:
-        ss.setdefault("표정", {})["selected"] = cfg.pop("selected_expressions", [])
-    if cfg.get("selected_yuri") is not None:
-        ss.setdefault("백합", {})["selected"] = cfg.pop("selected_yuri", [])
-        ss["백합"].setdefault("opts", {})
-        if cfg.get("yuri_undress"):
-            ss["백합"]["opts"]["옷진행"] = cfg.pop("yuri_undress")
-    # 상대역 → 세팅 파일로
-    def put_role(name, role_updates):
-        p = setting_path(name)
-        if not p:
-            return
-        try:
-            pack = load_json_recover(p)
-            role = pack.setdefault("상대역", {})
-            for k, v in role_updates.items():
-                if v and not role.get(k):
-                    role[k] = v
-            atomic_write_json(p, pack)
-        except Exception as e:
-            log.warning(f"상대역 이전 실패({name}): {e}")
-    legacy_male = cfg.pop("male_prompt", "")
-    legacy_male_outfit = cfg.pop("male_outfit", "")
-    if legacy_male:
-        put_role("남녀 체위", {"외형": legacy_male,
-                              "의상": legacy_male_outfit})
-    if cfg.get("partner_prompt"):
-        put_role("백합", {"외형": cfg.pop("partner_prompt", ""),
-                         "착의": cfg.pop("partner_clothed", ""),
-                         "네거티브": cfg.pop("partner_negative", "")})
-    cfg.pop("pack_pos", None); cfg.pop("pack_expr", None); cfg.pop("pack_yuri", None)
-    cfg["_settings_migrated"] = True
+    return _character_storage.migrate_legacy_selections(
+        cfg,
+        _character_storage_operations(),
+    )
 
 # ── 장소 테마 (카테고리 A~G별 배경. 시간 표현은 시간대에서 결합) ──
 LOCATION_THEMES = {
@@ -4678,83 +4634,13 @@ def _read_legacy_txt():
 
 
 def _migrate_legacy(cfg):
-    old = _read_legacy_txt()
-    if not old:
-        return cfg
-    log.info("설정.txt 발견 — 설정.json 으로 1회 이전합니다.")
-    cfg["token"] = old.get("토큰", cfg["token"])
-    if old.get("시드", "").isdigit():
-        cfg["seed"] = int(old["시드"])
-    cfg["base_prompt"] = old.get("그림체", cfg["base_prompt"])
-    cfg["negative_prompt"] = old.get("네거티브", cfg["negative_prompt"])
-    cfg["male_prompt"] = old.get("남자", cfg["male_prompt"])
-    for key, cast, target in (("CFG", float, "cfg_scale"), ("리스케일", float, "cfg_rescale"),
-                               ("스텝", int, "steps")):
-        v = old.get(key, "")
-        if v:
-            try:
-                cfg[target] = cast(v)
-            except ValueError:
-                pass
-    if old.get("샘플러"):
-        cfg["sampler"] = old["샘플러"]
-    if old.get("노이즈"):
-        cfg["scheduler"] = old["노이즈"]
-    if old.get("버라이어티"):
-        cfg["variety"] = old["버라이어티"].lower() in ("켬", "on", "true", "1", "yes")
-
-    if old.get("여자"):
-        cfg["characters"].append({
-            "id": "char1", "name": "캐릭터 1", "female": old["여자"], "negative": "",
-            "enabled": True, "folder_id": None, "subfolder_id": None,
-        })
-
-    # 설정.txt 하단의 [여자 이름]/[남자 이름] 캐릭터 섹션도 이전
-    cur = None
-    sections = {}
-    try:
-        with open(LEGACY_SETTINGS_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip().lstrip("﻿")
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("[") and line.endswith("]"):
-                    head = line[1:-1].strip()
-                    parts = head.split(None, 1)
-                    if len(parts) == 2 and parts[0] in ("여자", "남자"):
-                        cur = (parts[0], parts[1].strip())
-                        sections[cur] = {}
-                    else:
-                        cur = None
-                elif "=" in line and cur:
-                    k, v = line.split("=", 1)
-                    sections[cur][k.strip()] = v.strip()
-    except OSError:
-        pass
-    for (ctype, cname), fields in sections.items():
-        if ctype == "여자" and fields.get("외형"):
-            if any(c.get("name") == cname for c in cfg["characters"]):
-                continue
-            cfg["characters"].append({
-                "id": "".join(random.choices(string.ascii_lowercase + string.digits, k=8)),
-                "name": cname, "female": fields.get("외형", ""),
-                "clothed": fields.get("착의", ""), "negative": fields.get("네거티브", ""),
-                "enabled": True, "folder_id": None, "subfolder_id": None,
-            })
-        elif ctype == "남자" and fields.get("외형") and not cfg.get("male_prompt"):
-            cfg["male_prompt"] = fields["외형"]
-
-    select_raw = old.get("선택체위", "").strip()
-    if select_raw:
-        cfg["selected_positions"] = [int(x) for x in select_raw.split(",") if x.strip().isdigit()]
-    else:
-        preset_name = old.get("세트", "전체")
-        if preset_name == "가벼움":
-            cfg["selected_positions"] = list(LIGHT_PRESET)
-        else:
-            cfg["selected_positions"] = [p["id"] for p in POSITIONS]
-    return cfg
-
+    return _character_storage.migrate_legacy(
+        _character_storage_paths(),
+        _character_storage_operations(),
+        cfg,
+        light_preset=LIGHT_PRESET,
+        positions=POSITIONS,
+    )
 
 def _prefill_partner_defaults(cfg):
     """새 설정을 만들 때 asset_config.json 의 기본 파트너(백합 상대역) 외형을 미리 채워준다."""
@@ -4828,248 +4714,76 @@ def load_or_init_config():
 # UI에서 수정하면 파일에도 반영, UI에서 삭제하면 파일도 삭제됩니다.
 
 CHAR_DIR = BASE_DIR / "캐릭터"
-GROUP_ORDER = ["기본", "상황", "행동", "외모", "의상", "장신구", "마무리"]
+GROUP_ORDER = list(_character_storage.GROUP_ORDER)
+CHARACTER_ASSET_OPTIONAL_FIELDS = _character_storage.CHARACTER_ASSET_OPTIONAL_FIELDS
+
+
+def _character_storage_paths():
+    return _character_storage.CharacterStoragePaths(
+        legacy_settings_file=LEGACY_SETTINGS_FILE,
+        settings_file=SETTINGS_FILE,
+        character_dir=CHAR_DIR,
+    )
+
+
+def _character_random_id():
+    return "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=8)
+    )
+
+
+def _character_storage_operations():
+    """현재 파일·복구·ID 경계를 호출 때 주입해 기존 patch와 저장 순서를 보존한다."""
+    return _character_storage.CharacterStorageOperations(
+        read_legacy_settings=_read_legacy_txt,
+        setting_path=setting_path,
+        load_json=load_json_recover,
+        atomic_write_json=atomic_write_json,
+        recoverable_remove=recoverable_remove,
+        random_id=_character_random_id,
+        log_info=log.info,
+        log_warning=log.warning,
+    )
 
 
 def _safe_name(name):
-    bad = '<>:"/\\|?*'
-    out = "".join(c for c in (name or "") if c not in bad).strip()
-    return out or "이름없음"
+    return _character_storage.safe_name(name)
 
 
 def _compose_from_groups(groups):
-    parts = []
-    for g in GROUP_ORDER:
-        v = (groups or {}).get(g, "").strip().rstrip(",")
-        if v:
-            parts.append(v)
-    return ", ".join(parts)
+    return _character_storage.compose_from_groups(groups)
 
 
 def _folder_by_name(cfg, name, parent_id=None):
-    for f in cfg.get("character_folders", []):
-        if f.get("name") == name and f.get("parent_id") == parent_id:
-            return f
-    f = {"id": "".join(random.choices(string.ascii_lowercase + string.digits, k=8)),
-         "name": name, "parent_id": parent_id}
-    cfg.setdefault("character_folders", []).append(f)
-    return f
+    return _character_storage.folder_by_name(
+        cfg,
+        _character_storage_operations(),
+        name,
+        parent_id,
+    )
 
 
 def _read_char_documents(paths):
-    """많은 독립 JSON을 원자 저장 잠금 밖에서 병렬로 읽는다.
-
-    파일 교체는 os.replace라 잠금 없는 독자는 완성된 이전판 또는 새 판만 본다.
-    깨진 파일만 기존 복구 경로로 다시 읽어 `.bak`을 살린다. Windows에서 파일
-    1,000개를 직렬 open하면 보안 검사 지연만 수십 초가 걸려 자료 수에 비례해
-    시작이 멈추므로, 충분히 많을 때만 제한된 읽기 풀을 쓴다.
-    """
-    paths = list(paths)
-
-    def one(path):
-        try:
-            return path, json.loads(path.read_text(encoding="utf-8-sig")), None
-        except Exception as first:
-            try:
-                return path, load_json_recover(path), None
-            except Exception:
-                return path, None, first
-
-    if len(paths) < 32:
-        return [one(path) for path in paths]
-    from concurrent.futures import ThreadPoolExecutor
-    workers = min(16, max(4, (os.cpu_count() or 4) * 2))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(one, paths))
-
-
-CHARACTER_ASSET_OPTIONAL_FIELDS = (
-    "variant", "variants", "selected_variant_id",
-    "reference_ids", "vibe_ids", "representative", "representative_image",
-    "images", "evidence", "evidence_refs", "evidence_images",
-    "variation_images", "reference_inset",
-    "temporary_generation_overrides", "lineage",
-)
+    return _character_storage.read_character_documents(
+        _character_storage_operations(),
+        paths,
+    )
 
 
 def import_char_files(cfg):
-    """캐릭터/ 폴더의 규격 JSON을 등록하고, 더 새 외부 편집은 설정에 반영한다.
-
-    UI 저장은 캐릭터 파일을 먼저 쓰고 설정.json을 나중에 쓰므로 정상 저장 뒤에는
-    설정 쪽 시각이 더 새롭다. 반대로 사용자가 캐릭터 JSON을 직접 고친 경우에만
-    파일 쪽이 더 새로워진다. 같은 id라는 이유로 그 편집을 무시한 뒤 옛 설정으로
-    덮어쓰지 않는다.
-    """
-    if not CHAR_DIR.exists():
-        return
-    known = {c.get("id"): c for c in cfg.get("characters", []) if c.get("id")}
-    try:
-        settings_mtime = SETTINGS_FILE.stat().st_mtime_ns
-    except OSError:
-        settings_mtime = -1
-    registered, refreshed = [], []
-    paths = sorted(CHAR_DIR.rglob("*.json"))
-    for p, data, error in _read_char_documents(paths):
-        if error is not None:
-            log.warning(f"캐릭터 파일 손상(건너뜀): {p.name}")
-            continue
-        if not isinstance(data, dict):
-            continue
-        cid = data.get("id")
-        female = (data.get("외형") or "").strip() or _compose_from_groups(data.get("그룹"))
-        clothed = data.get("착의", "")
-        if not (female or str(clothed or "").strip()):
-            continue
-        rel = p.relative_to(CHAR_DIR).parts[:-1]  # 폴더 경로 (최대 2단계)
-        folder_id = subfolder_id = None
-        if len(rel) >= 1:
-            folder = _folder_by_name(cfg, rel[0])
-            folder_id = folder["id"]
-        if len(rel) >= 2:
-            sub = _folder_by_name(cfg, rel[1], parent_id=folder_id)
-            subfolder_id = sub["id"]
-        if cid and cid in known:
-            try:
-                externally_newer = p.stat().st_mtime_ns > settings_mtime
-            except OSError:
-                externally_newer = False
-            if not externally_newer:
-                continue
-            current = known[cid]
-            current.update({
-                "name": data.get("이름") or p.stem,
-                "female": female,
-                "clothed": clothed,
-                "negative": data.get("네거티브", ""),
-                "source": data.get("출처", ""),
-                "folder_id": folder_id,
-                "subfolder_id": subfolder_id,
-            })
-            for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
-                if field in data:
-                    current[field] = copy.deepcopy(data[field])
-            if data.get("그룹"):
-                current["groups"] = data["그룹"]
-            else:
-                current.pop("groups", None)
-            refreshed.append(str(p.relative_to(CHAR_DIR)))
-            continue
-        new_id = cid or "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        new_char = {
-            "id": new_id, "name": data.get("이름") or p.stem,
-            "female": female, "clothed": clothed,
-            "negative": data.get("네거티브", ""), "source": data.get("출처", ""),
-            "enabled": True, "folder_id": folder_id, "subfolder_id": subfolder_id,
-        }
-        for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
-            if field in data:
-                new_char[field] = copy.deepcopy(data[field])
-        if data.get("그룹"):
-            new_char["groups"] = data["그룹"]
-        cfg.setdefault("characters", []).append(new_char)
-        known[new_id] = new_char
-        registered.append(str(p.relative_to(CHAR_DIR)))
-    if registered:
-        sample = ", ".join(registered[:3])
-        log.info(
-            f"캐릭터 파일 등록: {len(registered):,}개"
-            + (f" (예: {sample})" if sample else "")
-        )
-    if refreshed:
-        sample = ", ".join(refreshed[:3])
-        log.info(
-            f"외부에서 더 새로 편집한 캐릭터 반영: {len(refreshed):,}개"
-            + (f" (예: {sample})" if sample else "")
-        )
+    return _character_storage.import_char_files(
+        _character_storage_paths(),
+        _character_storage_operations(),
+        cfg,
+    )
 
 
 def sync_chars_to_files(cfg):
-    """설정의 캐릭터를 캐릭터/ 폴더 규격 JSON으로 내보낸다 (UI 폴더 = 실제 디렉터리)."""
-    CHAR_DIR.mkdir(exist_ok=True)
-    folders = {f["id"]: f for f in cfg.get("character_folders", [])}
-    # 시작할 때 수천 파일을 내용이 같은데도 모두 다시 fsync하면 실행이 수십 초
-    # 느려지고 .bak도 쓸데없이 수천 개 생긴다. id별 현재 파일과 원문을 한 번 읽어,
-    # 그대로인 파일은 건드리지 않고 이름·폴더·내용이 바뀐 것만 쓴다.
-    existing_by_id, existing_by_path = {}, {}
-    for old_path, old_data, error in _read_char_documents(
-            CHAR_DIR.rglob("*.json")):
-        if error is not None:
-            continue
-        if not isinstance(old_data, dict) or not old_data.get("id"):
-            continue
-        existing_by_id.setdefault(str(old_data["id"]), []).append(
-            (old_path, old_data))
-        existing_by_path[old_path.resolve()] = old_data
-    keep = set()
-    for c in cfg.get("characters", []):
-        parts = []
-        f = folders.get(c.get("folder_id"))
-        if f:
-            parts.append(_safe_name(f["name"]))
-        sf = folders.get(c.get("subfolder_id"))
-        if sf:
-            parts.append(_safe_name(sf["name"]))
-        d = CHAR_DIR.joinpath(*parts) if parts else CHAR_DIR
-        d.mkdir(parents=True, exist_ok=True)
-        desired = d / f"{_safe_name(c.get('name') or c['id'])}.json"
-        candidates = existing_by_id.get(str(c["id"]), [])
-        # 외부 파일을 처음 읽은 직후에는 원래 파일명과 알려지지 않은 필드를
-        # 그대로 지킨다. UI에서 이름·폴더를 바꾼 경우에만 새 위치로 옮긴다.
-        stable = next((
-            old_path for old_path, old_data in candidates
-            if old_path.parent.resolve() == d.resolve()
-            and str(old_data.get("이름") or old_path.stem)
-                == str(c.get("name") or "")
-        ), None)
-        p = stable or desired
-        if stable is None:
-            serial = 2
-            while p.exists():
-                occupant = existing_by_path.get(p.resolve())
-                if isinstance(occupant, dict) and str(occupant.get("id")) == str(c["id"]):
-                    break
-                p = d / f"{_safe_name(c.get('name') or c['id'])} ({serial}).json"
-                serial += 1
-        prior = existing_by_path.get(p.resolve())
-        if prior is None and candidates:
-            # 이름·폴더 이동에서도 외부 도구가 적은 알 수 없는 필드를 버리지 않는다.
-            prior = candidates[0][1]
-        data = dict(prior) if isinstance(prior, dict) else {}
-        data.update({
-            "id": c["id"], "이름": c.get("name", ""), "외형": c.get("female", ""),
-            "착의": c.get("clothed", ""), "네거티브": c.get("negative", ""),
-        })
-        for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
-            if field in c:
-                data[field] = copy.deepcopy(c[field])
-        if c.get("groups"):
-            data["그룹"] = c["groups"]
-        else:
-            data.pop("그룹", None)
-        if c.get("source"):
-            data["출처"] = c["source"]
-        else:
-            data.pop("출처", None)
-        try:
-            if not (p.is_file() and existing_by_path.get(p.resolve()) == data):
-                atomic_write_json(p, data)
-            keep.add(p.resolve())
-        except OSError as e:
-            log.warning(f"캐릭터 파일 저장 실패({p.name}): {e}")
-    # 설정에 있는 캐릭터의 옛 파일(이동/이름변경/삭제 잔재) 정리
-    ids = {c["id"] for c in cfg.get("characters", [])}
-    for p, data in (
-        (old_path, old_data)
-        for rows in existing_by_id.values()
-        for old_path, old_data in rows
-    ):
-        if p.resolve() in keep:
-            continue
-        if isinstance(data, dict) and data.get("id") and data["id"] in ids:
-            # 같은 캐릭터의 새 위치 파일이 먼저 확정된 뒤 옛 위치는 복구 가능한
-            # 백업으로 옮긴다. 이동 중 중단돼도 캐릭터 원문은 남는다.
-            recoverable_remove(p, label="옛위치")
-
+    return _character_storage.sync_chars_to_files(
+        _character_storage_paths(),
+        _character_storage_operations(),
+        cfg,
+    )
 
 def delete_char_files(cfg, removed_ids):
     """UI에서 삭제된 캐릭터의 파일을 지운다."""
