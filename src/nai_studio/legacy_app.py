@@ -4914,9 +4914,12 @@ def metadata_audit_adapter():
     return _METADATA_AUDIT_ADAPTER
 
 
-def metadata_audit_status():
+def metadata_audit_status(found_offset=0, found_limit=50):
     try:
-        result = metadata_audit_adapter().status_light()
+        result = metadata_audit_adapter().status_light(
+            found_offset=max(0, int(found_offset or 0)),
+            found_limit=max(1, min(100, int(found_limit or 50))),
+        )
         return {"ok": True, **result}
     except MetadataAuditLedgerError:
         return {"ok": True, "empty": True}
@@ -7037,11 +7040,13 @@ def comparison_job_values(cfg, plan, job):
     negative = negative or ""
     char = job.get("character")
     if char is not None:
+        used = character_resource_config(used, char)
         # 캐릭터 자료의 외형+착의를 일반 캐릭터 칸과 같은 한 덩어리로 보낸다.
         people = [{"prompt": _comparison_character_prompt(char),
                    "negative": char.get("negative", "") or ""}]
         centers = [{"x": 0.5, "y": 0.5}]
     else:
+        used = characters_resource_config(used, cfg.get("char_slots") or [])
         # active_people가 원래 칸 index로 좌표를 함께 거른다. 슬롯을 먼저 줄이면
         # 꺼진 캐릭터 뒤의 인물이 앞 캐릭터 좌표를 받는다.
         people, centers = active_people(
@@ -7091,16 +7096,41 @@ def comparison_job_recipe_snapshot(
             "scene": int(job.get("scene_num") or 0),
             "copy": int(job.get("copy") or 1),
         } if setting else {}
+    elif character:
+        slots = [{
+            "id": character.get("id") or character.get("_compare_id") or "",
+            "name": character.get("name") or character.get("_compare_name") or "",
+            "prompt": character.get("female", ""),
+            "outfit": character.get("clothed", ""),
+            "negative": character.get("negative", ""),
+            "variant": copy.deepcopy(character.get("variant") or {}),
+            "variants": copy.deepcopy(character.get("variants") or []),
+            "reference_ids": copy.deepcopy(character.get("reference_ids") or []),
+            "vibe_ids": copy.deepcopy(character.get("vibe_ids") or []),
+            "enabled": True,
+        }]
+        char_centers = [{"x": 0.5, "y": 0.5}]
+        source_setting = {}
     else:
-        slots = []
-        char_centers = []
+        slots = [
+            copy.deepcopy(slot) for slot in (cfg.get("char_slots") or [])
+            if isinstance(slot, dict)
+            and slot.get("enabled") is not False
+            and slot_prompt(slot).strip()
+        ][:MAX_CHARS]
+        _, char_centers = active_people(
+            cfg.get("char_slots") or [], cfg.get("char_centers"))
         source_setting = {}
     include_refs = bool(plan["options"].get("include_refs"))
     wanted_vibes = {
-        str(value) for value in (character.get("vibe_ids") or []) if value
+        str(value)
+        for slot in slots if isinstance(slot, dict)
+        for value in (slot.get("vibe_ids") or []) if value
     }
     wanted_refs = {
-        str(value) for value in (character.get("reference_ids") or []) if value
+        str(value)
+        for slot in slots if isinstance(slot, dict)
+        for value in (slot.get("reference_ids") or []) if value
     }
     saved_vibes = [
         copy.deepcopy(item) for item in (cfg.get("vibes") or [])
@@ -7121,10 +7151,14 @@ def comparison_job_recipe_snapshot(
     return {
         "version": 2,
         "mode": plan["options"].get("mode") or "",
-        # 사용자 원문은 resolved prompt와 별도로 보존한다.
-        "base_prompt": cfg.get("base_prompt", ""),
-        "negative_prompt": cfg.get("negative_prompt", ""),
-        "style_name": cfg.get("style_name", ""),
+        # 이 결과에 실제로 쓰인 원문을 승격·재적용의 주 레시피로 보존한다.
+        # 현재 화면 값은 아래 source에 별도로 남아 결과를 덮어쓰지 않는다.
+        "base_prompt": base,
+        "negative_prompt": negative,
+        "style_name": (
+            style.get("name") or style.get("title")
+            or style.get("_compare_name") or cfg.get("style_name", "")
+        ),
         "settings": {
             key: used.get(key) for key in COMPARE_RECIPE_SETTING_KEYS
         },
@@ -8540,6 +8574,7 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
                 "enabled": bool(cfg.get("use_coords")),
             },
             "variant": copy.deepcopy(slot.get("variant") or {}),
+            "variants": copy.deepcopy(slot.get("variants") or []),
             "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
             "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
         })
@@ -8766,6 +8801,23 @@ def character_resource_config(cfg, character):
             if resource_id in by_id
         ]
     return scoped
+
+
+def characters_resource_config(cfg, characters):
+    """여러 캐릭터가 명시한 Reference·Vibe를 순서대로 합쳐 한 호출에 적용한다.
+
+    어느 캐릭터도 id를 명시하지 않은 과거 설정은 기존 전역 선택을 그대로 쓴다.
+    """
+    synthetic = {"reference_ids": [], "vibe_ids": []}
+    for character in characters or []:
+        if not isinstance(character, dict) or character.get("enabled") is False:
+            continue
+        for key in ("reference_ids", "vibe_ids"):
+            for value in character.get(key) or []:
+                value = str(value)
+                if value and value not in synthetic[key]:
+                    synthetic[key].append(value)
+    return character_resource_config(cfg, synthetic)
 
 
 def setting_scene_people(scene, female, male, char_negative, male_negative,
@@ -11570,6 +11622,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             style="margin-top:7px;">감사 기록을 확인하는 중입니다.</div>
           <div id="metadataAuditFound" class="bar"
             style="margin-top:7px;flex-wrap:wrap;"></div>
+          <button type="button" id="metadataAuditMore" class="hidden"
+            style="margin-top:7px;">복원 후보 더 보기</button>
         </div>
       </div>
 
@@ -16578,18 +16632,22 @@ if($('dataOriginsShow')) $('dataOriginsShow').addEventListener('click', async ()
   }catch(error){ host.textContent = '출처 장부 확인 실패: ' + error; }
 });
 
-function renderMetadataAudit(r){
+var METADATA_AUDIT_OFFSET = 0;
+function renderMetadataAudit(r, append=false){
   const host = $('metadataAuditStatus');
   const found = $('metadataAuditFound');
+  const more = $('metadataAuditMore');
   if(!host || !found) return;
   if(!r || !r.ok){
     host.textContent = (r && r.error) || '메타데이터 감사 기록을 읽지 못했습니다.';
     found.innerHTML = '';
+    if(more) more.classList.add('hidden');
     return;
   }
   if(r.empty){
     host.textContent = '아직 감사 기록이 없습니다. 자료 색인을 만든 뒤 처음부터 확인하세요.';
     found.innerHTML = '';
+    if(more) more.classList.add('hidden');
     return;
   }
   const s = r.summary || {};
@@ -16603,12 +16661,16 @@ function renderMetadataAudit(r){
     + ` · 복원 후보 ${Number(c.found||0).toLocaleString()}`
     + ` · 메타 없음 ${Number(c.none||0).toLocaleString()}`
     + ` · 오류 ${Number(c.error||0).toLocaleString()}`;
-  found.innerHTML = (r.found || []).map(item =>
+  const buttons = (r.found || []).map(item =>
     `<button type="button" data-audit-candidate="${escA(item.path)}"
       data-audit-sha="${escA(item.sha256)}" title="원본을 다시 SHA 검증한 뒤 읽기 전용으로 확인">
       ${esc(item.path)}</button>`).join('');
-  found.querySelectorAll('[data-audit-candidate]').forEach(button =>
-    button.addEventListener('click', async () => {
+  if(append) found.insertAdjacentHTML('beforeend', buttons);
+  else found.innerHTML = buttons;
+  METADATA_AUDIT_OFFSET = Number(r.found_offset||0) + (r.found||[]).length;
+  if(more) more.classList.toggle('hidden', !r.found_more);
+  found.querySelectorAll('[data-audit-candidate]').forEach(button => {
+    button.onclick = async () => {
       button.disabled = true;
       try{
         const response = await fetch('/api/metadata_audit_candidate', {
@@ -16626,12 +16688,14 @@ function renderMetadataAudit(r){
       }finally{
         button.disabled = false;
       }
-    }));
+    };
+  });
 }
-async function loadMetadataAudit(){
+async function loadMetadataAudit(offset=0, append=false){
   try{
     renderMetadataAudit(await (await fetch(
-      '/api/metadata_audit_status', {cache:'no-store'})).json());
+      '/api/metadata_audit_status?offset=' + Number(offset||0)
+        + '&limit=50', {cache:'no-store'})).json(), append);
   }catch(error){
     renderMetadataAudit({ok:false,error:'메타데이터 감사 기록 확인 실패: ' + error});
   }
@@ -16645,7 +16709,8 @@ async function metadataAuditAction(action){
     const r = await (await fetch('/api/metadata_audit_control', {
       method:'POST', body:JSON.stringify({action}),
     })).json();
-    renderMetadataAudit(r);
+    METADATA_AUDIT_OFFSET = 0;
+    renderMetadataAudit(r, false);
   }catch(error){
     renderMetadataAudit({ok:false,error:'메타데이터 감사 실행 실패: ' + error});
   }finally{
@@ -16658,6 +16723,8 @@ if($('metadataAuditContinue')) $('metadataAuditContinue').addEventListener(
   'click', () => metadataAuditAction('continue'));
 if($('metadataAuditRetry')) $('metadataAuditRetry').addEventListener(
   'click', () => metadataAuditAction('retry'));
+if($('metadataAuditMore')) $('metadataAuditMore').addEventListener(
+  'click', () => loadMetadataAudit(METADATA_AUDIT_OFFSET, true));
 loadMetadataAudit();
 
 let PUBLIC_COLLECT_TIMER = null;
@@ -20636,6 +20703,7 @@ class ConfigServer:
         self.config_revision = 0
         self.anlas_balance_cache = None
         self.anlas_balance_token_key = None
+        self.pending_batch_config = None
 
     def latest_config_from_disk(self):
         """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
@@ -20862,6 +20930,8 @@ class ConfigServer:
         material = single_generation_legacy_material(blueprint)
         job_cfg = copy.deepcopy(cfg)
         job_cfg.update(material.get("config_overrides") or {})
+        job_cfg = characters_resource_config(
+            job_cfg, blueprint.get("characters") or [])
         call = material["call"]
         tok = self.live.try_claim(
             "단독 생성",
@@ -20907,7 +20977,7 @@ class ConfigServer:
                 img.nai_blueprint_fingerprint = blueprint["fingerprint"]
                 out_dir = out_sub(job_cfg, "단독")
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                save_with_meta(
+                saved = save_with_meta(
                     img, out_dir / f"{n:04d}.webp",
                     fmt=out_format(job_cfg), clean=_ocargs(job_cfg)[0],
                     max_side=_ocargs(job_cfg)[1], quality=out_clean(job_cfg)[2])
@@ -20915,7 +20985,11 @@ class ConfigServer:
                 bump_daily(state)
                 save_state(state)
                 self.live.update(
-                    status_text=f"단독 생성 완료 ✓ (output/단독/{n:04d}.webp)",
+                    status_text=(
+                        "단독 생성 완료 ✓ ("
+                        + saved.resolve().relative_to(out_root(job_cfg).resolve()).as_posix()
+                        + ")"
+                    ),
                     completed=1, phase="completed")
             except Exception as e:
                 log.error(f"단독 생성 실패: {e}")
@@ -21429,7 +21503,6 @@ class ConfigServer:
             with self.config_lock:
                 self.use_latest_config()
                 promotions = None
-                lineage_error = ""
                 try:
                     promotions = _result_promotion_records(
                         self.cfg,
@@ -21437,10 +21510,10 @@ class ConfigServer:
                         data.get("kind"),
                         name=data.get("name"),
                     )
-                except Exception as error:
+                except LegacyPromotionLineageUnavailable:
                     # 구형 비교 결과는 실행 식별자가 없을 수 있다. 자산 저장은 호환
                     # 경로로 허용하되 계보를 꾸며 내지 않고 미확인으로 명시한다.
-                    lineage_error = redact_diagnostic_text(error)
+                    pass
                 result = promote_comparison_recipe_assets(
                     self.cfg,
                     data.get("path"),
@@ -21453,6 +21526,14 @@ class ConfigServer:
                 result["revision"] = self.config_revision
                 if result.get("ok") and promotions is not None:
                     try:
+                        # 이름 충돌 시 실제 저장된 이름으로 엄격 레코드를 다시 만든다.
+                        promotions = _result_promotion_records(
+                            self.cfg,
+                            data.get("path"),
+                            data.get("kind"),
+                            name=data.get("name"),
+                            resolved_names=list(result.get("names") or []),
+                        )
                         result["lineage"] = _append_result_promotion_ledger(
                             promotions)
                         result["lineage"]["verified"] = all(
@@ -21471,8 +21552,8 @@ class ConfigServer:
                         "verified": False,
                         "warning": (
                             "자산은 저장했지만 이 구형 결과에는 엄격한 실행 계보가 "
-                            f"없어 승격 장부에는 넣지 않았습니다. {lineage_error}"
-                        ).strip(),
+                            "없어 승격 장부에는 넣지 않았습니다."
+                        ),
                     }
                 return result
         except Exception as e:
@@ -22204,6 +22285,10 @@ class ConfigServer:
         if not any((st.get("use") is not False and st.get("selected"))
                    for st in (self.cfg.get("setting_state") or {}).values()):
             return {"ok": False, "error": "세팅 탭에서 씬을 1개 이상 선택해주세요."}
+        # 시작 버튼을 누른 순간의 계획을 고정한다. 진행 중 화면 저장은 다음 실행에만
+        # 반영되어 한 batch 안에서 프롬프트·캐스트·세팅이 섞이지 않는다.
+        with self.config_lock:
+            self.pending_batch_config = copy.deepcopy(self.cfg)
         self.start_event.set()
         return {"ok": True}
 
@@ -22279,8 +22364,13 @@ class ConfigServer:
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/metadata_audit_status"):
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
                     try:
-                        self._json(metadata_audit_status())
+                        self._json(metadata_audit_status(
+                            found_offset=int(q.get("offset", ["0"])[0]),
+                            found_limit=int(q.get("limit", ["50"])[0]),
+                        ))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/config"):
@@ -23924,12 +24014,31 @@ def _comparison_result_evaluation(path, manifest, job_key):
     }
 
 
-def _result_promotion_records(cfg, rel, kind, name=""):
+class LegacyPromotionLineageUnavailable(ValueError):
+    """엄격 실행 식별자가 전혀 없는 구형 비교 결과."""
+
+
+def _result_promotion_records(
+    cfg, rel, kind, name="", resolved_names=None,
+):
     """새 비교 결과의 검증 가능한 계보와 명시적 자산 내용을 승격 레코드로 만든다."""
     context = _comparison_result_context(cfg, rel)
     restored = comparison_recipe_for_output(cfg, rel)
     recipe = restored["recipe"]
     record = context["record"]
+    strict_keys = (
+        "content_sha256", "request_id", "payload_hash",
+        "blueprint_fingerprint",
+    )
+    present = [key for key in strict_keys if record.get(key)]
+    if not present:
+        raise LegacyPromotionLineageUnavailable(
+            "이 비교 결과에는 엄격 실행 식별자가 없습니다.")
+    missing = [key for key in strict_keys if not record.get(key)]
+    if missing:
+        raise ValueError(
+            "비교 결과의 엄격 실행 식별자가 일부 빠졌습니다: "
+            + ", ".join(missing))
     actual_sha = hashlib.sha256(
         context["image_path"].read_bytes()).hexdigest()
     if actual_sha != str(record.get("content_sha256") or "").lower():
@@ -23955,7 +24064,9 @@ def _result_promotion_records(cfg, rel, kind, name=""):
             context["manifest"],
             evaluation,
             target="style",
-            name=str(name or recipe.get("style_name") or ""),
+            name=str(
+                ((resolved_names or [""])[0] if resolved_names else "")
+                or name or recipe.get("style_name") or ""),
             content={
                 "base": str(recipe.get("base_prompt") or ""),
                 "negative": str(recipe.get("negative_prompt") or ""),
@@ -23979,7 +24090,13 @@ def _result_promotion_records(cfg, rel, kind, name=""):
             context["manifest"],
             evaluation,
             target="character",
-            name=str(slot.get("name") or f"비교 결과 캐릭터 {index}"),
+            name=str(
+                (
+                    resolved_names[index - 1]
+                    if resolved_names and index <= len(resolved_names)
+                    else ""
+                )
+                or slot.get("name") or f"비교 결과 캐릭터 {index}"),
             content={
                 "prompt": slot_prompt(slot),
                 "appearance": str(
@@ -24715,23 +24832,30 @@ def main():
 
     while True:
         server.start_event.wait()  # '생성 시작' 클릭까지 대기
+        with server.config_lock:
+            run_cfg = copy.deepcopy(
+                server.pending_batch_config
+                if isinstance(server.pending_batch_config, dict)
+                else server.cfg
+            )
+            server.pending_batch_config = None
         # 단독 생성 등이 그 틈에 실행권을 가져갔다면 배치를 겹쳐 돌리지 않는다
         tok = server.live.try_claim(
             "세팅 배치 생성",
             "settings",
             blueprint=generation_blueprint(
-                server.cfg,
+                run_cfg,
                 source={"kind": "settings-batch"},
             ),
             payload_identity={
-                "kind": "setting", "seed_round": server.cfg.get("seed")},
+                "kind": "setting", "seed_round": run_cfg.get("seed")},
         )
         if tok is None:
             server.start_event.clear()
             server.live.update(status_text="다른 생성이 도는 중입니다 — 끝난 뒤 '생성 시작'을 다시 눌러주세요.")
             continue
         try:
-            _run_generation(server)
+            _run_generation(server, run_cfg)
             if server.live.stop_req:
                 server.live.update(
                     status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.",
@@ -24768,8 +24892,10 @@ def main():
     print("프로그램을 종료합니다.")
 
 
-def _run_generation(server):
-    seed_idx = int(server.cfg.get("seed", 1) or 1)
+def _run_generation(server, cfg_snapshot=None):
+    cfg = copy.deepcopy(
+        cfg_snapshot if isinstance(cfg_snapshot, dict) else server.cfg)
+    seed_idx = int(cfg.get("seed", 1) or 1)
     seed_key = f"{seed_idx:02d}"
 
     state = load_state()
@@ -24780,21 +24906,21 @@ def _run_generation(server):
     # 조각 순차(<*이름>) 순번은 배치 내내, 그리고 다음 실행까지 이어진다.
     # cfg 에 실어 두면 call_nai_api 가 장마다 하나씩 올려 준다.
     state.setdefault("frag_seq", {})
-    server.cfg["_frag_counters"] = state["frag_seq"]
+    cfg["_frag_counters"] = state["frag_seq"]
     server.live.update(seed_key=seed_key)
-    if fixed_seed(server.cfg):
-        log.info(f"═══ 회차 {seed_key} — NAI 시드 고정 {fixed_seed(server.cfg)} "
+    if fixed_seed(cfg):
+        log.info(f"═══ 회차 {seed_key} — NAI 시드 고정 {fixed_seed(cfg)} "
                  f"(모든 장이 같은 시드) ═══")
     else:
         log.info(f"═══ 회차 {seed_key} (기준 시드 {base_seed}) — 장마다 '기준+씬번호' 시드. "
                  f"같은 회차를 다시 돌리면 같은 결과 ═══")
     log.info(f"오늘 생성량: {daily_count(state)}/{DAILY_CAP}")
 
-    characters_now = server.cfg.get("characters", [])
+    characters_now = cfg.get("characters", [])
     enabled_now = [c for c in characters_now if c.get("enabled", True)]
     sel_summary = " · ".join(
         f"{name} {len(st.get('selected', []))}세트"
-        for name, st in (server.cfg.get("setting_state") or {}).items()
+        for name, st in (cfg.get("setting_state") or {}).items()
         if st.get("use") is not False and st.get("selected"))
     log.info(f"캐릭터 {len(enabled_now)}명 켜짐 (전체 {len(characters_now)}명) · 선택: {sel_summary or '없음'}")
     if not enabled_now:
@@ -24804,7 +24930,6 @@ def _run_generation(server):
     #   예전에는 progress 를 쓰기만 하고 읽지 않아, 중지 후 '생성 시작'을 다시 누르면
     #   끝난 장을 처음부터 다시 만들고 같은 파일을 덮어썼다 (Anlas·시간 재소모).
     #   회차(seed) 를 바꾸면 progress 키가 달라져 자연히 새로 시작한다.
-    cfg = server.cfg
     acfg = load_asset_config(cfg)
     context_fingerprint = generation_context_fingerprint(cfg, acfg)
     records = {}
@@ -24823,14 +24948,14 @@ def _run_generation(server):
     done_this_run = {}
     invalid_records = 0
     candidates = compute_pending(cfg, acfg, {}, set())
-    for char, cid, num, copy in candidates:
-        record = records.get((cid, num, copy))
+    for char, cid, num, copy_num in candidates:
+        record = records.get((cid, num, copy_num))
         if record is None:
             continue
         fingerprint = generation_task_fingerprint(
-            context_fingerprint, char, cid, num, copy)
+            context_fingerprint, char, cid, num, copy_num)
         if progress_record_valid(record, cfg, fingerprint):
-            done_this_run.setdefault(cid, set()).add((num, copy))
+            done_this_run.setdefault(cid, set()).add((num, copy_num))
         else:
             invalid_records += 1
     if done_this_run:
@@ -24850,7 +24975,6 @@ def _run_generation(server):
                 phase="stopped", can_retry=True)
             save_state(state)
             return
-        cfg = server.cfg  # 매 루프마다 최신 설정을 다시 읽는다 (실시간 반영 핵심)
         acfg = load_asset_config(cfg)
         context_fingerprint = generation_context_fingerprint(cfg, acfg)
         pending = compute_pending(cfg, acfg, done_this_run, skip_set)
@@ -24893,7 +25017,7 @@ def _run_generation(server):
         variety = cfg.get("variety", False)
         steps = int(cfg.get("steps", acfg["base"].get("steps", 28)))
         token = cfg["token"]
-        char, cid, num, copy = pending[0]
+        char, cid, num, copy_num = pending[0]
         total_now = completed + len(skip_set) + len(pending)
 
         try:
@@ -24907,14 +25031,14 @@ def _run_generation(server):
             reference_cfg, _, _ = setting_reference_config(cast_cfg, scene)
             params = runtime_generation_params(reference_cfg, token)
             char_label = char.get("name") or cid
-            suffix = "" if copy == 1 else f"_{copy}벌"
+            suffix = "" if copy_num == 1 else f"_{copy_num}벌"
             fname = (f"{num:03d}_{scene['name'].replace(' ', '_').replace('/', '_')}"
                      f"{suffix}.webp")
             base_p, female, male, char_neg, male_neg, w, h = build_scene(acfg, char, cfg, num)
         except Exception as e:
             log.error(f"[{completed+1}/{total_now}] 프롬프트/폴더 준비 중 오류로 이 컷 건너뜀: {e}")
             log.error(traceback.format_exc())
-            skip_set.add((cid, num, copy))
+            skip_set.add((cid, num, copy_num))
             server.live.update(
                 status_text=f"오류(건너뜀): {e}", failed=len(skip_set),
                 last_error=str(e), can_retry=True)
@@ -24924,7 +25048,7 @@ def _run_generation(server):
 
         # 이 장의 시드 — 씬 번호로 갈라지고, 같은 씬을 여러 벌 뽑으면 벌마다 또 갈라진다
         # (안 그러면 2벌·3벌이 1벌과 똑같은 그림이 된다)
-        seed = seed_for(cfg, base_seed, num + (copy - 1) * 100003)
+        seed = seed_for(cfg, base_seed, num + (copy_num - 1) * 100003)
         log.info(f"[{completed+1}/{total_now}] ({char_label}) {fname} "
                  f"시드 {seed} (오늘 {daily_count(state)+1}/{DAILY_CAP})")
         server.live.update(index=completed + 1, total=total_now, filename=fname,
@@ -25007,13 +25131,16 @@ def _run_generation(server):
                     break                      # 중지 — 재시도하지 않는다
 
         if ok:
-            done_this_run.setdefault(cid, set()).add((num, copy))
+            done_this_run.setdefault(cid, set()).add((num, copy_num))
             fingerprint = generation_task_fingerprint(
-                context_fingerprint, char, cid, num, copy)
+                context_fingerprint, char, cid, num, copy_num)
             record = make_progress_record(
-                cfg, num, copy, saved_path, fingerprint)
+                cfg, num, copy_num, saved_path, fingerprint)
             rec = state["progress"].setdefault(seed_key, {}).setdefault(cid, [])
-            rec[:] = [item for item in rec if progress_item_key(item) != (num, copy)]
+            rec[:] = [
+                item for item in rec
+                if progress_item_key(item) != (num, copy_num)
+            ]
             rec.append(record)
             bump_daily(state)
             completed += 1
@@ -25023,7 +25150,7 @@ def _run_generation(server):
             # 매 장 저장한다 — 중지·강제 종료 후 재개가 정확해야 하고 파일은 몇 KB 다
             save_state(state)
         else:
-            skip_set.add((cid, num, copy))
+            skip_set.add((cid, num, copy_num))
             server.live.update(
                 status_text=f"실패 — 건너뜀: {fname}",
                 failed=len(skip_set), can_retry=True)

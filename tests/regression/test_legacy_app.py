@@ -1632,10 +1632,8 @@ class RegressionTests(unittest.TestCase):
                 for used, _ in runtime_cfgs
             ))
             recipe = restored["recipe"]
-            self.assertEqual(
-                recipe["base_prompt"], "base original\n1.2::weight::")
-            self.assertEqual(
-                recipe["negative_prompt"], "negative original\n||red||")
+            self.assertEqual(recipe["base_prompt"], calls[0]["base"])
+            self.assertEqual(recipe["negative_prompt"], calls[0]["negative"])
             self.assertEqual(
                 recipe["char_slots"][0]["prompt"],
                 "appearance\nline two",
@@ -2878,12 +2876,102 @@ class RegressionTests(unittest.TestCase):
             with patch.object(APP, "PICKS_FILE", picks):
                 promotions = APP._result_promotion_records(
                     cfg, rel, "style", name="검증 그림체")
+                image.write_bytes(b"changed-after-manifest")
+                with self.assertRaisesRegex(ValueError, "바뀌어"):
+                    APP._result_promotion_records(
+                        cfg, rel, "style", name="검증 그림체")
+                image.write_bytes(b"saved-image")
+                partial = json.loads(
+                    (run / "manifest.json").read_text(encoding="utf-8"))
+                partial["completed"]["cell-one"].pop("request_id")
+                (run / "manifest.json").write_text(
+                    json.dumps(partial, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "일부 빠졌"):
+                    APP._result_promotion_records(
+                        cfg, rel, "style", name="검증 그림체")
+                for key in (
+                    "content_sha256", "payload_hash",
+                    "blueprint_fingerprint",
+                ):
+                    partial["completed"]["cell-one"].pop(key)
+                (run / "manifest.json").write_text(
+                    json.dumps(partial, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaises(APP.LegacyPromotionLineageUnavailable):
+                    APP._result_promotion_records(
+                        cfg, rel, "style", name="검증 그림체")
 
         self.assertEqual(len(promotions), 1)
         lineage = promotions[0]["lineage"]
         self.assertTrue(lineage["execution"]["manifest_verified"])
         self.assertEqual(lineage["comparison"]["job_key"], "cell-one")
         self.assertEqual(promotions[0]["evidence"]["evaluation"]["rating"], 5)
+
+    def test_strict_promotion_failure_never_falls_back_to_asset_save(self):
+        server = APP.ConfigServer(copy.deepcopy(APP.DEFAULT_CONFIG))
+        with (
+            patch.object(server, "use_latest_config", return_value=None),
+            patch.object(
+                APP, "_result_promotion_records",
+                side_effect=ValueError("content SHA mismatch")),
+            patch.object(APP, "promote_comparison_recipe_assets") as save_asset,
+        ):
+            result = server.handle_compare_promote(json.dumps({
+                "path": "비교생성/run/winner.webp",
+                "kind": "style",
+                "name": "검증",
+            }).encode("utf-8"))
+        self.assertFalse(result["ok"])
+        self.assertIn("SHA", result["error"])
+        save_asset.assert_not_called()
+
+    def test_comparison_snapshot_uses_actual_recipe_and_character_resources(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update({
+            "base_prompt": "CURRENT BASE",
+            "negative_prompt": "CURRENT NEGATIVE",
+            "style_name": "CURRENT STYLE",
+            "char_refs": [
+                {"id": "ref-a", "enabled": False},
+                {"id": "ref-b", "enabled": True},
+            ],
+            "vibes": [
+                {"id": "vibe-a", "enabled": False},
+                {"id": "vibe-b", "enabled": True},
+            ],
+        })
+        character = {
+            "id": "char-a", "_compare_id": "char-a",
+            "name": "Character A", "_compare_name": "Character A",
+            "female": "appearance", "clothed": "outfit",
+            "negative": "char negative",
+            "variant": {"id": "winter"},
+            "variants": [{"id": "winter"}, {"id": "summer"}],
+            "reference_ids": ["ref-a"], "vibe_ids": ["vibe-a"],
+        }
+        style = {
+            "_compare_name": "ACTUAL STYLE",
+            "base": "ACTUAL BASE", "negative": "ACTUAL NEGATIVE",
+            "params": {},
+        }
+        plan = {"options": {
+            "mode": "both", "fixed_size": False, "include_refs": True,
+        }}
+        job = {"style": style, "character": character}
+        used, base, negative, people, centers = APP.comparison_job_values(
+            cfg, plan, job)
+        recipe = APP.comparison_job_recipe_snapshot(
+            cfg, plan, job, used, base, negative, people, centers, 123)
+        self.assertEqual(recipe["base_prompt"], "ACTUAL BASE")
+        self.assertEqual(recipe["negative_prompt"], "ACTUAL NEGATIVE")
+        self.assertEqual(recipe["style_name"], "ACTUAL STYLE")
+        self.assertEqual(recipe["char_slots"][0]["prompt"], "appearance")
+        self.assertEqual(recipe["char_slots"][0]["outfit"], "outfit")
+        self.assertEqual(
+            recipe["char_slots"][0]["variants"],
+            [{"id": "winter"}, {"id": "summer"}],
+        )
+        self.assertEqual([x["id"] for x in used["char_refs"]], ["ref-a"])
+        self.assertEqual([x["id"] for x in used["vibes"]], ["vibe-a"])
 
     def test_recent_comparison_summary_only_opens_an_existing_output_folder(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4060,8 +4148,10 @@ class RegressionTests(unittest.TestCase):
             "metadataAuditRetry",
             "metadataAuditStatus",
             "metadataAuditFound",
+            "metadataAuditMore",
         ):
             self.assertIn(f'id="{element_id}"', page)
+        self.assertIn("loadMetadataAudit(METADATA_AUDIT_OFFSET, true)", page)
         self.assertIsNone(APP._nai_json_metadata({
             "title": "그림체",
             "base": "artist one",
@@ -4877,6 +4967,8 @@ class RegressionTests(unittest.TestCase):
             "char_slots": [{
                 "id": "slot-a", "name": "A", "prompt": "appearance",
                 "outfit": "outfit", "negative": "character negative",
+                "variant": {"id": "winter"},
+                "variants": [{"id": "winter"}, {"id": "summer"}],
                 "reference_ids": ["ref-a"], "vibe_ids": ["vibe-a"],
             }],
             "char_centers": [{"x": 0.13, "y": 0.87}],
@@ -4902,6 +4994,10 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["knowledge_assets"][0]["kind"], "style")
         self.assertEqual(snapshot["knowledge_assets"][1]["kind"], "character")
+        self.assertEqual(
+            blueprint["characters"][0]["variants"],
+            [{"id": "winter"}, {"id": "summer"}],
+        )
         self.assertNotIn("pst-never-cross", json.dumps(
             snapshot, ensure_ascii=False))
 
