@@ -24,6 +24,10 @@ STATIC_ASSETS = {
         "studio-settings.js",
         "text/javascript; charset=utf-8",
     ),
+    "/ui/studio-library.js": (
+        "studio-library.js",
+        "text/javascript; charset=utf-8",
+    ),
     "/ui/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
 }
 

@@ -61,6 +61,7 @@ REQUIRED_STATIC_ASSETS: tuple[str, ...] = (
     "src/nai_studio/web/static/studio-core.js",
     "src/nai_studio/web/static/studio-generation.js",
     "src/nai_studio/web/static/studio-settings.js",
+    "src/nai_studio/web/static/studio-library.js",
     "src/nai_studio/web/static/studio.js",
 )
 
