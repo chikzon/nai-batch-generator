@@ -229,6 +229,10 @@ from src.nai_studio.web.http_server import (
     start_http_server,
 )
 from src.nai_studio.web.page_template import PAGE_TEMPLATE
+from src.nai_studio.web.routes.recovery import (
+    RecoveryGetOperations,
+    handle_recovery_get,
+)
 from src.nai_studio.web.routes.runtime import handle_runtime_get
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -12665,6 +12669,21 @@ class ConfigServer:
 
     def start(self, open_browser=True):
         server = self
+        recovery_get = RecoveryGetOperations(
+            metadata_audit=lambda offset, limit: metadata_audit_status(
+                found_offset=offset, found_limit=limit
+            ),
+            folder_inventory=lambda offset, limit: folder_inventory_page(
+                offset, limit
+            ),
+            trash=lambda cfg: list_trash_batches(cfg),
+            pack_log=lambda: {"ok": True, "log": pack_log_brief()},
+            public_restoration=lambda: PUBLIC_COLLECTION.restoration_snapshot(),
+            public_collection=lambda: PUBLIC_COLLECTION.snapshot(),
+            data_storage=lambda: data_storage_status(),
+            image_origins=lambda: image_origin_stats(),
+            local_integrity=lambda: local_image_integrity(),
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12673,33 +12692,10 @@ class ConfigServer:
                     return
                 if handle_runtime_get(self, server):
                     return
-                if self.path.startswith("/api/metadata_audit_status"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json(metadata_audit_status(
-                            found_offset=int(q.get("offset", ["0"])[0]),
-                            found_limit=int(q.get("limit", ["50"])[0]),
-                        ))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/folder_inventory"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json(folder_inventory_page(
-                            q.get("offset", ["0"])[0],
-                            q.get("limit", ["50"])[0],
-                        ))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/config"):
+                if handle_recovery_get(self, server, recovery_get):
+                    return
+                if self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
-                elif self.path.startswith("/api/trash"):
-                    try:
-                        self._json(list_trash_batches(server.cfg))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/refimg"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
@@ -12832,38 +12828,6 @@ class ConfigServer:
                     # 자동 병합이 못 잡는다). 묶어서 보여 주고 고르게 한다.
                     try:
                         self._json(find_style_dupes())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/pack_log"):
-                    try:
-                        self._json({"ok": True, "log": pack_log_brief()})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/public_collection_restoration"):
-                    try:
-                        self._json(PUBLIC_COLLECTION.restoration_snapshot())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/public_collection"):
-                    try:
-                        self._json(PUBLIC_COLLECTION.snapshot())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/data_storage"):
-                    try:
-                        self._json(data_storage_status())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/img_origins"):
-                    # 원격 캐시는 **주소 해시**로 파일을 만든다. 주소가 달라도 같은 그림이면
-                    # 두 벌이 남는데, 내려받을 때 적어 둔 **내용 해시**로 그걸 찾아낸다.
-                    try:
-                        self._json(image_origin_stats())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/local_image_integrity"):
-                    try:
-                        self._json(local_image_integrity())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_catalog"):

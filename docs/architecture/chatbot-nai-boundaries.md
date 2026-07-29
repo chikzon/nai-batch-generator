@@ -33,6 +33,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 정적 HTML·JavaScript 화면 | `web/page_template.py` |
 | localhost HTTP 보안·본문 제한·정적 응답·포트 기동 | `web/http_server.py` |
 | 설계도·순서·작업 상태 GET 라우트 | `web/routes/runtime.py` |
+| 자료 복구·보존 상태 GET 라우트 | `web/routes/recovery.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 
