@@ -1118,21 +1118,27 @@ class RegressionTests(unittest.TestCase):
     def test_combo_search_loads_artist_ratings_once_per_request(self):
         rows = [
             {"id": f"s{i}", "combo": f"artist:a{i}", "artists": [f"a{i}"]}
-            for i in range(200)
+            for i in range(732)
         ]
-        calls = []
+        calls, rating_calls = [], []
 
         def ratings():
             calls.append(1)
             return {}
 
+        def style_rating(row, _ratings):
+            rating_calls.append(row["id"])
+            return {"score": 0, "fav": False, "block": False, "rated": 0}
+
         with (
             patch.object(APP, "load_combos", return_value=rows),
             patch.object(APP, "load_ratings", side_effect=ratings),
+            patch.object(APP, "style_rating", side_effect=style_rating),
         ):
-            result = APP.search_combos(limit=200)
+            result = APP.search_combos(limit=200, rating="hideblock")
         self.assertEqual(len(result["items"]), 200)
         self.assertEqual(len(calls), 1)
+        self.assertEqual(len(rating_calls), 732)
 
     def test_builder_combo_picker_preserves_builder_and_recipes_load_lazily(self):
         page = APP.PAGE_TEMPLATE
@@ -1143,11 +1149,17 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("RECIPES_OBSERVER.observe(target)", page)
         self.assertIn("while($('modalBody').firstChild) saved.appendChild", page)
         self.assertIn("$('modalBody').replaceChildren(back.body)", page)
-        self.assertIn("returnToBuilder(val)", page)
+        self.assertIn("returnToBuilder(c.combo || '')", page)
         self.assertIn("작가 조합을 넣고 빌더로 돌아왔습니다", page)
         self.assertIn("const name = $('bldName'); if(name) name.focus()", page)
         self.assertIn("WELCOME_COUNT_TIMER = setTimeout", page)
         self.assertIn("clearTimeout(WELCOME_COUNT_TIMER)", page)
+        self.assertIn("composer.addEventListener('toggle'", page)
+        self.assertIn("if(composer.open) setupArtistWorkspace()", page)
+        self.assertIn("comboLoadAbort = new AbortController()", page)
+        self.assertIn("if(seq !== comboLoadSeq", page)
+        self.assertIn("requestAnimationFrame(resolve)", page)
+        self.assertIn("stashArtistWorkspaceDraft(true)", page)
 
     def test_concurrent_combo_requests_parse_the_collection_once(self):
         """첫 화면 개수 조회와 모달 열기가 겹쳐도 큰 JSON을 중복 파싱하지 않는다."""
@@ -5202,6 +5214,14 @@ class RegressionTests(unittest.TestCase):
             cfg["negative_prompt"] = negative
             cfg["char_slots"] = [{"prompt": char1, "outfit": "red dress\n1.1::lace::",
                                   "negative": negative, "enabled": True}]
+            draft = {
+                "mode": "random", "curve_start": "1.2", "curve_end": "0.8",
+                "seed": "초안 🎨",
+                "rows": [{"name": "작가 한글", "weight": "1.25",
+                          "min": "-0.5", "max": "2.0", "locked": True}],
+            }
+            cfg["ui"] = copy.deepcopy(cfg.get("ui") or {})
+            cfg["ui"]["artist_composer"] = draft
             with patch.object(APP, "SETTINGS_FILE", path):
                 APP.save_config(cfg)
                 back = APP.load_json_recover(path)
@@ -5212,6 +5232,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(back["base_prompt"].encode("utf-8"), base.encode("utf-8"))
             self.assertEqual(back["char_slots"][0]["outfit"].encode("utf-8"),
                              "red dress\n1.1::lace::".encode("utf-8"))
+            self.assertEqual(back["ui"]["artist_composer"], draft)
 
             # 그림체 자료도 같은 규칙 — 저장했다 읽으면 그대로여야 한다
             style = Path(td) / "그림체.json"

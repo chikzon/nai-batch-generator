@@ -2442,7 +2442,10 @@ def prewarm_images(items, n=48):
 # 수집/그림체.json 이 본체이고, 없으면 옛 작가조합.json 으로 대체한다.
 STYLE_FILE = BASE_DIR / "수집" / "그림체.json"
 COMBO_FILE = BASE_DIR / "수집" / "작가조합.json"
-_COMBOS = {"loaded": False, "rows": []}
+_COMBOS = {
+    "loaded": False, "rows": [], "search": [],
+    "sources": {}, "tabs": {}, "seeded": 0,
+}
 _COMBOS_LOCK = threading.Lock()
 _STYLE_TX_LOCK = threading.RLock()
 
@@ -2758,7 +2761,30 @@ def load_combos():
                 break
             except Exception as e:
                 log.warning(f"그림체 로드 실패 {f.name}: {e}")
-        _COMBOS.update({"loaded": True, "rows": rows})
+        search = []
+        sources, tabs, seeded_count = {}, {}, 0
+        for row in rows:
+            if not isinstance(row, dict):
+                search.append("")
+                continue
+            search.append((
+                str(row.get("combo") or "") + " "
+                + str(row.get("title") or "") + " "
+                + str(row.get("source") or "") + " "
+                + str(row.get("rest") or "") + " "
+                + str(row.get("negative") or "")
+            ).casefold())
+            source = row.get("source") or "도랑"
+            sources[source] = sources.get(source, 0) + 1
+            tab = row.get("tab") or ""
+            if tab:
+                tabs[tab] = tabs.get(tab, 0) + 1
+            if (row.get("params") or {}).get("seed"):
+                seeded_count += 1
+        _COMBOS.update({
+            "loaded": True, "rows": rows, "search": search,
+            "sources": sources, "tabs": tabs, "seeded": seeded_count,
+        })
     return _COMBOS["rows"]
 
 
@@ -3104,13 +3130,21 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
     sort=recommend|views|newest|oldest|artists, seeded=1 이면 설정값 완비된 것만."""
     rows = load_combos()
     ratings = load_ratings()
-    q = (q or "").strip().lower()
+    q = (q or "").strip().casefold()
     hit = rows
     if q:
         terms = [t for t in q.split() if t]
-        hit = [r for r in hit if all(t in (
-            r.get("combo", "") + " " + r.get("title", "") + " " + r.get("source", "") +
-            " " + r.get("rest", "") + " " + r.get("negative", "")).lower() for t in terms)]
+        cached = (_COMBOS.get("search") or []) if rows is _COMBOS.get("rows") else []
+        if len(cached) != len(rows):
+            cached = [(
+                str(r.get("combo") or "") + " "
+                + str(r.get("title") or "") + " "
+                + str(r.get("source") or "") + " "
+                + str(r.get("rest") or "") + " "
+                + str(r.get("negative") or "")
+            ).casefold() for r in rows]
+        hit = [r for r, text in zip(rows, cached)
+               if all(term in text for term in terms)]
     if tab and tab != "all":
         hit = [r for r in hit if (r.get("tab") or "") == tab]
     if source and source != "all":
@@ -3118,18 +3152,31 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
     if seeded in ("1", "true", True):
         hit = [r for r in hit if (r.get("params") or {}).get("seed")]
     # 평가 필터 — fav(즐겨찾기만) · rated(별점 매긴 것만) · hideblock(차단 숨김)
+    rating_cache = {}
+
+    def rating_for(row):
+        key = id(row)
+        if key not in rating_cache:
+            rating_cache[key] = style_rating(row, ratings)
+        return rating_cache[key]
+
     if rating:
         if rating == "fav":
-            hit = [r for r in hit if style_rating(r, ratings)["fav"]]
+            hit = [r for r in hit if rating_for(r)["fav"]]
         elif rating == "rated":
-            hit = [r for r in hit if style_rating(r, ratings)["score"]]
+            hit = [r for r in hit if rating_for(r)["score"]]
         elif rating == "hideblock":
-            hit = [r for r in hit if not style_rating(r, ratings)["block"]]
+            hit = [r for r in hit if not rating_for(r)["block"]]
     if sort in STYLE_SORTS and sort != "default":
         rev = sort in {"newest"}
         hit = sorted(hit, key=STYLE_SORTS[sort], reverse=rev)
 
     def tally(key, default=""):
+        if rows is _COMBOS.get("rows"):
+            if key == "source" and _COMBOS.get("sources") is not None:
+                return dict(_COMBOS["sources"])
+            if key == "tab" and _COMBOS.get("tabs") is not None:
+                return dict(_COMBOS["tabs"])
         out = {}
         for r in rows:
             v = r.get(key) or default
@@ -3151,11 +3198,16 @@ def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="
         item = {k: r[k] for k in card_fields if k in r}
         if isinstance(item.get("images"), list):
             item["images"] = item["images"][:1]
-        item["_rate"] = style_rating(r, ratings)
+        item["_rate"] = rating_for(r)
         items.append(item)
+    seeded_total = (
+        int(_COMBOS.get("seeded") or 0)
+        if rows is _COMBOS.get("rows")
+        else sum(1 for r in rows if (r.get("params") or {}).get("seed"))
+    )
     return {"total": len(rows), "matched": len(hit),
             "sources": tally("source", "도랑"), "tabs": tally("tab"),
-            "seeded": sum(1 for r in rows if (r.get("params") or {}).get("seed")),
+            "seeded": seeded_total,
             "items": items, "offset": offset}
 
 
@@ -19333,6 +19385,8 @@ function openLib(it){
    한 그림체 = 작가 조합 + 베이스 + 네거티브 + 생성 설정값 전부(시드·CFG·
    리스케일·스텝·샘플러·스케줄러·해상도·Variety+). 셋이 합쳐져야 그림체다. */
 let comboOffset = 0, comboT = null, COMBO_RETURN = null, WELCOME_COUNT_TIMER = null;
+let comboLoadSeq = 0, comboLoadAbort = null, comboLoading = false;
+let artistDraftT = null;
 const CARD_PX = {small: 74, medium: 116, large: 190};
 function cq(){ return {
   q: ($('comboQ')||{}).value || '', tab: ($('comboTab')||{}).value || '',
@@ -19342,6 +19396,7 @@ function cq(){ return {
   size: +(($('comboSize')||{}).value || 50) }; }
 
 function openCombos(target){
+  cancelComboWork();
   if(WELCOME_COUNT_TIMER){
     clearTimeout(WELCOME_COUNT_TIMER);
     WELCOME_COUNT_TIMER = null;
@@ -19436,14 +19491,18 @@ function openCombos(target){
     <div id="comboList"></div>
     <div class="bar"><button id="comboMore" style="flex:1;">더 보기 ▾</button></div>`;
   if($('comboBack')) $('comboBack').addEventListener('click', () => returnToBuilder());
-  setupArtistWorkspace();
+  const composer = $('comboComposer');
+  composer.addEventListener('toggle', () => {
+    if(composer.open) setupArtistWorkspace();
+  });
   bindTidy();
+  bindComboListActions();
   $('comboQ').addEventListener('input', () => { clearTimeout(comboT); comboT = setTimeout(() => loadCombos(false), 300); });
   ['comboSort','comboTab','comboSrc','comboSize','comboSeeded','comboRate'].forEach(id =>
     $(id).addEventListener('change', () => loadCombos(false)));
   $('comboCard').addEventListener('change', () => {
     const px = CARD_PX[$('comboCard').value] || 116;
-    $('comboList').querySelectorAll('img').forEach(i => { i.style.width = px+'px'; i.style.height = px+'px'; });
+    $('comboList').style.setProperty('--combo-thumb', px+'px');
   });
   $('comboMore').addEventListener('click', () => loadCombos(true));
   setupInspectDrop();
@@ -19455,6 +19514,7 @@ function openCombos(target){
 function returnToBuilder(comboValue){
   const back = COMBO_RETURN;
   if(!back) return false;
+  cancelComboWork();
   $('modalBody').replaceChildren(back.body);
   $('modalTitle').textContent = back.title;
   window._mm = back.mode;
@@ -19479,6 +19539,8 @@ function returnToBuilder(comboValue){
 }
 
 function discardComboReturn(){
+  stashArtistWorkspaceDraft(true);
+  cancelComboWork();
   COMBO_RETURN = null;
   window._comboTarget = null;
   $('modalSave').style.display = '';
@@ -19511,6 +19573,21 @@ function drawArtistWorkspace(rows){
     <button type="button" data-aw-down title="프롬프트에서 뒤로">↓</button>
     <button type="button" data-aw-del class="danger" title="이 행 빼기">×</button>
   </div>`).join('');
+}
+function stashArtistWorkspaceDraft(persist=false){
+  const host = $('comboArtistRows');
+  if(window._comboTarget || !host || host.dataset.ready !== '1') return;
+  const payload = artistWorkspacePayload();
+  STATE.ui = STATE.ui || {};
+  STATE.ui.artist_composer = {
+    mode:payload.mode, curve_start:payload.curve_start,
+    curve_end:payload.curve_end, seed:payload.seed, rows:payload.rows,
+  };
+  if(persist) save();
+}
+function scheduleArtistDraft(){
+  clearTimeout(artistDraftT);
+  artistDraftT = setTimeout(() => stashArtistWorkspaceDraft(true), 300);
 }
 async function parseArtistWorkspace(){
   const source = window._comboTarget ? (window._comboTarget.value||'') : (STATE.base_prompt||'');
@@ -19567,6 +19644,8 @@ async function composeArtistWorkspace(apply=false){
 }
 function setupArtistWorkspace(){
   const host = $('comboArtistRows'); if(!host) return;
+  if(host.dataset.ready === '1') return;
+  host.dataset.ready = '1';
   const saved = !window._comboTarget && ((STATE.ui||{}).artist_composer||{});
   if(saved.mode) $('comboWeightMode').value = saved.mode;
   if(saved.curve_start != null) $('comboCurveStart').value = saved.curve_start;
@@ -19579,6 +19658,7 @@ function setupArtistWorkspace(){
     const rows = artistWorkspaceRows();
     rows.push({name:'',weight:1,min:0.7,max:1.3,locked:false});
     drawArtistWorkspace(rows);
+    scheduleArtistDraft();
     host.querySelector('[data-artist-row]:last-child [data-aw="name"]').focus();
   });
   host.addEventListener('click', event => {
@@ -19591,7 +19671,10 @@ function setupArtistWorkspace(){
       [rows[index+1],rows[index]]=[rows[index],rows[index+1]];
     else return;
     drawArtistWorkspace(rows);
+    scheduleArtistDraft();
   });
+  $('comboComposer').addEventListener('input', scheduleArtistDraft);
+  $('comboComposer').addEventListener('change', scheduleArtistDraft);
   $('comboArtistPreview').addEventListener('click', () => composeArtistWorkspace(false));
   $('comboArtistApply').addEventListener('click', () => composeArtistWorkspace(true));
 }
@@ -19801,7 +19884,7 @@ function styleCard(c){
   el._comboRecord = c;
   el.innerHTML = `<div class="tag">${esc(c.source||'도랑')}${c.tab ? ' · '+esc(c.tab) : ''} · 작가 ${c.count}명${c.title ? ' · '+esc(c.title.slice(0,34)) : ''}${meta.length ? ' · '+esc(meta.join(' · ')) : ''}</div>
     <div style="display:flex;gap:9px;">
-      ${(c.images && c.images[0]) ? `<img src="/img?u=${encodeURIComponent(c.images[0])}" loading="lazy" decoding="async" fetchpriority="low" alt="" onerror="this.style.display='none'" style="width:${px}px;height:${px}px;object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);flex:none;background:#0004;">` : ''}
+      ${(c.images && c.images[0]) ? `<img src="/img?u=${encodeURIComponent(c.images[0])}" loading="lazy" decoding="async" fetchpriority="low" alt="" onerror="this.style.display='none'" style="width:var(--combo-thumb,${px}px);height:var(--combo-thumb,${px}px);object-fit:cover;border-radius:var(--radius);border:1px solid var(--line);flex:none;background:#0004;">` : ''}
       <div style="flex:1;min-width:0;">
         <div style="font-family:var(--mono);font-size:var(--fs-xs);line-height:1.5;max-height:66px;overflow:auto;">${esc(c.combo || '(작가 태그 없음)')}</div>
         ${bits.length ? `<div class="hint" style="margin-top:5px;">⚙ ${esc(bits.join(' · '))}</div>` : ''}
@@ -19817,6 +19900,59 @@ function styleCard(c){
       </div>
     </div>`;
   return el;
+}
+
+function cancelComboWork(){
+  comboLoadSeq += 1;
+  comboLoading = false;
+  if(comboLoadAbort){
+    comboLoadAbort.abort();
+    comboLoadAbort = null;
+  }
+  clearTimeout(comboT);
+  clearTimeout(artistDraftT);
+  artistDraftT = null;
+}
+
+function bindComboListActions(){
+  const host = $('comboList'); if(!host || host.dataset.bound === '1') return;
+  host.dataset.bound = '1';
+  host.addEventListener('click', async event => {
+    const button = event.target.closest('button');
+    const card = event.target.closest('.combo-card');
+    if(!button || !card) return;
+    const c = card._comboRecord || {};
+    if(button.matches('[data-cuse]')){
+      returnToBuilder(c.combo || '');
+      return;
+    }
+    if(button.matches('[data-cfull]')){
+      applyStyle(c);
+      return;
+    }
+    if(button.matches('[data-crate]')){
+      const arts = c.artists || [];
+      if(!arts.length){ flash('이 조합에는 작가 태그가 없습니다.'); return; }
+      openRate(arts);
+      return;
+    }
+    if(!button.matches('[data-csave]')) return;
+    const name = prompt('프리셋 이름:', (c.title || '그림체').slice(0, 30));
+    if(!name) return;
+    const p = c.params || {};
+    const res = await (await fetch('/api/style_save', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, prompt: c.base || c.combo, negative: c.negative || '',
+        settings: {cfg_scale: p.scale, cfg_rescale: p.cfg_rescale, steps: p.steps,
+          sampler: p.sampler, scheduler: p.noise_schedule, variety: !!p.variety_plus,
+          width: p.width, height: p.height,
+          uc_preset: (p.uc_preset != null ? p.uc_preset : STATE.uc_preset),
+          quality_toggle: (p.quality_toggle != null ? p.quality_toggle : STATE.quality_toggle)}})})).json();
+    if(res.ok){
+      STYLES = res.styles; renderPresets(); renderLibrary();
+      $('modalFlash').textContent = `프리셋 "${name}" 저장됨 ✓`;
+    }else $('modalFlash').textContent = res.error || '저장 실패';
+  });
 }
 
 /* 상태 메시지 — 모달이 열려 있으면 모달에, 아니면 첫 화면 안내에 */
@@ -19973,14 +20109,34 @@ function bindTidy(){
 }
 
 async function loadCombos(append){
+  if(append && comboLoading) return;
   const f = cq();
   if(!append) comboOffset = 0;
+  const seq = ++comboLoadSeq;
+  if(comboLoadAbort) comboLoadAbort.abort();
+  comboLoadAbort = new AbortController();
+  comboLoading = true;
+  const more = $('comboMore');
+  if(more){ more.disabled = true; more.textContent = '불러오는 중…'; }
   const url = `/api/combos?q=${encodeURIComponent(f.q)}&limit=${f.size}&offset=${comboOffset}`
     + `&tab=${encodeURIComponent(f.tab)}&source=${encodeURIComponent(f.source)}`
     + `&sort=${encodeURIComponent(f.sort)}&seeded=${f.seeded}`
     + `&rating=${encodeURIComponent(f.rating || '')}`;
-  const r = await (await fetch(url)).json();
-  if(!r.ok) return;
+  let r;
+  try{
+    r = await (await fetch(url, {signal:comboLoadAbort.signal})).json();
+  }catch(error){
+    if(error && error.name === 'AbortError') return;
+    if(seq === comboLoadSeq){
+      comboLoading = false;
+      if(more) more.disabled = false;
+      if($('comboStat')) $('comboStat').textContent = String(error);
+    }
+    return;
+  }finally{
+    if(seq === comboLoadSeq) comboLoadAbort = null;
+  }
+  if(seq !== comboLoadSeq || !r.ok || window._mm !== 'combo') return;
   $('comboStat').textContent = `${r.matched} / ${r.total}개 (설정값 ${r.seeded})`;
   const sel = $('comboSrc');
   if(sel && sel.options.length <= 1 && r.sources){
@@ -19991,50 +20147,23 @@ async function loadCombos(append){
   if(!append) host.innerHTML = '';
   // DocumentFragment로 한 번만 레이아웃한다. 50~200장을 한 장씩 붙이면
   // 모달 높이 계산과 스타일 계산이 카드 수만큼 반복된다.
-  const fragment = document.createDocumentFragment();
-  const added = r.items.map(c => {
-    const card = styleCard(c);
-    fragment.appendChild(card);
-    return card;
-  });
-  host.appendChild(fragment);
-  /* '이 조합 쓰기' 는 **빌더에서 열었을 때만** 나온다.
-     빌더의 작가 조합 칸에 값을 고르는 일이지 '그림체를 적용' 하는 것이 아니다.
-     그림체를 왼쪽 화면에 넣는 길은 '통째로 적용' **하나뿐**이다 — 베이스만·설정만
-     넣는 길을 두면 원래 그림이 재현되지 않는 잡종이 만들어진다. */
-  added.flatMap(card => [...card.querySelectorAll('[data-cuse]')]).forEach(btn => {
-    btn.addEventListener('click', () => {
-      const val = (btn.closest('.row')._comboRecord || {}).combo || '';
-      returnToBuilder(val);
-    });
-  });
-  added.flatMap(card => [...card.querySelectorAll('[data-cfull]')]).forEach(b =>
-    b.addEventListener('click', () => applyStyle(b.closest('.row')._comboRecord)));
+  /* 첫 20장은 즉시, 사용자가 50~200장을 골랐을 때의 나머지는 프레임 사이에
+     나눠 붙인다. 표시 개수 기능은 유지하면서 한 번의 긴 메인 스레드 정지만 막는다. */
+  for(let start=0; start<r.items.length; start+=20){
+    if(start) await new Promise(resolve => requestAnimationFrame(resolve));
+    if(seq !== comboLoadSeq || window._mm !== 'combo') return;
+    const fragment = document.createDocumentFragment();
+    r.items.slice(start, start+20).forEach(c => fragment.appendChild(styleCard(c)));
+    host.appendChild(fragment);
+  }
   if(tidyOn()) addPickBoxes();      /* 더 보기로 이어 붙인 카드에도 붙는다 */
-  added.flatMap(card => [...card.querySelectorAll('[data-crate]')]).forEach(b => b.addEventListener('click', () => {
-    const arts = (b.closest('.row')._comboRecord || {}).artists || [];
-    if(!arts.length){ flash('이 조합에는 작가 태그가 없습니다.'); return; }
-    openRate(arts);
-  }));
-  added.flatMap(card => [...card.querySelectorAll('[data-csave]')]).forEach(b => b.addEventListener('click', async () => {
-    const c = b.closest('.row')._comboRecord;
-    const name = prompt('프리셋 이름:', (c.title || '그림체').slice(0, 30));
-    if(!name) return;
-    const p = c.params || {};
-    const res = await (await fetch('/api/style_save', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, prompt: c.base || c.combo, negative: c.negative || '',
-        settings: {cfg_scale: p.scale, cfg_rescale: p.cfg_rescale, steps: p.steps,
-          sampler: p.sampler, scheduler: p.noise_schedule, variety: !!p.variety_plus,
-          width: p.width, height: p.height,
-          uc_preset: (p.uc_preset != null ? p.uc_preset : STATE.uc_preset),
-          quality_toggle: (p.quality_toggle != null ? p.quality_toggle : STATE.quality_toggle)}})})).json();
-    if(res.ok){ STYLES = res.styles; renderPresets(); renderLibrary();
-      $('modalFlash').textContent = `프리셋 "${name}" 저장됨 ✓`; }
-    else $('modalFlash').textContent = res.error || '저장 실패';
-  }));
   comboOffset += r.items.length;
-  $('comboMore').style.display = (comboOffset < r.matched) ? '' : 'none';
-  $('comboMore').textContent = `더 보기 ▾ (${comboOffset} / ${r.matched})`;
+  if(seq === comboLoadSeq){
+    comboLoading = false;
+    more.disabled = false;
+    more.style.display = (comboOffset < r.matched) ? '' : 'none';
+    more.textContent = `더 보기 ▾ (${comboOffset} / ${r.matched})`;
+  }
 }
 
 /* ── 이미지 → 그림체 추출 (novelai.net/inspect 를 로컬에서) ──
