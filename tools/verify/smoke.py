@@ -33,6 +33,8 @@ def main():
         "-m", "py_compile",
         ROOT / "start.py",
         ROOT / "src" / "nai_studio" / "legacy_app.py",
+        ROOT / "src" / "nai_studio" / "runtime" / "logging_config.py",
+        ROOT / "src" / "nai_studio" / "runtime" / "diagnostics.py",
         ROOT / "빌드.py",
         ROOT / "배포준비.py",
         ROOT / "tools" / "build" / "app.py",

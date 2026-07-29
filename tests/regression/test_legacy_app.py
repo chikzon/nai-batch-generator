@@ -6,11 +6,14 @@ audit and are intentionally runnable with the Python standard test runner.
 
 from __future__ import annotations
 
+import atexit
 import copy
 import hashlib
 import io
 import importlib.util
 import json
+import os
+import re
 import shutil
 import socket
 import subprocess
@@ -32,6 +35,13 @@ from PIL.PngImagePlugin import PngInfo
 
 
 ROOT = Path(__file__).resolve().parents[2]
+_TEST_LOG_FD, _TEST_LOG_NAME = tempfile.mkstemp(
+    prefix="nais-regression-", suffix=".log")
+os.close(_TEST_LOG_FD)
+_TEST_LOG_FILE = Path(_TEST_LOG_NAME)
+# 회귀의 고의 실패·손상 복구 사건은 운영 생성.log와 섞지 않는다. 이 파일은
+# 검증 프로세스가 끝날 때 닫고 제거한다.
+os.environ["NAI_LOG_FILE"] = str(_TEST_LOG_FILE)
 # start.py가 유지보수 가능한 보조 모듈을 불러오므로, 파일 경로로 직접 로드하는
 # 이 시험도 일반 `python start.py`와 같은 모듈 검색 경로를 갖게 한다.
 if str(ROOT) not in sys.path:
@@ -43,6 +53,17 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 APP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(APP)
+
+
+def _cleanup_test_log():
+    APP.close_application_logging(APP.log)
+    try:
+        _TEST_LOG_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+atexit.register(_cleanup_test_log)
 BUILD_SPEC = importlib.util.spec_from_file_location(
     "nai_build_under_test",
     ROOT / "tools" / "build" / "app.py",
@@ -5247,11 +5268,20 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(rows[0]["characters"][0]["prompt"], char1)
 
     def test_prompt_fields_have_no_length_caps(self):
-        """화면 입력칸에 `maxlength` 를 달지 않는다 — 달면 긴 원문을 **붙여넣는 순간**
-        잘린다. 미리보기 말줄임(카드·요약)은 괜찮지만 입력·편집칸은 안 된다."""
+        """프롬프트 textarea에 `maxlength`를 달지 않는다.
+
+        프로젝트 이름처럼 프롬프트가 아닌 짧은 식별 입력의 제한까지 실패로
+        오인하지 않는다.
+        """
         page = APP.render_page()
-        self.assertFalse("maxlength" in page.lower(),
-                         "입력칸에 maxlength 가 생겼다 — 긴 프롬프트가 붙여넣기에서 잘린다")
+        textareas = re.findall(r"<textarea\b[^>]*>", page, flags=re.I)
+        self.assertTrue(textareas)
+        limited = [tag for tag in textareas if "maxlength" in tag.lower()]
+        self.assertEqual(
+            limited,
+            [],
+            "프롬프트 textarea에 maxlength가 생겼다 — 긴 원문이 붙여넣기에서 잘린다",
+        )
 
     def test_destructive_buttons_are_not_adjacent_to_creating_ones(self):
         """되돌릴 수 없는 단추를 만드는 단추 **바로 옆**에 두지 않는다.
