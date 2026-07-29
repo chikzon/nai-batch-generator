@@ -8291,6 +8291,22 @@ def apply_evaluation_action(data):
     action = str(data.get("action") or "")
     with _JSON_IO_LOCK:
         picks = load_picks()
+        decision_id = str(data.get("decision_id") or "").strip()
+        prior_decisions = picks.get("evaluation_decision_ids")
+        if not isinstance(prior_decisions, list):
+            prior_decisions = []
+        if action == "blind-match" and decision_id in prior_decisions:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "appended": [],
+                "picks": {
+                    "elo": picks.get("elo", {}),
+                    "elo_matches": picks.get("elo_matches", {}),
+                    "folders": picks.get("folders", {}),
+                    "review_states": picks.get("review_states", {}),
+                },
+            }
         paths = [
             str(value or "").replace("\\", "/")
             for value in (data.get("paths") or [])
@@ -8348,6 +8364,9 @@ def apply_evaluation_action(data):
                 by_path[paths[0]], str(data.get("target") or "")))
         else:
             raise ValueError("지원하지 않는 평가 작업입니다.")
+        if action == "blind-match" and decision_id:
+            picks["evaluation_decision_ids"] = [
+                *prior_decisions, decision_id]
         appended = append_evaluation_events(picks, events)
         saved = save_picks(appended["picks"])
     return {
@@ -12398,8 +12417,9 @@ async function loadJobCenter(){
       (ledger.contracts || []).map(job => [String(job.id || ''), job])
     );
     const jobActions = job => {
+      if(!contracts.has(String(job.id || ''))) return [];
       const phase = String(job.phase || '');
-      if(['preparing','encoding','uploading','generating','downloading','persisting','reconciling'].includes(phase)){
+      if(['preparing','sending','receiving','saving'].includes(phase)){
         return [['pause','일시정지'],['cancel','취소']];
       }
       if(phase === 'paused') return [['resume','이어가기'],['cancel','취소']];
@@ -13967,7 +13987,7 @@ async function eloStart(){
     const j = Math.floor(Math.random() * (i + 1));
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
-  ELO = {pool, target:3, played:0, pair:null};
+  ELO = {pool, target:3, played:0, pair:null, busy:false, decision:''};
   eloNext();
 }
 function eloNext(){
@@ -13989,6 +14009,9 @@ function eloNext(){
       - Math.abs(Number(EXP.elo[y] || 1000) - aScore));
   const b = opponents[0];
   ELO.pair = [a,b];
+  ELO.decision = (globalThis.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `elo-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let ov = $('eloBg');
   if(!ov){
     ov = document.createElement('div'); ov.id = 'eloBg';
@@ -14012,15 +14035,23 @@ function eloNext(){
   });
 }
 async function eloPick(which){
-  if(!ELO || !ELO.pair) return;
-  const [a,b] = ELO.pair;
-  const r = await (await fetch('/api/evaluation_action', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      action:'blind-match', paths:[a,b],
-      outcome:which === 'a' ? 'first' : (which === 'b' ? 'second' : 'tie')
-    })
-  })).json();
+  if(!ELO || !ELO.pair || ELO.busy) return;
+  const session = ELO;
+  session.busy = true;
+  const [a,b] = session.pair;
+  let r;
+  try{
+    r = await (await fetch('/api/evaluation_action', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'blind-match', paths:[a,b],
+        outcome:which === 'a' ? 'first' : (which === 'b' ? 'second' : 'tie'),
+        decision_id:session.decision
+      })
+    })).json();
+  }catch(error){
+    r = {ok:false, error:String(error)};
+  }
   if(!r.ok){
     $('expStat').textContent = r.error || '블라인드 평가를 저장하지 못했습니다.';
     const el = $('eloBg'); if(el) el.remove();
@@ -14029,7 +14060,8 @@ async function eloPick(which){
   EXP.elo = Object.assign({}, EXP.elo || {}, (r.picks || {}).elo || {});
   EXP.elo_matches = Object.assign(
     {}, EXP.elo_matches || {}, (r.picks || {}).elo_matches || {});
-  ELO.played++;
+  session.played++;
+  session.busy = false;
   eloNext();
 }
 async function picksSave(){
@@ -18987,7 +19019,19 @@ def finish_job_record(job_id, *, status, completed=0, failed=0,
                 "can_resume": bool(can_resume),
                 "message": str(message or "")[:500],
             })
-            common_job_store().save(from_legacy_job_record(job))
+            projected = from_legacy_job_record(job)
+            try:
+                existing = common_job_store().get(job_id)
+            except Exception:
+                existing = None
+            # 사용자가 명시적으로 취소한 작업을 뒤늦게 끝난 legacy worker의
+            # stopped/partial 관찰값이 paused로 되돌리면 안 된다.
+            if not (
+                isinstance(existing, dict)
+                and existing.get("phase") == "cancelled"
+                and projected.get("phase") != "cancelled"
+            ):
+                common_job_store().save(projected)
             break
         _save_job_ledger(data)
 
@@ -19347,41 +19391,19 @@ class ConfigServer:
                     "error": redact_diagnostic_text(error),
                 })
         progress = _comparison_progress_load()
-        if progress.get("signature"):
+        live_is_current_comparison = (
+            bool(live.get("running"))
+            and "비교" in str(live.get("operation") or "")
+        )
+        if progress.get("signature") and not live_is_current_comparison:
             try:
-                active_contracts.append(project_comparison_progress(
-                    progress,
-                    blueprint=generation_blueprint(
-                        self.cfg,
-                        source={"kind": "comparison-progress-projection"},
-                        experiment=(progress.get("plan") or {}).get(
-                            "options") or {},
-                    ),
-                    payload_identity={
-                        "signature": progress.get("signature"),
-                        "folder": progress.get("folder"),
-                        "completed": sorted(
-                            (progress.get("completed") or {}).keys()),
-                    },
-                ))
+                active_contracts.append(project_comparison_progress(progress))
             except Exception as error:
                 issues.append({
                     "source": "comparison-progress",
                     "error": redact_diagnostic_text(error),
                 })
-        persisted = []
-        for contract in active_contracts:
-            try:
-                common_job_store().save(contract)
-                persisted.append(contract.get("id"))
-            except Exception as error:
-                issues.append({
-                    "source": "job-store",
-                    "job_id": contract.get("id"),
-                    "error": redact_diagnostic_text(error),
-                })
         summary["active_contracts"] = active_contracts
-        summary["persisted_active_contract_ids"] = persisted
         summary["projection_issues"] = issues
         return summary
 
@@ -19404,34 +19426,43 @@ class ConfigServer:
         message = ""
 
         if action in ("pause", "cancel"):
-            handled = self.live.request_stop()
-            if not handled and job.get("phase") not in (
-                "completed", "failed", "cancelled",
+            live = self.live.snapshot()
+            if (
+                not live.get("running")
+                or str(live.get("job_id") or "") != job_id
             ):
-                message = "현재 실행 중인 NAI 요청이 없어 상태만 기록했습니다."
+                raise ValueError(
+                    "이 기록은 현재 NAI 실행권을 가진 작업이 아닙니다. "
+                    "무관한 현재 작업은 멈추지 않았습니다.")
+            handled = self.live.request_stop()
             updated = transition_job(job, command["next_phase"])
         elif action in ("retry", "resume"):
             if handler.get("target") == "comparison":
                 activated = activate_comparison_run(
                     self.cfg, handler.get("folder"))
-                handled = bool(activated.get("resumable"))
+                if not activated.get("resumable"):
+                    raise ValueError(
+                        "이 비교 기록은 완료됐거나 재개 근거가 없습니다.")
+                handled = True
                 navigation = "compare"
                 message = (
                     "중단 지점을 활성화했습니다. 장수와 비용을 확인한 뒤 실행하세요."
+                )
+                updated = (
+                    retry_job(job) if action == "retry"
+                    else transition_job(job, command["next_phase"])
                 )
             else:
                 navigation = (
                     "settings" if job.get("kind") == "setting" else "preview")
                 message = (
-                    "원래 작업 화면을 열었습니다. 현재 입력과 비용을 확인한 뒤 "
-                    "다시 실행하세요."
+                    "원래 작업 화면으로 이동합니다. 현재 입력과 비용을 확인해 "
+                    "실제로 다시 실행할 때까지 작업 상태는 바꾸지 않았습니다."
                 )
-            updated = (
-                retry_job(job) if action == "retry"
-                else transition_job(job, command["next_phase"])
-            )
+                updated = job
         else:
-            updated = reconcile_job(job, data.get("observation") or {})
+            # make_job_command가 whitelist로 정제한 관찰값만 저장한다.
+            updated = reconcile_job(job, command.get("observation") or {})
             handled = True
             message = "디스크의 실제 결과와 작업 기록을 대조했습니다."
         store.save(updated)

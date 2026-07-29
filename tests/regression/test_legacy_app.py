@@ -1676,18 +1676,108 @@ class RegressionTests(unittest.TestCase):
         store = MemoryStore(job)
         server = APP.ConfigServer(
             copy.deepcopy(APP.DEFAULT_CONFIG), persist_jobs=False)
+        server.live.update(
+            running=True, phase="running", job_id="job-center-fixture")
         with patch.object(APP, "common_job_store", return_value=store):
             result = server.handle_job_command(json.dumps({
                 "job_id": "job-center-fixture",
                 "action": "pause",
             }).encode("utf-8"))
         self.assertTrue(result["ok"])
-        self.assertFalse(result["handled"])
+        self.assertTrue(result["handled"])
         self.assertEqual(result["job"]["phase"], "paused")
         self.assertEqual(result["command"]["resource"]["mode"], "exclusive")
         page = APP.render_page()
         self.assertIn("/api/job_command", page)
         self.assertIn("data-job-action", page)
+
+    def test_stale_job_command_cannot_stop_unrelated_live_generation(self):
+        stale = APP.new_job(
+            "comparison",
+            blueprint_fingerprint="a" * 64,
+            payload_hash="b" * 64,
+            request_id="stale-request",
+            job_id="stale-job",
+        )
+        stale = APP.transition_job(stale, "preparing")
+
+        class MemoryStore:
+            def get(self, _job_id):
+                return copy.deepcopy(stale)
+
+            def save(self, value):
+                self.value = copy.deepcopy(value)
+
+        server = APP.ConfigServer(
+            copy.deepcopy(APP.DEFAULT_CONFIG), persist_jobs=False)
+        server.live.update(
+            running=True, phase="running", job_id="current-paid-generation")
+        with patch.object(APP, "common_job_store", return_value=MemoryStore()):
+            with self.assertRaisesRegex(ValueError, "무관한 현재 작업"):
+                server.handle_job_command(json.dumps({
+                    "job_id": "stale-job",
+                    "action": "cancel",
+                }).encode("utf-8"))
+        self.assertTrue(server.live.snapshot()["running"])
+        self.assertFalse(server.live.snapshot()["stopping"])
+
+    def test_job_snapshot_is_read_only_and_reconcile_uses_sanitized_observation(self):
+        server = APP.ConfigServer(
+            copy.deepcopy(APP.DEFAULT_CONFIG), persist_jobs=False)
+        server.live.update(
+            running=True, phase="running", job_id="job-read-only",
+            operation="단독 생성", total=1)
+        ledger = {
+            "ok": True, "schema": "nais-job-ledger/v1",
+            "jobs": [], "contracts": [], "durable_jobs": [],
+        }
+        with (
+            patch.object(APP, "job_ledger_summary", return_value=ledger),
+            patch.object(APP, "_comparison_progress_load", return_value={}),
+            patch.object(
+                APP, "common_job_store",
+                side_effect=AssertionError("GET must not write JobStore"),
+            ),
+        ):
+            summary = server.snapshot_jobs()
+        self.assertEqual(len(summary["active_contracts"]), 1)
+
+        job = APP.new_job(
+            "single",
+            blueprint_fingerprint="a" * 64,
+            payload_hash="b" * 64,
+            request_id="request-reconcile",
+            job_id="job-reconcile",
+        )
+
+        class MemoryStore:
+            def __init__(self):
+                self.value = copy.deepcopy(job)
+
+            def get(self, _job_id):
+                return copy.deepcopy(self.value)
+
+            def save(self, value):
+                self.value = copy.deepcopy(value)
+                return value
+
+        store = MemoryStore()
+        secret = "PRIVATE PROMPT pst-ne-EXAMPLE"
+        with patch.object(APP, "common_job_store", return_value=store):
+            server.handle_job_command(json.dumps({
+                "job_id": "job-reconcile",
+                "action": "reconcile",
+                "observation": {
+                    "progress": {
+                        "completed": 0, "failed": 0, "total": 1,
+                        "message": secret,
+                    },
+                    "token": secret,
+                    "artifacts_intact": True,
+                },
+            }).encode("utf-8"))
+        self.assertNotIn(
+            secret, json.dumps(store.value, ensure_ascii=False))
 
     def test_live_state_eta_does_not_count_failed_work_as_remaining(self):
         live = APP.LiveState()
@@ -4416,6 +4506,13 @@ class RegressionTests(unittest.TestCase):
                     "action": "blind-match",
                     "paths": ["비교/A.webp", "비교/B.webp"],
                     "outcome": "first",
+                    "decision_id": "one-visible-choice",
+                })
+                duplicate = APP.apply_evaluation_action({
+                    "action": "blind-match",
+                    "paths": ["비교/A.webp", "비교/B.webp"],
+                    "outcome": "first",
+                    "decision_id": "one-visible-choice",
                 })
                 APP.apply_evaluation_action({
                     "action": "fixed-board",
@@ -4435,6 +4532,7 @@ class RegressionTests(unittest.TestCase):
                 saved = APP.load_picks()
 
         self.assertTrue(result["ok"])
+        self.assertTrue(duplicate["duplicate"])
         self.assertEqual(saved["elo_matches"]["비교/A.webp"], 1)
         self.assertEqual(saved["elo_matches"]["비교/B.webp"], 1)
         self.assertGreater(saved["elo"]["비교/A.webp"], 1000)
