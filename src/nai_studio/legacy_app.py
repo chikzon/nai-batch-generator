@@ -178,6 +178,7 @@ from src.nai_studio.services.experiment_bridge import (
     expand_legacy_experiment_cells,
 )
 from src.nai_studio.services import (
+    artist_workspace as _artist_workspace,
     catalog_search as _catalog_search,
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
@@ -1615,139 +1616,36 @@ def _merge_style_evidence(existing, incoming):
 
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
-_CNUM = r"-?(?:\d+\.\d*|\.\d+|\d+)"
-_COPEN = re.compile(rf"^\s*\{{*\s*({_CNUM})\s*::\s*")
-_CART = re.compile(r"^\s*artists?\s*:\s*(.+?)\s*$", re.IGNORECASE)
-_CGLUE = re.compile(rf"::\s+(?=(?:{_CNUM}\s*::\s*)?artists?\s*:)", re.IGNORECASE)
-_NOT_ARTIST = {"artist collaboration", "artist name", "artist request", "artist logo",
-               "artist signature", "artist self-insert", "multiple artists", "style parody"}
+def _artist_workspace_operations():
+    """현재 난수·태그 결합 함수를 주입해 seed와 APP patch 계약을 보존한다."""
+    return _artist_workspace.ArtistWorkspaceOperations(
+        seeded_random=random.Random,
+        system_random=random.SystemRandom,
+        join_tags=_join_tags,
+    )
 
 
 def parse_artist_combo(text):
-    """프롬프트 → ([(가중치|None, 작가명)], 작가가 아닌 나머지 토큰)"""
-    artists, rest, weight = [], [], None
-    for tok in _CGLUE.sub(":: , ", text or "").replace("\n", ",").split(","):
-        raw, t = tok, tok.strip()
-        if not t:
-            continue
-        m = _COPEN.match(t)
-        if m:
-            weight = float(m.group(1))
-            t = t[m.end():].strip()
-        closing = t.endswith("::") or t.endswith("}}")
-        t = t.rstrip("}").rstrip(":").rstrip().rstrip("{").strip()
-        if t:
-            a = _CART.match(t)
-            if a:
-                name = re.sub(r"\s+", " ", a.group(1)).strip(" _:")
-                if name.count(")") > name.count("("):
-                    name = name.rstrip(")").strip()
-                if name and len(name) <= 60 and "::" not in name \
-                        and name.lower() not in _NOT_ARTIST:
-                    artists.append((weight, name))
-            else:
-                rest.append(raw.strip())
-        if closing:
-            weight = None
-    return artists, rest
+    return _artist_workspace.parse_artist_combo(text)
 
 
 def compose_artist_workspace(rows, mode="custom", curve_start=1.2,
                              curve_end=0.8, seed=""):
-    """작가 조합 작업공간의 행을 NAI 가중치 prompt로 만든다.
-
-    순서는 사용자가 정한 실제 prompt 순서다. ``locked`` 행은 균형·곡선·무작위
-    모드에서도 고정하고, 무작위는 행별 min/max 안에서만 뽑는다.
-    """
-    if not isinstance(rows, list):
-        raise ValueError("작가 목록 형식이 올바르지 않습니다.")
-    mode = str(mode or "custom").strip().lower()
-    if mode not in {"custom", "balanced", "curve", "random"}:
-        raise ValueError("알 수 없는 가중치 방식입니다.")
-    cleaned, seen = [], set()
-
-    def number(value, fallback=1.0):
-        try:
-            result = float(value)
-        except (TypeError, ValueError):
-            result = float(fallback)
-        if not math.isfinite(result):
-            raise ValueError("가중치는 유한한 숫자여야 합니다.")
-        return result
-
-    for raw in rows[:20]:
-        if not isinstance(raw, dict):
-            continue
-        name = re.sub(r"\s+", " ", str(raw.get("name") or "")).strip()
-        if not name:
-            continue
-        if len(name) > 60 or any(mark in name for mark in (",", "\n", "\r", "::")):
-            raise ValueError(f"작가 이름 형식이 올바르지 않습니다: {name[:30]}")
-        key = name.casefold()
-        if key in seen:
-            raise ValueError(f"같은 작가가 두 번 들어 있습니다: {name}")
-        seen.add(key)
-        weight = number(raw.get("weight"), 1.0)
-        low = number(raw.get("min"), weight)
-        high = number(raw.get("max"), weight)
-        if low > high:
-            low, high = high, low
-        cleaned.append({
-            "name": name, "weight": weight, "min": low, "max": high,
-            "locked": bool(raw.get("locked")),
-        })
-    if not cleaned:
-        return {"rows": [], "combo": ""}
-
-    unlocked = [row for row in cleaned if not row["locked"]]
-    if mode == "balanced":
-        for row in unlocked:
-            row["weight"] = 1.0
-    elif mode == "curve":
-        start, end = number(curve_start, 1.2), number(curve_end, 0.8)
-        for index, row in enumerate(unlocked):
-            ratio = index / max(1, len(unlocked) - 1)
-            row["weight"] = start + (end - start) * ratio
-    elif mode == "random":
-        rng = random.Random(str(seed)) if str(seed) else random.SystemRandom()
-        for row in unlocked:
-            row["weight"] = rng.uniform(row["min"], row["max"])
-
-    def weight_text(value):
-        text = f"{value:.3f}".rstrip("0").rstrip(".")
-        return "0" if text in {"-0", ""} else text
-
-    combo = ", ".join(
-        f"{weight_text(row['weight'])}::artist:{row['name']}::"
-        for row in cleaned
+    return _artist_workspace.compose_artist_workspace(
+        _artist_workspace_operations(),
+        rows,
+        mode,
+        curve_start,
+        curve_end,
+        seed,
     )
-    return {"rows": cleaned, "combo": combo}
 
 
 def artist_workspace_request(data):
-    """작가 조합 UI의 parse/compose를 한 규칙으로 처리한다."""
-    if not isinstance(data, dict):
-        raise ValueError("잘못된 요청 형식입니다.")
-    action = str(data.get("action") or "compose")
-    base = str(data.get("base") or "")
-    if action == "parse":
-        artists, _ = parse_artist_combo(base)
-        rows = [{
-            "name": name, "weight": weight if weight is not None else 1.0,
-            "min": weight if weight is not None else 0.7,
-            "max": weight if weight is not None else 1.3,
-            "locked": False,
-        } for weight, name in artists]
-        return {"ok": True, "rows": rows}
-    result = compose_artist_workspace(
-        data.get("rows") or [], mode=data.get("mode"),
-        curve_start=data.get("curve_start"), curve_end=data.get("curve_end"),
-        seed=data.get("seed"),
+    return _artist_workspace.artist_workspace_request(
+        _artist_workspace_operations(),
+        data,
     )
-    _, rest = parse_artist_combo(base)
-    prompt = _join_tags(result["combo"], ", ".join(rest))
-    return {"ok": True, **result, "prompt": prompt}
-
 
 def load_combos():
     if _COMBOS["loaded"]:
