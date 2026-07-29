@@ -12,6 +12,7 @@ from src.nai_studio.services.variation_bridge import (
     approved_proposal_to_legacy_candidates,
     character_asset_from_legacy_record,
     character_assets_from_legacy_config,
+    selected_variation_values,
     variation_plan_to_legacy_payload_material,
 )
 
@@ -182,7 +183,42 @@ class VariationBridgeContractTests(unittest.TestCase):
             candidates["evidence_candidate"]["image_ref"],
             {"path": "pink.webp"},
         )
+        self.assertEqual(
+            candidates["variant_candidate"]["reference_ids"],
+            ["ref-a", "missing-ref"],
+        )
+        self.assertEqual(
+            candidates["variant_candidate"]["vibe_ids"], ["vibe-a"])
         self.assertEqual(candidates["original_record"], legacy)
+
+    def test_only_explicit_selected_variation_overrides_whole_character_bundle(self):
+        record = {
+            "prompt": "base appearance",
+            "outfit": "base outfit",
+            "negative": "base negative",
+            "selected_variant_id": "winter",
+            "variants": [{
+                "id": "winter",
+                "name": "겨울",
+                "female": "winter appearance",
+                "clothed": "",
+                "negative": "winter negative",
+                "future": {"stay": True},
+            }],
+        }
+        before = copy.deepcopy(record)
+        selected = selected_variation_values(record)
+        self.assertEqual(record, before)
+        self.assertEqual(selected["prompt"], "winter appearance")
+        self.assertEqual(selected["outfit"], "")
+        self.assertEqual(selected["negative"], "winter negative")
+        self.assertEqual(selected["selected_variant_id"], "winter")
+        self.assertEqual(selected["selected_variant"]["future"], {"stay": True})
+        missing = selected_variation_values(
+            dict(record, selected_variant_id="removed"))
+        self.assertEqual(missing["prompt"], "base appearance")
+        self.assertEqual(missing["outfit"], "base outfit")
+        self.assertEqual(missing["selected_variant_id"], "")
 
     def test_wrong_ranges_refs_and_foreign_proposals_are_rejected(self):
         asset = character_asset_from_legacy_record(

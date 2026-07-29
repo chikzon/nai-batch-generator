@@ -45,6 +45,51 @@ def _stable_id(prefix: str, value: Any) -> str:
     return f"{prefix}-{hashlib.sha256(encoded).hexdigest()[:24]}"
 
 
+def selected_variation_values(value: Mapping[str, Any]) -> dict:
+    """명시 선택된 저장 variation의 실행값만 비파괴적으로 해석한다.
+
+    ``variant`` 단수 필드는 같은 캐릭터의 형제 레코드 묶음이고, 여기서 다루는
+    ``variants`` 목록은 한 캐릭터 자산 안의 이미지 근거가 붙은 실행 후보다.
+    선택 id가 없거나 사라졌으면 기본 원문을 그대로 사용한다.
+    """
+    record = _mapping(value)
+    selected_id = str(record.get("selected_variant_id") or "").strip()
+    selected = next((
+        _mapping(item)
+        for item in _list(record.get("variants"))
+        if isinstance(item, Mapping)
+        and str(item.get("id") or "").strip() == selected_id
+    ), {})
+
+    def present(source: Mapping[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in source:
+                return source.get(key)
+        return None
+
+    base_prompt = present(record, "prompt", "female", "appearance")
+    base_outfit = present(record, "outfit", "clothed")
+    prompt = (
+        present(selected, "prompt", "female", "appearance")
+        if selected else base_prompt
+    )
+    outfit = (
+        present(selected, "outfit", "clothed")
+        if selected else base_outfit
+    )
+    negative = (
+        selected.get("negative")
+        if selected and "negative" in selected else record.get("negative")
+    )
+    return {
+        "prompt": "" if prompt is None else str(prompt),
+        "outfit": "" if outfit is None else str(outfit),
+        "negative": "" if negative is None else str(negative),
+        "selected_variant_id": selected_id if selected else "",
+        "selected_variant": deepcopy(selected),
+    }
+
+
 def _index_by_id(records: Sequence[Mapping[str, Any]] | None) -> dict[str, dict]:
     return {
         str(record.get("id")): deepcopy(dict(record))
@@ -353,6 +398,8 @@ def approved_proposal_to_legacy_candidates(
         "female": str(variant.get("appearance") or ""),
         "clothed": str(variant.get("outfit") or ""),
         "negative": str(variant.get("negative") or ""),
+        "reference_ids": _list(record.get("reference_ids")),
+        "vibe_ids": _list(record.get("vibe_ids")),
         "image_ref": deepcopy(variant.get("image_ref")),
         "lineage": deepcopy(variant.get("lineage") or {}),
         "status": "approved-candidate",

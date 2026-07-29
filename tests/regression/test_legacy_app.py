@@ -261,6 +261,7 @@ class RegressionTests(unittest.TestCase):
                 image.nai_seed = kwargs["seed"]
                 return image
 
+
             saved_path = root / "output" / "Outpaint" / "0001.webp"
             with (
                 patch.object(APP, "runtime_generation_params",
@@ -1457,6 +1458,13 @@ class RegressionTests(unittest.TestCase):
                     "female": "appearance\nline two",
                     "clothed": "artistically transformed outfit",
                     "negative": "character negative",
+                    "selected_variant_id": "winter",
+                    "variants": [{
+                        "id": "winter", "name": "겨울",
+                        "female": "selected appearance",
+                        "clothed": "selected transformed outfit",
+                        "negative": "selected character negative",
+                    }],
                     "position": {"x": 0.2, "y": 0.8},
                     "reference_ids": ["ref-a"],
                     "vibe_ids": ["vibe-a"],
@@ -1555,21 +1563,21 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(cfg, before, "preview가 사용자 설정이나 직접 cast를 바꿨다")
         self.assertEqual(
             jobs[0]["scene_character"]["female"],
-            "appearance\nline two",
+            "selected appearance",
         )
         self.assertEqual(
             jobs[0]["scene_character"]["clothed"],
-            "artistically transformed outfit",
+            "selected transformed outfit",
         )
         self.assertEqual(
             jobs[0]["scene_character"]["negative"],
-            "character negative",
+            "selected character negative",
         )
         self.assertEqual(base, "1girl, BASE\n1.2::weighted::")
         self.assertEqual(negative, "NEGATIVE\n||red||")
-        self.assertIn("appearance", people[0]["prompt"])
-        self.assertIn("artistically transformed outfit", people[0]["prompt"])
-        self.assertEqual(people[0]["negative"], "character negative")
+        self.assertIn("selected appearance", people[0]["prompt"])
+        self.assertIn("selected transformed outfit", people[0]["prompt"])
+        self.assertEqual(people[0]["negative"], "selected character negative")
         self.assertEqual(centers, [{"x": 0.2, "y": 0.8}])
         self.assertTrue(used["use_coords"])
         self.assertTrue(used["char_refs"][0]["enabled"])
@@ -4896,6 +4904,15 @@ class RegressionTests(unittest.TestCase):
                 "외형": "new appearance", "착의": "new clothes",
                 "네거티브": "new negative", "출처": "user file",
                 "그룹": {"예술적 변형": "watercolor"},
+                "representative": "local:representative.webp",
+                "evidence_images": ["local:evidence.webp"],
+                "variation_images": ["local:variation.webp"],
+                "variants": [{
+                    "id": "winter", "name": "겨울",
+                    "female": "winter appearance", "clothed": "winter coat",
+                    "negative": "winter negative",
+                }],
+                "selected_variant_id": "winter",
                 "미래필드": {"keep": "unknown character metadata"},
             }, ensure_ascii=False), encoding="utf-8")
 
@@ -4917,9 +4934,16 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(char["negative"], "new negative")
             self.assertEqual(char["source"], "user file")
             self.assertEqual(char["groups"], {"예술적 변형": "watercolor"})
+            self.assertEqual(char["representative"], "local:representative.webp")
+            self.assertEqual(char["evidence_images"], ["local:evidence.webp"])
+            self.assertEqual(char["variation_images"], ["local:variation.webp"])
+            self.assertEqual(char["variants"][0]["id"], "winter")
+            self.assertEqual(char["selected_variant_id"], "winter")
             self.assertFalse(char["enabled"], "화면의 켜기/끄기 상태는 보존해야 한다")
             self.assertEqual(saved_file["외형"], "new appearance")
             self.assertEqual(saved_file["착의"], "new clothes")
+            self.assertEqual(saved_file["variants"][0]["id"], "winter")
+            self.assertEqual(saved_file["selected_variant_id"], "winter")
             self.assertEqual(
                 saved_file["미래필드"],
                 {"keep": "unknown character metadata"},
@@ -7372,6 +7396,7 @@ class RegressionTests(unittest.TestCase):
                     "info_extracted": 0.9,
                 }],
             })
+            original_cfg = copy.deepcopy(cfg)
             source = io.BytesIO()
             Image.new("RGB", (128, 128), "white").save(source, "PNG")
             body = json.dumps({
@@ -7395,13 +7420,19 @@ class RegressionTests(unittest.TestCase):
                 image.nai_seed = kwargs["seed"]
                 return image
 
+            def save_result(image, path, **_kwargs):
+                path = Path(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(path, "WEBP")
+                return path
+
             with (
                 patch.object(APP, "runtime_generation_params",
                              side_effect=runtime_params),
                 patch.object(APP, "pace_gate", return_value=(True, "")),
                 patch.object(APP, "pace_complete", return_value=None),
                 patch.object(APP, "call_nai_api", side_effect=generate),
-                patch.object(APP, "save_with_meta", return_value=None),
+                patch.object(APP, "save_with_meta", side_effect=save_result),
                 patch.object(APP, "load_state",
                              return_value={"daily": {}, "total_generated": 0}),
                 patch.object(APP, "save_state", return_value=None),
@@ -7414,6 +7445,8 @@ class RegressionTests(unittest.TestCase):
                     time.sleep(0.01)
 
             self.assertFalse(server.live.running)
+            self.assertEqual(server.live.phase, "completed")
+            self.assertEqual(server.live.failed, 0)
             temporary = captured["job_cfg"]
             self.assertEqual(temporary["char_slots"][0]["prompt"],
                              "1girl, red hair")
@@ -7425,14 +7458,184 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(temporary["vibes"][0]["id"], "vibe-hero")
             self.assertEqual(captured["chars"][0]["prompt"],
                              "1girl, red hair, blue dress")
-            self.assertEqual(server.cfg["char_slots"],
-                             cfg["char_slots"])
+            self.assertEqual(server.cfg, original_cfg)
 
         page = APP.render_page()
         for marker in (
                 'id="libVary"', "variation_character_id",
-                "이 증거 그림으로 캐릭터 변형"):
+                "이 증거 그림으로 캐릭터 변형",
+                'id="i2iVariationTools"', 'id="i2iVariationMode"',
+                "/api/character_variation_save",
+                'data-slot-variation', 'data-cast-variation'):
             self.assertIn(marker, page)
+
+    def test_character_reference_trial_saves_selected_variation_without_cfg_leak(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update({
+                "token": "pst-fixture",
+                "out_dir": str(root / "output"),
+                "base_prompt": "original scene",
+                "negative_prompt": "original base negative",
+                "characters": [{
+                    "id": "hero", "name": "주인공",
+                    "female": "base appearance",
+                    "clothed": "base outfit",
+                    "negative": "base character negative",
+                    "reference_ids": [],
+                    "vibe_ids": ["saved-vibe"],
+                }],
+                "vibes": [{
+                    "id": "saved-vibe", "name": "저장 바이브",
+                    "enabled": False, "strength": 0.7,
+                    "info_extracted": 0.9,
+                }],
+            })
+            original = copy.deepcopy(cfg)
+            source = io.BytesIO()
+            Image.new("RGB", (192, 256), "white").save(source, "PNG")
+            body = json.dumps({
+                "image": "data:image/png;base64,"
+                         + APP.base64.b64encode(source.getvalue()).decode(),
+                "variation_character_id": "hero",
+                "variation_mode": "character-reference",
+                "trial_width": 512,
+                "trial_height": 512,
+                "trial_scene_prompt": "temporary scene",
+                "trial_appearance": "trial appearance",
+                "trial_outfit": "",
+                "trial_negative": "trial negative",
+                "reference_strength": 1.2,
+                "reference_fidelity": 0.8,
+                "seed": 77,
+            }).encode()
+            captured = {}
+
+            def generate(_token, base, _female, _male, negative,
+                         width, height, **kwargs):
+                captured.update({
+                    "base": base, "negative": negative,
+                    "width": width, "height": height,
+                    "chars": copy.deepcopy(kwargs["chars"]),
+                    "params": copy.deepcopy(kwargs["params"]),
+                })
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kwargs["seed"]
+                return image
+
+            def save_result(image, path, **_kwargs):
+                path = Path(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(path, "WEBP")
+                return path
+
+            with (
+                patch.object(APP, "SETTINGS_FILE", root / "설정.json"),
+                patch.object(APP, "CHAR_DIR", root / "캐릭터"),
+                patch.object(APP, "IMG_CACHE", root / "수집" / "이미지캐시"),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=generate),
+                patch.object(APP, "save_with_meta", side_effect=save_result),
+                patch.object(APP, "load_state",
+                             return_value={"daily": {}, "total_generated": 0}),
+                patch.object(APP, "save_state", return_value=None),
+            ):
+                server = APP.ConfigServer(cfg)
+                started = server.handle_i2i(body)
+                self.assertTrue(started["ok"], started)
+                self.assertTrue(started["vibe_suppressed"])
+                deadline = time.time() + 3
+                while server.live.running and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(server.live.phase, "completed")
+                self.assertEqual(server.cfg, original)
+                self.assertEqual(captured["base"], "temporary scene")
+                self.assertEqual(captured["chars"], [{
+                    "prompt": "trial appearance",
+                    "negative": "trial negative",
+                }])
+                self.assertNotIn("_i2i", captured["params"])
+                self.assertEqual(
+                    len(captured["params"]["_char_refs"]["images"]), 1)
+                saved = server.handle_character_variation_save(
+                    json.dumps({
+                        "save_as": "variation",
+                        "name": "시험 변형",
+                    }).encode())
+                self.assertTrue(saved["ok"], saved)
+                character = saved["character"]
+                self.assertEqual(character["female"], "base appearance")
+                self.assertEqual(character["clothed"], "base outfit")
+                self.assertEqual(character["negative"], "base character negative")
+                self.assertEqual(len(character["variants"]), 1)
+                variant = character["variants"][0]
+                self.assertEqual(variant["female"], "trial appearance")
+                self.assertEqual(variant["clothed"], "")
+                self.assertEqual(variant["negative"], "trial negative")
+                slot = {
+                    "prompt": character["female"],
+                    "outfit": character["clothed"],
+                    "negative": character["negative"],
+                    "variants": character["variants"],
+                    "selected_variant_id": variant["id"],
+                }
+                self.assertEqual(APP.slot_prompt(slot), "trial appearance")
+                self.assertEqual(
+                    APP.active_people([slot])[0][0]["negative"],
+                    "trial negative")
+                reloaded = json.loads(
+                    (root / "설정.json").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    reloaded["characters"][0]["variants"][0]["id"],
+                    variant["id"])
+                char_file = next((root / "캐릭터").glob("*.json"))
+                on_disk = json.loads(char_file.read_text(encoding="utf-8"))
+                self.assertEqual(on_disk["variants"][0]["id"], variant["id"])
+
+                captured.clear()
+                inset_request = json.loads(body)
+                inset_request["variation_mode"] = "reference-inset"
+                inset_request["trial_width"] = 1152
+                inset_request["trial_height"] = 896
+                inset_server = APP.ConfigServer(copy.deepcopy(original))
+                started = inset_server.handle_i2i(
+                    json.dumps(inset_request).encode())
+                self.assertTrue(started["ok"], started)
+                deadline = time.time() + 3
+                while inset_server.live.running and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(inset_server.live.phase, "completed")
+                self.assertEqual(inset_server.cfg, original)
+                self.assertEqual(
+                    (captured["width"], captured["height"]), (1152, 896))
+                self.assertEqual(
+                    captured["params"]["_i2i"]["strength"], 1.0)
+                self.assertIsNotNone(
+                    captured["params"]["_i2i"]["mask"])
+
+                failed_server = APP.ConfigServer(copy.deepcopy(original))
+                with patch.object(
+                    APP, "call_nai_api",
+                    side_effect=RuntimeError("fixture failure"),
+                ):
+                    failed = failed_server.handle_i2i(body)
+                    self.assertTrue(failed["ok"], failed)
+                    deadline = time.time() + 3
+                    while failed_server.live.running and time.time() < deadline:
+                        time.sleep(0.01)
+                self.assertEqual(failed_server.live.phase, "failed")
+                self.assertEqual(failed_server.cfg, original)
+                self.assertFalse(
+                    (failed_server.pending_variation or {}).get("result_path"))
+
+            inset = APP.reference_inset_canvas(source.getvalue(), 1152, 896)
+            self.assertEqual(
+                (inset["width"], inset["height"]), (1152, 896))
+            with Image.open(io.BytesIO(inset["mask"])) as mask:
+                self.assertEqual(mask.getpixel((0, 0)), 0)
+                self.assertEqual(mask.getpixel((1151, 895)), 255)
 
 
 if __name__ == "__main__":

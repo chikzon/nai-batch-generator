@@ -112,6 +112,10 @@ from src.nai_studio.services.metadata_audit_adapter import (
     MetadataAuditAdapter,
     MetadataAuditLedgerError,
 )
+from src.nai_studio.services.character_bench import (
+    apply_character_variation_candidates,
+    reference_inset_canvas,
+)
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
     reroll_legacy_components,
@@ -136,9 +140,12 @@ from src.nai_studio.services.result_promotion import (
     new_promotion_ledger,
 )
 from src.nai_studio.services.variation_bridge import (
+    approved_proposal_to_legacy_candidates,
     character_asset_from_legacy_record,
+    selected_variation_values,
     variation_plan_to_legacy_payload_material,
 )
+from src.nai_studio.domain.variations import accept_variation
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -1643,12 +1650,21 @@ def prepare_char_refs(cfg):
     for r in cfg.get("char_refs", []):
         if not r.get("enabled"):
             continue
+        raw = r.get("_image_bytes")
         p = VIBE_DIR / f"{r.get('id','')}.ref.png"
-        if not p.exists():
-            continue
+        if raw is None:
+            if not p.exists():
+                if r.get("_required"):
+                    raise ValueError("시험용 Character Reference 원본을 찾지 못했습니다.")
+                continue
+            raw = p.read_bytes()
         try:
-            b64, cv = letterbox_ref(p.read_bytes())
+            b64, cv = letterbox_ref(raw)
         except Exception as e:
+            if r.get("_required"):
+                raise ValueError(
+                    f"시험용 Character Reference를 준비하지 못했습니다: {e}"
+                ) from e
             log.warning(f"캐릭터 레퍼런스 준비 실패({p.name}): {e}")
             continue
         log.info(f"캐릭터 레퍼런스 {p.stem} → {cv[0]}×{cv[1]} 로 맞춤")
@@ -1701,6 +1717,12 @@ def runtime_generation_params(cfg, token, include_refs=True):
         if newly:
             log.info(f"바이브 {newly}개를 새로 인코딩했습니다.")
     except Exception as e:
+        if any(
+            item.get("enabled") and item.get("_required")
+            for item in (cfg.get("char_refs") or [])
+            if isinstance(item, dict)
+        ):
+            raise
         log.warning(f"레퍼런스 준비 실패 — 레퍼런스 없이 계속합니다: {e}")
         params["_vibes"] = {}
         params["_char_refs"] = {}
@@ -3281,8 +3303,18 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
         if not isinstance(char, dict):
             continue
         name = str(char.get("name") or "(무명)")
-        character_images = copy.deepcopy(
-            char.get("images") if isinstance(char.get("images"), list) else [])
+        character_images = []
+        for image_ref in [
+            char.get("representative"),
+            char.get("representative_image"),
+            *(char.get("images") if isinstance(char.get("images"), list) else []),
+            *(char.get("evidence_images")
+              if isinstance(char.get("evidence_images"), list) else []),
+            *(char.get("variation_images")
+              if isinstance(char.get("variation_images"), list) else []),
+        ]:
+            if isinstance(image_ref, str) and image_ref and image_ref not in character_images:
+                character_images.append(image_ref)
         rows.append({
             "id": "character:" + str(char.get("id") or name),
             "kind": "캐릭터", "store": "character", "name": name,
@@ -3300,7 +3332,9 @@ def search_library(cfg, spec, q="", kind="", source="", limit=100, offset=0,
                     "id", "name", "female", "clothed", "negative", "groups",
                     "source", "folder_id", "subfolder_id",
                     "variant", "variants", "reference_ids", "vibe_ids",
-                    "images", "evidence", "evidence_ids", "evidence_refs",
+                    "selected_variant_id", "representative", "images",
+                    "evidence", "evidence_ids", "evidence_refs",
+                    "evidence_images", "variation_images",
                 ) if key in char
             },
         })
@@ -6672,6 +6706,9 @@ def _comparison_character_prompt(item):
     return slot_prompt({
         "prompt": (item or {}).get("female", ""),
         "outfit": (item or {}).get("clothed", ""),
+        "negative": (item or {}).get("negative", ""),
+        "variants": copy.deepcopy((item or {}).get("variants") or []),
+        "selected_variant_id": (item or {}).get("selected_variant_id", ""),
     })
 
 
@@ -6689,6 +6726,11 @@ def comparison_characters(cfg):
         if not prompt:
             continue
         item = dict(raw)
+        effective = selected_variation_values(item)
+        item["female"] = effective["prompt"]
+        item["clothed"] = effective["outfit"]
+        item["negative"] = effective["negative"]
+        item["selected_variant_id"] = effective["selected_variant_id"]
         item["_compare_id"] = str(item.get("id") or _comparison_id(
             "char", item.get("name"), prompt, item.get("negative"), i))
         item["_compare_name"] = (item.get("name") or f"캐릭터 {i + 1}").strip()
@@ -6722,6 +6764,8 @@ def setting_cast_members(cfg, state):
             "outfit": item.get("clothed", ""),
             "negative": item.get("negative", ""),
             "variant": copy.deepcopy(item.get("variant") or {}),
+            "variants": copy.deepcopy(item.get("variants") or []),
+            "selected_variant_id": item.get("selected_variant_id", ""),
             "reference_ids": copy.deepcopy(item.get("reference_ids") or []),
             "vibe_ids": copy.deepcopy(item.get("vibe_ids") or []),
             "enabled": True,
@@ -8244,6 +8288,15 @@ def _read_char_documents(paths):
         return list(pool.map(one, paths))
 
 
+CHARACTER_ASSET_OPTIONAL_FIELDS = (
+    "variant", "variants", "selected_variant_id",
+    "reference_ids", "vibe_ids", "representative", "representative_image",
+    "images", "evidence", "evidence_refs", "evidence_images",
+    "variation_images", "reference_inset",
+    "temporary_generation_overrides", "lineage",
+)
+
+
 def import_char_files(cfg):
     """캐릭터/ 폴더의 규격 JSON을 등록하고, 더 새 외부 편집은 설정에 반영한다.
 
@@ -8297,7 +8350,7 @@ def import_char_files(cfg):
                 "folder_id": folder_id,
                 "subfolder_id": subfolder_id,
             })
-            for field in ("variant", "reference_ids", "vibe_ids"):
+            for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
                 if field in data:
                     current[field] = copy.deepcopy(data[field])
             if data.get("그룹"):
@@ -8313,7 +8366,7 @@ def import_char_files(cfg):
             "negative": data.get("네거티브", ""), "source": data.get("출처", ""),
             "enabled": True, "folder_id": folder_id, "subfolder_id": subfolder_id,
         }
-        for field in ("variant", "reference_ids", "vibe_ids"):
+        for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
             if field in data:
                 new_char[field] = copy.deepcopy(data[field])
         if data.get("그룹"):
@@ -8391,7 +8444,7 @@ def sync_chars_to_files(cfg):
             "id": c["id"], "이름": c.get("name", ""), "외형": c.get("female", ""),
             "착의": c.get("clothed", ""), "네거티브": c.get("negative", ""),
         })
-        for field in ("variant", "reference_ids", "vibe_ids"):
+        for field in CHARACTER_ASSET_OPTIONAL_FIELDS:
             if field in c:
                 data[field] = copy.deepcopy(c[field])
         if c.get("groups"):
@@ -8707,8 +8760,9 @@ def slot_prompt(sl):
     주석 전용 슬롯이 (people, centers) 짝을 어긋내지 못한다 (CQA-003)."""
     if not isinstance(sl, dict):
         return ""
-    return _join_tags(strip_comment_lines(sl.get("prompt", "")),
-                      strip_comment_lines(sl.get("outfit", "")))
+    effective = selected_variation_values(sl)
+    return _join_tags(strip_comment_lines(effective["prompt"]),
+                      strip_comment_lines(effective["outfit"]))
 
 
 def slot_bundle_identity(sl):
@@ -8719,14 +8773,24 @@ def slot_bundle_identity(sl):
     """
     if not isinstance(sl, dict):
         return ""
+    effective = selected_variation_values(sl)
+    selected = effective["selected_variant"]
     bundle = {
         "id": sl.get("id", ""),
-        "prompt": sl.get("prompt", ""),
-        "outfit": sl.get("outfit", ""),
-        "negative": sl.get("negative", ""),
+        "prompt": effective["prompt"],
+        "outfit": effective["outfit"],
+        "negative": effective["negative"],
         "variant": sl.get("variant") or {},
-        "reference_ids": sl.get("reference_ids") or [],
-        "vibe_ids": sl.get("vibe_ids") or [],
+        "variants": sl.get("variants") or [],
+        "selected_variant_id": effective["selected_variant_id"],
+        "reference_ids": (
+            selected.get("reference_ids")
+            if "reference_ids" in selected else sl.get("reference_ids")
+        ) or [],
+        "vibe_ids": (
+            selected.get("vibe_ids")
+            if "vibe_ids" in selected else sl.get("vibe_ids")
+        ) or [],
         "position": sl.get("position") or {},
     }
     return json.dumps(
@@ -8743,6 +8807,8 @@ def character_run_from_group(group, fallback_index=0, position_mode=None):
         return {}
     primary = members[0]
     partner = members[1] if len(members) > 1 else {}
+    primary_effective = selected_variation_values(primary)
+    partner_effective = selected_variation_values(partner)
     names = [str(item.get("name") or "").strip() for item in members]
     names = [name for name in names if name]
     centers = []
@@ -8755,13 +8821,13 @@ def character_run_from_group(group, fallback_index=0, position_mode=None):
     return {
         "name": " + ".join(names) or f"인물{fallback_index + 1}",
         "female": slot_prompt(primary),
-        "negative": primary.get("negative", ""),
+        "negative": primary_effective["negative"],
         "male_prompt_base": slot_prompt(partner),
-        "partner_negative": partner.get("negative", ""),
+        "partner_negative": partner_effective["negative"],
         "extras": [
             {
                 "prompt": slot_prompt(item),
-                "negative": item.get("negative", ""),
+                "negative": selected_variation_values(item)["negative"],
                 "center": copy.deepcopy(item.get("position") or item.get("center")),
             }
             for item in members[2:]
@@ -9228,7 +9294,8 @@ def active_people(slots, centers=None, extra=None):
         cap = slot_prompt(sl)
         if not (cap or "").strip():
             continue
-        people.append({"prompt": cap, "negative": sl.get("negative", "")})
+        effective = selected_variation_values(sl)
+        people.append({"prompt": cap, "negative": effective["negative"]})
         c = centers[i] if i < len(centers) and isinstance(centers[i], dict) else None
         ctrs.append(c or {"x": 0.5, "y": 0.5})
     for e in (extra or []):
@@ -9266,15 +9333,17 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
     for index, slot in enumerate(slots):
         if not isinstance(slot, dict):
             continue
+        effective = selected_variation_values(slot)
+        selected = effective["selected_variant"]
         center = (centers[index] if index < len(centers)
                   and isinstance(centers[index], dict) else {"x": 0.5, "y": 0.5})
         characters.append({
             "id": str(slot.get("id") or ""),
             "name": str(slot.get("name") or ""),
             "enabled": slot.get("enabled") is not False,
-            "appearance": str(slot.get("prompt") or slot.get("female") or ""),
-            "clothed": str(slot.get("outfit") or slot.get("clothed") or ""),
-            "negative": str(slot.get("negative") or ""),
+            "appearance": effective["prompt"],
+            "clothed": effective["outfit"],
+            "negative": effective["negative"],
             "resolved_prompt": slot_prompt(slot),
             "position": {
                 "x": center.get("x", 0.5),
@@ -9286,8 +9355,15 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
             },
             "variant": copy.deepcopy(slot.get("variant") or {}),
             "variants": copy.deepcopy(slot.get("variants") or []),
-            "reference_ids": copy.deepcopy(slot.get("reference_ids") or []),
-            "vibe_ids": copy.deepcopy(slot.get("vibe_ids") or []),
+            "selected_variant_id": effective["selected_variant_id"],
+            "reference_ids": copy.deepcopy((
+                selected.get("reference_ids")
+                if "reference_ids" in selected else slot.get("reference_ids")
+            ) or []),
+            "vibe_ids": copy.deepcopy((
+                selected.get("vibe_ids")
+                if "vibe_ids" in selected else slot.get("vibe_ids")
+            ) or []),
         })
 
     active_settings = {}
@@ -9557,8 +9633,13 @@ def character_resource_config(cfg, character):
     동작이 바뀌지 않고, 새 출연 구성에서 자료 id를 명시했을 때만 범위를 좁힌다.
     """
     scoped = dict(cfg)
+    selected = selected_variation_values(character).get("selected_variant") or {}
     for key, id_key in (("char_refs", "reference_ids"), ("vibes", "vibe_ids")):
-        wanted = [str(value) for value in (character.get(id_key) or []) if value]
+        source_ids = (
+            selected.get(id_key)
+            if id_key in selected else character.get(id_key)
+        )
+        wanted = [str(value) for value in (source_ids or []) if value]
         if not wanted:
             continue
         by_id = {
@@ -12005,6 +12086,35 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <input type="file" id="i2iFile" accept="image/png,image/webp" style="display:none;">
         </div>
         <div id="i2iStage" class="hidden" style="margin-top:8px;">
+          <div id="i2iVariationTools" class="row hidden" style="margin-bottom:8px;">
+            <div class="bar">
+              <b id="i2iVariationName">캐릭터 이미지 시험·변형</b>
+              <span class="n">시험용 설정 — 일반 생성 설정에는 반영되지 않음</span>
+            </div>
+            <div class="grid3" style="margin-top:7px;">
+              <label class="field"><span>방식</span><select id="i2iVariationMode">
+                <option value="img2img">img2img · 원본 전체 변형</option>
+                <option value="inpaint">Inpaint · 칠한 부분 변형</option>
+                <option value="character-reference">Character Reference · 새 장면</option>
+                <option value="reference-inset">Reference inset · 원본 옆에 생성</option>
+              </select></label>
+              <label class="field"><span>시험 가로</span><input type="number" id="i2iTrialWidth" min="256" max="2048" step="64"></label>
+              <label class="field"><span>시험 세로</span><input type="number" id="i2iTrialHeight" min="256" max="2048" step="64"></label>
+            </div>
+            <label class="field"><span>시험 장면 Prompt</span>
+              <textarea id="i2iTrialScene" placeholder="일반 생성 베이스를 바꾸지 않고 이 시험에만 적용"></textarea></label>
+            <div class="grid2">
+              <label class="field"><span>캐릭터 외형 원문</span><textarea id="i2iTrialAppearance"></textarea></label>
+              <label class="field"><span>착의·예술적 변형</span><textarea id="i2iTrialOutfit"></textarea></label>
+            </div>
+            <label class="field"><span>캐릭터 전용 Negative</span><textarea id="i2iTrialNegative"></textarea></label>
+            <div class="grid3">
+              <label class="field"><span>Reference 강도</span><input type="number" id="i2iRefStrength" min="-1" max="2" step="0.05" value="1"></label>
+              <label class="field"><span>Reference 충실도</span><input type="number" id="i2iRefFidelity" min="-1" max="2" step="0.05" value="0.6"></label>
+              <label class="field"><span>variation 이름</span><input type="text" id="i2iVariationSaveName" placeholder="예: 겨울 코트"></label>
+            </div>
+            <div class="row" id="i2iVariationPreview"></div>
+          </div>
           <!-- 겹쳐 그리려면 두 캔버스의 화면 크기가 정확히 같아야 한다.
                배율은 JS 가 style.width 로 직접 준다 (max-width 로 눌리면 어긋난다). -->
           <div id="i2iWrap" style="overflow:auto;max-height:78vh;border:1px solid var(--line);
@@ -12038,6 +12148,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <button id="i2iDrop2">다른 그림</button>
           </div>
           <p class="hint" id="i2iMsg"></p>
+          <div class="bar hidden" id="i2iVariationSave">
+            <span class="hint">완료 결과를 확인한 뒤에만 저장</span>
+            <button type="button" data-variation-save="representative">대표 이미지로 지정</button>
+            <button type="button" data-variation-save="evidence">근거 이미지로 추가</button>
+            <button type="button" data-variation-save="variation" class="primary">variation으로 저장</button>
+          </div>
         </div>
       </div>
 
@@ -13791,10 +13907,13 @@ async function naiTokens(){
       const clean = x => (x || '').replace(/^[ \t]*#.*$/gm, '').trim();
       const join = (a, b) => [a, b].map(x => clean(x).replace(/^,|,$/g, '').trim())
         .filter(Boolean).join(', ');
-      const slots = (STATE.char_slots || []).filter(s => s && s.enabled !== false
-        && clean(join(s.prompt, s.outfit)));
-      const chars = slots.map(s => join(s.prompt, s.outfit)).filter(Boolean);
-      const charNegs = slots.map(s => s.negative || '').filter(Boolean);
+      const slots = (STATE.char_slots || []).filter(s => {
+        const value = selectedVariationBundle(s);
+        return s && s.enabled !== false && clean(join(value.prompt, value.outfit));
+      });
+      const effective = slots.map(selectedVariationBundle);
+      const chars = effective.map(s => join(s.prompt, s.outfit)).filter(Boolean);
+      const charNegs = effective.map(s => s.negative || '').filter(Boolean);
       const r = await (await fetch('/api/tokens', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({base: $('basePrompt').value,
@@ -15209,6 +15328,26 @@ function comparisonCharacterChoices(){
   });
   return standalone;
 }
+function selectedVariationBundle(record){
+  const variants = Array.isArray((record||{}).variants) ? record.variants : [];
+  const selected = variants.find(item =>
+    String((item||{}).id||'') === String((record||{}).selected_variant_id||''));
+  const pick = (baseKeys, variantKeys=baseKeys) => {
+    if(selected){
+      for(const key of variantKeys) if(Object.prototype.hasOwnProperty.call(selected,key))
+        return selected[key] == null ? '' : String(selected[key]);
+    }
+    for(const key of baseKeys) if(Object.prototype.hasOwnProperty.call(record||{},key))
+      return record[key] == null ? '' : String(record[key]);
+    return '';
+  };
+  return {
+    prompt:pick(['prompt','female','appearance']),
+    outfit:pick(['outfit','clothed']),
+    negative:pick(['negative']),
+    selected:selected || null
+  };
+}
 function characterBundle(c, forSlot=true){
   c = characterVariantChoice(c);
   const result = {
@@ -15216,6 +15355,7 @@ function characterBundle(c, forSlot=true){
     outfit:c.clothed||c.outfit||'', negative:c.negative||'',
     variant:JSON.parse(JSON.stringify(c.variant||{})),
     variants:JSON.parse(JSON.stringify(c.variants||[])),
+    selected_variant_id:c.selected_variant_id||'',
     reference_ids:JSON.parse(JSON.stringify(c.reference_ids||[])),
     vibe_ids:JSON.parse(JSON.stringify(c.vibe_ids||[]))
   };
@@ -15239,6 +15379,10 @@ function renderSlots(){
            전송할 때 외형 뒤에 이어 붙는다. -->
       <input type="text" data-sf="outfit" data-si="${i}" placeholder="의상 (비워도 됨 · 외형 뒤에 붙습니다)" value="${escA(s.outfit || '')}">
       <input type="text" data-sf="negative" data-si="${i}" placeholder="이 인물 전용 네거티브" value="${escA(s.negative)}">
+      ${(s.variants||[]).length ? `<label class="field" style="margin-top:5px;"><span>저장한 이미지 variation</span>
+        <select data-slot-variation="${i}"><option value="">기본 원문</option>${(s.variants||[]).map(v =>
+          `<option value="${escA(v.id||'')}"${String(s.selected_variant_id||'')===String(v.id||'')?' selected':''}>${esc(v.name||'이름 없는 variation')}</option>`
+        ).join('')}</select></label>` : ''}
       <div class="posrow"><span class="hint">위치</span>
         <span class="hint" data-posai>AI가 배치</span>
         <span data-posgrid-wrap><div class="posgrid" data-pos="${i}"></div></span>
@@ -15258,6 +15402,10 @@ function renderSlots(){
     STATE.char_slots[+x.dataset.sen].enabled = x.checked;
     /* 켠 인물 수가 바뀌면 좌표·경고도 다시 (끈 인물은 보내지 않는다) */
     autoCoordsOnSecond(); renderSlots(); tokens(); save();
+  }));
+  h.querySelectorAll('[data-slot-variation]').forEach(el => el.addEventListener('change', () => {
+    STATE.char_slots[+el.dataset.slotVariation].selected_variant_id = el.value;
+    tokens(); save();
   }));
   h.querySelectorAll('[data-sdel]').forEach(b => b.addEventListener('click', () => {
     STATE.char_slots.splice(+b.dataset.sdel, 1);
@@ -15299,9 +15447,12 @@ function activeSlotIdx(){
   /* 주석(#) 줄만 있는 칸은 '켠 인물'이 아니다 — 서버 slot_prompt 와 같은 규칙 (CQA-003) */
   return (STATE.char_slots || [])
     .map((s, i) => ({s, i}))
-    .filter(x => x.s.enabled !== false
-      && [x.s.prompt, x.s.outfit].some(v =>
-        ((v || '').replace(/^[ \t]*#.*$/gm, '')).trim()))
+    .filter(x => {
+      const value = selectedVariationBundle(x.s);
+      return x.s.enabled !== false
+      && [value.prompt, value.outfit].some(v =>
+        Boolean((v || '').replace(/^[ \t]*#.*$/gm, '').trim()))
+    })
     .map(x => x.i);
 }
 function autoCoordsOnSecond(){
@@ -15945,6 +16096,10 @@ function renderCast(name, openMember=-1){
       <textarea data-cf="prompt" data-ci="${i}" placeholder="외형·캐릭터 원문">${esc(c.prompt)}</textarea>
       <input type="text" data-cf="outfit" data-ci="${i}" placeholder="착의·예술적 변형" value="${escA(c.outfit||'')}">
       <input type="text" data-cf="negative" data-ci="${i}" placeholder="전용 네거티브" value="${escA(c.negative)}">
+      ${(c.variants||[]).length ? `<label class="field"><span>저장한 이미지 variation</span>
+        <select data-cast-variation="${i}"><option value="">기본 원문</option>${(c.variants||[]).map(v =>
+          `<option value="${escA(v.id||'')}"${String(c.selected_variant_id||'')===String(v.id||'')?' selected':''}>${esc(v.name||'이름 없는 variation')}</option>`
+        ).join('')}</select></label>` : ''}
       <details class="cast-advanced" data-cast-advanced="${i}"${advancedOpen?' open':''}>
         <summary>위치 · Vibe · Reference</summary>
         <div class="cast-position">
@@ -16055,6 +16210,10 @@ function renderCast(name, openMember=-1){
   host.querySelectorAll('[data-cf]').forEach(el => el.addEventListener('input', () => {
     s.cast[+el.dataset.ci][el.dataset.cf] = el.value; tokens(); save();
   }));
+  host.querySelectorAll('[data-cast-variation]').forEach(el => el.addEventListener('change', () => {
+    s.cast[+el.dataset.castVariation].selected_variant_id = el.value;
+    tokens(); save();
+  }));
   host.querySelectorAll('[data-cpos]').forEach(el => el.addEventListener('change', () => {
     const member = s.cast[+el.dataset.ci];
     const inputs = host.querySelectorAll(`[data-cpos][data-ci="${el.dataset.ci}"]`);
@@ -16104,7 +16263,40 @@ $('scenePresetSave').addEventListener('click', async () => {
    마스크는 흰색이 '다시 그릴 곳'. NAI 는 64 배수 크기를 원하므로 맞춰서 보낸다.
    Outpaint도 별도 생성기가 아니라 원본 바깥을 자동 마스킹한 같은 infill 작업이다. */
 let I2I = {img:null, painting:false, erase:false, undo:[],
-  variationCharacter:null, operation:'edit', sourceWidth:0, sourceHeight:0};
+  variationCharacter:null, variationMode:'img2img',
+  hasVariationCandidate:false,
+  operation:'edit', sourceWidth:0, sourceHeight:0};
+function i2iVariationUpdate(){
+  const character = I2I.variationCharacter;
+  const tools = $('i2iVariationTools'), saves = $('i2iVariationSave');
+  if(!tools || !saves) return;
+  tools.classList.toggle('hidden', !character);
+  saves.classList.toggle(
+    'hidden', !character || !I2I.hasVariationCandidate);
+  if(!character) return;
+  I2I.variationMode = $('i2iVariationMode').value || 'img2img';
+  const effectivePrompt = [$('i2iTrialAppearance').value, $('i2iTrialOutfit').value]
+    .filter(Boolean).join(', ');
+  const reference = I2I.variationMode === 'character-reference'
+    ? 'Character Reference 1장 · 저장된 Vibe는 이 시험에서만 제외'
+    : I2I.variationMode === 'reference-inset'
+    ? '왼쪽 원본 보존 · 오른쪽 자동 마스크 Inpaint'
+    : I2I.variationMode === 'inpaint'
+    ? '사용자가 칠한 마스크만 Inpaint'
+    : '원본 전체 img2img';
+  $('i2iVariationPreview').innerHTML =
+    `<b>전송 전 확인</b><span>캐릭터 ${esc(effectivePrompt||'(비어 있음)')}</span>`
+    + `<span>Negative ${esc($('i2iTrialNegative').value||'(없음)')}</span>`
+    + `<span>${esc($('i2iTrialWidth').value)}×${esc($('i2iTrialHeight').value)}</span>`
+    + `<span>${esc(reference)}</span>`;
+  const manualMask = I2I.variationMode === 'inpaint';
+  ['i2iBrush','i2iErase','i2iUndo','i2iClear'].forEach(id => {
+    const el = $(id); if(el) el.disabled = !manualMask;
+  });
+  $('i2iMask').style.pointerEvents = manualMask ? 'auto' : 'none';
+  $('i2iMask').style.cursor = manualMask ? 'crosshair' : 'default';
+  if(window.i2iCostRefresh) window.i2iCostRefresh();
+}
 function outpaintValue(id){
   const raw = Math.max(0, Math.min(1536, Number($(id).value) || 0));
   const value = Math.round(raw / 64) * 64;
@@ -16191,6 +16383,7 @@ function i2iLoad(file){
           ? ` · '${I2I.variationCharacter.name}' 전체 프롬프트·착의·네거티브로 임시 변형`
           : ' (NAI 는 64 배수만 받습니다)')
         + (I2I.operation === 'outpaint' ? ' · 흰 바깥 영역만 이어 그립니다' : '');
+      i2iVariationUpdate();
       if(window.i2iCostRefresh) window.i2iCostRefresh();
     };
     im.src = fr.result;
@@ -16234,6 +16427,23 @@ async function resultToI2I(url, name, msg, variationCharacter=null, operation='e
   if(msg) msg.textContent = '결과 그림을 준비하는 중...';
   try{
     I2I.variationCharacter = variationCharacter;
+    if(variationCharacter){
+      I2I.hasVariationCandidate = false;
+      const effective = selectedVariationBundle(variationCharacter);
+      I2I.variationMode = 'img2img';
+      $('i2iVariationMode').value = 'img2img';
+      $('i2iVariationName').textContent =
+        `'${variationCharacter.name || '캐릭터'}' 이미지 시험·변형`;
+      $('i2iTrialAppearance').value =
+        effective.prompt;
+      $('i2iTrialOutfit').value =
+        effective.outfit;
+      $('i2iTrialNegative').value = effective.negative;
+      $('i2iTrialScene').value = STATE.base_prompt || '';
+      $('i2iTrialWidth').value = STATE.width || 832;
+      $('i2iTrialHeight').value = STATE.height || 1216;
+      $('i2iVariationSaveName').value = '';
+    }
     setI2IOperation(operation);
     const file = await resultFile(url, name);
     expClose();
@@ -16242,6 +16452,7 @@ async function resultToI2I(url, name, msg, variationCharacter=null, operation='e
     STATE.ui.result_tool = 'i2i';
     arrangeResultTools((STATE.ui || {}).layout !== 'classic');
     i2iLoad(file);
+    i2iVariationUpdate();
     if(msg) msg.textContent = operation === 'outpaint'
       ? 'Outpaint에 넣었습니다.' : 'img2img·인페인트에 넣었습니다.';
     setTimeout(() => $('i2iStage').scrollIntoView({behavior:'smooth', block:'start'}), 80);
@@ -16376,6 +16587,7 @@ if($('i2iDrop')){
   $('i2iFile').addEventListener('change', () => {
     if($('i2iFile').files[0]){
       I2I.variationCharacter = null;
+      i2iVariationUpdate();
       i2iLoad($('i2iFile').files[0]);
     }
     $('i2iFile').value = '';
@@ -16386,8 +16598,14 @@ if($('i2iDrop')){
     e.preventDefault(); $('i2iDrop').style.borderColor = ''; }));
   $('i2iDrop').addEventListener('drop', e => {
     const f = [...(e.dataTransfer.files || [])].find(x => /image\/(png|webp)/.test(x.type));
-    if(f){ I2I.variationCharacter = null; i2iLoad(f); }
+    if(f){ I2I.variationCharacter = null; i2iVariationUpdate(); i2iLoad(f); }
   });
+  [
+    'i2iVariationMode','i2iTrialWidth','i2iTrialHeight','i2iTrialScene',
+    'i2iTrialAppearance','i2iTrialOutfit','i2iTrialNegative',
+    'i2iRefStrength','i2iRefFidelity'
+  ].forEach(id => $(id).addEventListener(
+    id === 'i2iVariationMode' ? 'change' : 'input', i2iVariationUpdate));
   /* 원본 그림을 쓰는 작업은 Opus 무료가 아니다 — 실행 버튼 옆에 실제 비용을 띄운다 (CQA-008) */
   window.i2iCostRefresh = async () => {
     const el = $('i2iCost');
@@ -16395,14 +16613,28 @@ if($('i2iDrop')){
     const painted = i2iPainted();
     const outpaint = I2I.operation === 'outpaint';
     const b = $('i2iBase');
-    const w = Math.max(64, Math.floor(b.width / 64) * 64), h = Math.max(64, Math.floor(b.height / 64) * 64);
+    const trialMode = I2I.variationCharacter ? I2I.variationMode : '';
+    const w = ['character-reference','reference-inset'].includes(trialMode)
+      ? Number($('i2iTrialWidth').value)
+      : Math.max(64, Math.floor(b.width / 64) * 64);
+    const h = ['character-reference','reference-inset'].includes(trialMode)
+      ? Number($('i2iTrialHeight').value)
+      : Math.max(64, Math.floor(b.height / 64) * 64);
+    const costMode = trialMode === 'character-reference' ? 't2i'
+      : ['reference-inset','inpaint'].includes(trialMode) ? 'infill'
+      : (painted || outpaint) ? 'infill' : 'img2img';
     try{
       const r = await (await fetch('/api/anlas', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({count:1, mode: (painted || outpaint) ? 'infill' : 'img2img', width:w, height:h,
+        body: JSON.stringify({count:1, mode:costMode, width:w, height:h,
+          char_refs:trialMode === 'character-reference' ? 1 : 0,
           strength: Number($('i2iStrength').value)})})).json();
+      const label = trialMode === 'character-reference' ? 'Character Reference'
+        : trialMode === 'reference-inset' ? 'Reference inset'
+        : trialMode === 'inpaint' ? '인페인트'
+        : outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img';
       if(r.ok) el.textContent = r.est.total > 0
-        ? `💰 ${r.est.total} Anlas (${outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img'} — 원본을 쓰면 무료가 아닙니다)`
-        : `${outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img'} — ${r.est.why}`;
+        ? `💰 ${r.est.total} Anlas · ${label}`
+        : `${label} — ${r.est.why}`;
     }catch(e){}
   };
   if($('i2iStrength')) $('i2iStrength').addEventListener('change', () => window.i2iCostRefresh());
@@ -16410,6 +16642,11 @@ if($('i2iDrop')){
     if(!I2I.img){ $('i2iMsg').textContent = '먼저 그림을 넣어주세요.'; return; }
     const painted = i2iPainted();
     const outpaint = I2I.operation === 'outpaint';
+    const variationMode = I2I.variationCharacter ? I2I.variationMode : 'img2img';
+    if(variationMode === 'inpaint' && !painted){
+      $('i2iMsg').textContent = 'Inpaint 방식은 바꿀 부분을 먼저 칠해주세요.';
+      return;
+    }
     const margins = outpaintMargins();
     if(outpaint && !(margins.left || margins.right || margins.top || margins.bottom)){
       $('i2iMsg').textContent = '이어 그릴 방향의 확장 크기를 하나 이상 입력해주세요.';
@@ -16440,11 +16677,50 @@ if($('i2iDrop')){
         operation: outpaint ? 'outpaint' : 'edit',
         expansion: outpaint ? margins : null,
         strength: Number($('i2iStrength').value),
+        variation_mode:variationMode,
+        trial_width:Number($('i2iTrialWidth').value),
+        trial_height:Number($('i2iTrialHeight').value),
+        trial_scene_prompt:$('i2iTrialScene').value,
+        trial_appearance:$('i2iTrialAppearance').value,
+        trial_outfit:$('i2iTrialOutfit').value,
+        trial_negative:$('i2iTrialNegative').value,
+        reference_strength:Number($('i2iRefStrength').value),
+        reference_fidelity:Number($('i2iRefFidelity').value),
         variation_character_id:(I2I.variationCharacter||{}).id || ''})})).json();
+    if(r.ok && I2I.variationCharacter){
+      I2I.hasVariationCandidate = true;
+      i2iVariationUpdate();
+    }
     $('i2iMsg').textContent = r.ok
-      ? `${r.mode} 시작 (${r.width}×${r.height}) — 위 미리보기에 나옵니다`
+      ? `${r.mode} 시작 (${r.width}×${r.height}) — 일반 생성 설정은 바뀌지 않습니다`
+        + (r.vibe_suppressed ? ' · 저장 Vibe는 이 시험에서만 제외' : '')
       : (r.error || '실패');
   });
+  $('i2iVariationSave').querySelectorAll('[data-variation-save]').forEach(button =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try{
+        const r = await (await fetch('/api/character_variation_save', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            save_as:button.dataset.variationSave,
+            name:$('i2iVariationSaveName').value
+          })
+        })).json();
+        if(!r.ok) throw new Error(r.error || '저장하지 못했습니다.');
+        const at = (STATE.characters||[]).findIndex(item => item.id === r.character.id);
+        if(at >= 0) STATE.characters[at] = r.character;
+        if(r.revision != null) STATE._revision = r.revision;
+        rememberSavedKeys(['characters']);
+        renderLibrary(); renderSlots(); renderSettings();
+        $('i2iMsg').textContent =
+          `${r.character.name || '캐릭터'}에 ${button.textContent.trim()} 완료 ✓`;
+      }catch(error){
+        $('i2iMsg').textContent = String(error.message || error);
+      }finally{
+        button.disabled = false;
+      }
+    }));
 }
 
 /* ── 생성물 탐색기 · 선별 · 비교함 ──────────────────────────────────
@@ -18805,6 +19081,12 @@ function renderCharCards(){
   const shown = filtered.slice(0, CHAR_EDIT_LIMIT);
   shown.forEach(c => {
     const variant = c.variant && typeof c.variant === 'object' ? c.variant : {};
+    const assetImages = [
+      c.representative,
+      ...(Array.isArray(c.images) ? c.images : []),
+      ...(Array.isArray(c.evidence_images) ? c.evidence_images : []),
+      ...(Array.isArray(c.variation_images) ? c.variation_images : [])
+    ].filter((value,index,rows) => typeof value === 'string' && value && rows.indexOf(value) === index);
     const el = document.createElement('div'); el.className = 'slot';
     el.innerHTML = `<div class="r1"><input type="text" data-xc="${c.id}" data-xf="name" value="${escA(c.name)}" placeholder="이름">
       <button data-xdup="${c.id}" title="이 캐릭터를 복사해 의상·변형만 바꿉니다">복제</button>
@@ -18812,6 +19094,12 @@ function renderCharCards(){
       <textarea data-xc="${c.id}" data-xf="female" placeholder="girl, ...">${esc(c.female)}</textarea>
       <input type="text" data-xc="${c.id}" data-xf="clothed" placeholder="착의 (선택)" value="${escA(c.clothed)}" style="margin-top:4px;">
       <input type="text" data-xc="${c.id}" data-xf="negative" placeholder="전용 네거티브" value="${escA(c.negative)}" style="margin-top:4px;">
+      ${assetImages.length ? `<div class="bar" style="margin-top:6px;">
+        <img src="/img?u=${encodeURIComponent(assetImages[0])}" alt="${escA(c.name||'캐릭터')} 대표·근거"
+          loading="lazy" style="width:72px;height:72px;object-fit:cover;border-radius:var(--radius);">
+        <span class="hint">대표·근거 ${assetImages.length}장 · 저장 variation ${(c.variants||[]).length}개</span>
+        <button type="button" data-xbench="${c.id}" data-ximage="${escA(assetImages[0])}">이미지 시험·변형</button>
+      </div>` : `<p class="hint">근거 이미지를 자료실에서 열어 ‘이 증거 그림으로 캐릭터 변형’을 누르면 이미지 작업대를 시작할 수 있습니다.</p>`}
       <details class="cast-advanced"${variant.group ? ' open' : ''}>
         <summary>같은 캐릭터의 변형 묶음${variant.group ? ` · ${esc(variant.name || '기본 변형')}` : ''}</summary>
         <div class="grid3" style="margin-top:7px;">
@@ -18883,6 +19171,16 @@ function renderCharCards(){
     const input = document.querySelector(`[data-xc="${cloned.id}"][data-xf="name"]`);
     if(input){ input.focus(); input.select(); }
     flash(`'${name}' 복제됨 — 이름·의상·예술적 변형을 바꿔 저장하세요.`);
+  }));
+  h.querySelectorAll('[data-xbench]').forEach(button => button.addEventListener('click', async () => {
+    const character = (STATE.characters||[]).find(item => item.id === button.dataset.xbench);
+    if(!character) return;
+    const msg = $('charEditMsg');
+    await resultToI2I(
+      `/img?u=${encodeURIComponent(button.dataset.ximage)}`,
+      `${character.name || '캐릭터'} 근거.webp`,
+      msg,
+      characterBundle(character, false));
   }));
   h.querySelectorAll('[data-xdel]').forEach(b => b.addEventListener('click', () => {
     const chars = STATE.characters || [];
@@ -19021,7 +19319,9 @@ function openLib(it){
       `/img?u=${encodeURIComponent(it.images[0])}`,
       `${it.name || '캐릭터'} 증거.webp`,
       $('modalFlash'),
-      {id:ref.id || it.id, name:it.name || ref.name || '캐릭터'});
+      characterBundle(Object.assign({}, ref, {
+        id:ref.id || it.id, name:it.name || ref.name || '캐릭터'
+      }), false));
     if(ok) $('i2iMsg').textContent =
       `'${it.name}' 자산의 외형·착의·네거티브·Reference·Vibe를 임시 계획으로 사용합니다.`;
   });
@@ -22433,6 +22733,7 @@ class ConfigServer:
         self.pack_preview_blob = None
         self.pack_preview_sha256 = ""
         self.pack_preview_filename = ""
+        self.pending_variation = None
 
     def latest_config_from_disk(self):
         """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
@@ -22871,6 +23172,11 @@ class ConfigServer:
             d = json.loads(body or b"{}")
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        variation_mode = str(d.get("variation_mode") or "img2img").strip().lower()
+        if variation_mode not in (
+            "img2img", "inpaint", "character-reference", "reference-inset"
+        ):
+            return {"ok": False, "error": "알 수 없는 캐릭터 시험 방식입니다."}
         operation = str(d.get("operation") or "edit").strip().lower()
         if operation not in ("edit", "outpaint"):
             return {"ok": False, "error": "알 수 없는 이미지 편집 작업입니다."}
@@ -22881,7 +23187,9 @@ class ConfigServer:
         if operation == "outpaint" and not mask_b64:
             return {"ok": False, "error": "Outpaint 확장 영역 마스크가 없습니다."}
         mode = "Outpaint" if operation == "outpaint" else (
-            "인페인트" if mask_b64 else "img2img")
+            "Character Reference" if variation_mode == "character-reference"
+            else "Reference inset" if variation_mode == "reference-inset"
+            else "인페인트" if mask_b64 else "img2img")
         expansion = {}
         for key in ("left", "right", "top", "bottom"):
             try:
@@ -22895,6 +23203,7 @@ class ConfigServer:
             return {"ok": False, "error": "Outpaint 확장 방향과 크기가 없습니다."}
         try:
             raw = base64.b64decode(img_b64)
+            original_source_raw = raw
             with Image.open(io.BytesIO(raw)) as im:
                 w, h = im.size
             if mask_b64:
@@ -22903,13 +23212,37 @@ class ConfigServer:
                         return {"ok": False, "error": "원본과 마스크 크기가 다릅니다."}
         except Exception as e:
             return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
+        if variation_mode in ("character-reference", "reference-inset"):
+            try:
+                trial_w = int(d.get("trial_width") or cfg.get("width") or w)
+                trial_h = int(d.get("trial_height") or cfg.get("height") or h)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "시험 해상도가 올바르지 않습니다."}
+            trial_w = max(64, min(2048, trial_w // 64 * 64))
+            trial_h = max(64, min(2048, trial_h // 64 * 64))
+            if variation_mode == "character-reference":
+                w, h = trial_w, trial_h
+                mask_b64 = None
+            else:
+                try:
+                    inset = reference_inset_canvas(
+                        original_source_raw, trial_w, trial_h)
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+                raw = inset["image"]
+                img_b64 = base64.b64encode(raw).decode("ascii")
+                mask_b64 = base64.b64encode(inset["mask"]).decode("ascii")
+                w, h = inset["width"], inset["height"]
         # NAI 는 64 의 배수를 원한다
         w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
         if w > 2048 or h > 2048:
             return {"ok": False, "error": "최종 크기는 가로·세로 2048px를 넘을 수 없습니다."}
         original_b64 = (d.get("original") or "").split(",", 1)[-1] or None
         try:
-            source_raw = base64.b64decode(original_b64) if original_b64 else raw
+            source_raw = (
+                base64.b64decode(original_b64)
+                if original_b64 else original_source_raw
+            )
             with Image.open(io.BytesIO(source_raw)) as source:
                 source_size = {"width": source.width, "height": source.height}
         except Exception as e:
@@ -22919,6 +23252,8 @@ class ConfigServer:
         job_cfg = cfg
         variation_id = str(d.get("variation_character_id") or "").strip()
         variation_name = ""
+        variation_plan = None
+        transient_reference_bytes = None
         if variation_id:
             record = next(
                 (item for item in cfg.get("characters", [])
@@ -22933,26 +23268,72 @@ class ConfigServer:
                     char_refs=cfg.get("char_refs") or [],
                     vibes=cfg.get("vibes") or [],
                 )
+                planned_mode = (
+                    variation_mode
+                    if variation_mode != "reference-inset" else "inpaint"
+                )
+                prompt_overrides = {}
+                for target, source_key in (
+                    ("appearance", "trial_appearance"),
+                    ("outfit", "trial_outfit"),
+                    ("negative", "trial_negative"),
+                ):
+                    if source_key in d:
+                        prompt_overrides[target] = str(d.get(source_key) or "")
+                temporary_settings = {
+                    "strength": (
+                        1.0 if variation_mode == "reference-inset"
+                        else float(d.get("strength", 0.7))
+                    ),
+                    "noise": (
+                        0.0 if variation_mode == "reference-inset"
+                        else float(d.get("noise", 0.0))
+                    ),
+                    "reference_strength": float(
+                        d.get("reference_strength", 1.0)),
+                    "reference_fidelity": float(
+                        d.get("reference_fidelity", 0.6)),
+                }
                 plan = variation_plan_to_legacy_payload_material(asset, {
-                    "mode": "inpaint" if mask_b64 else "img2img",
+                    "mode": planned_mode,
                     "source_image": {
                         "content_hash": hashlib.sha256(raw).hexdigest()},
+                    "reference": (
+                        {"content_hash": source_hash}
+                        if variation_mode == "character-reference" else None
+                    ),
                     "mask": ({"content_hash": hashlib.sha256(
                         base64.b64decode(mask_b64)).hexdigest()}
                              if mask_b64 else None),
+                    "inset": (
+                        {"content_hash": source_hash}
+                        if variation_mode == "reference-inset" else None
+                    ),
+                    "prompt_overrides": prompt_overrides,
                     "seed": seed,
                     "resolution": {"width": w, "height": h},
-                    "temporary_settings": {
-                        "strength": float(d.get("strength", 0.7)),
-                        "noise": float(d.get("noise", 0.0)),
-                    },
+                    "temporary_settings": temporary_settings,
                 })
             except Exception as e:
                 return {"ok": False, "error": f"캐릭터 변형 계획을 만들지 못했습니다: {e}"}
             job_cfg = copy.deepcopy(cfg)
             job_cfg["char_slots"] = plan["char_slots"]
-            job_cfg["char_refs"] = plan["char_refs"]
-            job_cfg["vibes"] = plan["vibes"]
+            if variation_mode == "character-reference":
+                # Character Reference와 Vibe는 NAI에서 동시에 쓸 수 없다. 저장 자산의
+                # 연결은 유지하고, 이 요청 한 번에서만 새 Reference를 사용한다.
+                job_cfg["char_refs"] = [copy.deepcopy(plan["char_refs"][0])]
+                job_cfg["vibes"] = []
+                transient_reference_bytes = original_source_raw
+            else:
+                job_cfg["char_refs"] = plan["char_refs"]
+                job_cfg["vibes"] = plan["vibes"]
+            if "trial_scene_prompt" in d:
+                job_cfg["base_prompt"] = str(d.get("trial_scene_prompt") or "")
+            if "trial_base_negative" in d:
+                job_cfg["negative_prompt"] = str(
+                    d.get("trial_base_negative") or "")
+            job_cfg["width"], job_cfg["height"] = w, h
+            variation_plan = copy.deepcopy(plan["variation_plan"])
             variation_name = str(record.get("name") or variation_id)
         tok = self.live.try_claim(
             mode,
@@ -22982,6 +23363,22 @@ class ConfigServer:
         )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
+        if transient_reference_bytes is not None:
+            job_cfg["char_refs"][0]["_image_bytes"] = transient_reference_bytes
+            job_cfg["char_refs"][0]["_required"] = True
+        with self.config_lock:
+            self.pending_variation = ({
+                "character_id": variation_id,
+                "character_name": variation_name,
+                "asset_fingerprint": (
+                    variation_plan.get("character_asset_fingerprint")
+                    if variation_plan else ""),
+                "plan": copy.deepcopy(variation_plan),
+                "mode": variation_mode,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "result_path": "",
+                "job_id": self.live.job_id,
+            } if variation_id else None)
 
         def run():
             label = f"{variation_name} 변형" if variation_name else mode
@@ -22996,9 +23393,20 @@ class ConfigServer:
                 slots = [s for s in job_cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
                 params = runtime_generation_params(job_cfg, job_cfg["token"])
-                params["_i2i"] = {"image": img_b64, "mask": mask_b64,
-                                  "strength": float(d.get("strength", 0.7)),
-                                  "noise": float(d.get("noise", 0.0)), "seed": seed}
+                if variation_mode != "character-reference":
+                    params["_i2i"] = {
+                        "image": img_b64,
+                        "mask": mask_b64,
+                        "strength": (
+                            1.0 if variation_mode == "reference-inset"
+                            else float(d.get("strength", 0.7))
+                        ),
+                        "noise": (
+                            0.0 if variation_mode == "reference-inset"
+                            else float(d.get("noise", 0.0))
+                        ),
+                        "seed": seed,
+                    }
                 try:
                     img = call_nai_api(
                         job_cfg["token"], job_cfg.get("base_prompt", "") or "1girl", "", "",
@@ -23026,6 +23434,24 @@ class ConfigServer:
                     artifact=saved.resolve().relative_to(
                         out_root(job_cfg).resolve()).as_posix(),
                 )
+                if variation_id:
+                    with self.config_lock:
+                        pending = self.pending_variation
+                        if (
+                            isinstance(pending, dict)
+                            and pending.get("character_id") == variation_id
+                            and pending.get("job_id") == self.live.job_id
+                        ):
+                            pending.update({
+                                "result_path": str(saved.resolve()),
+                                "result_hash": hashlib.sha256(
+                                    saved.read_bytes()).hexdigest(),
+                                "seed": seed,
+                                "width": w,
+                                "height": h,
+                                "completed_at": datetime.now().isoformat(
+                                    timespec="seconds"),
+                            })
                 self.live.set_image(img)
                 st = load_state(); bump_daily(st); save_state(st)
                 self.live.update(
@@ -23045,7 +23471,96 @@ class ConfigServer:
             "source_hash": source_hash, "expansion": (
                 expansion if operation == "outpaint" else None),
             "variation_character": variation_name,
+            "variation_mode": variation_mode if variation_id else "",
+            "temporary": bool(variation_id),
+            "vibe_suppressed": bool(
+                variation_id and variation_mode == "character-reference"
+                and plan.get("vibes")),
         }
+
+    @serialized_data_write(lambda: CHAR_DIR.parent)
+    def handle_character_variation_save(self, body):
+        """완료된 고정 결과를 명시 선택한 캐릭터 자산 항목에만 추가한다."""
+        try:
+            request = json.loads(body or b"{}")
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        save_as = str(request.get("save_as") or "").strip()
+        if save_as not in ("representative", "evidence", "variation"):
+            return {"ok": False, "error": "대표·근거·variation 중 저장 위치를 골라주세요."}
+        with self.config_lock:
+            pending = copy.deepcopy(self.pending_variation)
+            if not isinstance(pending, dict) or not pending.get("result_path"):
+                return {"ok": False, "error": "저장할 완료 결과가 없습니다."}
+            result_path = Path(str(pending["result_path"])).resolve()
+            latest = self.latest_config_from_disk()
+            root = out_root(latest).resolve()
+            try:
+                inside = result_path.is_relative_to(root)
+            except AttributeError:
+                inside = str(result_path).startswith(str(root))
+            if not inside or not result_path.is_file():
+                return {"ok": False, "error": "고정된 생성 결과 파일을 확인할 수 없습니다."}
+            actual_hash = hashlib.sha256(result_path.read_bytes()).hexdigest()
+            if actual_hash != str(pending.get("result_hash") or ""):
+                return {"ok": False, "error": "생성 뒤 결과 파일이 바뀌어 저장하지 않았습니다."}
+            character = next((
+                item for item in (latest.get("characters") or [])
+                if str(item.get("id") or "") == str(pending.get("character_id") or "")
+            ), None)
+            if character is None:
+                return {"ok": False, "error": "대상 캐릭터가 없어졌습니다."}
+            try:
+                asset = character_asset_from_legacy_record(
+                    character,
+                    char_refs=latest.get("char_refs") or [],
+                    vibes=latest.get("vibes") or [],
+                )
+                proposal = accept_variation(
+                    asset,
+                    pending.get("plan") or {},
+                    {
+                        "image_ref": {"content_hash": actual_hash},
+                        "name": str(request.get("name") or "").strip(),
+                        "metadata": {
+                            key: copy.deepcopy(pending.get(key))
+                            for key in (
+                                "mode", "job_id", "seed", "width", "height",
+                                "started_at", "completed_at",
+                            )
+                        },
+                    },
+                )
+                candidates = approved_proposal_to_legacy_candidates(
+                    character, proposal, approved=True)
+            except Exception as e:
+                return {"ok": False, "conflict": True, "error": str(e)}
+            content_type = (
+                "image/png" if result_path.suffix.lower() == ".png"
+                else "image/webp"
+            )
+            local_ref, _ = _local_import_image(
+                result_path.read_bytes(), content_type)
+            updated_character = apply_character_variation_candidates(
+                character,
+                candidates,
+                local_ref=local_ref,
+                save_as=save_as,
+            )
+            character.clear()
+            character.update(updated_character)
+            self.cfg.clear()
+            self.cfg.update(latest)
+            sync_chars_to_files(self.cfg)
+            save_config(self.cfg)
+            self.config_revision += 1
+            return {
+                "ok": True,
+                "save_as": save_as,
+                "character": copy.deepcopy(character),
+                "revision": self.config_revision,
+                "local_ref": local_ref,
+            }
 
     def handle_regen(self, body):
         """그림체 복구 — 뽑아 둔 그림의 **메타데이터를 읽어 그 설정 그대로 다시 돌린다**.
@@ -25119,7 +25634,13 @@ class ConfigServer:
                         opus = bool(known_balance and known_balance.get("opus"))
                         cfg = server.cfg
                         # 켜진 캐릭터 레퍼런스 수 — Opus 무료 생성은 유지되고 장당 +5만 별도 과금
-                        refs = sum(1 for r in cfg.get("char_refs", []) if r.get("enabled"))
+                        refs = (
+                            max(0, int(d.get("char_refs")))
+                            if "char_refs" in d
+                            else sum(
+                                1 for r in cfg.get("char_refs", [])
+                                if r.get("enabled"))
+                        )
                         # 아직 인코딩 안 된 바이브 — 처음 한 번만 2 Anlas
                         vibe_new = 0
                         for v in cfg.get("vibes", []):
@@ -25376,6 +25897,8 @@ class ConfigServer:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/i2i"):
                     self._json(server.handle_i2i(body))
+                elif self.path.startswith("/api/character_variation_save"):
+                    self._json(server.handle_character_variation_save(body))
                 elif self.path.startswith("/api/regen"):
                     self._json(server.handle_regen(body))
                 elif self.path.startswith("/api/scenes_run"):
