@@ -187,6 +187,7 @@ from src.nai_studio.services import (
     local_image_store as _local_image_store,
     metadata_candidate_store as _metadata_candidate_store,
     output_lifecycle as _output_lifecycle,
+    public_style_import as _public_style_import,
     style_store as _style_store,
     user_backup_store as _user_backup_store,
 )
@@ -4812,57 +4813,24 @@ def _local_import_image(data, content_type, source_url=""):
     return f"local:{name}", created
 
 
-def _style_record_from_public_image(data, content_type, article):
-    """공개 이미지의 NAI 메타를 프롬프트 무손실 그림체 묶음으로 바꾼다."""
-    meta = extract_nai_metadata(data, content_type)
-    if meta["metadata_status"] != "ok":
-        return None
-    params = dict(meta.get("params") or {})
-    source_model = model_id_from_metadata(
-        params.get("model"), "nai-diffusion-4-5-full")
-    uc_preset, user_negative = split_uc_preset(
-        meta.get("negative") or "", source_model)
-    if "uc_preset" not in params and uc_preset is not None:
-        params["uc_preset"] = uc_preset
-        params["uc_preset_guessed"] = True
-    base_prompt, quality_toggle = restore_quality_prompt(
-        meta.get("base") or "", source_model, params)
-    if "quality_toggle" not in params:
-        params["quality_toggle"] = quality_toggle
-        params["quality_toggle_guessed"] = True
-    artists, rest = parse_artist_combo(base_prompt)
-    article_id = str(article.get("article_id") or "")
-    image_digest = hashlib.sha256(data).hexdigest()
-    return {
-        "id": f"arca-{article_id}-{image_digest[:12]}",
-        "title": str(article.get("title") or f"아카라이브 {article_id}")[:160],
-        "source": "아카라이브",
-        "tab": str(article.get("board_tab") or ""),
-        "posted_at": str(article.get("posted_at") or ""),
-        "recommend": article.get("recommend"),
-        "views": article.get("views"),
-        "url": str(article.get("source_url") or ""),
-        "count": len(artists),
-        "combo": ", ".join(
-            f"{weight:g}::artist:{name}::" if weight is not None
-            else f"artist:{name}" for weight, name in artists),
-        "artists": [name for _, name in artists],
-        "weights": {
-            name: (weight if weight is not None else 1.0)
-            for weight, name in artists
-        },
-        "base": base_prompt,
-        "rest": ", ".join(rest),
-        "negative": (
-            user_negative if uc_preset is not None
-            else meta.get("negative") or ""),
-        "negative_full": meta.get("negative") or "",
-        "characters": copy.deepcopy(meta.get("characters") or []),
-        "metadata_raw": copy.deepcopy(meta.get("raw") or {}),
-        "params": params,
-        "images": [],
-    }
+def _public_style_import_operations():
+    """현재 메타·모델·UC·품질·작가 파서를 호출 때 주입해 APP patch를 보존한다."""
+    return _public_style_import.PublicStyleImportOperations(
+        extract_metadata=extract_nai_metadata,
+        model_id=model_id_from_metadata,
+        split_uc_preset=split_uc_preset,
+        restore_quality_prompt=restore_quality_prompt,
+        parse_artist_combo=parse_artist_combo,
+    )
 
+
+def _style_record_from_public_image(data, content_type, article):
+    return _public_style_import.style_record_from_public_image(
+        _public_style_import_operations(),
+        data,
+        content_type,
+        article,
+    )
 
 class PublicCollectionManager(_PublicCollectionManager):
     """기존 import와 patch 지점을 유지하는 공개자료 서비스 연결."""
