@@ -3,8 +3,21 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+@dataclass(frozen=True)
+class FragmentImportOperations:
+    """조각 경로·이름 정리·원자 저장·목록 조회를 현재 앱에 연결한다."""
+
+    fragment_dir: Callable[[], Path]
+    safe_name: Callable[[str], str]
+    atomic_write_text: Callable[..., None]
+    list_fragments: Callable[[], dict]
 
 
 def save_fragment_workflow(operations: Any, data: dict) -> dict:
@@ -65,8 +78,80 @@ def preview_fragment_workflow(operations: Any, data: dict) -> dict:
     }
 
 
+def import_fragments_bytes(
+    operations: FragmentImportOperations,
+    data: bytes,
+    filename: str = "",
+) -> dict:
+    """TXT 또는 ZIP의 조각을 UTF-8·CP949로 읽고 기존 이름은 보존한다."""
+    directory = operations.fragment_dir()
+    directory.mkdir(exist_ok=True)
+    added: list[str] = []
+    skipped: list[str] = []
+    if data[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for name in archive.namelist():
+                if name.lower().endswith(".txt") and not name.endswith("/"):
+                    _put_imported_fragment(
+                        operations,
+                        Path(name).stem,
+                        archive.read(name),
+                        added,
+                        skipped,
+                    )
+    else:
+        _put_imported_fragment(
+            operations,
+            Path(filename).stem or "조각",
+            data,
+            added,
+            skipped,
+        )
+    return {
+        "ok": bool(added),
+        "added": added,
+        "skipped": skipped,
+        "fragments": operations.list_fragments(),
+    }
+
+
+def _put_imported_fragment(
+    operations: FragmentImportOperations,
+    stem: str,
+    raw: bytes,
+    added: list[str],
+    skipped: list[str],
+) -> None:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("cp949")
+        except Exception:
+            skipped.append(f"{stem}: 글자 인코딩을 못 읽었습니다")
+            return
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        skipped.append(f"{stem}: 빈 파일")
+        return
+    base = operations.safe_name(stem) or "조각"
+    target = operations.fragment_dir() / f"{base}.txt"
+    serial = 2
+    while target.exists():
+        target = operations.fragment_dir() / f"{base} ({serial}).txt"
+        serial += 1
+    operations.atomic_write_text(
+        target,
+        "\n".join(lines) + "\n",
+        keep_backup=False,
+    )
+    added.append(target.stem)
+
+
 __all__ = [
     "delete_fragment_workflow",
+    "FragmentImportOperations",
+    "import_fragments_bytes",
     "preview_fragment_workflow",
     "reset_fragment_sequence",
     "save_fragment_workflow",

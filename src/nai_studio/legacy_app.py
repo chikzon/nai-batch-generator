@@ -201,6 +201,7 @@ from src.nai_studio.services import (
     generation_progress as _generation_progress,
     generation_retry as _generation_retry,
     generation_step as _generation_step,
+    fragment_workflow as _fragment_workflow,
     image_tool_handlers as _image_tool_handlers,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
@@ -259,6 +260,7 @@ from src.nai_studio.services.generation_blueprint import (
     generation_blueprint,
 )
 from src.nai_studio.services.generation_runtime import (
+    finalized_token_texts as _finalized_token_texts,
     runtime_generation_params as _prepare_runtime_references,
 )
 from src.nai_studio.services.nai_client import (
@@ -1298,50 +1300,29 @@ def artist_workspace_request(data):
         data,
     )
 
+
+def _style_catalog_paths():
+    return _library_catalog.StyleCatalogPaths(
+        style_file=STYLE_FILE,
+        combo_file=COMBO_FILE,
+    )
+
+
+def _style_catalog_operations():
+    return _library_catalog.StyleCatalogOperations(
+        load_json=load_json_recover,
+        info=log.info,
+        warning=log.warning,
+        lock=_COMBOS_LOCK,
+    )
+
+
 def load_combos():
-    if _COMBOS["loaded"]:
-        return _COMBOS["rows"]
-    # 첫 화면의 개수 조회와 사용자의 모달 열기가 겹쳐도 732건 JSON을 두 번 동시에
-    # 읽고 파싱하지 않는다. ThreadingHTTPServer라 잠금이 없으면 둘 다 loaded=False를
-    # 보고 같은 큰 파일을 잡아 메인 화면까지 버벅였다.
-    with _COMBOS_LOCK:
-        if _COMBOS["loaded"]:
-            return _COMBOS["rows"]
-        rows = []
-        for f in (STYLE_FILE, COMBO_FILE):
-            if not f.exists():
-                continue
-            try:
-                rows = load_json_recover(f)
-                log.info(f"그림체 로드: {len(rows)}개 ({f.name})")
-                break
-            except Exception as e:
-                log.warning(f"그림체 로드 실패 {f.name}: {e}")
-        search = []
-        sources, tabs, seeded_count = {}, {}, 0
-        for row in rows:
-            if not isinstance(row, dict):
-                search.append("")
-                continue
-            search.append((
-                str(row.get("combo") or "") + " "
-                + str(row.get("title") or "") + " "
-                + str(row.get("source") or "") + " "
-                + str(row.get("rest") or "") + " "
-                + str(row.get("negative") or "")
-            ).casefold())
-            source = row.get("source") or "도랑"
-            sources[source] = sources.get(source, 0) + 1
-            tab = row.get("tab") or ""
-            if tab:
-                tabs[tab] = tabs.get(tab, 0) + 1
-            if (row.get("params") or {}).get("seed"):
-                seeded_count += 1
-        _COMBOS.update({
-            "loaded": True, "rows": rows, "search": search,
-            "sources": sources, "tabs": tabs, "seeded": seeded_count,
-        })
-    return _COMBOS["rows"]
+    return _library_catalog.load_style_catalog(
+        _style_catalog_paths(),
+        _style_catalog_operations(),
+        _COMBOS,
+    )
 
 
 def add_style(rec, import_info=None, return_detail=False):
@@ -3250,6 +3231,12 @@ def _comparison_handler_operations():
         comparison_characters=globals()["comparison_characters"],
         comparison_sources=globals()["comparison_sources"],
         run_comparison=globals()["_run_comparison"],
+        selected_comparison_record=globals()[
+            "_selected_comparison_record"
+        ],
+        rerun_selected_comparison=globals()[
+            "_rerun_selected_comparison"
+        ],
         start_daemon=lambda target: globals()["threading"].Thread(
             target=target,
             daemon=True,
@@ -3513,44 +3500,29 @@ def _prefill_partner_defaults(cfg):
     return cfg
 
 
+def _config_initialization_operations():
+    """설정 복구와 캐릭터 동기화의 기존 patch 경계를 늦게 연결한다."""
+    return _management_state.ConfigInitializationOperations(
+        load_settings=globals()["load_settings_recover"],
+        quarantine_corrupt=globals()["quarantine_corrupt_settings"],
+        migrate_legacy=globals()["_migrate_legacy"],
+        ensure_settings_migration=globals()["ensure_settings_migration"],
+        migrate_selections=globals()["migrate_legacy_selections"],
+        migrate_char_slots=globals()["migrate_char_slots"],
+        import_char_files=globals()["import_char_files"],
+        sync_chars_to_files=globals()["sync_chars_to_files"],
+        save_config=globals()["save_config"],
+        log_critical=globals()["log"].critical,
+    )
+
+
 def load_or_init_config():
     global STARTUP_RECOVERY_NOTICE
-    STARTUP_RECOVERY_NOTICE = None
-    if SETTINGS_FILE.exists():
-        try:
-            cfg = load_settings_recover(SETTINGS_FILE)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
-            # 주 파일과 `.bak`이 모두 JSON으로 읽히지 않는 경우만 구조 시작으로 전환한다.
-            # 권한·디스크 오류는 손상으로 오인해 파일을 옮기지 않고 그대로 알린다.
-            STARTUP_RECOVERY_NOTICE = quarantine_corrupt_settings(
-                SETTINGS_FILE, e)
-            log.critical(
-                "설정과 자동 백업이 모두 손상되어 원본을 보관하고 기본 설정으로 시작합니다: %s",
-                STARTUP_RECOVERY_NOTICE["folder"])
-            cfg = dict(DEFAULT_CONFIG)
-            cfg = _migrate_legacy(cfg)
-            ensure_settings_migration()
-            migrate_legacy_selections(cfg)
-            import_char_files(cfg)
-            sync_chars_to_files(cfg)
-            save_config(cfg)
-            return cfg
-        merged = dict(DEFAULT_CONFIG)
-        merged.update(cfg)
-        ensure_settings_migration()
-        migrate_legacy_selections(merged)
-        migrate_char_slots(merged)
-        import_char_files(merged)
-        sync_chars_to_files(merged)
-        save_config(merged)
-        return merged
-    cfg = dict(DEFAULT_CONFIG)
-    cfg = _migrate_legacy(cfg)
-    ensure_settings_migration()
-    migrate_legacy_selections(cfg)
-    import_char_files(cfg)
-    sync_chars_to_files(cfg)
-    save_config(cfg)
+    cfg, STARTUP_RECOVERY_NOTICE = _management_state.load_or_init_config(
+        SETTINGS_FILE,
+        DEFAULT_CONFIG,
+        _config_initialization_operations(),
+    )
     return cfg
 
 
@@ -4135,6 +4107,15 @@ def save_fragment(name, lines):
     return safe
 
 
+def _fragment_import_operations():
+    return _fragment_workflow.FragmentImportOperations(
+        fragment_dir=lambda: FRAG_DIR,
+        safe_name=_safe_name,
+        atomic_write_text=atomic_write_text,
+        list_fragments=list_fragments,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  씬 모드 — NAIS3 식 평면 씬 목록. 세팅과 **별도로 병존**한다.
 #    세팅 = 5장 묶음 + 문맥에 반응하는 옵션 (구조적 대규모)
@@ -4207,42 +4188,11 @@ def export_fragments_zip():
 
 def import_fragments_bytes(data, filename=""):
     """조각 TXT 낱개 또는 ZIP. 같은 이름이면 덮지 않고 ' (2)' 를 붙인다."""
-    import io
-    import zipfile
-    FRAG_DIR.mkdir(exist_ok=True)
-    added, skipped = [], []
-
-    def put(stem, raw):
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                text = raw.decode("cp949")       # 메모장에서 만든 파일
-            except Exception:
-                skipped.append(f"{stem}: 글자 인코딩을 못 읽었습니다")
-                return
-        lines = [x.strip() for x in text.splitlines() if x.strip()]
-        if not lines:
-            skipped.append(f"{stem}: 빈 파일")
-            return
-        base = _safe_name(stem) or "조각"
-        target, k = FRAG_DIR / f"{base}.txt", 2
-        while target.exists():
-            target = FRAG_DIR / f"{base} ({k}).txt"
-            k += 1
-        atomic_write_text(
-            target, "\n".join(lines) + "\n", keep_backup=False)
-        added.append(target.stem)
-
-    if data[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for n in z.namelist():
-                if n.lower().endswith(".txt") and not n.endswith("/"):
-                    put(Path(n).stem, z.read(n))
-    else:
-        put(Path(filename).stem or "조각", data)
-    return {"ok": bool(added), "added": added, "skipped": skipped,
-            "fragments": list_fragments()}
+    return _fragment_workflow.import_fragments_bytes(
+        _fragment_import_operations(),
+        data,
+        filename,
+    )
 
 
 def resolve_fragments(texts, frags=None, counters=None, rng=None):
@@ -4257,51 +4207,19 @@ def resolve_fragments(texts, frags=None, counters=None, rng=None):
 
 
 def finalized_token_texts(base, negative, chars, char_negatives, cfg):
-    """Return NAI-bound prompt strings without advancing fragment state.
-
-    The token preview must expand fragments, normalize weights, append the
-    quality suffix, and merge the UC preset just like ``call_nai_api``. A
-    private RNG keeps a preview from consuming the generator random stream.
-    """
-    chars = list(chars or [])
-    char_negatives = list(char_negatives or [])
-    count = max(len(chars), len(char_negatives))
-    chars += [""] * (count - len(chars))
-    char_negatives += [""] * (count - len(char_negatives))
-    pairs = [[chars[i], char_negatives[i]] for i in range(count)]
-
-    fixed = [strip_comment_lines(x) for x in (base, negative, "", "", "", "")]
-    flat = [strip_comment_lines(x) for pair in pairs for x in pair]
-    if cfg.get("use_fragments", True):
-        counters = cfg.get("_frag_counters")
-        if counters is None:
-            try:
-                counters = load_state().get("frag_seq", {})
-            except Exception:
-                counters = {}
-        resolved, _ = resolve_fragments(
-            fixed + flat, counters=dict(counters or {}), rng=random.Random(0))
-        fixed, flat = list(resolved[:6]), list(resolved[6:])
-
-    fixed = [normalize_prompt(x) for x in fixed]
-    flat = [normalize_prompt(x) for x in flat]
-    base, negative = fixed[0], fixed[1]
-    if cfg.get("quality_toggle"):
-        base = merge_quality_suffix(
-            base,
-            cfg.get("model") or "nai-diffusion-4-5-full",
-        )
-    negative = merge_uc_preset(
+    return _finalized_token_texts(
+        base,
         negative,
-        cfg.get("model") or "nai-diffusion-4-5-full",
-        cfg.get("uc_preset"),
+        chars,
+        char_negatives,
+        cfg,
+        strip_comments=globals()["strip_comment_lines"],
+        load_state=globals()["load_state"],
+        resolve_fragments=globals()["resolve_fragments"],
+        normalize_prompt=globals()["normalize_prompt"],
+        merge_quality_suffix=globals()["merge_quality_suffix"],
+        merge_uc_preset=globals()["merge_uc_preset"],
     )
-    return {
-        "base": base,
-        "negative": negative,
-        "chars": [flat[i * 2] for i in range(count)],
-        "char_negatives": [flat[i * 2 + 1] for i in range(count)],
-    }
 
 
 # ═══════════════ 진행 상태 (재개용) ═══════════════
@@ -4823,43 +4741,11 @@ class ConfigServer:
         )
 
     def handle_compare_rerun(self, body):
-        """선택 실험 결과 한 장의 canonical 셀만 같은 seed로 다시 실행한다."""
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        try:
-            data = json.loads(body or b"{}")
-            path = str(data.get("path") or "")
-            with self.config_lock:
-                run_cfg = copy.deepcopy(self.cfg)
-            if not run_cfg.get("token", "").startswith("pst-"):
-                return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-            # 실행권을 잡기 전에 manifest와 셀 재료가 실제로 있는지 확인한다.
-            _selected_comparison_record(run_cfg, path)
-        except Exception as error:
-            return {"ok": False, "error": str(error)}
-        token = self.live.try_claim(
-            "비교 한 셀 재실행",
-            "library",
-            payload_identity={"kind": "comparison-rerun", "path": path},
+        return _comparison_handlers.handle_compare_rerun(
+            self,
+            {"body": body},
+            _comparison_handler_operations(),
         )
-        if token is None:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-
-        def run():
-            try:
-                _rerun_selected_comparison(self, run_cfg, path)
-            except Exception as error:
-                log.error("비교 한 셀 재실행 실패: %s", error)
-                self.live.update(
-                    status_text=f"비교 한 셀 재실행 실패: {error}",
-                    failed=1, last_error=str(error),
-                    phase="failed", can_retry=True,
-                )
-            finally:
-                self.live.release(token)
-
-        threading.Thread(target=run, daemon=True).start()
-        return {"ok": True, "path": path}
 
     def handle_inspect(self, body, filename="", save_flag=""):
         return _collection_handlers.handle_inspect(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -58,6 +59,20 @@ class ConfigProjectionOperations:
     comparison_progress: Callable[[], dict]
     project_comparison_progress: Callable[[dict], dict]
     redact: Callable[[Any], str]
+
+
+@dataclass(frozen=True)
+class ConfigInitializationOperations:
+    load_settings: Callable[[Path], dict]
+    quarantine_corrupt: Callable[[Path, Exception], dict]
+    migrate_legacy: Callable[[dict], dict]
+    ensure_settings_migration: Callable[[], Any]
+    migrate_selections: Callable[[dict], Any]
+    migrate_char_slots: Callable[[dict], Any]
+    import_char_files: Callable[[dict], Any]
+    sync_chars_to_files: Callable[[dict], Any]
+    save_config: Callable[[dict], Any]
+    log_critical: Callable[..., Any]
 
 
 def resolve_common_job_store(
@@ -436,6 +451,55 @@ def latest_config_from_disk(
     return merged
 
 
+def load_or_init_config(
+    settings_file: Path,
+    defaults: dict,
+    operations: ConfigInitializationOperations,
+) -> tuple[dict, dict | None]:
+    """설정 복구·마이그레이션·캐릭터 동기화의 기존 순서를 보존한다."""
+    recovery_notice = None
+    if settings_file.exists():
+        try:
+            config = operations.load_settings(settings_file)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            recovery_notice = operations.quarantine_corrupt(
+                settings_file,
+                error,
+            )
+            operations.log_critical(
+                "설정과 자동 백업이 모두 손상되어 원본을 보관하고 "
+                "기본 설정으로 시작합니다: %s",
+                recovery_notice["folder"],
+            )
+            config = operations.migrate_legacy(dict(defaults))
+            operations.ensure_settings_migration()
+            operations.migrate_selections(config)
+            operations.import_char_files(config)
+            operations.sync_chars_to_files(config)
+            operations.save_config(config)
+            return config, recovery_notice
+        merged = dict(defaults)
+        merged.update(config)
+        operations.ensure_settings_migration()
+        operations.migrate_selections(merged)
+        operations.migrate_char_slots(merged)
+        operations.import_char_files(merged)
+        operations.sync_chars_to_files(merged)
+        operations.save_config(merged)
+        return merged, recovery_notice
+    config = operations.migrate_legacy(dict(defaults))
+    operations.ensure_settings_migration()
+    operations.migrate_selections(config)
+    operations.import_char_files(config)
+    operations.sync_chars_to_files(config)
+    operations.save_config(config)
+    return config, recovery_notice
+
+
 def snapshot_jobs(
     server: Any,
     operations: ConfigProjectionOperations,
@@ -497,12 +561,14 @@ def snapshot_jobs(
 
 __all__ = [
     "ConfigProjectionOperations",
+    "ConfigInitializationOperations",
     "JobLedgerOperations",
     "JobLedgerPaths",
     "finish_durable_job",
     "finish_job_record",
     "job_ledger_summary",
     "latest_config_from_disk",
+    "load_or_init_config",
     "link_job_ancestor",
     "load_job_ledger",
     "record_job_result",

@@ -24,6 +24,8 @@ class ComparisonHandlerOperations:
     comparison_characters: Callable[[dict], list]
     comparison_sources: Callable[[dict, Any], tuple[list, list]]
     run_comparison: Callable[..., Any]
+    selected_comparison_record: Callable[[dict, str], Any]
+    rerun_selected_comparison: Callable[[Any, dict, str], Any]
     start_daemon: Callable[[Callable[[], Any]], Any]
     error: Callable[..., Any]
 
@@ -209,6 +211,68 @@ def handle_compare_run(
     return {"ok": True, "plan": plan}
 
 
+def handle_compare_rerun(
+    server: Any,
+    data: dict,
+    operations: ComparisonHandlerOperations,
+) -> dict:
+    """검증된 비교 결과 한 셀의 같은 seed 재실행권을 잡는다."""
+    if server.live.running:
+        return {"ok": False, "error": "이미 생성 중입니다."}
+    try:
+        request = json.loads(data.get("body") or b"{}")
+        path = str(request.get("path") or "")
+        with server.config_lock:
+            run_config = copy.deepcopy(server.cfg)
+        if not run_config.get("token", "").startswith("pst-"):
+            return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
+        operations.selected_comparison_record(run_config, path)
+    except Exception as error:
+        return {"ok": False, "error": str(error)}
+    token = server.live.try_claim(
+        "비교 한 셀 재실행",
+        "library",
+        payload_identity={
+            "kind": "comparison-rerun",
+            "path": path,
+        },
+    )
+    if token is None:
+        return {"ok": False, "error": "이미 생성 중입니다."}
+    operations.start_daemon(
+        lambda: _comparison_rerun_worker(
+            operations,
+            server,
+            run_config,
+            path,
+            token,
+        )
+    )
+    return {"ok": True, "path": path}
+
+
+def _comparison_rerun_worker(
+    operations: ComparisonHandlerOperations,
+    server: Any,
+    config: dict,
+    path: str,
+    token: Any,
+) -> None:
+    try:
+        operations.rerun_selected_comparison(server, config, path)
+    except Exception as error:
+        operations.error("비교 한 셀 재실행 실패: %s", error)
+        server.live.update(
+            status_text=f"비교 한 셀 재실행 실패: {error}",
+            failed=1,
+            last_error=str(error),
+            phase="failed",
+            can_retry=True,
+        )
+    finally:
+        server.live.release(token)
+
+
 def _comparison_confirmation(
     request: dict,
     plan: dict,
@@ -277,5 +341,6 @@ def _comparison_worker(
 __all__ = [
     "ComparisonHandlerOperations",
     "handle_compare_promote",
+    "handle_compare_rerun",
     "handle_compare_run",
 ]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from typing import Any
 
 
@@ -231,6 +232,77 @@ def token_response(application: Any, operations: Any, data: dict) -> dict:
     }
 
 
+def finalized_token_texts(
+    base: str,
+    negative: str,
+    characters: list,
+    character_negatives: list,
+    config: dict,
+    *,
+    strip_comments: Any,
+    load_state: Any,
+    resolve_fragments: Any,
+    normalize_prompt: Any,
+    merge_quality_suffix: Any,
+    merge_uc_preset: Any,
+) -> dict:
+    """미리보기에서 fragment 상태를 소비하지 않고 실제 전송 문자열을 조립한다."""
+    characters = list(characters or [])
+    character_negatives = list(character_negatives or [])
+    count = max(len(characters), len(character_negatives))
+    characters += [""] * (count - len(characters))
+    character_negatives += [""] * (
+        count - len(character_negatives)
+    )
+    pairs = [
+        [characters[index], character_negatives[index]]
+        for index in range(count)
+    ]
+    fixed = [
+        strip_comments(value)
+        for value in (base, negative, "", "", "", "")
+    ]
+    flat = [
+        strip_comments(value)
+        for pair in pairs
+        for value in pair
+    ]
+    if config.get("use_fragments", True):
+        counters = config.get("_frag_counters")
+        if counters is None:
+            try:
+                counters = load_state().get("frag_seq", {})
+            except Exception:
+                counters = {}
+        resolved, _ = resolve_fragments(
+            fixed + flat,
+            counters=dict(counters or {}),
+            rng=random.Random(0),
+        )
+        fixed = list(resolved[:6])
+        flat = list(resolved[6:])
+    fixed = [normalize_prompt(value) for value in fixed]
+    flat = [normalize_prompt(value) for value in flat]
+    base, negative = fixed[0], fixed[1]
+    model = config.get("model") or "nai-diffusion-4-5-full"
+    if config.get("quality_toggle"):
+        base = merge_quality_suffix(base, model)
+    negative = merge_uc_preset(
+        negative,
+        model,
+        config.get("uc_preset"),
+    )
+    return {
+        "base": base,
+        "negative": negative,
+        "chars": [flat[index * 2] for index in range(count)],
+        "char_negatives": [
+            flat[index * 2 + 1]
+            for index in range(count)
+        ],
+    }
+
+
 def runtime_generation_params(
     config: dict,
     token: str,
@@ -293,6 +365,7 @@ def runtime_generation_params(
 
 __all__ = [
     "anlas_response",
+    "finalized_token_texts",
     "runtime_generation_params",
     "token_response",
 ]

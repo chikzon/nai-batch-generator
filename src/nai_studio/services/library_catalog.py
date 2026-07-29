@@ -48,6 +48,88 @@ class LibraryCatalogOperations:
     load_json: Callable[[Path], Any]
     atomic_write_json: Callable[..., None]
     now: Callable[[], Any]
+
+
+@dataclass(frozen=True)
+class StyleCatalogPaths:
+    """현재 그림체 원본과 이전 작가조합 대체 파일의 우선순위."""
+
+    style_file: Path
+    combo_file: Path
+
+
+@dataclass(frozen=True)
+class StyleCatalogOperations:
+    """복구 로더·로그·동시 최초 조회 잠금을 실행 환경에 연결한다."""
+
+    load_json: Callable[[Path], Any]
+    info: Callable[[str], Any]
+    warning: Callable[[str], Any]
+    lock: Any
+
+
+def load_style_catalog(
+    paths: StyleCatalogPaths,
+    operations: StyleCatalogOperations,
+    cache: dict[str, Any],
+) -> list:
+    """최초 한 번만 원본을 읽고 검색·출처·탭 색인을 같은 cache에 채운다."""
+    if cache["loaded"]:
+        return cache["rows"]
+    with operations.lock:
+        if cache["loaded"]:
+            return cache["rows"]
+        rows = _read_style_rows(paths, operations)
+        search, sources, tabs, seeded = _style_indexes(rows)
+        cache.update(
+            loaded=True,
+            rows=rows,
+            search=search,
+            sources=sources,
+            tabs=tabs,
+            seeded=seeded,
+        )
+    return cache["rows"]
+
+
+def _read_style_rows(
+    paths: StyleCatalogPaths,
+    operations: StyleCatalogOperations,
+) -> list:
+    rows: list = []
+    for path in (paths.style_file, paths.combo_file):
+        if not path.exists():
+            continue
+        try:
+            rows = operations.load_json(path)
+            operations.info(f"그림체 로드: {len(rows)}개 ({path.name})")
+            break
+        except Exception as exc:
+            operations.warning(f"그림체 로드 실패 {path.name}: {exc}")
+    return rows
+
+
+def _style_indexes(rows: list) -> tuple[list[str], dict, dict, int]:
+    search, sources, tabs, seeded = [], {}, {}, 0
+    for row in rows:
+        if not isinstance(row, dict):
+            search.append("")
+            continue
+        search.append((
+            str(row.get("combo") or "") + " "
+            + str(row.get("title") or "") + " "
+            + str(row.get("source") or "") + " "
+            + str(row.get("rest") or "") + " "
+            + str(row.get("negative") or "")
+        ).casefold())
+        source = row.get("source") or "도랑"
+        sources[source] = sources.get(source, 0) + 1
+        tab = row.get("tab") or ""
+        if tab:
+            tabs[tab] = tabs.get(tab, 0) + 1
+        if (row.get("params") or {}).get("seed"):
+            seeded += 1
+    return search, sources, tabs, seeded
     review_lock: Any
     warning: Callable[..., Any]
 
@@ -931,8 +1013,11 @@ __all__ = [
     "LibraryCatalogOperations",
     "LibraryCatalogPaths",
     "LibraryCatalogState",
+    "StyleCatalogOperations",
+    "StyleCatalogPaths",
     "library_review_revision",
     "load_library_review",
+    "load_style_catalog",
     "normalize_library_labels",
     "organize_library_items",
     "search_combos",
