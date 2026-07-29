@@ -211,6 +211,14 @@ from src.nai_studio.services.nai_client import (
     request_nai_image,
     retry_after_seconds,
 )
+from src.nai_studio.services.result_store import (
+    _atomic_save_image,
+    _ocargs,
+    available_output_path,
+    out_clean,
+    out_format,
+    save_with_meta,
+)
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
     reroll_legacy_components,
@@ -8169,162 +8177,6 @@ def call_nai_api(
         endpoint=NAI_API_URL,
         max_characters=MAX_CHARS,
     )
-
-
-def out_format(cfg):
-    """저장 포맷 — 공홈처럼 PNG / WebP 를 고를 수 있게. 기본은 WebP(용량이 작다)."""
-    f = str((cfg or {}).get("save_format", "webp")).lower()
-    return "png" if f == "png" else "webp"
-
-
-def _ocargs(cfg):
-    """save_with_meta 에 넘길 (clean, max_side) — 호출부를 짧게 유지하려고."""
-    clean, side, _q = out_clean(cfg)
-    return (clean, side)
-
-
-def out_clean(cfg):
-    """저장할 때 아예 메타 없이 · 가볍게 저장할지 (NAIS2-Custom 의 '메타데이터 제거 저장').
-    반환: (메타지울까, 긴변상한, 품질)  — 긴변 0 이면 원본 크기."""
-    c = cfg or {}
-    if not c.get("save_clean"):
-        return False, 0, int(c.get("save_quality", 92) or 92)
-    return True, int(c.get("save_max_side", 0) or 0), int(c.get("save_quality", 92) or 92)
-
-
-def _atomic_save_image(path, writer):
-    """생성 결과도 완전히 인코딩된 뒤에만 최종 파일명으로 보이게 한다."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        writer(tmp)
-        # Windows의 fsync는 읽기 전용 핸들을 거부할 수 있어 쓰기 가능한 핸들로 연다.
-        with open(tmp, "rb+") as f:
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return path
-
-
-def save_with_meta(
-    img,
-    path,
-    quality=92,
-    fmt="webp",
-    clean=False,
-    max_side=0,
-    blueprint_fingerprint="",
-):
-    """생성 결과를 저장하면서 NAI 메타데이터(시드·프롬프트·설정)를 EXIF 로 심는다.
-    이렇게 해두면 나중에 이 그림을 앱에 끌어다 놓아 그림체를 복원할 수 있다.
-    fmt="png" 이면 확장자를 .png 로 바꿔 무손실로 저장한다.
-
-    clean=True 면 **메타를 아예 안 넣고** 저장한다 (NAIS2-Custom 의 '메타데이터 제거 저장').
-    스텔스(알파 LSB)가 들어갈 자리도 없애려고 픽셀을 새로 만든다.
-    max_side>0 이면 긴 변을 줄여 함께 가볍게 만든다.
-    ⚠ 이렇게 저장한 그림은 **끌어다 놓아도 그림체가 복원되지 않는다** — 공유용이다."""
-    if clean:
-        path = Path(path)
-        if max_side and max(img.size) > max_side:
-            r = max_side / max(img.size)
-            img = img.resize((max(1, round(img.width * r)), max(1, round(img.height * r))),
-                             Image.LANCZOS)
-        if fmt == "png":
-            path = path.with_suffix(".png")
-            flat = Image.new("RGB", img.size)
-            flat.putdata(list(img.convert("RGB").getdata()))
-            _atomic_save_image(
-                path, lambda tmp: flat.save(tmp, "PNG"))
-        else:
-            path = path.with_suffix(".webp")
-            flat = Image.new("RGB", img.size)
-            flat.putdata(list(img.convert("RGB").getdata()))
-            _atomic_save_image(
-                path, lambda tmp: flat.save(tmp, "WEBP", quality=quality))
-        return path
-    path = Path(path)
-    if fmt == "png" and path.suffix.lower() != ".png":
-        path = path.with_suffix(".png")
-    elif fmt == "webp" and path.suffix.lower() != ".webp":
-        path = path.with_suffix(".webp")
-    exif_bytes = None
-    comment = getattr(img, "nai_comment", "")
-    # NAI가 돌려준 원문 Comment는 그대로 두고, 우리 실행 계보 식별값만 같은
-    # JSON에 보강한다. clean 저장은 위에서 먼저 반환하므로 사용자가 고른
-    # 메타데이터 제거 계약은 바뀌지 않는다.
-    try:
-        raw_comment = json.loads(str(comment or ""))
-        if isinstance(raw_comment, dict):
-            request_id = str(getattr(img, "nai_request_id", "") or "")
-            payload_hash = str(getattr(img, "nai_payload_hash", "") or "")
-            blueprint_id = str(
-                blueprint_fingerprint
-                or getattr(img, "nai_blueprint_fingerprint", "")
-                or ""
-            )
-            if request_id:
-                raw_comment["requestId"] = request_id
-            if payload_hash:
-                raw_comment["payloadHash"] = payload_hash
-            if blueprint_id:
-                raw_comment["blueprintFingerprint"] = blueprint_id
-            comment = json.dumps(
-                raw_comment, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
-    try:
-        if comment:
-            ex = Image.Exif()
-            ex[270] = comment                      # ImageDescription
-            ex[305] = "NovelAI"                    # Software
-            exif_bytes = ex.tobytes()
-    except Exception as e:
-        log.warning(f"EXIF 준비 실패(그림은 그대로 저장): {e}")
-    if fmt == "png":
-        # PNG 는 NAI 와 같은 방식으로 텍스트 청크에 넣는다 (EXIF 보다 널리 읽힌다)
-        def save_png(tmp):
-            try:
-                from PIL import PngImagePlugin
-                info = PngImagePlugin.PngInfo()
-                if comment:
-                    info.add_text("Comment", comment)
-                    info.add_text("Software", "NovelAI")
-                img.save(tmp, "PNG", pnginfo=info)
-            except Exception as e:
-                log.warning(f"PNG 메타 심기 실패(그림은 그대로 저장): {e}")
-                img.save(tmp, "PNG")
-        _atomic_save_image(path, save_png)
-        return path
-    def save_webp(tmp):
-        try:
-            if exif_bytes:
-                img.save(tmp, "WEBP", quality=quality, exif=exif_bytes)
-            else:
-                img.save(tmp, "WEBP", quality=quality)
-        except Exception:
-            # EXIF 때문에 실패하면 메타 없이라도 저장
-            img.save(tmp, "WEBP", quality=quality)
-    _atomic_save_image(path, save_webp)
-    return path
-
-
-def available_output_path(path, fmt="webp"):
-    """기존 생성물을 덮지 않는 실제 확장자 경로를 예약한다(단일 실행 owner 전제)."""
-    path = Path(path).with_suffix(".png" if fmt == "png" else ".webp")
-    if not path.exists():
-        return path
-    stem, suffix, n = path.stem, path.suffix, 2
-    while True:
-        candidate = path.with_name(f"{stem}_{n}{suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
 
 
 # ══════════════════════════════════════════════════════════════════════
