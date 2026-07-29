@@ -18,7 +18,7 @@ class CollectionPostOperations:
     summarize_queue: Any
     forget_caches: Any
     load_spec: Any
-    options: dict
+    options: Any
     load_options: Any
     public_start: Any
     public_retry: Any
@@ -128,8 +128,9 @@ def _pack_import(
         _reset_preview(application)
         operations.forget_caches()
         application.spec = operations.load_spec()
-        operations.options.clear()
-        operations.options.update(operations.load_options())
+        options = operations.options()
+        options.clear()
+        options.update(operations.load_options())
     request._json(result)
 
 
@@ -164,8 +165,9 @@ def _pack_undo(
         result["revision"] = application.config_revision
     if result.get("ok"):
         application.spec = operations.load_spec()
-        operations.options.clear()
-        operations.options.update(operations.load_options())
+        options = operations.options()
+        options.clear()
+        options.update(operations.load_options())
     request._json(result)
 
 

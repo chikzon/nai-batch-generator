@@ -12,7 +12,7 @@ from urllib.parse import unquote
 
 @dataclass(frozen=True)
 class FragmentPostOperations:
-    fragment_dir: Path
+    fragment_dir: Any
     save_fragment: Any
     list_fragments: Any
     recoverable_remove: Any
@@ -40,7 +40,7 @@ def _save(
         data.get("name", ""), data.get("lines") or []
     )
     if old_name and old_name != name:
-        old_path = operations.fragment_dir / f"{old_name}.txt"
+        old_path = operations.fragment_dir() / f"{old_name}.txt"
         if old_path.exists():
             operations.recoverable_remove(old_path, label="이름변경")
     request._json({
@@ -54,7 +54,7 @@ def _delete(
     request: Any, operations: FragmentPostOperations, body: bytes
 ) -> None:
     name = Path(_json_body(body).get("name", "")).name
-    path = operations.fragment_dir / f"{name}.txt"
+    path = operations.fragment_dir() / f"{name}.txt"
     if path.exists():
         operations.recoverable_remove(path)
     request._json({"ok": True, "fragments": operations.list_fragments()})

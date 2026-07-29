@@ -166,7 +166,7 @@ class RegressionTests(unittest.TestCase):
 
         with patch.object(APP.requests, "post", side_effect=fake_post):
             APP.call_nai_api(
-                "pst-fixture", base, "", "", negative, 832, 1216,
+                "pst-fixture", base, negative, 832, 1216,
                 seed=1,
                 params={"model": "nai-diffusion-4-5-full", "uc_preset": 4},
                 chars=[{"prompt": char, "negative": char_negative}],
@@ -4427,7 +4427,7 @@ class RegressionTests(unittest.TestCase):
         with patch.object(APP.requests, "post", return_value=bad_request):
             with self.assertRaises(APP.APIError) as caught:
                 APP.call_nai_api(
-                    "pst-fixture", "base", "", "", "negative", 832, 1216)
+                    "pst-fixture", "base", "negative", 832, 1216)
         self.assertFalse(caught.exception.retryable)
         self.assertEqual(caught.exception.status_code, 400)
 
@@ -4437,7 +4437,7 @@ class RegressionTests(unittest.TestCase):
         with patch.object(APP.requests, "post", return_value=limited):
             with self.assertRaises(APP.RateLimitError) as caught:
                 APP.call_nai_api(
-                    "pst-fixture", "base", "", "", "negative", 832, 1216)
+                    "pst-fixture", "base", "negative", 832, 1216)
         self.assertEqual(caught.exception.retry_after, 3)
 
     def test_output_delete_moves_to_recoverable_trash_and_restores_without_overwrite(self):
@@ -5494,15 +5494,15 @@ class RegressionTests(unittest.TestCase):
         ]
         with patch.object(APP.requests, "post", side_effect=fake_post):
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1, params={**base, "use_coords": False}, chars=people,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1, params={**base, "use_coords": True}, chars=people,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1,
                 params={
                     **base,
@@ -5512,7 +5512,7 @@ class RegressionTests(unittest.TestCase):
                 chars=people,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1,
                 params={
                     **base,
@@ -5522,7 +5522,7 @@ class RegressionTests(unittest.TestCase):
                 chars=people,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1,
                 params={
                     **base,
@@ -5532,7 +5532,7 @@ class RegressionTests(unittest.TestCase):
                 chars=people,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=10,
                 params={
                     **base,
@@ -5636,11 +5636,11 @@ class RegressionTests(unittest.TestCase):
         }
         with patch.object(APP.requests, "post", side_effect=fake_post):
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1, params=vibe_params,
             )
             APP.call_nai_api(
-                "pst-fixture", "base", "", "", "negative", 832, 1216,
+                "pst-fixture", "base", "negative", 832, 1216,
                 seed=1, params=reference_params,
             )
 

@@ -11,8 +11,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 @dataclass(frozen=True)
 class AssetGetOperations:
-    vibe_dir: Path
-    mime: dict
+    vibe_dir: Any
+    mime: Any
     output_preview: Any
     output_list: Any
     setting_thumbs: Any
@@ -58,7 +58,7 @@ def _reference_image(
 ) -> None:
     resource_id = Path(_one(query, "id")).name
     suffix = ".ref.png" if _one(query, "kind", "vibe") == "cref" else ".png"
-    path = operations.vibe_dir / f"{resource_id}{suffix}"
+    path = operations.vibe_dir() / f"{resource_id}{suffix}"
     if not resource_id or not path.is_file():
         _not_found(request)
         return
@@ -78,7 +78,7 @@ def _output_image(
     _send(
         request,
         path.read_bytes(),
-        operations.mime.get(path.suffix.lower(), "image/webp"),
+        operations.mime().get(path.suffix.lower(), "image/webp"),
         cache="max-age=60",
     )
 

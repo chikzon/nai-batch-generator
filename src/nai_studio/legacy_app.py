@@ -8728,12 +8728,26 @@ def _i2i_fields(i2i, action, seed):
     return image_to_image_fields(i2i, action, seed)
 
 
-def call_nai_api(token, base_prompt, female_caption, male_caption, negative, width, height,
-                 char_negative="", male_negative="", scale=5.5, cfg_rescale=0.56, steps=28,
-                 sampler="k_euler_ancestral", scheduler="karras", uc_preset=3,
-                 seed=None, variety=False, params=None, chars=None):
+def call_nai_api(
+    token,
+    base_prompt,
+    negative,
+    width,
+    height,
+    *,
+    scale=5.5,
+    cfg_rescale=0.56,
+    steps=28,
+    sampler="k_euler_ancestral",
+    scheduler="karras",
+    uc_preset=3,
+    seed=None,
+    variety=False,
+    params=None,
+    chars=None,
+):
     """params: 설정.json 의 고급 파라미터 dict (없으면 기존 기본값 그대로)
-    chars: 인물 목록 [{prompt, negative}, …] — 주면 female/male 대신 이것을 쓴다 (최대 6명)"""
+    chars: 인물 목록 [{prompt, negative}, …] (최대 6명)"""
     p = dict(params or {})
     # ── 전처리 순서: 주석 제거 → 조각 치환 → 정규화 ──────────────────
     # ⚠ 이 순서와 대상 목록이 중요하다 (CQA-004·005):
@@ -8750,20 +8764,18 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
             else:
                 pair = (list(c) + ["", ""])[:2]
                 chars_list.append([pair[0], pair[1]])
-    fixed = [strip_comment_lines(x) for x in
-             (base_prompt, negative, female_caption, male_caption, char_negative, male_negative)]
+    fixed = [strip_comment_lines(x) for x in (base_prompt, negative)]
     flat_chars = [strip_comment_lines(x) for pair in chars_list for x in pair]
     if p.get("use_fragments", True):
         resolved, counters = resolve_fragments(fixed + flat_chars,
                                                counters=p.get("_frag_counters"))
-        fixed, flat_chars = list(resolved[:6]), list(resolved[6:])
+        fixed, flat_chars = list(resolved[:2]), list(resolved[2:])
         if p.get("_frag_counters") is not None:
             p["_frag_counters"].update(counters)     # 호출자가 이어서 쓴다
     # 숫자로 끝나는 태그가 `::` 에 붙으면 NAI 가 그 숫자를 새 가중치로 읽어
     # 묶음이 닫히지 않는다 (`2::tag_number_37::` → 37 이 가중치가 됨).
     # 닫는 `::` 앞에 공백을 넣어 원래 의도대로 전달한다. **캐릭터 칸도 똑같이.**
-    (base_prompt, negative, female_caption, male_caption,
-     char_negative, male_negative) = [normalize_prompt(x) for x in fixed]
+    base_prompt, negative = [normalize_prompt(x) for x in fixed]
     flat_chars = [normalize_prompt(x) for x in flat_chars]
     for i in range(len(chars_list)):
         chars_list[i] = [flat_chars[i * 2], flat_chars[i * 2 + 1]]
@@ -8788,16 +8800,10 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     # 레거시 입력 모양만 여기서 인물 목록으로 바꾸고, 좌표·Reference·img2img와
     # 최종 JSON 조립은 domain.nai_payload의 공통 계약에 맡긴다.
     people = []
-    if chars:
-        # 위에서 주석 제거·조각 치환·정규화를 마친 값이다 (CQA-004·005)
-        for cap, ng in chars_list:
-            if (cap or "").strip():
-                people.append((cap, ng or ""))
-    else:
-        if female_caption:
-            people.append((female_caption, char_negative or ""))
-        if male_caption:
-            people.append((male_caption, male_negative or ""))
+    # 위에서 주석 제거·조각 치환·정규화를 마친 값이다 (CQA-004·005)
+    for caption, character_negative in chars_list:
+        if (caption or "").strip():
+            people.append((caption, character_negative or ""))
     if len(people) > MAX_CHARS:
         log.warning(f"인물이 {len(people)}명인데 NAI 는 {MAX_CHARS}명까지입니다 — "
                     f"뒤쪽 {len(people)-MAX_CHARS}명은 보내지 않습니다.")
@@ -10973,8 +10979,7 @@ class ConfigServer:
                 state = load_state()
                 try:
                     img = call_nai_api(
-                        cfg["token"], base, "", "",
-                        call.get("negative_prompt", ""),
+                        cfg["token"], base, call.get("negative_prompt", ""),
                         int(call.get("width") or 832), int(call.get("height") or 1216),
                         chars=people,
                         scale=job_cfg.get("cfg_scale", 5.5),
@@ -11271,7 +11276,7 @@ class ConfigServer:
                     }
                 try:
                     img = call_nai_api(
-                        job_cfg["token"], job_cfg.get("base_prompt", "") or "1girl", "", "",
+                        job_cfg["token"], job_cfg.get("base_prompt", "") or "1girl",
                         job_cfg.get("negative_prompt", ""), w, h,
                         chars=active_people(slots, job_cfg.get("char_centers"))[0],
                         scale=job_cfg.get("cfg_scale", 5.5), cfg_rescale=job_cfg.get("cfg_rescale", 0.56),
@@ -11532,7 +11537,7 @@ class ConfigServer:
                     try:
                         try:
                             img = call_nai_api(
-                                cfg["token"], base, "", "", neg,
+                                cfg["token"], base, neg,
                                 int(raw.get("width") or cfg.get("width", 832)),
                                 int(raw.get("height") or cfg.get("height", 1216)),
                                 scale=float(raw.get("scale") or cfg.get("cfg_scale", 5.5)),
@@ -11729,8 +11734,8 @@ class ConfigServer:
                     try:
                         try:
                             img = call_nai_api(
-                                cfg["token"], base, "", "",
-                                neg, int(sc.get("width", 832)), int(sc.get("height", 1216)),
+                                cfg["token"], base, neg,
+                                int(sc.get("width", 832)), int(sc.get("height", 1216)),
                                 chars=people,
                                 scale=cfg.get("cfg_scale", 5.5),
                                 cfg_rescale=cfg.get("cfg_rescale", 0.56),
@@ -12729,6 +12734,10 @@ class ConfigServer:
 
     def start(self, open_browser=True):
         server = self
+
+        def late_bound(name):
+            return lambda *args, **kwargs: globals()[name](*args, **kwargs)
+
         catalog_get = CatalogGetOperations(
             booru=lambda *args: search_booru(*args),
             style_duplicates=lambda: find_style_dupes(),
@@ -12756,8 +12765,8 @@ class ConfigServer:
             comparison_progress=lambda cfg: comparison_progress_summary(cfg),
         )
         asset_get = AssetGetOperations(
-            vibe_dir=VIBE_DIR,
-            mime=MIME,
+            vibe_dir=lambda: VIBE_DIR,
+            mime=lambda: MIME,
             output_preview=lambda cfg, rel: output_file_for_preview(cfg, rel),
             output_list=lambda *args, **kwargs: list_output(*args, **kwargs),
             setting_thumbs=lambda name, cfg: setting_thumbs(name, cfg),
@@ -12789,39 +12798,39 @@ class ConfigServer:
             local_integrity=lambda: local_image_integrity(),
         )
         recovery_post = RecoveryPostOperations(
-            preview_backup=preview_user_backup,
-            restore_backup=restore_user_backup,
-            rollback_backup=rollback_user_backup,
-            load_settings=lambda: load_json_recover(SETTINGS_FILE),
-            default_config=DEFAULT_CONFIG,
-            migrate_selections=migrate_legacy_selections,
-            migrate_slots=migrate_char_slots,
-            load_spec=load_spec,
-            options=OPTIONS,
-            load_options=load_options,
-            normalize_local_images=normalize_local_image_refs,
-            rollback_local_images=rollback_local_image_normalize,
-            rebuild_data_index=rebuild_data_index,
-            metadata_control=metadata_audit_control,
-            metadata_candidate=metadata_audit_candidate,
-            metadata_save=metadata_audit_save_candidate,
-            image_batch_queue=image_batch_queue,
-            summarize_queue=summarize_restore_queue,
+            preview_backup=late_bound("preview_user_backup"),
+            restore_backup=late_bound("restore_user_backup"),
+            rollback_backup=late_bound("rollback_user_backup"),
+            load_settings=lambda: load_settings_recover(SETTINGS_FILE),
+            default_config=lambda: DEFAULT_CONFIG,
+            migrate_selections=late_bound("migrate_legacy_selections"),
+            migrate_slots=late_bound("migrate_char_slots"),
+            load_spec=late_bound("load_spec"),
+            options=lambda: OPTIONS,
+            load_options=late_bound("load_options"),
+            normalize_local_images=late_bound("normalize_local_image_refs"),
+            rollback_local_images=late_bound("rollback_local_image_normalize"),
+            rebuild_data_index=late_bound("rebuild_data_index"),
+            metadata_control=late_bound("metadata_audit_control"),
+            metadata_candidate=late_bound("metadata_audit_candidate"),
+            metadata_save=late_bound("metadata_audit_save_candidate"),
+            image_batch_queue=late_bound("image_batch_queue"),
+            summarize_queue=late_bound("summarize_restore_queue"),
         )
         collection_post = CollectionPostOperations(
-            preview_pack=preview_datapack_bytes,
-            import_pack=import_datapack_bytes,
-            pack_queue=pack_import_queue,
-            summarize_queue=summarize_restore_queue,
-            forget_caches=forget_collection_caches,
-            load_spec=load_spec,
-            options=OPTIONS,
-            load_options=load_options,
-            public_start=PUBLIC_COLLECTION.start,
-            public_retry=PUBLIC_COLLECTION.retry_failed,
-            public_control=PUBLIC_COLLECTION.control,
-            undo_pack=undo_datapack,
-            import_settings=import_settings_bytes,
+            preview_pack=late_bound("preview_datapack_bytes"),
+            import_pack=late_bound("import_datapack_bytes"),
+            pack_queue=late_bound("pack_import_queue"),
+            summarize_queue=late_bound("summarize_restore_queue"),
+            forget_caches=late_bound("forget_collection_caches"),
+            load_spec=late_bound("load_spec"),
+            options=lambda: OPTIONS,
+            load_options=late_bound("load_options"),
+            public_start=lambda payload: PUBLIC_COLLECTION.start(payload),
+            public_retry=lambda payload: PUBLIC_COLLECTION.retry_failed(payload),
+            public_control=lambda action: PUBLIC_COLLECTION.control(action),
+            undo_pack=late_bound("undo_datapack"),
+            import_settings=late_bound("import_settings_bytes"),
             resource_import=server.handle_resource_import,
             reference_add=server.handle_ref_add,
             reference_save=server.handle_ref_save,
@@ -12829,72 +12838,72 @@ class ConfigServer:
         catalog_post = CatalogPostOperations(
             style_save=server.handle_style_save,
             normalization_save=server.handle_norm_save,
-            verify_tags=verify_tags,
-            organize_library=organize_library_items,
-            delete_styles=delete_styles,
-            restore_styles=restore_styles,
+            verify_tags=late_bound("verify_tags"),
+            organize_library=late_bound("organize_library_items"),
+            delete_styles=late_bound("delete_styles"),
+            restore_styles=late_bound("restore_styles"),
         )
         evaluation_post = EvaluationPostOperations(
-            artist_workspace=artist_workspace_request,
-            load_ratings=load_ratings,
-            rate_artist=rate_artist,
-            apply_evaluation=apply_evaluation_action,
+            artist_workspace=late_bound("artist_workspace_request"),
+            load_ratings=late_bound("load_ratings"),
+            rate_artist=late_bound("rate_artist"),
+            apply_evaluation=late_bound("apply_evaluation_action"),
             picks_lock=_JSON_IO_LOCK,
-            load_picks=load_picks,
-            save_picks=save_picks,
-            trash_outputs=trash_output_files,
-            restore_trash=restore_trash_batch,
-            output_subdir=out_sub,
-            atomic_write=_atomic_write_bytes,
-            strip_and_save=strip_and_save,
+            load_picks=late_bound("load_picks"),
+            save_picks=late_bound("save_picks"),
+            trash_outputs=late_bound("trash_output_files"),
+            restore_trash=late_bound("restore_trash_batch"),
+            output_subdir=late_bound("out_sub"),
+            atomic_write=late_bound("_atomic_write_bytes"),
+            strip_and_save=late_bound("strip_and_save"),
         )
         fragment_post = FragmentPostOperations(
-            fragment_dir=FRAG_DIR,
-            save_fragment=save_fragment,
-            list_fragments=list_fragments,
-            recoverable_remove=recoverable_remove,
-            load_state=load_state,
-            save_state=save_state,
-            import_fragments=import_fragments_bytes,
-            reroll_components=reroll_legacy_components,
-            resolve_prompt=resolve_legacy_prompt,
-            sequence_text=legacy_sequence_text,
-            resolve_fragments=resolve_fragments,
+            fragment_dir=lambda: FRAG_DIR,
+            save_fragment=late_bound("save_fragment"),
+            list_fragments=late_bound("list_fragments"),
+            recoverable_remove=late_bound("recoverable_remove"),
+            load_state=late_bound("load_state"),
+            save_state=late_bound("save_state"),
+            import_fragments=late_bound("import_fragments_bytes"),
+            reroll_components=late_bound("reroll_legacy_components"),
+            resolve_prompt=late_bound("resolve_legacy_prompt"),
+            sequence_text=late_bound("legacy_sequence_text"),
+            resolve_fragments=late_bound("resolve_fragments"),
             random_factory=random.Random,
         )
         settings_post = SettingsPostOperations(
-            duplicate_scene_undo=undo_duplicate_setting_scene,
-            duplicate_scene=duplicate_setting_scene,
+            duplicate_scene_undo=late_bound("undo_duplicate_setting_scene"),
+            duplicate_scene=late_bound("duplicate_setting_scene"),
             scene_save=server.handle_scene_save,
             option_item=server.handle_option_item,
             role_save=server.handle_role_save,
             sceneset_save=server.handle_sceneset_save,
-            load_asset_config=load_asset_config,
-            setting_state=setting_state,
-            cast_members=setting_cast_members,
-            slot_prompt=slot_prompt,
-            character_run=character_run_from_group,
-            build_scene=build_scene,
-            reference_config=setting_reference_config,
-            scene_people=setting_scene_people,
-            seed_for=seed_for,
-            load_state=load_state,
-            normalize_prompt=normalize_prompt,
-            join_tags=_join_tags,
-            token_count=nai_tokens,
-            save_scenes=save_scenes,
-            new_setting=new_setting,
-            add_set=setting_add_set,
-            save_meta=setting_meta_save,
-            renumber=setting_renumber,
-            delete_setting=setting_delete,
-            duplicate_group=duplicate_setting_group,
+            load_asset_config=late_bound("load_asset_config"),
+            setting_state=late_bound("setting_state"),
+            cast_members=late_bound("setting_cast_members"),
+            slot_prompt=late_bound("slot_prompt"),
+            character_run=late_bound("character_run_from_group"),
+            build_scene=late_bound("build_scene"),
+            reference_config=late_bound("setting_reference_config"),
+            scene_people=late_bound("setting_scene_people"),
+            seed_for=late_bound("seed_for"),
+            load_state=late_bound("load_state"),
+            normalize_prompt=late_bound("normalize_prompt"),
+            join_tags=late_bound("_join_tags"),
+            token_count=late_bound("nai_tokens"),
+            save_scenes=late_bound("save_scenes"),
+            new_setting=late_bound("new_setting"),
+            add_set=late_bound("setting_add_set"),
+            save_meta=late_bound("setting_meta_save"),
+            renumber=late_bound("setting_renumber"),
+            delete_setting=late_bound("setting_delete"),
+            duplicate_group=late_bound("duplicate_setting_group"),
             log_warning=log.warning,
         )
         generation_post = GenerationPostOperations(
-            activate_comparison=activate_comparison_run,
+            activate_comparison=late_bound("activate_comparison_run"),
             compare_rerun=server.handle_compare_rerun,
-            comparison_recipe=comparison_recipe_for_output,
+            comparison_recipe=late_bound("comparison_recipe_for_output"),
             compare_promote=server.handle_compare_promote,
             compare_preview=server.handle_compare_preview,
             compare_run=server.handle_compare_run,
@@ -12912,14 +12921,14 @@ class ConfigServer:
         runtime_post = RuntimePostOperations(
             blueprint_project=server.handle_blueprint_project,
             save_config=server.handle_save,
-            fetch_balance=lambda token: fetch_anlas_balance(token),
-            vibe_paths=vibe_paths,
-            load_asset_config=load_asset_config,
-            compute_pending=compute_pending,
-            estimate_anlas=anlas_estimate,
-            finalize_tokens=finalized_token_texts,
-            token_count=nai_tokens,
-            tokens_exact=tokens_exact,
+            fetch_balance=late_bound("fetch_anlas_balance"),
+            vibe_paths=late_bound("vibe_paths"),
+            load_asset_config=late_bound("load_asset_config"),
+            compute_pending=late_bound("compute_pending"),
+            estimate_anlas=late_bound("anlas_estimate"),
+            finalize_tokens=late_bound("finalized_token_texts"),
+            token_count=late_bound("nai_tokens"),
+            tokens_exact=late_bound("tokens_exact"),
         )
 
         class Handler(ConfigRequestHandler):
@@ -13950,7 +13959,7 @@ def _rerun_selected_comparison(server, cfg, rel):
         used, token, include_refs=plan["options"].get("include_refs", False))
     try:
         image = call_nai_api(
-            token, base, "", "", negative,
+            token, base, negative,
             int(used.get("width", 832)), int(used.get("height", 1216)),
             chars=people,
             scale=used.get("cfg_scale", 5.5),
@@ -14167,7 +14176,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
                     used, token, include_refs=options["include_refs"])
                 try:
                     img = call_nai_api(
-                        token, base, "", "", negative,
+                        token, base, negative,
                         int(used.get("width", 832)), int(used.get("height", 1216)),
                         chars=people,
                         scale=used.get("cfg_scale", 5.5),
@@ -14670,7 +14679,7 @@ def _run_generation(server, cfg_snapshot=None):
                 if use_positions:
                     scene_params = with_centers(scene_params, centers)
                 try:
-                    img = call_nai_api(token, base_p, "", "", neg_now, w, h,
+                    img = call_nai_api(token, base_p, neg_now, w, h,
                                        chars=people,
                                        scale=scale, cfg_rescale=cfg_rescale,
                                        steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,

@@ -14,11 +14,11 @@ class RecoveryPostOperations:
     restore_backup: Any
     rollback_backup: Any
     load_settings: Any
-    default_config: dict
+    default_config: Any
     migrate_selections: Any
     migrate_slots: Any
     load_spec: Any
-    options: dict
+    options: Any
     load_options: Any
     normalize_local_images: Any
     rollback_local_images: Any
@@ -43,15 +43,16 @@ def _refresh_restored_state(
     application: Any, operations: RecoveryPostOperations
 ) -> None:
     fresh = operations.load_settings()
-    merged = dict(operations.default_config)
+    merged = dict(operations.default_config())
     merged.update(fresh if isinstance(fresh, dict) else {})
     operations.migrate_selections(merged)
     operations.migrate_slots(merged)
     application.cfg.clear()
     application.cfg.update(merged)
     application.spec = operations.load_spec()
-    operations.options.clear()
-    operations.options.update(operations.load_options())
+    options = operations.options()
+    options.clear()
+    options.update(operations.load_options())
     application.config_revision += 1
 
 
