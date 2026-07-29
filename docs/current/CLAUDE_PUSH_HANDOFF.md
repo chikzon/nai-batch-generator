@@ -1,13 +1,37 @@
 # Claude push 인계
 
-현재 기능 코드 기준은 `76c7f62`이며 로컬 `main`은
-`origin/main`보다 69커밋 앞서 있다. Outpaint 실제 NAI 검증, 백업·자료팩 선택 복원,
+현재 기능 코드 기준은 `76c7f62`, 전체 검증 기준은 `846ded8`이다.
+이 인계 문서 커밋까지 포함한 로컬 `main`은 `origin/main`보다 70커밋 앞선다.
+Outpaint 실제 NAI 검증, 백업·자료팩 선택 복원,
 프로젝트 공통 설계도, 캐릭터 이미지 시험·variation, 작가 조합 성능 개선까지
 포함한다.
 
-**아직 push하지 않는다.** 현재 회귀는 171/171이고, `dist/`는 최신 구현
-커밋보다 오래됐다. `NEXT_TASK.md`의 구조 분리와 최신 재빌드·설치/제거
-재검증이 끝난 뒤 사용자 지시가 있어야 push한다.
+**사용자가 이번에는 소스 push를 지시했다.** 아래 절차로 `main`만 push한다.
+`dist/`는 최신 UI보다 오래됐으므로 Release·태그·산출물 게시에는 사용하지 않는다.
+포터블·설치본 재빌드와 설치·제거 검증은 별도 작업이다.
+
+## Claude가 실행할 push 절차
+
+```powershell
+cd "C:\Users\82108\Desktop\클로드 코드 작업용\챗봇 이세계 미아 작업\배포용_시드생성기"
+git status --short
+git rev-list --count origin/main..HEAD
+git log -3 --oneline
+git push origin main
+git status -sb
+git rev-parse HEAD
+git rev-parse origin/main
+```
+
+확인 조건:
+
+- push 전 추적 파일 변경이 없어야 한다.
+- `디자인 시스템.html`, `출력 테마 디자인 가이드.html`은 사용자가 둔 참고 원본이며
+  현재 untracked다. `git add -A`로 임의 포함하거나 삭제하지 않는다.
+- push 뒤 `HEAD`와 `origin/main` 해시가 같아야 한다.
+- GitHub Actions가 시작되면 최종 상태를 확인한다.
+- CI 실패 시 Release·태그를 만들지 말고 실패 단계와 로그 근거만 보고한다.
+- 강제 push, rebase, reset, 새 커밋, Release, 태그 생성은 하지 않는다.
 
 ## 최종 구현
 
@@ -66,9 +90,12 @@
 ## 검증 결과
 
 - 전체 `python 검증.py`: 계약 **10/10**, 모듈 경계 **3/3**, 무과금 회귀
-  **171/171** (`c483ab5` 기준)
+  **171/171** (`846ded8` 기준)
 - 현재 UI 커밋: 렌더 JS·중복 id 1/1, 작업실 회귀 4/4, Python 구문,
   데스크톱·390px 브라우저 스모크 통과
+- 전체 검증 전후 운영 `생성.log` 크기·수정 시각 동일
+- `origin/main..HEAD` 전체와 현재 HEAD 비밀값 검사에서 사용자 NAI 토큰 없음.
+  `pst-ne-` 접두사가 있는 값은 테스트용 가짜 토큰뿐이다.
 - 프롬프트 무손실 검사는 프롬프트 textarea만 검사하며, 프로젝트 이름 같은 제한
   입력을 오인하지 않는다. 검증 중 운영 `생성.log`는 변경되지 않았다.
 - 19:43 산출물 EXE 직접 기동: `/`, `/ui/studio.css` HTTP 200. 당시 위치 UI와
