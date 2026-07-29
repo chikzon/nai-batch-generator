@@ -31,6 +31,8 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 사용자 자료 잠금·원자 저장·손상 복구 | `runtime/data_files.py` |
 | 실행권·중지·진행률·미리보기 상태 | `runtime/live_state.py` |
 | 정적 HTML·JavaScript 화면 | `web/page_template.py` |
+| 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
+| 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 
 `legacy_app.py`는 위 이름을 import하거나 얇은 호환 어댑터로 노출한다. 저장 schema,
 사용자 자료 위치, HTTP endpoint와 `start.py` 진입점은 바꾸지 않았다.
@@ -40,7 +42,6 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 점진 분리는 **완료되지 않았다**. 다음 큰 경계가 `legacy_app.py`에 남아 있다.
 
 - `ConfigServer`: API endpoint 조정과 HTTP handler
-- `PublicCollectionManager`: 공개자료 발견·재개·임포트
 - 자료실 검색·그림체·작가 평가·태그 자동완성
 - 세팅·자료팩·전체 백업·휴지통
 - 비교 계획·결과 승격·재실행

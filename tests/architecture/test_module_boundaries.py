@@ -11,7 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import arca_public_import as legacy
+from src.nai_studio import legacy_app
 from src.nai_studio.collection import arca
+from src.nai_studio.services.public_collection import PublicCollectionManager
 
 
 class PublicCollectionBoundaryTests(unittest.TestCase):
@@ -41,6 +43,14 @@ class PublicCollectionBoundaryTests(unittest.TestCase):
         self.assertEqual(
             legacy.normalize_article_url(value),
             arca.normalize_article_url(value),
+        )
+
+    def test_collection_manager_implementation_stays_out_of_legacy_app(self):
+        self.assertTrue(
+            issubclass(legacy_app.PublicCollectionManager, PublicCollectionManager)
+        )
+        self.assertIsNot(
+            legacy_app.PublicCollectionManager, PublicCollectionManager
         )
 
 
