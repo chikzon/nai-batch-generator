@@ -181,7 +181,9 @@ from src.nai_studio.services.experiment_bridge import (
     expand_legacy_experiment_cells,
 )
 from src.nai_studio.services import (
+    artist_rating_store as _artist_rating_store,
     artist_workspace as _artist_workspace,
+    builder_handlers as _builder_handlers,
     catalog_search as _catalog_search,
     character_storage as _character_storage,
     collection_handlers as _collection_handlers,
@@ -203,9 +205,12 @@ from src.nai_studio.services import (
     output_lifecycle as _output_lifecycle,
     program_data_migration as _program_data_migration,
     public_style_import as _public_style_import,
+    remote_image_cache as _remote_image_cache,
     setting_runtime as _setting_runtime,
+    setting_store as _setting_store,
     settings_handlers as _settings_handlers,
     style_store as _style_store,
+    tag_catalog as _tag_catalog,
     user_backup_store as _user_backup_store,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
@@ -642,17 +647,10 @@ SCENESET_KEYS = ("setting_state",)
 
 
 def list_scene_presets():
-    presets = []
-    if not SCENESET_DIR.exists():
-        return presets
-    for p in sorted(SCENESET_DIR.glob("*.json")):
-        try:
-            data = load_json_recover(p)
-            if isinstance(data, dict):
-                presets.append({"name": p.stem, "data": data})
-        except Exception:
-            continue
-    return presets
+    return _setting_store.list_presets(
+        _setting_store_paths(),
+        _setting_store_operations(),
+    )
 
 
 # ══ 레시피 라이브러리 (수집/레시피.json — 도랑위키 등에서 모은 남들의 조합) ══
@@ -1134,25 +1132,10 @@ MIME = {".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg",
 
 def trim_remote_cache():
     """원격 캐시가 상한을 넘으면 오래된 것부터 지운다. (동봉된 로컬 이미지는 건드리지 않음)"""
-    try:
-        files = [(f.stat().st_mtime, f.stat().st_size, f)
-                 for f in REMOTE_CACHE.glob("*") if f.is_file()]
-    except Exception:
-        return
-    total = sum(s for _, s, _ in files)
-    cap = REMOTE_CAP_MB * 1024 * 1024
-    if total <= cap:
-        return
-    files.sort()
-    for _, size, f in files:
-        try:
-            f.unlink()
-            total -= size
-        except Exception:
-            pass
-        if total <= cap * 0.8:
-            break
-    log.info(f"예시 이미지 캐시 정리 → {total/1024/1024:.0f}MB")
+    return _remote_image_cache.trim_remote_cache(
+        _remote_image_cache_paths(),
+        _remote_image_cache_operations(),
+    )
 
 
 # 호스트별 헤더. 부루 CDN 은 Cloudflare 뒤에 있는데, 브라우저를 흉내낸
@@ -1169,53 +1152,24 @@ DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://wiki.dorang.
 
 
 def headers_for(url):
-    from urllib.parse import urlparse
-    host = (urlparse(url).hostname or "").lower()
-    for h, hdr in HOST_HEADERS.items():
-        if host == h or host.endswith("." + h):
-            return hdr
-    return DEFAULT_HEADERS
+    return _remote_image_cache.headers_for(
+        url,
+        HOST_HEADERS,
+        DEFAULT_HEADERS,
+    )
 
 
 def fetch_cached_image(url):
     """예시 이미지를 (bytes, content-type)으로 반환.
     local:파일명 → 수집/이미지캐시 에서 바로 읽음. http(s) → 받아서 캐시."""
-    import hashlib
-    url = (url or "").strip()
-    if not url:
-        return None, None
-    IMG_CACHE.mkdir(parents=True, exist_ok=True)
-
-    if url.startswith("local:"):
-        name = Path(url[6:]).name          # 경로 탈출 차단
-        p = IMG_CACHE / name
-        if p.exists() and p.is_file():
-            return p.read_bytes(), MIME.get(p.suffix.lower(), "image/png")
-        log.warning(f"로컬 이미지 없음: {name}")
-        return None, None
-
-    if not url.startswith(("http://", "https://")):
-        return None, None
-    suf = Path(url.split("?")[0]).suffix.lower()
-    if suf not in MIME:
-        suf = ".webp"
-    REMOTE_CACHE.mkdir(parents=True, exist_ok=True)
-    p = REMOTE_CACHE / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:20] + suf)
-    if p.exists():
-        return p.read_bytes(), MIME.get(suf, "image/webp")
-    try:
-        r = requests.get(url, timeout=25, headers=headers_for(url))
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and ct.startswith("image/"):
-            # 중간 종료 때 잘린 캐시가 정상 파일처럼 남으면 이후에도 계속 그 파일을
-            # 돌려주게 된다. 캐시도 완성된 바이트만 이름을 얻는다.
-            _atomic_write_bytes(p, r.content, keep_backup=False)
-            note_image_origin(url, r.content)
-            return r.content, ct
-        log.warning(f"이미지 응답 이상 [{r.status_code} {ct}]: {url[:80]}")
-    except Exception as e:
-        log.warning(f"이미지 가져오기 실패: {e}")
-    return None, None
+    return _remote_image_cache.fetch_cached_image(
+        _remote_image_cache_paths(),
+        _remote_image_cache_operations(),
+        url,
+        HOST_HEADERS,
+        DEFAULT_HEADERS,
+        note_image_origin,
+    )
 
 
 # ── 그림 출처 장부 ──────────────────────────────────────────────────────────
@@ -1235,51 +1189,55 @@ def _img_origin_path():
     return IMG_CACHE / "출처장부.json"
 
 
+def _remote_image_cache_paths():
+    """patch 가능한 레거시 경로·상한·MIME 계약을 서비스에 늦게 연결한다."""
+    return _remote_image_cache.RemoteImageCachePaths(
+        image_cache=IMG_CACHE,
+        remote_cache=REMOTE_CACHE,
+        origin_file=_img_origin_path(),
+        cap_mb=REMOTE_CAP_MB,
+        mime=MIME,
+    )
+
+
+def _remote_image_cache_operations():
+    """현재 HTTP·원자 저장·복구·로그 의존성을 서비스에 주입한다."""
+    return _remote_image_cache.RemoteImageCacheOperations(
+        http_get=requests.get,
+        load_json=load_json_recover,
+        atomic_write_bytes=_atomic_write_bytes,
+        atomic_write_json=atomic_write_json,
+        warning=log.warning,
+        info=log.info,
+        origin_lock=_ORIGIN_LOCK,
+    )
+
+
 def load_image_origins():
-    p = _img_origin_path()
-    if p.exists():
-        try:
-            d = load_json_recover(p)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
-    return {}
+    return _remote_image_cache.load_image_origins(
+        _remote_image_cache_paths(),
+        _remote_image_cache_operations(),
+    )
 
 
 def note_image_origin(url, data, pack=""):
     """받아온 그림의 **원본 주소 · 내용 해시 · 저장 이름**을 적어 둔다.
     나중에 원격↔로컬을 되돌리거나, 주소가 달라도 같은 그림을 묶는 근거가 된다."""
-    if not url or not data:
-        return None
-    sha = hashlib.sha256(data).hexdigest()
-    try:
-        with _ORIGIN_LOCK:
-            book = load_image_origins()
-            row = book.get(sha) or {"sha256": sha, "urls": [], "pack": pack}
-            if url not in row["urls"]:
-                row["urls"].append(url)
-            if pack and not row.get("pack"):
-                row["pack"] = pack
-            row["size"] = len(data)
-            book[sha] = row
-            p = _img_origin_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(p, book, indent=None)
-    except Exception as e:
-        log.warning(f"출처 기록 실패: {e}")
-    return sha
+    return _remote_image_cache.note_image_origin(
+        _remote_image_cache_paths(),
+        _remote_image_cache_operations(),
+        url,
+        data,
+        pack,
+    )
 
 
 def image_origin_stats():
     """장부 요약 — 같은 그림을 가리키는 주소가 여럿인 것이 몇 건인가."""
-    book = load_image_origins()
-    dup = {k: v for k, v in book.items() if len(v.get("urls") or []) > 1}
-    return {"ok": True,
-            "그림": len(book),
-            "주소여럿": len(dup),
-            "낭비주소": sum(len(v["urls"]) - 1 for v in dup.values()),
-            "예시": [{"sha256": k[:16], "urls": v["urls"][:4]}
-                     for k, v in list(dup.items())[:20]]}
+    return _remote_image_cache.image_origin_stats(
+        _remote_image_cache_paths(),
+        _remote_image_cache_operations(),
+    )
 
 
 _WARM_POOL = None
@@ -1291,30 +1249,18 @@ def prewarm_images(items, n=48):
     """목록 응답에 딸린 예시 이미지를 미리 받아 캐시에 채운다.
     브라우저가 <img>를 요청할 땐 이미 디스크에 있어 즉시 응답된다."""
     global _WARM_POOL
-    urls = []
-    for it in (items or [])[:n]:
-        for u in (it.get("images") or [])[:1]:
-            if isinstance(u, str) and u.startswith(("http://", "https://")):
-                urls.append(u)
-    if not urls:
-        return
-    with _WARM_LOCK:
-        todo = [u for u in urls if u not in _WARM_SEEN]
-        _WARM_SEEN.update(todo)
-        if _WARM_POOL is None:
-            from concurrent.futures import ThreadPoolExecutor
-            _WARM_POOL = ThreadPoolExecutor(max_workers=8,
-                                            thread_name_prefix="imgwarm")
-    for u in todo:
-        try:
-            _WARM_POOL.submit(fetch_cached_image, u)
-        except Exception:
-            break
-    if len(_WARM_SEEN) % 600 < len(todo):
-        try:
-            _WARM_POOL.submit(trim_remote_cache)
-        except Exception:
-            pass
+    from concurrent.futures import ThreadPoolExecutor
+
+    _WARM_POOL = _remote_image_cache.prewarm_images(
+        items,
+        n,
+        seen=_WARM_SEEN,
+        pool=_WARM_POOL,
+        lock=_WARM_LOCK,
+        executor_factory=ThreadPoolExecutor,
+        fetch_image=fetch_cached_image,
+        trim_cache=trim_remote_cache,
+    )
 
 
 # ══ 그림체 라이브러리 ══════════════════════════════════════════════════
@@ -1663,100 +1609,79 @@ _RATINGS_LOCK = threading.RLock()
 
 
 def artist_key(name):
-    """작가 이름 표준화 — 저장·조회·프롬프트 판정이 **같은 규칙**을 써야 한다.
-    파서가 내부 연속 공백을 하나로 줄이므로 여기서도 같이 줄인다 (R3-02)."""
-    return re.sub(r"\s+", " ", str(name or "")).strip().casefold()
+    return _artist_rating_store.artist_key(name)
+
+
+def _artist_rating_paths():
+    return _artist_rating_store.ArtistRatingPaths(
+        ratings_file=RATINGS_FILE,
+    )
+
+
+def _artist_rating_state():
+    return _artist_rating_store.ArtistRatingState(
+        cache=_RATINGS,
+        lock=_RATINGS_LOCK,
+    )
+
+
+def _artist_rating_operations():
+    """현재 저장 경계와 patch 가능한 조회·저장 함수를 서비스에 늦게 연결한다."""
+    return _artist_rating_store.ArtistRatingOperations(
+        transaction=shared_data_transaction,
+        load_json=load_json_recover,
+        atomic_write_json=atomic_write_json,
+        parse_artist_combo=parse_artist_combo,
+        warning=log.warning,
+        current_loader=lambda: globals()["load_ratings"](),
+        current_saver=lambda data: globals()["save_ratings"](data),
+    )
 
 
 def load_ratings():
-    """파일이 바뀌었으면 다시 읽는다 — 프로필을 둘 돌려도 서로의 평가를 안 잃는다."""
-    with _RATINGS_LOCK:
-        try:
-            mt = RATINGS_FILE.stat().st_mtime_ns if RATINGS_FILE.exists() else 0
-        except OSError:
-            mt = 0
-        if mt != _RATINGS["mtime"]:
-            d = {}
-            if RATINGS_FILE.exists():
-                try:
-                    d = load_json_recover(RATINGS_FILE) or {}
-                except Exception as e:
-                    log.warning(f"작가평가.json 읽기 실패: {e}")
-                    return _RATINGS["data"]        # 깨진 파일로 기억을 지우지 않는다
-            _RATINGS.update({"mtime": mt, "data": d if isinstance(d, dict) else {}})
-        return _RATINGS["data"]
+    return _artist_rating_store.load_ratings(
+        _artist_rating_paths(),
+        _artist_rating_state(),
+        _artist_rating_operations(),
+    )
 
 
 def save_ratings(d):
-    """원자적으로 저장한다 (반쪽 JSON·동시 쓰기 유실 방지 — R3-01)."""
-    with _RATINGS_LOCK:
-        RATINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(RATINGS_FILE, d)
-        try:
-            _RATINGS.update({"mtime": RATINGS_FILE.stat().st_mtime, "data": d})
-        except OSError:
-            _RATINGS.update({"mtime": -1, "data": d})
-        return d
+    return _artist_rating_store.save_ratings(
+        _artist_rating_paths(),
+        _artist_rating_state(),
+        _artist_rating_operations(),
+        d,
+    )
 
 
-@serialized_data_write(lambda: RATINGS_FILE.parent.parent)
 def rate_artist(name, **fields):
-    """작가 하나의 평가를 고친다. fields: score(0~5) · fav · block · memo"""
-    key = artist_key(name)
-    if not key:
-        return {}
-    with _RATINGS_LOCK:
-        # 프로세스 잠금을 기다린 사이 바뀐 파일을 반드시 다시 읽는다. Windows의
-        # 짧은 저장 간격에서도 놓치지 않도록 load_ratings는 mtime_ns를 쓴다.
-        _RATINGS["mtime"] = -1
-        d = dict(load_ratings())      # 최신을 다시 읽어 병합 (남의 저장을 덮지 않게)
-        cur = dict(d.get(key) or {})
-        for k in ("score", "fav", "block", "memo"):
-            if k in fields:
-                if k == "score":
-                    try:
-                        cur[k] = max(0, min(5, int(fields[k] or 0)))
-                    except (TypeError, ValueError):
-                        cur[k] = 0
-                elif k == "memo":
-                    # 메모도 사용자 원문이다. 화면·API 어디에도 500자 제한을 알리지
-                    # 않으면서 저장할 때만 자르면 다시 복구할 수 없다.
-                    cur[k] = str(fields[k] or "")
-                else:
-                    v = fields[k]
-                    # "false"·0·"" 같은 값이 참으로 읽히면 애먼 작가가 차단된다 (R4-01)
-                    cur[k] = (v if isinstance(v, bool)
-                              else str(v).strip().lower() in ("1", "true", "yes", "on"))
-        if not any([cur.get("score"), cur.get("fav"), cur.get("block"), cur.get("memo")]):
-            d.pop(key, None)          # 전부 비면 기록을 남기지 않는다
-        else:
-            d[key] = cur
-        save_ratings(d)
-        return cur
+    return _artist_rating_store.rate_artist(
+        _artist_rating_paths(),
+        _artist_rating_state(),
+        _artist_rating_operations(),
+        name,
+        **fields,
+    )
 
 
 def blocked_artists_in(text):
-    """프롬프트에 차단한 작가가 들어 있으면 목록으로 (생성 전 경고용)."""
-    d = load_ratings()
-    blocked = {k for k, v in d.items() if v.get("block")}
-    if not blocked:
-        return []
-    names = {artist_key(a) for _, a in parse_artist_combo(text or "")[0]}
-    return sorted(blocked & names)
+    return _artist_rating_store.blocked_artists_in(
+        _artist_rating_paths(),
+        _artist_rating_state(),
+        _artist_rating_operations(),
+        text,
+    )
 
 
 def style_rating(rec, ratings=None):
-    """그림체 한 줄의 평가 요약 — 작가들의 평균 별점·즐겨찾기·차단 포함 여부."""
-    d = load_ratings() if ratings is None else ratings
-    arts = [artist_key(a) for a in (rec.get("artists") or [])]
-    vals = [d.get(a) for a in arts if d.get(a)]
-    scores = [v["score"] for v in vals if v.get("score")]
-    return {
-        "score": round(sum(scores) / len(scores), 1) if scores else 0,
-        "fav": any(v.get("fav") for v in vals),
-        "block": any(v.get("block") for v in vals),
-        "rated": len(vals),
-    }
+    return _artist_rating_store.style_rating(
+        _artist_rating_paths(),
+        _artist_rating_state(),
+        _artist_rating_operations(),
+        rec,
+        ratings,
+    )
 
 
 LIBRARY_REVIEW_FILE = BASE_DIR / "수집" / "자료정리.json"
@@ -1869,89 +1794,63 @@ _TAG_LOCK = threading.RLock()
 
 
 def _slot_of_tag(tag, cat, char_rules, style_rules):
-    """규격.json 의 키워드 규칙 + CSV 카테고리로 슬롯 결정. (슬롯이름, 종류) 반환"""
-    if cat == 1:
-        return "작가", "style"
-    if cat == 3:
-        return "원작/장르", "style"
-    if cat == 4:
-        return "기본", "char"
-    core = tag.replace("_", " ").lower()
-    best, best_len, kind = None, 0, "char"
-    for rules, k in ((char_rules, "char"), (style_rules, "style")):
-        for g in rules:
-            for kw in g.get("키워드", []):
-                kl = kw.lower()
-                if len(kl) > best_len and kl in core:
-                    best, best_len, kind = g["이름"], len(kl), k
-    return best, kind
+    return _tag_catalog.slot_of_tag(
+        tag,
+        cat,
+        char_rules,
+        style_rules,
+    )
+
+
+def _tag_catalog_paths():
+    return _tag_catalog.TagCatalogPaths(
+        tag_dir=TAG_DIR,
+        cache_file=AC_CACHE_FILE,
+    )
+
+
+def _tag_catalog_state():
+    return _tag_catalog.TagCatalogState(
+        cache=_TAG_CACHE,
+        lock=_TAG_LOCK,
+        cache_version=AC_CACHE_VER,
+    )
+
+
+def _tag_catalog_operations():
+    return _tag_catalog.TagCatalogOperations(
+        renamed_tag=nai_renamed_tag,
+        info=log.info,
+        warning=log.warning,
+    )
 
 
 def load_tag_dict(spec):
-    """CSV들을 한 번만 읽어 메모리에 인덱싱 (5~10MB, 1~2초).
-    태그/*.csv 가 없으면 빈 사전으로 돌아간다 — 자동완성·빌더 사전만 비고 생성은 정상."""
-    if _TAG_CACHE["loaded"]:
-        return _TAG_CACHE
-    with _TAG_LOCK:
-        if _TAG_CACHE["loaded"]:      # 기다리는 동안 다른 쪽이 다 만들었으면 그걸 쓴다
-            return _TAG_CACHE
-        return _load_tag_dict_inner(spec)
+    return _tag_catalog.load_tag_dict(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        spec,
+    )
 
 
 def _load_tag_dict_inner(spec):
-    rows, by_slot = [], {}
-    if TAG_DIR.exists():
-        import csv as _csv
-        char_rules = spec.get("캐릭터_그룹", [])
-        style_rules = spec.get("그림체_그룹", [])
-        for p in sorted(TAG_DIR.glob("*.csv")):
-            try:
-                with open(p, encoding="utf-8", errors="ignore", newline="") as f:
-                    for r in _csv.reader(f):
-                        if len(r) < 3 or not r[0].strip():
-                            continue
-                        tag = r[0].strip()
-                        try:
-                            cat = int(r[1]) if r[1].strip() else 0
-                            cnt = int(r[2]) if r[2].strip() else 0
-                        except ValueError:
-                            continue
-                        slot, kind = _slot_of_tag(tag, cat, char_rules, style_rules)
-                        display = tag.replace("_", " ")
-                        # CSV 4열은 **별칭**이다 (`1girl,0,6008644,"1girls,sole_female"`).
-                        # 예전엔 버렸다 — 별칭으로 치면 정식 태그를 못 찾았다 (F-01).
-                        al = [x.strip().replace("_", " ") for x in (r[3] if len(r) > 3 else "").split(",")]
-                        rows.append((display, cnt, slot or "", kind, [x for x in al if x]))
-                        if slot:
-                            by_slot.setdefault((kind, slot), []).append((display, cnt))
-            except Exception as e:
-                log.warning(f"태그 CSV 읽기 실패({p.name}): {e}")
-    for k in by_slot:
-        by_slot[k].sort(key=lambda x: -x[1])
-    _TAG_CACHE.update({"loaded": True, "rows": rows, "by_slot": by_slot})
-    log.info(f"태그 사전 로드: {len(rows):,}개 (슬롯 분류 {len(by_slot)}종)")
-    return _TAG_CACHE
+    return load_tag_dict(spec)
 
 
 def _ac_index(spec):
-    """자동완성 색인 — 사전 22만 줄을 매번 훑으면 한 번에 0.7초가 걸려 타이핑에 못 쓴다.
-    ① 앞 두 글자 → 빈도순 목록 (앞에서 맞는 것)
-    ② 전체를 빈도순으로 한 줄 (안에 든 것 — 흔한 것부터 보므로 일찍 끊을 수 있다)
-    작가 태그는 `artist:` 를 뗀 형태도 같은 바구니에 넣는다."""
-    if _TAG_CACHE.get("ac"):
-        return _TAG_CACHE["ac"]
-    with _TAG_LOCK:
-        if _TAG_CACHE.get("ac"):
-            return _TAG_CACHE["ac"]
-        # 캐시가 있으면 CSV 파싱(10초)까지 건너뛴다
-        got = _ac_cache_load()
-        if got:
-            _TAG_CACHE["rows"] = got["rows"]
-            _TAG_CACHE["loaded"] = True
-            _TAG_CACHE["ac"] = {"buckets": got["buckets"], "flat": got["flat"]}
-            log.info(f"자동완성 색인(캐시): 앞2글자 {len(got['buckets']):,}종")
-            return _TAG_CACHE["ac"]
-        return _ac_index_inner(load_tag_dict(spec))
+    return _tag_catalog.autocomplete_index(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        spec,
+        cache_loader=lambda: globals()["_ac_cache_load"](),
+        cache_saver=lambda rows, buckets, flat: globals()["_ac_cache_save"](
+            rows,
+            buckets,
+            flat,
+        ),
+    )
 
 
 AC_CACHE_FILE = BASE_DIR / "수집" / "태그색인.pickle"
@@ -1959,170 +1858,100 @@ AC_CACHE_VER = 3      # 3 = 별칭 색인 + NAI 개명 태그 교정
 
 
 def _tag_fingerprint():
-    """태그 CSV 들의 (이름, 크기, 수정시각) — 사전이 바뀌면 캐시를 버린다."""
-    if not TAG_DIR.exists():
-        return ()
-    return tuple(sorted((p.name, p.stat().st_size, int(p.stat().st_mtime))
-                        for p in TAG_DIR.glob("*.csv")))
+    return _tag_catalog.tag_fingerprint(
+        _tag_catalog_paths(),
+    )
 
 
 def _ac_cache_load():
-    """디스크에 저장해 둔 색인을 읽는다. 처음 한 번만 13초 걸리고 그 뒤엔 1초 안이다."""
-    try:
-        if not AC_CACHE_FILE.exists():
-            return None
-        import pickle
-        with open(AC_CACHE_FILE, "rb") as f:
-            got = pickle.load(f)
-        if got.get("fp") != _tag_fingerprint():
-            log.info("태그 사전이 바뀌어 색인 캐시를 버립니다")
-            return None
-        # 색인 구조가 바뀌면(별칭 추가 등) 옛 캐시는 못 쓴다 — 버전으로 가른다
-        if got.get("ver") != AC_CACHE_VER:
-            log.info("색인 형식이 바뀌어 캐시를 다시 만듭니다")
-            return None
-        return got
-    except Exception as e:
-        log.info(f"색인 캐시 읽기 건너뜀: {e}")
-        return None
+    return _tag_catalog.cache_load(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+    )
 
 
 def _ac_cache_save(rows, buckets, flat):
-    try:
-        import pickle
-        AC_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = AC_CACHE_FILE.with_suffix(".tmp")
-        with open(tmp, "wb") as f:
-            pickle.dump({"fp": _tag_fingerprint(), "ver": AC_CACHE_VER, "rows": rows,
-                         "buckets": buckets, "flat": flat}, f, protocol=4)
-        tmp.replace(AC_CACHE_FILE)
-        log.info(f"색인 캐시 저장: {AC_CACHE_FILE.stat().st_size//1024//1024}MB")
-    except Exception as e:
-        log.info(f"색인 캐시 저장 건너뜀: {e}")
+    return _tag_catalog.cache_save(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        rows,
+        buckets,
+        flat,
+    )
 
 
 def _ac_index_inner(d):
-    # 디스크 캐시가 있으면 그걸 쓴다 (사전 로드까지 건너뛴다)
-    got = _ac_cache_load()
-    if got:
-        d["rows"] = got["rows"]
-        d["ac"] = {"buckets": got["buckets"], "flat": got["flat"]}
-        log.info(f"자동완성 색인(캐시): 앞2글자 {len(got['buckets']):,}종")
-        return d["ac"]
-    buckets, flat = {}, []
-    for row in d["rows"]:
-        t, c, _slot, _k = row[0], row[1], row[2], row[3]
-        aliases = row[4] if len(row) > 4 else []
-        tl = t.lower()
-        suggested = nai_renamed_tag(t) or t
-        sl = suggested.lower()
-        flat.append((suggested, c, sl))
-        if sl != tl:
-            flat.append((suggested, c, tl))
-        keys = {tl[:2], sl[:2]}
-        tb = re.sub(r"^artists?:", "", tl)
-        if tb is not tl:
-            keys.add(tb[:2])
-        # 별칭으로 쳐도 **정식 태그**가 나오게 한다 (F-01).
-        # 넣는 값은 정식 이름(t)이고 비교용 문자열만 별칭이다 — 사용자는 옳은 태그를 받는다.
-        for a2 in aliases[:6]:
-            al = a2.lower()
-            if al and al != tl:
-                flat.append((suggested, c, al))
-                if len(al) >= 2:
-                    keys.add(al[:2])
-                    buckets.setdefault(al[:2], []).append((suggested, c, al))
-        for k in keys:
-            if len(k) == 2:
-                buckets.setdefault(k, []).append((suggested, c, sl if k == sl[:2] else tl))
-    for k in buckets:
-        buckets[k].sort(key=lambda x: -x[1])
-    flat.sort(key=lambda x: -x[1])
-    d["ac"] = {"buckets": buckets, "flat": flat}
-    log.info(f"자동완성 색인: 앞2글자 {len(buckets):,}종")
-    _ac_cache_save(d["rows"], buckets, flat)
-    return d["ac"]
+    return _tag_catalog.build_index(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        d,
+        cache_loader=lambda: globals()["_ac_cache_load"](),
+        cache_saver=lambda rows, buckets, flat: globals()["_ac_cache_save"](
+            rows,
+            buckets,
+            flat,
+        ),
+    )
 
 
 def autocomplete_tags(spec, q, limit=12):
-    """프롬프트 칸의 자동완성 — 앞에서 맞는 것 먼저, 그다음 안에 든 것.
-    각 묶음 안에서는 **빈도순**(단부루 자동완성과 같은 순서).
-    `_` 와 공백을 같게 보고, 작가 태그도 `artist:` 를 떼고 비교한다."""
-    q = (q or "").strip().lower().replace("_", " ")
-    if len(q) < 2:
-        return []
-    idx = _ac_index(spec)
-    bare = re.sub(r"^artists?:", "", q)
-    seen, out = set(), []
-    for key in {q[:2], bare[:2]}:
-        for t, c, tl in idx["buckets"].get(key, []):
-            if t in seen:
-                continue
-            if tl.startswith(q) or re.sub(r"^artists?:", "", tl).startswith(bare):
-                seen.add(t); out.append((t, c))
-                if len(out) >= limit * 2:
-                    break
-    out.sort(key=lambda x: -x[1])
-    if len(out) < limit:
-        for t, c, tl in idx["flat"]:           # 빈도순이라 흔한 것부터 나온다
-            if t in seen or q not in tl:
-                continue
-            seen.add(t); out.append((t, c))
-            if len(out) >= limit:
-                break
-    return [{"tag": t, "count": c} for t, c in out[:limit]]
+    return _tag_catalog.autocomplete_tags(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        spec,
+        q,
+        limit,
+        index=globals()["_ac_index"](spec),
+    )
 
 
 def search_tags(spec, kind, slot, q, limit=60):
-    d = load_tag_dict(spec)
-    q = (q or "").strip().lower().replace("_", " ")
-    if slot:
-        pool = d["by_slot"].get((kind, slot), [])
-        if q:
-            hit = [x for x in pool if q in x[0].lower()]
-            if hit:
-                return [{"tag": t, "count": c} for t, c in hit[:limit]]
-            # 슬롯 키워드에 없는 태그도 찾을 수 있게 전체 사전으로 폴백
-        else:
-            return [{"tag": t, "count": c} for t, c in pool[:limit]]
-    if not q:
-        return []
-    out = [(r[0], r[1]) for r in d["rows"] if q in r[0].lower()]   # rows 는 5칸(별칭 포함)
-    out.sort(key=lambda x: -x[1])
-    return [{"tag": t, "count": c} for t, c in out[:limit]]
+    return _tag_catalog.search_tags(
+        _tag_catalog_paths(),
+        _tag_catalog_state(),
+        _tag_catalog_operations(),
+        spec,
+        kind,
+        slot,
+        q,
+        limit,
+    )
+
+
+def _builder_handler_paths():
+    return _builder_handlers.BuilderHandlerPaths(
+        builder_file=BUILDER_FILE,
+        transaction_root=CHAR_DIR.parent,
+    )
+
+
+def _builder_handler_operations():
+    """빌더 저장이 쓰는 기존 저장·잠금·파일 동기화 경계를 늦게 연결한다."""
+    return _builder_handlers.BuilderHandlerOperations(
+        load_json=globals()["load_json_recover"],
+        transaction=globals()["shared_data_transaction"],
+        compose_ordered=globals()["_compose_ordered"],
+        save_style_file=globals()["save_style_file"],
+        list_styles=globals()["list_styles"],
+        random_character_id=lambda: "".join(random.choices(
+            string.ascii_lowercase + string.digits,
+            k=8,
+        )),
+        sync_chars_to_files=globals()["sync_chars_to_files"],
+        save_config=globals()["save_config"],
+        warning=globals()["log"].warning,
+    )
 
 
 def load_builder():
-    if BUILDER_FILE.exists():
-        try:
-            data = load_json_recover(BUILDER_FILE)
-            if isinstance(data, dict):
-                # 후보사전은 사람이 직접 고치는 자료다. 과거에는 캐릭터의 의상·신체·
-                # 성별 변형인 "예술적 변형"이 베이스 목록 안에 들어가 있었다.
-                # `대상`을 명시한 단계는 파일의 물리적 위치와 무관하게 올바른 빌더로
-                # 옮긴다. 이렇게 하면 기존 사용자 후보사전의 순서를 부수지 않으면서도
-                # 화면과 저장 결과는 정확한 캐릭터 경로를 쓴다.
-                chars = list(data.get("캐릭터단계") or [])
-                base = []
-                for step in list(data.get("베이스단계") or []):
-                    if isinstance(step, dict) and step.get("대상") == "캐릭터":
-                        chars.append(step)
-                    else:
-                        base.append(step)
-                # 기존 후보사전의 첫 슬롯은 이름만 "작가 조합"이고 후보가 비어 있다.
-                # 별도 표시값이 없어 빌더 화면에는 조합 라이브러리를 여는 버튼이 0개였다.
-                # 사용자가 고친 후보사전과도 호환되게, 이 명확한 빈 전용 슬롯만 연결한다.
-                for step in base:
-                    for slot in (step.get("슬롯") or []) if isinstance(step, dict) else []:
-                        if (slot.get("라벨") == "작가 조합"
-                                and not (slot.get("후보") or [])):
-                            slot.setdefault("조합전용", True)
-                data["캐릭터단계"] = chars
-                data["베이스단계"] = base
-                return data
-        except Exception as e:
-            log.warning(f"후보사전.json 손상: {e}")
-    return {"슬롯": [], "풀": {}, "한글": {}}
+    return _builder_handlers.load_builder(
+        _builder_handler_paths(),
+        _builder_handler_operations(),
+    )
 
 # ═══════════════════════════════════════════════════════════════════
 #  규격 vs 세팅 — 이 프로그램의 기본 구분
@@ -2144,100 +1973,68 @@ KINDS = ("체위", "표정", "백합")
 _SETTING_TX_LOCK = threading.RLock()
 
 
-def serialized_setting_write(func):
-    """세팅 한 파일의 읽기→수정→쓰기를 한 덩어리로 직렬화한다.
-
-    atomic_write_json은 반쪽 파일을 막지만, 두 요청이 같은 옛 파일을 읽은 뒤 각각
-    정상 저장하면 마지막 저장이 앞 변경을 덮는 문제까지 막지는 못한다.
-    """
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        with shared_data_transaction(SETTINGS_DIR.parent):
-            with _SETTING_TX_LOCK:
-                return func(*args, **kwargs)
-    return wrapped
+def _setting_store_paths():
+    """세팅 서비스가 현재 프로필 경로를 호출 시점에 읽게 한다."""
+    return _setting_store.SettingStorePaths(
+        settings_dir=SETTINGS_DIR,
+        schema_dir=SCHEMA_DIR,
+        preset_dir=SCENESET_DIR,
+    )
 
 
-@serialized_setting_write
+def _setting_store_operations():
+    """원자 저장·잠금·컴파일 규칙을 세팅 저장소에 연결한다."""
+    return _setting_store.SettingStoreOperations(
+        transaction=_setting_transaction,
+        load_json=globals()["load_json_recover"],
+        atomic_write_json=globals()["atomic_write_json"],
+        recoverable_remove=globals()["recoverable_remove"],
+        safe_name=globals()["_safe_name"],
+        derive_catalog=globals()["derive_setting_catalog"],
+        axis_specs=globals()["axis_specs"],
+        ensure_schema_split=globals()["ensure_schema_split"],
+        warning=globals()["log"].warning,
+        info=globals()["log"].info,
+    )
+
+
 def ensure_settings_migration():
-    """씬규격/(구) 또는 asset_config.json(구구) → 세팅/ 으로 1회 변환"""
-    if SETTINGS_DIR.exists():
-        return
-    ensure_schema_split()  # asset_config → 씬규격 (더 옛 버전 대비)
-    if not SCHEMA_DIR.exists():
-        return
-    SETTINGS_DIR.mkdir()
-    mapping = {"체위": ("남녀 체위", "남녀"), "표정": ("표정", "단독"), "백합": ("백합", "백합")}
-    for kind, (name, mode) in mapping.items():
-        src = SCHEMA_DIR / kind / "기본.json"
-        if not src.exists():
-            continue
-        try:
-            data = load_json_recover(src)
-        except Exception as e:
-            log.warning(f"{kind} 변환 실패: {e}")
-            continue
-        out = {"이름": name, "방식": mode, "씬": data.get("씬", {}),
-               "옵션": data.get("옵션", {}),
-               "상대역": {"외형": "", "착의": "", "네거티브": "", "의상": ""}}
-        atomic_write_json(
-            SETTINGS_DIR / f"{name}.json", out, keep_backup=False)
-    log.info("세팅/ 폴더 생성 완료 (씬규격에서 변환)")
+    return _setting_store.ensure_migration(
+        _setting_store_paths(),
+        _setting_store_operations(),
+    )
 
 
 def list_settings():
-    """세팅/ 폴더의 세팅 파일 목록 (파일 기반 — 넣고 빼는 대로 반영)"""
-    ensure_settings_migration()
-    out = []
-    if not SETTINGS_DIR.exists():
-        return out
-    for p in sorted(SETTINGS_DIR.glob("*.json")):
-        try:
-            data = load_json_recover(p)
-            if isinstance(data, dict) and data.get("씬"):
-                out.append({"file": p.name, "name": data.get("이름") or p.stem,
-                            "mode": data.get("방식", "단독"), "data": data})
-        except Exception as e:
-            log.warning(f"세팅 파일 손상({p.name}): {e}")
-    return out
+    return _setting_store.list_settings(
+        _setting_store_paths(),
+        _setting_store_operations(),
+    )
 
 
 def used_scene_nums(skip=None):
-    """모든 세팅이 쓰는 씬 번호. **번호는 세팅끼리 공유하는 전역 이름공간**이라
-    겹치면 나중에 읽힌 세팅이 앞의 것을 덮어써 조용히 사라진다."""
-    used = {}
-    for st in list_settings():
-        if skip and st["name"] == skip:
-            continue
-        for k in st["data"].get("씬", {}):
-            if str(k).isdigit():
-                used[int(k)] = st["name"]
-    return used
+    return _setting_store.used_scene_nums(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        skip,
+    )
 
 
 def free_scene_block(count, skip=None, step=100):
-    """빈 번호 구간을 찾아 시작 번호를 돌려준다 (100 단위 구간으로 잡아 눈에 띄게)."""
-    used = set(used_scene_nums(skip))
-    start = step
-    while True:
-        if not any((start + i) in used for i in range(max(1, count))):
-            return start
-        start += step
+    return _setting_store.free_scene_block(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        count,
+        skip,
+        step,
+    )
 
 
 def scene_num_clashes():
-    """세팅끼리 겹치는 번호 목록 (경고용)."""
-    seen, clash = {}, {}
-    for st in list_settings():
-        for k in st["data"].get("씬", {}):
-            if not str(k).isdigit():
-                continue
-            n = int(k)
-            if n in seen:
-                clash.setdefault(n, [seen[n]]).append(st["name"])
-            else:
-                seen[n] = st["name"]
-    return clash
+    return _setting_store.scene_num_clashes(
+        _setting_store_paths(),
+        _setting_store_operations(),
+    )
 
 
 def setting_thumbs(name, cfg=None):
@@ -2271,120 +2068,39 @@ def setting_thumbs(name, cfg=None):
     return out
 
 
-@serialized_setting_write
 def duplicate_setting_group(name, gid):
-    """세트 복제 — 그 세트의 씬들을 새 번호로 복사해 같은 세팅 파일에 넣는다."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
-    d = load_json_recover(p)
-    scenes = d.get("씬", {})
-    group = next((g for g in derive_setting_catalog(scenes) if g["id"] == int(gid)), None)
-    if not group:
-        return {"ok": False, "error": "그 세트를 찾을 수 없습니다."}
-    # 빈 번호 구간을 찾는다 (연속으로 len(ids)개)
-    used = {int(k) for k in scenes if str(k).isdigit()}
-    span = len(group["ids"])
-    start = max(used) + 1
-    while any((start + i) in used for i in range(span)):
-        start += 1
-    for i, src in enumerate(group["ids"]):
-        sc = dict(scenes[str(src)])
-        sc["name"] = f"{sc.get('name','')} 사본" if i == 0 else sc.get("name", "")
-        # 세트 묶음 규칙은 '이름의 마지막 단어를 뗀 나머지' 다.
-        # 원본 이름 뒤에 붙이면 원본과 다른 세트가 되면서 단계명은 그대로 유지된다.
-        nm = scenes[str(src)].get("name", "")
-        head, _, tail = nm.rpartition(" ")
-        sc["name"] = f"{head} 사본 {tail}" if head else f"{nm} 사본"
-        scenes[str(start + i)] = sc
-    d["씬"] = scenes
-    atomic_write_json(p, d, indent=1)
-    return {"ok": True, "new_id": start, "count": span}
+    return _setting_store.duplicate_group(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        gid,
+    )
 
 
 def setting_content_revision(data):
-    return hashlib.sha256(json.dumps(
-        data, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+    return _setting_store.content_revision(data)
 
 
-@serialized_setting_write
 def duplicate_setting_scene(name, scene_id, expect_revision=""):
-    """장면 하나의 모든 필드를 복제한다. 아직 저장하지 않은 화면 값은 대상이 아니다."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
-    pack = load_json_recover(p)
-    revision = setting_content_revision(pack)
-    if expect_revision and str(expect_revision) != revision:
-        return {
-            "ok": False, "conflict": True,
-            "error": "다른 저장이 먼저 반영되어 장면을 복제하지 않았습니다. 다시 열어 확인해주세요.",
-        }
-    scenes = pack.get("씬") or {}
-    scene_id = str(scene_id)
-    source = scenes.get(scene_id)
-    if not isinstance(source, dict):
-        return {"ok": False, "error": f"{scene_id}번 장면을 찾을 수 없습니다."}
-    used = set(used_scene_nums())
-    try:
-        candidate = int(scene_id) + 1
-    except ValueError:
-        candidate = max(used, default=99) + 1
-    while candidate in used:
-        candidate += 1
-    clone = copy.deepcopy(source)
-    root = str(clone.get("name") or "장면").strip() + " 사본"
-    names = {
-        str(scene.get("name") or "").casefold()
-        for scene in scenes.values() if isinstance(scene, dict)
-    }
-    clone_name = root
-    serial = 2
-    while clone_name.casefold() in names:
-        clone_name = f"{root} {serial}"
-        serial += 1
-    clone["name"] = clone_name
-    new_id = str(candidate)
-    scenes[new_id] = clone
-    pack["씬"] = scenes
-    atomic_write_json(p, pack, indent=1)
-    return {
-        "ok": True, "setting": name, "new_id": new_id,
-        "name": clone_name, "scene_sha256": setting_content_revision(clone),
-        "revision": setting_content_revision(pack),
-    }
+    return _setting_store.duplicate_scene(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        scene_id,
+        expect_revision,
+    )
 
 
-@serialized_setting_write
 def undo_duplicate_setting_scene(name, scene_id, scene_sha256,
                                  expect_revision=""):
-    """방금 복제한 장면이 그대로일 때만 제거한다."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅 파일을 찾을 수 없습니다."}
-    pack = load_json_recover(p)
-    revision = setting_content_revision(pack)
-    if expect_revision and str(expect_revision) != revision:
-        return {
-            "ok": False, "conflict": True,
-            "error": "복제 뒤 다른 저장이 반영되어 자동으로 취소하지 않았습니다.",
-        }
-    scene_id = str(scene_id)
-    scene = (pack.get("씬") or {}).get(scene_id)
-    if not isinstance(scene, dict):
-        return {"ok": False, "error": "취소할 복제 장면을 찾을 수 없습니다."}
-    if not scene_sha256 or setting_content_revision(scene) != str(scene_sha256):
-        return {
-            "ok": False, "conflict": True,
-            "error": "복제한 장면이 이미 수정되어 자동으로 지우지 않았습니다.",
-        }
-    pack["씬"].pop(scene_id, None)
-    atomic_write_json(p, pack, indent=1)
-    return {
-        "ok": True, "setting": name, "removed_id": scene_id,
-        "revision": setting_content_revision(pack),
-    }
+    return _setting_store.undo_duplicate_scene(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        scene_id,
+        scene_sha256,
+        expect_revision,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2393,172 +2109,73 @@ def undo_duplicate_setting_scene(name, scene_id, scene_sha256,
 #    `<세트이름> <단계명>` 으로 만들면 자동으로 한 묶음이 된다.
 #    단계 수는 자유다 (묶음 안의 순서로 단계를 세므로 5장에 묶이지 않는다).
 # ══════════════════════════════════════════════════════════════════════
-BUILDER_MODES = ("단독", "남녀", "백합")
+BUILDER_MODES = _setting_store.BUILDER_MODES
 
 
-@serialized_setting_write
 def new_setting(name, mode="단독", stages=None):
-    """빈 세팅 파일을 만든다. stages 는 단계명 목록 (["시작","중간","끝"] 처럼)."""
-    safe = _safe_name(name) or "새 세팅"
-    if mode not in BUILDER_MODES:
-        mode = "단독"
-    SETTINGS_DIR.mkdir(exist_ok=True)
-    target, k = SETTINGS_DIR / f"{safe}.json", 2
-    while target.exists():
-        target = SETTINGS_DIR / f"{safe} ({k}).json"
-        k += 1
-    data = {
-        "이름": target.stem,
-        "방식": mode,
-        "단계명": [x for x in (stages or ["시작", "중간", "끝"]) if str(x).strip()],
-        "계열이름": {},
-        "옵션규격": {},
-        "옵션": {},
-        "씬": {},
-        "상대역": {},
-    }
-    atomic_write_json(target, data, indent=1, keep_backup=False)
-    return {"ok": True, "name": target.stem, "file": target.name}
+    return _setting_store.create_setting(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        mode,
+        stages,
+    )
 
 
-@serialized_setting_write
 def setting_add_set(name, label, category="", width=832, height=1216, stages=None):
-    """세트 하나를 추가 — 단계명마다 씬을 하나씩 만든다."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = load_json_recover(p)
-    stages = [x for x in (stages or d.get("단계명") or ["시작", "중간", "끝"]) if str(x).strip()]
-    label = (label or "새 세트").strip()
-    scenes = d.setdefault("씬", {})
-    mine = {int(k) for k in scenes if str(k).isdigit()}
-    others = set(used_scene_nums(skip=name))
-    start = (max(mine) + 1) if mine else free_scene_block(len(stages), skip=name)
-    while any((start + i) in others or (start + i) in mine for i in range(len(stages))):
-        start += 1
-    for i, stg in enumerate(stages):
-        scenes[str(start + i)] = {
-            "name": f"{label} {stg}".strip(),
-            "female_prompt": "", "male_prompt": "",
-            "width": int(width), "height": int(height),
-            "category": category or "",
-        }
-    atomic_write_json(p, d, indent=1)
-    return {"ok": True, "start": start, "count": len(stages)}
+    return _setting_store.add_set(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        label,
+        category,
+        width,
+        height,
+        stages,
+    )
 
 
-@serialized_setting_write
 def setting_meta_save(name, patch):
-    """세팅의 머리 정보 (이름·방식·단계명·계열이름·옵션규격·옵션·상대역) 저장."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = load_json_recover(p)
-    for k in ("방식", "단계명", "계열이름", "옵션규격", "옵션", "상대역"):
-        if k in patch:
-            d[k] = patch[k]
-    if d.get("방식") not in BUILDER_MODES:
-        d["방식"] = "단독"
-    # 이름을 바꾸면 파일명도 맞춘다
-    newname = (patch.get("이름") or "").strip()
-    if newname and newname != d.get("이름"):
-        safe = _safe_name(newname) or d["이름"]
-        tgt = SETTINGS_DIR / f"{safe}.json"
-        if tgt.exists() and tgt != p:
-            return {"ok": False, "error": f"'{safe}' 이름이 이미 있습니다."}
-        d["이름"] = safe
-        # 새 이름의 완성본을 먼저 만든 뒤 옛 이름을 치운다. 중간 종료라면 두 벌이
-        # 남을 수는 있어도 세팅 내용 자체가 사라지지는 않는다.
-        atomic_write_json(tgt, d, indent=1, keep_backup=False)
-        recoverable_remove(p, label="이름변경")
-        return {"ok": True, "name": safe, "renamed": True}
-    d["이름"] = d.get("이름") or p.stem
-    atomic_write_json(p, d, indent=1)
-    return {"ok": True, "name": d["이름"]}
+    return _setting_store.save_meta(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        patch,
+    )
 
 
-@serialized_setting_write
 def setting_renumber(name, start=None):
-    """이 세팅의 씬 번호를 겹치지 않는 구간으로 다시 매긴다 (세트·단계 순서는 유지)."""
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    d = load_json_recover(p)
-    scenes = d.get("씬", {})
-    order = []
-    for g in derive_setting_catalog(scenes):
-        order.extend(g["ids"])
-    for k in sorted(int(x) for x in scenes if str(x).isdigit()):
-        if k not in order:
-            order.append(k)
-    if start is None:
-        start = free_scene_block(len(order), skip=name)
-    new = {}
-    for i, old in enumerate(order):
-        new[str(start + i)] = scenes[str(old)]
-    d["씬"] = new
-    atomic_write_json(p, d, indent=1)
-    return {"ok": True, "start": start, "count": len(new), "clashes": scene_num_clashes()}
+    return _setting_store.renumber(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+        start,
+    )
 
 
-@serialized_setting_write
 def setting_delete(name):
-    p = setting_path(name)
-    if not p:
-        return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-    backup = recoverable_remove(p)
-    return {"ok": True, "backup": backup.name}
+    return _setting_store.delete_setting(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+    )
 
 
 def export_settings_zip(names=None):
-    """세팅 파일들을 ZIP 바이트로. names 가 없으면 전부."""
-    import io
-    import zipfile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        for st in list_settings():
-            if names and st["name"] not in names:
-                continue
-            p = SETTINGS_DIR / st["file"]
-            z.write(p, p.name)
-    return buf.getvalue()
+    return _setting_store.export_settings(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        names,
+    )
 
 
-@serialized_setting_write
 def import_settings_bytes(data, filename=""):
-    """ZIP 이든 낱개 JSON 이든 받아 세팅/ 에 넣는다. 같은 이름은 덮어쓰지 않고 ' (2)' 를 붙인다."""
-    import io
-    import zipfile
-    SETTINGS_DIR.mkdir(exist_ok=True)
-    added, skipped = [], []
-
-    def put(stem, raw):
-        try:
-            d = json.loads(raw.decode("utf-8"))
-        except Exception:
-            skipped.append(f"{stem}: JSON 이 아닙니다")
-            return
-        if not (isinstance(d, dict) and d.get("씬")):
-            skipped.append(f"{stem}: 세팅 파일이 아닙니다 ('씬' 이 없음)")
-            return
-        base = _safe_name(d.get("이름") or stem) or "세팅"
-        target, k = SETTINGS_DIR / f"{base}.json", 2
-        while target.exists():
-            target = SETTINGS_DIR / f"{base} ({k}).json"
-            k += 1
-        if target.stem != base:
-            d["이름"] = target.stem          # 파일명과 세팅 이름을 맞춰 둔다
-        atomic_write_json(target, d, indent=1, keep_backup=False)
-        added.append(target.stem)
-
-    if data[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for n in z.namelist():
-                if n.lower().endswith(".json") and not n.endswith("/"):
-                    put(Path(n).stem, z.read(n))
-    else:
-        put(Path(filename).stem or "세팅", data)
-    return {"ok": bool(added), "added": added, "skipped": skipped}
+    return _setting_store.import_settings(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        data,
+        filename,
+    )
 
 
 # ── 자료팩 가져오기 ────────────────────────────────────────────────────────
@@ -3353,14 +2970,11 @@ def rollback_user_backup(batch_id):
 
 
 def setting_path(name):
-    for p in (SETTINGS_DIR.glob("*.json") if SETTINGS_DIR.exists() else []):
-        try:
-            d = load_json_recover(p)
-            if (d.get("이름") or p.stem) == name:
-                return p
-        except Exception:
-            continue
-    return None
+    return _setting_store.setting_path(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        name,
+    )
 
 
 def ensure_schema_split():
@@ -5580,35 +5194,15 @@ class ConfigServer:
         return merged
 
     def snapshot_config(self):
-        settings_out = []
         try:
-            for st in list_settings():
-                scenes = st["data"].get("씬", {})
-                groups = derive_setting_catalog(scenes)
-                cats = {}
-                for g in groups:
-                    cats[g["cat"]] = cats.get(g["cat"], 0) + 1
-                # 계열 이름표는 **세팅 파일의 '계열이름'** 이 먼저다.
-                # 없으면 내장 표(체위용), 그것도 없으면 'H 계열' 식으로 자동.
-                labels = st["data"].get("계열이름") or {}
-                meta = {c: {"name": (labels.get(c)
-                                     or CATEGORY_META.get(c, {}).get("name")
-                                     or (f"{c} 계열" if c else "전체")),
-                            "sub": f"{n}종"} for c, n in cats.items()}
-                settings_out.append({
-                    "file": st["file"], "name": st["name"], "mode": st["mode"],
-                    "groups": groups, "category_meta": meta,
-                    "options": st["data"].get("옵션", {}),
-                    "role": st["data"].get("상대역", {}),
-                    # ↓ 세팅 빌더용
-                    "stages": st["data"].get("단계명") or [],
-                    "axis_specs": {k: {"적용": t, "방식": sh}
-                                   for k, (t, sh) in axis_specs(st["data"]).items()},
-                    "cat_names": st["data"].get("계열이름") or {},
-                    "nums": sorted(int(k) for k in st["data"].get("씬", {}) if str(k).isdigit()),
-                })
+            settings_out = _setting_store.setting_catalog(
+                _setting_store_paths(),
+                _setting_store_operations(),
+                CATEGORY_META,
+            )
         except Exception as e:
             log.warning(f"세팅 로드 실패: {e}")
+            settings_out = []
         return {
             "config": {**{k: v for k, v in self.cfg.items() if not k.startswith("_")},
                        "_revision": self.config_revision},
@@ -5759,68 +5353,34 @@ class ConfigServer:
             self, None, _generation_handler_operations())
 
     def handle_role_save(self, body):
-        """세팅의 상대역 저장 → 세팅 파일에 기록"""
-        try:
-            data = json.loads(body)
-            path = setting_path(data.get("setting", ""))
-            if not path:
-                return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
-            pack = load_json_recover(path)
-            role = pack.setdefault("상대역", {})
-            for k in ("외형", "착의", "네거티브", "의상"):
-                if k in (data.get("role") or {}):
-                    role[k] = data["role"][k]
-            atomic_write_json(path, pack)
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _setting_store.save_role(
+            _setting_store_paths(),
+            _setting_store_operations(),
+            body,
+        )
 
     def handle_sceneset_save(self, body):
-        try:
-            data = json.loads(body)
-            name = (data.get("name") or "").strip()
-            if not name:
-                return {"ok": False, "error": "프리셋 이름을 입력해주세요."}
-            SCENESET_DIR.mkdir(exist_ok=True)
-            preset = {k: self.cfg.get(k) for k in SCENESET_KEYS}
-            atomic_write_json(SCENESET_DIR / f"{_safe_name(name)}.json", preset)
-            return {"ok": True, "scene_presets": list_scene_presets()}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _setting_store.save_preset(
+            _setting_store_paths(),
+            _setting_store_operations(),
+            body,
+            self.cfg,
+        )
 
-    @serialized_setting_write
     def handle_option_item(self, body):
-        """세팅에 소속된 옵션의 항목 추가/삭제. {setting, option, op: set|del, name, value}"""
-        try:
-            data = json.loads(body)
-            option = (data.get("option") or "").strip()
-            name = (data.get("name") or "").strip()
-            op = data.get("op")
-            path = setting_path(data.get("setting", ""))
-            if not path or not option or not name or op not in ("set", "del"):
-                return {"ok": False, "error": "잘못된 요청입니다."}
-            pack = load_json_recover(path)
-            opts = pack.setdefault("옵션", {}).setdefault(option, {})
-            if op == "del":
-                opts.pop(name, None)
-            else:
-                opts[name] = data.get("value")
-            atomic_write_json(path, pack)
-            return {"ok": True, "snapshot": self.snapshot_config()}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _setting_store.update_option(
+            _setting_store_paths(),
+            _setting_store_operations(),
+            body,
+            self.snapshot_config,
+        )
 
     def handle_style_save(self, body):
-        try:
-            data = json.loads(body)
-            name = (data.get("name") or "").strip()
-            if not name:
-                return {"ok": False, "error": "그림체 이름을 입력해주세요."}
-            save_style_file(name, prompt=data.get("prompt", ""), groups=data.get("groups"),
-                            settings=data.get("settings"), negative=data.get("negative", ""))
-            return {"ok": True, "styles": list_styles(self.spec)}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _builder_handlers.handle_style_save(
+            self,
+            {"body": body},
+            _builder_handler_operations(),
+        )
 
     @serialized_data_write(lambda: BASE_DIR)
     def handle_compare_promote(self, body):
@@ -5984,48 +5544,13 @@ class ConfigServer:
             _image_tool_operations(),
         )
 
-    @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_norm_save(self, body):
-        """규격화 도구 저장: type=char → 캐릭터 등록+파일, type=style → 그림체 파일"""
-        try:
-            data = json.loads(body)
-            name = (data.get("name") or "").strip()
-            groups = data.get("groups") or {}
-            if not name:
-                return {"ok": False, "error": "이름을 입력해주세요."}
-            if data.get("type") == "style":
-                order = [g["이름"] for g in self.spec.get("그림체_그룹", [])]
-                prompt = _compose_ordered(groups, order)
-                if not prompt:
-                    return {"ok": False, "error": "내용이 비어 있습니다."}
-                save_style_file(name, groups=groups)
-                return {"ok": True, "styles": list_styles(self.spec)}
-            order = [g["이름"] for g in self.spec.get("캐릭터_그룹", [])]
-            female = _compose_ordered(groups, order)
-            if not female:
-                # 규격 그룹명과 다른 그룹(빌더 등) → 값을 순서대로 이어붙임
-                female = ", ".join(v.strip().rstrip(",") for v in groups.values()
-                                   if isinstance(v, str) and v.strip())
-            if not female:
-                return {"ok": False, "error": "내용이 비어 있습니다."}
-            with self.config_lock:
-                self.use_latest_config()
-                new_char = {
-                    "id": "".join(random.choices(string.ascii_lowercase + string.digits, k=8)),
-                    "name": name, "female": female, "clothed": "",
-                    "negative": data.get("negative", ""),
-                    "groups": data.get("builder_groups") or groups, "enabled": True,
-                    "folder_id": data.get("folder_id") or None,
-                    "subfolder_id": data.get("subfolder_id") or None,
-                }
-                self.cfg.setdefault("characters", []).append(new_char)
-                sync_chars_to_files(self.cfg)
-                save_config(self.cfg)
-                self.config_revision += 1
-                return {"ok": True, "characters": self.cfg["characters"],
-                        "revision": self.config_revision}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _builder_handlers.handle_norm_save(
+            self,
+            {"body": body},
+            _builder_handler_paths(),
+            _builder_handler_operations(),
+        )
 
     def handle_save(self, body):
         return _settings_handlers.handle_save(
