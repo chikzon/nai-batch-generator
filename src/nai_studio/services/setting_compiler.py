@@ -10,6 +10,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from src.nai_studio.domain.image_metadata import strip_comment_lines
+from src.nai_studio.domain.positioning import (
+    normalize_scene_centers,
+    position_mode_uses_coords,
+    spread_centers,
+)
 
 AXIS_TARGETS = ("base", "여자", "남자", "네거티브")
 AXIS_SHAPES = ("고정", "계열별", "단계별")
@@ -32,6 +38,82 @@ def clean_char_prompt(raw: Any) -> str:
 def setting_state(config: dict, name: str) -> dict:
     """설정에 저장된 한 세팅의 선택 상태를 돌려준다."""
     return (config.get("setting_state") or {}).get(name, {})
+
+
+def load_asset_config(
+    config: dict,
+    *,
+    list_settings: Any,
+    derive_catalog: Any,
+    warn: Any,
+) -> dict:
+    """세팅 파일을 실행용 장면·옵션 축 사전으로 병합한다."""
+    style = (config.get("base_prompt") or "").strip()
+    asset_config = {
+        "base": {
+            "nsfw_base_prompt": "1girl, 1boy"
+            + (f", {style}" if style else ""),
+            "yuri_base_prompt": "2girls, yuri"
+            + (f", {style}" if style else ""),
+            "base_prompt": "1girl" + (f", {style}" if style else ""),
+            "nsfw_negative_prompt": config.get("negative_prompt", ""),
+            "negative_prompt": config.get("negative_prompt", ""),
+            "cfg_scale": config.get("cfg_scale", 5.5),
+            "cfg_rescale": config.get("cfg_rescale", 0.56),
+            "sampler": config.get(
+                "sampler", "k_euler_ancestral"
+            ),
+            "scheduler": config.get("scheduler", "karras"),
+            "uc_preset": 3,
+        },
+        "scenes": {},
+        "_settings": {},
+    }
+    for setting in list_settings():
+        name = setting["name"]
+        mode = setting["mode"]
+        data = setting["data"]
+        state = setting_state(config, name)
+        chosen = state.get("opts", {})
+        options = data.get("옵션", {})
+        role = data.get("상대역", {})
+        specs = axis_specs(data)
+        asset_config["_settings"][name] = {
+            "mode": mode,
+            "options": options,
+            "role": role,
+            "opts": chosen,
+            "file": setting["file"],
+            "specs": specs,
+        }
+        stage_of, stages_of = {}, {}
+        for group in derive_catalog(data.get("씬", {})):
+            for index, scene_number in enumerate(group["ids"]):
+                stage_of[scene_number] = index
+                stages_of[scene_number] = len(group["ids"])
+        for key, raw_scene in data.get("씬", {}).items():
+            if not str(key).isdigit():
+                continue
+            if str(key) in asset_config["scenes"]:
+                warn(
+                    f"씬 번호 {key}가 겹칩니다 "
+                    f"({asset_config['scenes'][str(key)].get('_setting')} ↔ {name}) — "
+                    "뒤에 읽힌 쪽이 이깁니다. 세팅 빌더의 "
+                    "'번호 다시 매기기'를 쓰세요."
+                )
+            scene = dict(raw_scene)
+            scene["_setting"] = name
+            scene["_mode"] = mode
+            scene["_num"] = int(key)
+            scene["_stage"] = stage_of.get(int(key), 0)
+            scene["_stages"] = stages_of.get(int(key), 1)
+            location = apply_axes(
+                specs, options, chosen, scene, "base"
+            )
+            if location:
+                scene["location"] = location
+            asset_config["scenes"][str(key)] = scene
+    return asset_config
 
 
 def _guess_shape(items: Any) -> str:
@@ -310,6 +392,120 @@ def build_yuri(asset_config: dict, character: dict, scene: dict) -> tuple:
     )
 
 
+def setting_scene_people(
+    scene: dict,
+    female: str,
+    male: str,
+    character_negative: str,
+    male_negative: str,
+    character: dict,
+    config: dict,
+    *,
+    limit: int = 6,
+) -> tuple[list[dict], list[dict], bool]:
+    """한 세팅 장면의 인물과 같은 순서의 좌표를 함께 만든다."""
+    people = [{
+        "prompt": female,
+        "negative": character_negative,
+    }]
+    if male:
+        people.append({
+            "prompt": male,
+            "negative": male_negative,
+        })
+    extras = [
+        item
+        for item in (character.get("extras") or [])
+        if isinstance(item, dict)
+    ]
+    for extra in extras:
+        prompt = strip_comment_lines(extra.get("prompt") or "")
+        if prompt.strip():
+            people.append({
+                "prompt": prompt,
+                "negative": strip_comment_lines(
+                    extra.get("negative") or ""
+                ),
+            })
+    people = people[:limit]
+
+    explicit = normalize_scene_centers(
+        scene.get("char_centers"), limit=limit
+    )
+    raw_cast_centers = character.get("centers") or []
+    has_cast_centers = any(
+        isinstance(center, dict) and center.get("x") is not None
+        for center in raw_cast_centers
+    )
+    cast_mode = str(
+        character.get("position_mode") or ""
+    ).strip().lower()
+    config_mode = str(
+        config.get("position_mode") or ""
+    ).strip().lower()
+    if cast_mode in ("ai", "grid", "coordinate"):
+        use_positions = position_mode_uses_coords(cast_mode)
+    elif config_mode in ("ai", "grid", "coordinate"):
+        use_positions = position_mode_uses_coords(config_mode)
+    else:
+        use_positions = (
+            bool(explicit)
+            or has_cast_centers
+            or position_mode_uses_coords(
+                None, config.get("use_coords")
+            )
+        )
+    if not use_positions:
+        return people, [], False
+
+    defaults = spread_centers(len(people))
+    cast_centers = []
+    if has_cast_centers:
+        for index in range(len(people)):
+            center = (
+                raw_cast_centers[index]
+                if index < len(raw_cast_centers)
+                else None
+            )
+            try:
+                cast_centers.append(
+                    normalize_scene_centers(
+                        [center], limit=limit
+                    )[0]
+                    if center
+                    else defaults[index]
+                )
+            except (ValueError, TypeError, IndexError):
+                cast_centers.append(defaults[index])
+    if explicit:
+        centers = list(explicit)
+    elif cast_centers:
+        centers = list(cast_centers)
+    else:
+        centers = normalize_scene_centers(
+            config.get("char_centers") or [], limit=limit
+        )
+    for index in range(len(centers), len(people)):
+        extra_index = index - (2 if male else 1)
+        extra_center = (
+            extras[extra_index].get("center")
+            if 0 <= extra_index < len(extras)
+            else None
+        )
+        try:
+            center = (
+                normalize_scene_centers(
+                    [extra_center], limit=limit
+                )[0]
+                if extra_center
+                else defaults[index]
+            )
+        except ValueError:
+            center = defaults[index]
+        centers.append(center)
+    return people, centers[:len(people)], True
+
+
 # 기존 import·테스트 patch 위치를 보존하는 호환 이름.
 _build_std = build_standard
 _build_yuri = build_yuri
@@ -331,6 +527,8 @@ __all__ = [
     "build_scene",
     "clean_char_prompt",
     "join_tags",
+    "load_asset_config",
     "remove_prompt_tags",
+    "setting_scene_people",
     "setting_state",
 ]

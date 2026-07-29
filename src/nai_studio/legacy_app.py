@@ -256,7 +256,9 @@ from src.nai_studio.services.setting_compiler import (
     axis_specs,
     build_scene,
     clean_char_prompt,
+    load_asset_config as _compile_asset_config,
     remove_prompt_tags,
+    setting_scene_people,
     setting_state,
 )
 from src.nai_studio.services.result_promotion import (
@@ -7836,62 +7838,13 @@ def save_config(cfg):
 
 
 def load_asset_config(cfg):
-    """세팅/ 폴더의 모든 세팅을 병합. 각 씬에 _setting(이름)/_mode(방식)를 부여하고,
-    세팅별 옵션 선택값(setting_state)을 규격이 아는 의미대로 반영한다."""
-    style = (cfg.get("base_prompt") or "").strip()
-    acfg = {
-        "base": {
-            "nsfw_base_prompt": "1girl, 1boy" + (f", {style}" if style else ""),
-            "yuri_base_prompt": "2girls, yuri" + (f", {style}" if style else ""),
-            "base_prompt": "1girl" + (f", {style}" if style else ""),
-            "nsfw_negative_prompt": cfg.get("negative_prompt", ""),
-            "negative_prompt": cfg.get("negative_prompt", ""),
-            "cfg_scale": cfg.get("cfg_scale", 5.5),
-            "cfg_rescale": cfg.get("cfg_rescale", 0.56),
-            "sampler": cfg.get("sampler", "k_euler_ancestral"),
-            "scheduler": cfg.get("scheduler", "karras"),
-            "uc_preset": 3,
-        },
-        "scenes": {},
-        "_settings": {},   # 이름 → {mode, options, role, opts(선택값)}
-    }
-    for st in list_settings():
-        name, mode, data = st["name"], st["mode"], st["data"]
-        state = setting_state(cfg, name)
-        opts_chosen = state.get("opts", {})
-        options = data.get("옵션", {})
-        role = data.get("상대역", {})
-        specs = axis_specs(data)
-        acfg["_settings"][name] = {"mode": mode, "options": options, "role": role,
-                                   "opts": opts_chosen, "file": st["file"],
-                                   "specs": specs}
-        # 씬이 자기 묶음(세트) 안에서 몇 번째인지 미리 새겨 둔다.
-        #   예전엔 `(번호-1) % 5` 로 단계를 셌는데 그러면 **5장 묶음에 묶여 있다.**
-        #   묶음 안의 순서를 쓰면 단계 수가 3장이든 7장이든 그대로 돌아간다.
-        stage_of, stages_of = {}, {}
-        for g in derive_setting_catalog(data.get("씬", {})):
-            for i, sn in enumerate(g["ids"]):
-                stage_of[sn] = i
-                stages_of[sn] = len(g["ids"])
-        for k, sc in data.get("씬", {}).items():
-            if not str(k).isdigit():
-                continue
-            if str(k) in acfg["scenes"]:
-                log.warning(f"씬 번호 {k} 가 겹칩니다 "
-                            f"({acfg['scenes'][str(k)].get('_setting')} ↔ {name}) — "
-                            f"뒤에 읽힌 쪽이 이깁니다. 세팅 빌더의 '번호 다시 매기기' 를 쓰세요.")
-            sc = dict(sc)
-            sc["_setting"] = name
-            sc["_mode"] = mode
-            sc["_num"] = int(k)
-            sc["_stage"] = stage_of.get(int(k), 0)
-            sc["_stages"] = stages_of.get(int(k), 1)
-            # 베이스로 갈 옵션(배경·시간 등)은 씬을 만들 때 미리 합쳐 둔다
-            loc = apply_axes(specs, options, opts_chosen, sc, "base")
-            if loc:
-                sc["location"] = loc
-            acfg["scenes"][str(k)] = sc
-    return acfg
+    """레거시 세팅 저장소와 순수 compiler를 연결한다."""
+    return _compile_asset_config(
+        cfg,
+        list_settings=list_settings,
+        derive_catalog=derive_setting_catalog,
+        warn=log.warning,
+    )
 
 
 # ═══════════════ NAI API ═══════════════
@@ -8057,83 +8010,6 @@ def characters_resource_config(cfg, characters):
                 if value and value not in synthetic[key]:
                     synthetic[key].append(value)
     return character_resource_config(cfg, synthetic)
-
-
-def setting_scene_people(scene, female, male, char_negative, male_negative,
-                         char, cfg):
-    """세팅 배치 한 장의 인물과 위치를 같은 순서로 만든다.
-
-    씬 전용 위치가 있으면 그것이 우선이고, 없으면 기존 전역 위치 설정을
-    따른다. 추가 인물까지 포함해 NAI 상한에서 함께 자르므로 프롬프트와
-    좌표의 인덱스가 어긋나지 않는다.
-    """
-    people = [{"prompt": female, "negative": char_negative}]
-    if male:
-        people.append({"prompt": male, "negative": male_negative})
-    extras = [e for e in (char.get("extras") or []) if isinstance(e, dict)]
-    for extra in extras:
-        prompt = strip_comment_lines(extra.get("prompt") or "")
-        if prompt.strip():
-            people.append({
-                "prompt": prompt,
-                "negative": strip_comment_lines(extra.get("negative") or ""),
-            })
-    people = people[:MAX_CHARS]
-
-    explicit = normalize_scene_centers(scene.get("char_centers"))
-    raw_cast_centers = char.get("centers") or []
-    has_cast_centers = any(
-        isinstance(center, dict) and center.get("x") is not None
-        for center in raw_cast_centers)
-    cast_mode = str(char.get("position_mode") or "").strip().lower()
-    cast_mode_known = cast_mode in ("ai", "grid", "coordinate")
-    cfg_mode = str(cfg.get("position_mode") or "").strip().lower()
-    cfg_mode_known = cfg_mode in ("ai", "grid", "coordinate")
-    if cast_mode_known:
-        # 사용자가 세팅 캐스트에서 고른 모드가 저장된 옛 좌표보다 우선한다.
-        # AI 자동은 좌표를 삭제하지 않되 이번 요청에는 적용하지 않는다.
-        use_positions = position_mode_uses_coords(cast_mode)
-    elif cfg_mode_known:
-        use_positions = position_mode_uses_coords(cfg_mode)
-    else:
-        # mode 필드가 없던 구형 자료만 좌표 존재 여부와 use_coords로 복원한다.
-        use_positions = (
-            bool(explicit)
-            or has_cast_centers
-            or position_mode_uses_coords(None, cfg.get("use_coords"))
-        )
-    if not use_positions:
-        return people, [], False
-
-    defaults = spread_centers(len(people))
-    cast_centers = []
-    if has_cast_centers:
-        for index in range(len(people)):
-            center = raw_cast_centers[index] if index < len(raw_cast_centers) else None
-            try:
-                cast_centers.append(
-                    normalize_scene_centers([center])[0]
-                    if center else defaults[index])
-            except (ValueError, TypeError, IndexError):
-                cast_centers.append(defaults[index])
-    if explicit:
-        centers = list(explicit)
-    elif cast_centers:
-        centers = list(cast_centers)
-    else:
-        centers = normalize_scene_centers(cfg.get("char_centers") or [])
-    for i in range(len(centers), len(people)):
-        extra_index = i - (2 if male else 1)
-        extra_center = (
-            extras[extra_index].get("center")
-            if 0 <= extra_index < len(extras) else None
-        )
-        try:
-            center = normalize_scene_centers([extra_center])[0] if extra_center else defaults[i]
-        except ValueError:
-            center = defaults[i]
-        centers.append(center)
-    return people, centers[:len(people)], True
 
 
 def _i2i_fields(i2i, action, seed):
