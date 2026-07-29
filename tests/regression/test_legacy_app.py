@@ -60,6 +60,7 @@ UI_SOURCE = (
     + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio-core.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio-generation.js").read_text(encoding="utf-8")
+    + (STATIC_UI_DIR / "studio-settings.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
 )
 
@@ -71,6 +72,7 @@ def rendered_ui_source():
         + (STATIC_UI_DIR / "studio.css").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio-core.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio-generation.js").read_text(encoding="utf-8")
+        + (STATIC_UI_DIR / "studio-settings.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
     )
 
@@ -120,7 +122,12 @@ class RegressionTests(unittest.TestCase):
 
         parser = PageAudit()
         parser.feed(APP.render_page())
-        for name in ("studio-core.js", "studio-generation.js", "studio.js"):
+        for name in (
+            "studio-core.js",
+            "studio-generation.js",
+            "studio-settings.js",
+            "studio.js",
+        ):
             parser.scripts.append(
                 (STATIC_UI_DIR / name).read_text(encoding="utf-8")
             )
@@ -1002,6 +1009,7 @@ class RegressionTests(unittest.TestCase):
                 ("ui/studio.css", "text/css"),
                 ("ui/studio-core.js", "text/javascript"),
                 ("ui/studio-generation.js", "text/javascript"),
+                ("ui/studio-settings.js", "text/javascript"),
                 ("ui/studio.js", "text/javascript"),
             ):
                 with urllib.request.urlopen(url + asset, timeout=3) as response:
@@ -1291,6 +1299,7 @@ class RegressionTests(unittest.TestCase):
                 "src/nai_studio/web/static/studio.css",
                 "src/nai_studio/web/static/studio-core.js",
                 "src/nai_studio/web/static/studio-generation.js",
+                "src/nai_studio/web/static/studio-settings.js",
                 "src/nai_studio/web/static/studio.js",
             },
         )

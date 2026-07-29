@@ -190,6 +190,7 @@ def verify(dst: Path):
         "src/nai_studio/web/static/studio.css",
         "src/nai_studio/web/static/studio-core.js",
         "src/nai_studio/web/static/studio-generation.js",
+        "src/nai_studio/web/static/studio-settings.js",
         "src/nai_studio/web/static/studio.js",
         "태그/danbooru_e621_merged.csv",
     )
