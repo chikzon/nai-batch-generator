@@ -179,6 +179,7 @@ from src.nai_studio.services.experiment_bridge import (
 )
 from src.nai_studio.services import (
     comparison_planning as _comparison_planning,
+    datapack_store as _datapack_store,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
     legacy_execution_material,
@@ -3560,229 +3561,87 @@ def import_settings_bytes(data, filename=""):
 #
 # 자리는 기존 상수를 그대로 쓴다 (STYLE_FILE·RECIPE_FILE·COMBO_FILE·IMG_CACHE·TAG_DIR).
 # 새 경로 상수를 만들면 두 곳이 어긋날 수 있다.
+def _datapack_paths():
+    """자료팩 서비스가 쓸 현재 프로필 경로를 호출 시점에 조립한다."""
+    return _datapack_store.DatapackPaths(
+        base_dir=BASE_DIR,
+        style_file=STYLE_FILE,
+        recipe_file=RECIPE_FILE,
+        combo_file=COMBO_FILE,
+        image_cache=IMG_CACHE,
+        tag_dir=TAG_DIR,
+        builder_file=BUILDER_FILE,
+        spec_file=SPEC_FILE,
+        options_file=OPTIONS_FILE,
+        settings_dir=SETTINGS_DIR,
+        character_dir=CHAR_DIR,
+    )
+
+
+def _datapack_operations():
+    """원자 저장과 캐릭터 동기화를 현재 전역 구현에 늦게 연결한다."""
+    return _datapack_store.DatapackOperations(
+        transaction=shared_data_transaction,
+        atomic_write_bytes=globals()["_atomic_write_bytes"],
+        atomic_write_json=globals()["atomic_write_json"],
+        load_json=globals()["load_json_recover"],
+        recoverable_remove=globals()["recoverable_remove"],
+        row_digest=globals()["_style_row_digest"],
+        character_signature=globals()["character_bundle_signature"],
+        delete_character_files=globals()["delete_char_files"],
+        sync_character_files=globals()["sync_chars_to_files"],
+        save_config=globals()["save_config"],
+        forget_caches=globals()["forget_collection_caches"],
+        pack_queue=globals()["pack_import_queue"],
+        summarize_queue=globals()["summarize_restore_queue"],
+        warning=log.warning,
+    )
+
+
 def _datapack_lists():
-    """{파일이름: (저장위치, 합칠 열쇠)}"""
-    return {
-        "그림체.json": (STYLE_FILE, "id"),
-        "레시피.json": (RECIPE_FILE, "id"),
-        "작가조합.json": (COMBO_FILE, "id"),        # 그림체.json 의 구세대 판
-        "작가통계.json": (BASE_DIR / "수집" / "작가통계.json", "tag"),
-    }
+    return _datapack_store.datapack_lists(_datapack_paths())
 
 
-# 새 이미지캐시는 SHA-256 내용주소를 쓰지만, 변환 전 원본 해시를 이름으로 쓴
-# 구 자료도 남아 있다. 따라서 가져올 때 실제 바이트를 재어 새 이름과 JSON 참조를
-# 함께 맞춘다. 기존 캐시는 참조가 살아 있으므로 자동 일괄 개명하지 않는다.
 def _datapack_dirs():
-    """{팩 안 경로: (저장위치, 받아들일 확장자)}"""
-    return {"수집/이미지캐시": (IMG_CACHE, (".webp", ".png", ".jpg", ".jpeg")),
-            "태그": (TAG_DIR, (".csv",))}
+    return _datapack_store.datapack_dirs(_datapack_paths())
 
 
 def _datapack_whole_files():
-    """목록 병합이 아니라 파일 전체가 한 단위인 기본 자료.
-
-    상수 중 SPEC_FILE은 이 함수보다 아래에서 선언되지만, 함수가 실제 호출되는 시점에는
-    모듈 초기화가 끝나 있으므로 안전하다.
-    """
-    return {
-        "후보사전.json": BUILDER_FILE,
-        "규격.json": SPEC_FILE,
-        "옵션.json": OPTIONS_FILE,
-    }
+    return _datapack_store.datapack_whole_files(_datapack_paths())
 
 
 def _pack_rel(name):
-    """ZIP 안 경로를 우리 폴더 기준 상대경로로. 위험하면 None."""
-    parts = [x for x in str(name).replace("\\", "/").split("/") if x not in ("", ".")]
-    if any(p == ".." for p in parts) or (parts and ":" in parts[0]):
-        return None                      # 경로 탈출·드라이브 지정 차단
-    # 팩이 한 겹 더 감싸여 있어도(자료팩/수집/…) 알아보게 앞을 훑는다
-    for i, p in enumerate(parts):
-        if p in ("수집", "태그", "세팅", "캐릭터"):
-            return "/".join(parts[i:])
-    return "/".join(parts)
+    return _datapack_store.pack_rel(name)
 
 
 def _read_rows(raw):
-    """남이 정리한 자료도 읽어 낸다 → (목록, 어떻게 읽었는지) · 못 읽으면 (None, 까닭).
-
-    사람마다 내보내는 모양이 달라서, 흔한 세 가지를 다 받는다:
-    ① 그냥 목록 `[...]`  ② 감싼 것 `{"styles":[...]}`  ③ 줄마다 한 건(NDJSON).
-    ⚠ 윈도우에서 만든 파일은 **BOM 이 붙어 있는 일이 흔하다**. `utf-8-sig` 로 읽어야
-      `json.loads` 가 안 터진다 (이걸 안 하면 멀쩡한 파일이 '깨짐' 으로 나온다)."""
-    try:
-        text = raw.decode("utf-8-sig")
-    except Exception:
-        try:
-            text = raw.decode("cp949")           # 옛 한글 윈도우에서 만든 것
-        except Exception:
-            return None, "글자를 못 읽었습니다 (UTF-8·CP949 둘 다 아님)"
-    text = text.strip()
-    if not text:
-        return None, "빈 파일입니다"
-    try:
-        d = json.loads(text)
-    except Exception:
-        rows, bad = [], 0
-        for line in text.splitlines():           # ③ NDJSON
-            line = line.strip().rstrip(",")
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                bad += 1
-        if rows and bad == 0:
-            return rows, "줄마다 한 건(NDJSON)"
-        return None, "JSON 으로 못 읽었습니다"
-    if isinstance(d, list):
-        return d, ""
-    if isinstance(d, dict):                      # ② 감싼 것 — 가장 큰 목록을 고른다
-        best, bk = None, ""
-        for k, v in d.items():
-            if isinstance(v, list) and (best is None or len(v) > len(best)):
-                best, bk = v, k
-        if best is not None:
-            return best, f"'{bk}' 안의 목록을 꺼냄"
-        return None, "목록이 들어 있지 않습니다"
-    return None, "목록이 아닙니다"
+    return _datapack_store.read_rows(raw)
 
 
-def _row_key(x, key):
-    """합칠 열쇠. 없으면 **내용으로 만들어 준다** — 남이 다르게 정리한 자료도
-    버리지 않으면서, 같은 것을 두 번 넣어도 중복이 안 생기게."""
-    k = x.get(key)
-    if k not in (None, ""):
-        return str(k), False
-    blob = json.dumps(x, ensure_ascii=False, sort_keys=True)
-    return "가져옴-" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12], True
+def _row_key(item, key):
+    return _datapack_store.row_key(item, key)
 
 
 def _datapack_match_key(item, primary):
-    """자료팩 충돌 판정은 id/tag를 우선하고, 없을 때만 사람이 보는 이름을 쓴다."""
-    value = item.get(primary)
-    if value not in (None, ""):
-        return str(value)
-    for field in ("id", "이름", "name", "title", "tag"):
-        value = item.get(field)
-        if value not in (None, ""):
-            return f"{field}={value}"
-    return _row_key(item, primary)[0]
+    return _datapack_store.datapack_match_key(item, primary)
 
 
 def _merge_list_json(path, incoming, key, overwrite=False, replace_keys=None):
-    """열쇠 기준으로 합친다 → 무슨 일이 있었는지 세어서 돌려준다.
-
-    ⚠ **'못 넣음' 을 '이미 있음' 으로 뭉뚱그리지 않는다.** 예전엔 열쇠 없는 항목이
-      조용히 버려지면서 '이미 있음' 으로 세어져, 아무것도 안 들어왔는데 중복인 것처럼
-      보였다 (실제로 겪은 거짓 보고다)."""
-    old = []
-    if path.exists():
-        try:
-            got = load_json_recover(path)
-            if not isinstance(got, list):
-                raise ValueError(f"{path.name}이 목록이 아니라 가져오기를 중단했습니다.")
-            old = got
-        except Exception:
-            # 주 파일과 백업을 둘 다 못 읽으면 빈 목록으로 덮어쓰지 않는다.
-            # 사용자가 가진 자료 전체를 "새 파일"로 오인해 날리는 것보다 가져오기를
-            # 실패시키는 편이 안전하다.
-            raise ValueError(f"{path.name}과 백업을 읽지 못해 가져오기를 중단했습니다.")
-    idx = {}
-    for i, x in enumerate(old):
-        if isinstance(x, dict):
-            kk = _datapack_match_key(x, key)
-            idx.setdefault(kk, i)
-    n = {"새로": 0, "같음": 0, "다름": 0, "열쇠없음": 0, "항목아님": 0, "덮어씀": 0}
-    added_keys, updates = [], []
-    replace_keys = set(map(str, replace_keys or ()))
-    for x in incoming:
-        if not isinstance(x, dict):
-            n["항목아님"] += 1
-            continue
-        raw_key, made = _row_key(x, key)
-        kk = _datapack_match_key(x, key)
-        made = made and kk.startswith("가져옴-")
-        if made:
-            n["열쇠없음"] += 1           # 버리진 않는다 — 내용 열쇠로 넣는다
-        if kk in idx:
-            same = old[idx[kk]] == x
-            if same:
-                n["같음"] += 1
-            elif overwrite or kk in replace_keys:
-                before = copy.deepcopy(old[idx[kk]])
-                old[idx[kk]] = x
-                n["덮어씀"] += 1
-                updates.append({
-                    "key": kk,
-                    "match_key": True,
-                    "before": before,
-                    "after_sha256": _style_row_digest(x),
-                })
-            else:
-                n["다름"] += 1           # 기존 것을 지킨다. 몇 건인지는 알려 준다
-            continue
-        idx[kk] = len(old)
-        old.append(x)
-        # 신규 제거 장부는 옛 undo와 호환되는 원래 _row_key를 계속 쓴다.
-        added_keys.append(raw_key)
-        n["새로"] += 1
-    added = n["새로"] + n["덮어씀"]
-    if added:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, old, indent=None)
-    return n, added_keys, updates
+    return _datapack_store.merge_list_json(
+        _datapack_operations(), path, incoming, key,
+        overwrite=overwrite, replace_keys=replace_keys)
 
 
-def _say_counts(n):
-    """센 것을 사람 말로. 0 인 항목은 말하지 않는다 (읽기 어려워진다)."""
-    order = [("새로", "새로 {}건"), ("덮어씀", "덮어씀 {}건"), ("같음", "이미 있음 {}건"),
-             ("다름", "같은 이름인데 내용이 달라 그대로 둠 {}건"),
-             ("열쇠없음", "이름표가 없어 내용으로 넣음 {}건"),
-             ("항목아님", "모양이 아니라 건너뜀 {}건")]
-    got = [t.format(n[k]) for k, t in order if n.get(k)]
-    return " · ".join(got) or "들어온 것 없음"
+def _say_counts(counts):
+    return _datapack_store.say_counts(counts)
 
 
 def _content_image_name(name, raw):
-    """자료팩 그림의 이름을 실제 바이트의 SHA-256으로 만든다.
-
-    `local:`은 파일명을 내용 주소로 믿는다. 외부 팩의 이름이 틀렸는데 그대로
-    넣으면 같은 이름의 다른 그림을 중복으로 오인하고, JSON 참조도 엉뚱한 바이트를
-    가리킨다. 확장자는 화면의 MIME 판별을 위해 원래 허용 확장자를 유지한다.
-    """
-    suffix = Path(str(name)).suffix.lower()
-    if suffix == ".jpeg":
-        suffix = ".jpg"
-    if suffix not in (".webp", ".png", ".jpg"):
-        suffix = ".webp"
-    # 이름과 실제 형식이 다르면 이름 쪽을 믿지 않는다. 잘못된 확장자는 /img 의
-    # Content-Type까지 틀리게 만들어 브라우저마다 표시 여부가 달라질 수 있다.
-    try:
-        with Image.open(io.BytesIO(raw)) as image:
-            suffix = {
-                "WEBP": ".webp", "PNG": ".png", "JPEG": ".jpg",
-            }.get((image.format or "").upper(), suffix)
-            image.verify()
-    except Exception:
-        # 자료팩 회귀 시험에는 이미지가 아닌 임의 바이트도 쓰인다. 그 경우에는
-        # 기존 허용 확장자를 유지하고, 실제 무결성 검사는 별도 감사에서 막는다.
-        pass
-    return hashlib.sha256(raw).hexdigest() + suffix
+    return _datapack_store.content_image_name(name, raw)
 
 
 def _rewrite_local_image_refs(value, renamed):
-    """자료팩 안의 `local:옛이름`을 실측한 내용 주소로 재귀 치환한다."""
-    if isinstance(value, str) and value.startswith("local:"):
-        old = Path(value[6:]).name
-        return "local:" + renamed.get(old, old)
-    if isinstance(value, list):
-        return [_rewrite_local_image_refs(x, renamed) for x in value]
-    if isinstance(value, dict):
-        return {k: _rewrite_local_image_refs(v, renamed) for k, v in value.items()}
-    return value
-
+    return _datapack_store.rewrite_local_image_refs(value, renamed)
 
 _LOCAL_IMAGE_LOCK = threading.RLock()
 _LOCAL_IMAGE_SUFFIXES = {".webp", ".png", ".jpg", ".jpeg"}
@@ -4126,53 +3985,22 @@ def forget_collection_caches():
 
 
 def _pack_log_path():
-    return BASE_DIR / "수집" / "가져온기록.json"
+    return _datapack_store.pack_log_path(_datapack_paths())
 
 
 def load_pack_log():
-    p = _pack_log_path()
-    if p.exists():
-        try:
-            d = load_json_recover(p)
-            return d if isinstance(d, list) else []
-        except Exception:
-            return []
-    return []
+    return _datapack_store.load_pack_log(
+        _datapack_paths(), _datapack_operations())
 
 
 def save_pack_log(rows):
-    p = _pack_log_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(p, rows[-50:], indent=1)
+    return _datapack_store.save_pack_log(
+        _datapack_paths(), _datapack_operations(), rows)
 
 
 def record_import_batch(batch):
-    """입력 경로와 무관한 한 번의 임포트를 기존 장착·undo 장부에 남긴다."""
-    batch = copy.deepcopy(batch) if isinstance(batch, dict) else {}
-    changed = any(batch.get(key) for key in (
-        "lists", "files", "installed", "list_updates", "characters"))
-    if not changed:
-        return None
-    batch.setdefault("id", f"{int(time.time())}-{os.urandom(4).hex()}")
-    batch.setdefault("at", time.strftime("%Y-%m-%d %H:%M:%S"))
-    batch.setdefault("file", "자료")
-    batch.setdefault("kind", "datapack")
-    batch.setdefault("lists", {})
-    batch.setdefault("files", {})
-    batch.setdefault("installed", [])
-    batch.setdefault("list_updates", [])
-    batch.setdefault("characters", [])
-    batch.setdefault("새로", (
-        sum(len(v) for v in batch["lists"].values())
-        + sum(len(v) for v in batch["files"].values())
-        + len(batch["installed"])
-        + len(batch["characters"])
-    ))
-    rows = load_pack_log()
-    rows.append(batch)
-    save_pack_log(rows)
-    return batch["id"]
-
+    return _datapack_store.record_import_batch(
+        _datapack_paths(), _datapack_operations(), batch)
 
 DATAPACK_SCHEMA = "nais-datapack/v1"
 DATA_INDEX_SCHEMA = "nais-data-index/v1"
@@ -4613,684 +4441,45 @@ def folder_inventory_page(offset=0, limit=50):
 
 
 def _validate_datapack_manifest(archive):
-    """v1 manifest가 있으면 쓰기 전에 파일 수·크기·내용 해시를 전부 확인한다.
-
-    manifest가 없는 예전 자료팩은 계속 받는다. 다만 manifest가 있다고 주장한 팩은
-    한 파일이라도 빠지거나 달라졌으면 일부만 설치하지 않고 전체를 거절한다.
-    """
-    infos = [info for info in archive.infolist() if not info.is_dir()]
-    if len(infos) > 100_000:
-        raise ValueError("자료팩 파일 수가 비정상적으로 많습니다.")
-    if any(info.file_size > 512 * 1024 * 1024 for info in infos):
-        raise ValueError("자료팩의 낱개 파일이 512MB를 넘습니다.")
-    if sum(info.file_size for info in infos) > 2 * 1024 * 1024 * 1024:
-        raise ValueError("자료팩을 풀었을 때 크기가 2GB를 넘습니다.")
-
-    members = {}
-    manifest_name = None
-    for info in infos:
-        rel = _pack_rel(info.filename)
-        if rel is None:
-            raise ValueError("자료팩에 앱 폴더 밖을 가리키는 경로가 있습니다.")
-        if rel in members:
-            raise ValueError(f"자료팩에 같은 경로가 두 번 있습니다: {rel}")
-        members[rel] = info.filename
-        if Path(rel).name == "manifest.json" and "/" not in rel:
-            manifest_name = info.filename
-    if not manifest_name:
-        return None
-    try:
-        manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
-    except Exception as e:
-        raise ValueError(f"자료팩 manifest.json을 읽지 못했습니다: {e}") from e
-    if manifest.get("schema") != DATAPACK_SCHEMA:
-        # 다른 도구가 넣은 일반 manifest는 기존 자료팩 호환을 위해 무시한다.
-        return None
-
-    declared, fingerprint_rows = set(), []
-    entries = manifest.get("files")
-    if not isinstance(entries, list):
-        raise ValueError("자료팩 manifest의 files가 목록이 아닙니다.")
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("자료팩 manifest의 파일 항목 모양이 잘못됐습니다.")
-        rel = _pack_rel(entry.get("path", ""))
-        if not rel or rel == "manifest.json" or rel in declared:
-            raise ValueError("자료팩 manifest에 위험하거나 중복된 경로가 있습니다.")
-        member = members.get(rel)
-        if not member:
-            raise ValueError(f"자료팩 내용이 빠졌습니다: {rel}")
-        raw = archive.read(member)
-        digest = hashlib.sha256(raw).hexdigest()
-        if len(raw) != int(entry.get("size", -1)) or digest != entry.get("sha256"):
-            raise ValueError(f"자료팩 내용 검사가 실패했습니다: {rel}")
-        declared.add(rel)
-        fingerprint_rows.append(f"{rel}\t{len(raw)}\t{digest}")
-    fingerprint = hashlib.sha256(
-        "\n".join(sorted(fingerprint_rows)).encode("utf-8")
-    ).hexdigest()
-    if manifest.get("content_sha256") != fingerprint:
-        raise ValueError("자료팩 전체 내용 지문이 manifest와 다릅니다.")
-
-    # manifest 밖에 숨은 자료 파일이 있으면 검사를 우회할 수 있다. 사용법 문서처럼
-    # 앱이 읽지 않는 파일은 허용하지만, 실제 장착 대상은 모두 선언돼야 한다.
-    known_lists = set(_datapack_lists())
-    known_whole = set(_datapack_whole_files())
-    for rel in members:
-        stem = Path(rel).name
-        is_data = (
-            stem in known_lists
-            or stem in known_whole
-            or rel.startswith((
-                "세팅/", "캐릭터/", "태그/", "수집/이미지캐시/",
-            ))
-        )
-        if is_data and rel not in declared:
-            raise ValueError(f"manifest에 기록되지 않은 자료가 들어 있습니다: {rel}")
-    return {
-        "id": str(manifest.get("id") or ""),
-        "name": str(manifest.get("name") or ""),
-        "version": str(manifest.get("version") or ""),
-        "content_sha256": fingerprint,
-        "files": len(declared),
-    }
+    return _datapack_store.validate_datapack_manifest(
+        _datapack_paths(), archive, schema=DATAPACK_SCHEMA)
 
 
 def _datapack_conflict_id(archive_sha, logical, key, current, incoming):
-    current_sha = _style_row_digest(current)
-    incoming_sha = _style_row_digest(incoming)
-    value = f"{archive_sha}\0{logical}\0{key}\0{current_sha}\0{incoming_sha}"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest(), current_sha, incoming_sha
+    return _datapack_store.datapack_conflict_id(
+        _datapack_operations(), archive_sha, logical, key,
+        current, incoming)
 
 
 def _datapack_character_destination(raw, fallback):
-    """캐릭터 파일명보다 안정적인 id가 같으면 현재 파일을 갱신 대상으로 쓴다."""
-    try:
-        incoming = json.loads(raw.decode("utf-8-sig"))
-    except Exception:
-        return fallback
-    cid = str(incoming.get("id") or "") if isinstance(incoming, dict) else ""
-    if not cid or not CHAR_DIR.is_dir():
-        return fallback
-    for path in CHAR_DIR.rglob("*.json"):
-        try:
-            current = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            continue
-        if isinstance(current, dict) and str(current.get("id") or "") == cid:
-            return path
-    return fallback
+    return _datapack_store.datapack_character_destination(
+        _datapack_paths(), _datapack_operations(), raw, fallback)
 
 
 def preview_datapack_bytes(data, filename=""):
-    """자료를 쓰기 전에 같은 열쇠·다른 내용만 자산 단위로 찾는다."""
-    lists, whole = _datapack_lists(), _datapack_whole_files()
-    archive_sha = hashlib.sha256(data).hexdigest()
-    conflicts, recognized = [], 0
-
-    def add_conflict(logical, key, current, incoming, kind):
-        conflict_id, current_sha, incoming_sha = _datapack_conflict_id(
-            archive_sha, logical, key, current, incoming)
-        conflicts.append({
-            "id": conflict_id,
-            "logical": logical,
-            "key": str(key),
-            "kind": kind,
-            "current": copy.deepcopy(current),
-            "incoming": copy.deepcopy(incoming),
-            "current_sha256": current_sha,
-            "incoming_sha256": incoming_sha,
-        })
-
-    def inspect_list(stem, raw, renamed=None):
-        nonlocal recognized
-        spot = lists.get(stem)
-        if not spot:
-            return False
-        recognized += 1
-        dest, key = spot
-        rows, _how = _read_rows(raw)
-        if rows is None:
-            return True
-        if renamed:
-            rows = _rewrite_local_image_refs(rows, renamed)
-        current = []
-        if dest.is_file():
-            try:
-                got = json.loads(dest.read_text(encoding="utf-8-sig"))
-            except Exception as e:
-                raise ValueError(
-                    f"{dest.name}을 읽지 못해 자료팩을 비교할 수 없습니다: {e}"
-                ) from e
-            if not isinstance(got, list):
-                raise ValueError(f"{dest.name}이 목록이 아니라 자료팩을 비교할 수 없습니다.")
-            current = got
-        by_key = {}
-        for item in current:
-            if isinstance(item, dict):
-                item_key = _datapack_match_key(item, key)
-                by_key.setdefault(item_key, item)
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            item_key = _datapack_match_key(item, key)
-            before = by_key.get(item_key, _BACKUP_MISSING)
-            if before is not _BACKUP_MISSING and before != item:
-                add_conflict(stem, item_key, before, item, "목록 자산")
-        return True
-
-    def inspect_whole(logical, raw, dest, kind):
-        nonlocal recognized
-        recognized += 1
-        try:
-            incoming = json.loads(raw.decode("utf-8-sig"))
-        except Exception:
-            return
-        if not isinstance(incoming, dict) or not dest.is_file():
-            return
-        try:
-            current = json.loads(dest.read_text(encoding="utf-8-sig"))
-        except Exception as e:
-            raise ValueError(
-                f"{dest.name}을 읽지 못해 자료팩을 비교할 수 없습니다: {e}"
-            ) from e
-        if current != incoming:
-            add_conflict(logical, logical, current, incoming, kind)
-
-    if data[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            manifest = _validate_datapack_manifest(archive)
-            renamed = {}
-            for name in archive.namelist():
-                if name.endswith("/"):
-                    continue
-                rel = _pack_rel(name)
-                if rel and rel.startswith("수집/이미지캐시/"):
-                    stem = Path(rel).name
-                    if Path(stem).suffix.lower() in _datapack_dirs()[
-                            "수집/이미지캐시"][1]:
-                        renamed[stem] = _content_image_name(stem, archive.read(name))
-            for name in archive.namelist():
-                if name.endswith("/"):
-                    continue
-                rel = _pack_rel(name)
-                if not rel:
-                    continue
-                stem = Path(rel).name
-                raw = archive.read(name)
-                if stem in lists:
-                    inspect_list(stem, raw, renamed)
-                elif stem in whole and not rel.startswith("세팅/"):
-                    inspect_whole(stem, raw, whole[stem], "기본 자료")
-                elif rel.startswith("세팅/") and stem.lower().endswith(".json"):
-                    inspect_whole(rel, raw, SETTINGS_DIR / stem, "세팅")
-                elif rel.startswith("캐릭터/") and stem.lower().endswith(".json"):
-                    inspect_whole(
-                        rel,
-                        raw,
-                        _datapack_character_destination(
-                            raw, CHAR_DIR / Path(rel).relative_to("캐릭터")),
-                        "캐릭터",
-                    )
-            pack_name = (
-                (manifest or {}).get("name")
-                or (manifest or {}).get("id")
-                or Path(filename).name
-                or "자료팩"
-            )
-    else:
-        stem = Path(filename).name
-        if stem in lists:
-            inspect_list(stem, data)
-        elif stem in whole:
-            inspect_whole(stem, data, whole[stem], "기본 자료")
-        else:
-            return {"ok": False, "error": f"'{stem}' 은(는) 자료팩이 아닙니다."}
-        pack_name = stem
-
-    if not recognized:
-        return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
-    conflicts.sort(key=lambda item: (item["logical"], item["key"]))
-    fingerprint = hashlib.sha256(
-        "\n".join(item["id"] for item in conflicts).encode("ascii")
-    ).hexdigest()
-    return {
-        "ok": True,
-        "name": pack_name,
-        "sha256": archive_sha,
-        "diff_fingerprint": fingerprint,
-        "conflicts": conflicts,
-        "conflict_count": len(conflicts),
-    }
+    return _datapack_store.preview_datapack_bytes(
+        _datapack_paths(), _datapack_operations(), data, filename,
+        schema=DATAPACK_SCHEMA)
 
 
-@serialized_data_write(lambda: BASE_DIR)
-def import_datapack_bytes(data, filename="", overwrite=False,
-                          selected_conflicts=None, expected_diff=""):
-    """자료팩 ZIP 이든 낱개 JSON 이든 받아 자료 종류별 제자리에 넣는다.
-
-    무엇이 들어왔는지 `수집/가져온기록.json` 에 남겨 **통째로 되돌릴 수 있게** 한다.
-    자료를 넣고 나서 정리하려면 '무엇이 이번에 들어왔나' 를 알아야 하기 때문이다."""
-    import io
-    import zipfile
-    lists, dirs, whole = _datapack_lists(), _datapack_dirs(), _datapack_whole_files()
-    selected_list_keys, selected_whole = {}, set()
-    if selected_conflicts is not None:
-        preview = preview_datapack_bytes(data, filename)
-        if not preview.get("ok"):
-            return preview
-        if expected_diff and expected_diff != preview["diff_fingerprint"]:
-            return {
-                "ok": False,
-                "conflict": True,
-                "error": "검사 뒤 현재 자료가 바뀌었습니다. 자료팩을 다시 검사해 주세요.",
-            }
-        by_id = {item["id"]: item for item in preview["conflicts"]}
-        wanted_ids = set(map(str, selected_conflicts))
-        if wanted_ids - set(by_id):
-            return {
-                "ok": False,
-                "conflict": True,
-                "error": "검사 뒤 충돌 항목이 바뀌었습니다. 자료팩을 다시 검사해 주세요.",
-            }
-        for item_id in wanted_ids:
-            item = by_id[item_id]
-            if item["kind"] == "목록 자산":
-                selected_list_keys.setdefault(item["logical"], set()).add(
-                    item["key"])
-            else:
-                selected_whole.add(item["logical"])
-    report, files = [], 0
-    batch_id = f"{int(time.time())}-{os.urandom(4).hex()}"
-    batch = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
-              "file": Path(filename).name or "자료팩",
-              "id": batch_id, "lists": {}, "files": {}, "installed": [],
-              "archive_sha256": hashlib.sha256(data).hexdigest()}
-
-    def take_whole(label, raw, dest):
-        """후보사전·규격·옵션·세팅 파일 하나를 검증한 뒤 원자적으로 설치한다.
-
-        덮어쓸 때는 가져온 판 전용 백업을 따로 남긴다. 되돌릴 때 현재 파일이
-        그 뒤 수정되지 않았을 때만 복구하므로, 자료팩 뒤의 사용자 편집을 덮지 않는다.
-        """
-        nonlocal files
-        try:
-            parsed = json.loads(raw.decode("utf-8-sig"))
-        except Exception:
-            report.append(f"{label}: JSON으로 읽지 못해 건너뜀")
-            return True
-        if not isinstance(parsed, dict):
-            report.append(f"{label}: JSON 객체가 아니라 건너뜀")
-            return True
-        canonical = json.dumps(parsed, ensure_ascii=False, indent=1).encode("utf-8")
-        rel = dest.relative_to(BASE_DIR).as_posix()
-        digest = hashlib.sha256(canonical).hexdigest()
-        if dest.exists():
-            try:
-                same = load_json_recover(dest) == parsed
-            except Exception:
-                same = False
-            if same:
-                report.append(f"{label}: 이미 같은 자료가 있음")
-                return True
-            if not overwrite and label not in selected_whole:
-                report.append(f"{label}: 기존 자료가 달라 그대로 둠")
-                return True
-            backup = BASE_DIR / "수집" / "가져온백업" / batch_id / rel
-            _atomic_write_bytes(backup, dest.read_bytes(), keep_backup=False)
-            _atomic_write_bytes(dest, canonical)
-            batch["installed"].append({
-                "path": rel, "backup": backup.relative_to(BASE_DIR).as_posix(),
-                "sha256": digest,
-            })
-            report.append(f"{label}: 기존 자료를 백업하고 새 것으로 바꿈")
-        else:
-            _atomic_write_bytes(dest, canonical, keep_backup=False)
-            batch["installed"].append({"path": rel, "sha256": digest})
-            report.append(f"{label}: 새로 넣음")
-        files += 1
-        return True
-
-    local_image_renames = {}
-
-    def take_list(stem, raw):
-        nonlocal files
-        spot = lists.get(stem)
-        if not spot:
-            return False
-        dest, key = spot
-        rows, how = _read_rows(raw)
-        if rows is None:
-            report.append(f"{stem}: {how}")
-            return True
-        if local_image_renames:
-            rows = _rewrite_local_image_refs(rows, local_image_renames)
-        n, keys, updates = _merge_list_json(
-            dest,
-            rows,
-            key,
-            overwrite,
-            replace_keys=selected_list_keys.get(stem),
-        )
-        report.append(f"{stem}: {_say_counts(n)}" + (f" ({how})" if how else ""))
-        if keys:
-            batch["lists"][stem] = keys
-        for update in updates:
-            batch.setdefault("list_updates", []).append({
-                "stem": stem,
-                **update,
-            })
-        files += n["새로"] + n["덮어씀"]
-        return True
-
-    if data[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            manifest = _validate_datapack_manifest(z)
-            if manifest:
-                batch["manifest"] = manifest
-                report.append(
-                    f"자료팩 확인: {manifest['name'] or manifest['id'] or '이름 없음'}"
-                    f" · 파일 {manifest['files']}개 · SHA-256 "
-                    f"{manifest['content_sha256'][:12]}"
-                )
-            # ZIP 순서와 무관하게 목록 JSON을 읽기 전에 모든 로컬 그림의 실제
-            # 내용 주소를 계산한다. 그래야 JSON이 그림보다 앞에 있어도 참조를 고친다.
-            image_payloads = {}
-            for n in z.namelist():
-                if n.endswith("/"):
-                    continue
-                rel = _pack_rel(n)
-                if rel is None or not rel.startswith("수집/이미지캐시/"):
-                    continue
-                stem = Path(rel).name
-                if Path(stem).suffix.lower() not in dirs["수집/이미지캐시"][1]:
-                    continue
-                raw = z.read(n)
-                correct = _content_image_name(stem, raw)
-                local_image_renames[stem] = correct
-                image_payloads[n] = (raw, correct)
-
-            copied, skipped, renamed = {}, {}, 0
-            for n in z.namelist():
-                if n.endswith("/"):
-                    continue
-                rel = _pack_rel(n)
-                if rel is None:
-                    continue
-                stem = Path(rel).name
-                if stem in lists:
-                    take_list(stem, z.read(n))
-                    continue
-                if stem in whole and not rel.startswith("세팅/"):
-                    take_whole(stem, z.read(n), whole[stem])
-                    continue
-                if rel.startswith("세팅/") and stem.lower().endswith(".json"):
-                    take_whole(rel, z.read(n), SETTINGS_DIR / stem)
-                    continue
-                if rel.startswith("캐릭터/") and stem.lower().endswith(".json"):
-                    raw = z.read(n)
-                    take_whole(
-                        rel,
-                        raw,
-                        _datapack_character_destination(
-                            raw, CHAR_DIR / Path(rel).relative_to("캐릭터")),
-                    )
-                    continue
-                for d, (root, exts) in dirs.items():
-                    if rel.startswith(d + "/") and stem.lower().endswith(exts):
-                        raw, saved_name = image_payloads.get(
-                            n, (z.read(n), stem))
-                        if d == "수집/이미지캐시" and saved_name != stem:
-                            renamed += 1
-                        dest = root / saved_name
-                        if dest.exists() and dest.read_bytes() == raw:
-                            skipped[d] = skipped.get(d, 0) + 1
-                        elif dest.exists():
-                            # 내용 주소와 실제 바이트가 다른 기존 파일은 없애지 않는다.
-                            # 판 전용 백업에 보존하고, 되돌릴 때 복구할 수 있게 기록한다.
-                            rel_dest = dest.relative_to(BASE_DIR).as_posix()
-                            backup = BASE_DIR / "수집" / "가져온백업" / batch_id / rel_dest
-                            _atomic_write_bytes(
-                                backup, dest.read_bytes(), keep_backup=False)
-                            _atomic_write_bytes(dest, raw, keep_backup=False)
-                            copied[d] = copied.get(d, 0) + 1
-                            batch["installed"].append({
-                                "path": rel_dest,
-                                "backup": backup.relative_to(BASE_DIR).as_posix(),
-                                "sha256": hashlib.sha256(raw).hexdigest(),
-                            })
-                        else:
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            _atomic_write_bytes(
-                                dest, raw, keep_backup=False)
-                            copied[d] = copied.get(d, 0) + 1
-                            batch["files"].setdefault(d, []).append(saved_name)
-                        break
-            for d in dirs:
-                c, s = copied.get(d, 0), skipped.get(d, 0)
-                if c or s:
-                    files += c
-                    report.append(f"{d}: 새로 {c}개" + (f" · 이미 있음 {s}개" if s else ""))
-            if renamed:
-                report.append(f"이미지 내용 주소: 이름이 달랐던 {renamed}개를 바로잡음")
-    else:
-        stem = Path(filename).name
-        if stem in whole:
-            take_whole(stem, data, whole[stem])
-        elif not take_list(stem, data):
-            return {"ok": False,
-                    "error": f"'{stem}' 은(는) 자료팩이 아닙니다. "
-                             f"자료팩.zip 이나 {' · '.join(list(lists) + list(whole))} 를 넣어 주세요."}
-
-    if not report:
-        return {"ok": False, "error": "자료팩에서 알아볼 수 있는 자료를 못 찾았습니다."}
-    # 알아본 자료가 있으면 성공이다. 같은 팩을 다시 넣어 **전부 중복이어도 실패가 아니다**
-    # (`files` 는 새로 들어온 수이므로 0 일 수 있다). 새 것이 있었는지는 따로 알려 준다.
-    if (batch["lists"] or batch["files"] or batch["installed"]
-            or batch.get("list_updates")):
-        rows = load_pack_log()
-        # ⚠ 판 id 는 **초 단위 시간만으로 지으면 안 된다.** 화면의 `sendPack` 은 여러 파일을
-        #   반복문으로 잇달아 넣으므로 두 파일을 함께 끌어다 놓으면 **같은 초**에 들어가
-        #   id 가 겹친다. 겹치면 `undo_datapack` 이 먼저 들어온 판을 집어 **엉뚱한 자료를
-        #   지우고**, 기록에서 겹친 판이 함께 빠져 나머지를 **영영 되돌릴 수 없게** 된다
-        #   (되돌리기에는 휴지통이 없다). 그래서 시간 뒤에 난수를 붙인다 —
-        #   앞의 시간은 사람이 읽고 정렬하기 위한 것이고, 겹침을 막는 것은 뒤의 난수다.
-        #   `random` 이 아니라 `os.urandom` 을 쓰는 것은 **프로필 두 개를 나란히 돌려도**
-        #   (서로 다른 프로세스) 겹치지 않게 하기 위해서다.
-        #   옛 기록의 숫자만 있는 id 도 그대로 읽히고 되돌려진다 (문자열로 견준다).
-        batch["새로"] = files
-        batch["요약"] = " · ".join(report)
-        rows.append(batch)
-        save_pack_log(rows)
-    result = {
-        "ok": True,
-        "added": files,
-        "report": report,
-        "batch": batch.get("id"),
-        "archive_sha256": batch.get("archive_sha256"),
-        "log": pack_log_brief(),
-    }
-    # brief log는 화면용이라 목록 key·설치 파일 계보가 없다. 복원 큐에는 이번 판의
-    # 실제 장부를 직접 투영하되, API result 최상위에는 중복으로 싣지 않는다.
-    queue = pack_import_queue(
-        {**result, "batch_record": copy.deepcopy(batch)},
-        filename=filename,
-    )
-    result["restoration"] = summarize_restore_queue(queue)
-    result["restoration_queue"] = queue
-    return result
+def import_datapack_bytes(
+    data, filename="", overwrite=False, selected_conflicts=None,
+    expected_diff="",
+):
+    return _datapack_store.import_datapack_bytes(
+        _datapack_paths(), _datapack_operations(), data, filename,
+        overwrite, selected_conflicts, expected_diff,
+        schema=DATAPACK_SCHEMA)
 
 
 def pack_log_brief():
-    """되돌리기 화면용 — 큰 id 목록은 빼고 요약만."""
-    return [{"id": b.get("id"), "at": b.get("at"), "file": b.get("file"),
-             "kind": b.get("kind", "datapack"),
-             "새로": b.get("새로", 0), "요약": b.get("요약", ""),
-             "pack_id": (b.get("manifest") or {}).get("id", ""),
-             "pack_name": (b.get("manifest") or {}).get("name", ""),
-             "content_sha256": (b.get("manifest") or {}).get(
-                 "content_sha256", b.get("archive_sha256", ""))}
-            for b in reversed(load_pack_log())]
+    return _datapack_store.pack_log_brief(
+        _datapack_paths(), _datapack_operations())
 
 
-@serialized_data_write(lambda: BASE_DIR)
 def undo_datapack(batch_id, cfg=None):
-    """어느 입력 경로든 한 번의 임포트를 되돌린다.
-
-    새로 들어온 것은 빼고, 같은 묶음에 근거만 추가한 경우에는 그 직전 행을 복원한다.
-    원래 갖고 있던 자료는 건드리지 않는다(열쇠를 그때 기록해 뒀다)."""
-    rows = load_pack_log()
-    hit = next((b for b in rows if str(b.get("id")) == str(batch_id)), None)
-    if not hit:
-        return {"ok": False, "error": "그 기록을 못 찾았습니다."}
-    lists, dirs = _datapack_lists(), _datapack_dirs()
-    said = []
-    failures = []
-    for update in reversed(hit.get("list_updates") or []):
-        stem = str(update.get("stem") or "")
-        spot = lists.get(stem)
-        before = update.get("before")
-        if not spot or not isinstance(before, dict):
-            continue
-        path, key = spot
-        if not path.is_file():
-            continue
-        try:
-            current_rows = load_json_recover(path)
-            wanted_key = str(update.get("key") or "")
-            index = next((
-                i for i, item in enumerate(current_rows)
-                if isinstance(item, dict)
-                and (
-                    _datapack_match_key(item, key)
-                    if update.get("match_key")
-                    else _row_key(item, key)[0]
-                ) == wanted_key
-            ), None)
-            if index is None:
-                said.append(f"{stem}: 바뀐 묶음을 찾지 못해 그대로 둠")
-                continue
-            if _style_row_digest(current_rows[index]) != update.get("after_sha256"):
-                said.append(f"{stem}: 가져온 뒤 수정되어 그대로 둠")
-                continue
-            current_rows[index] = before
-            atomic_write_json(path, current_rows, indent=None)
-            said.append(f"{stem}: 임포트 전 묶음으로 복구")
-        except Exception as e:
-            log.warning(f"임포트 목록 갱신 되돌리기 실패: {e}")
-            failures.append(f"{stem}: 목록 갱신 복구 실패")
-    for stem, keys in (hit.get("lists") or {}).items():
-        spot = lists.get(stem)
-        if not spot or not keys:
-            continue
-        path, key = spot
-        if not path.exists():
-            continue
-        try:
-            old = load_json_recover(path)
-        except Exception as e:
-            log.warning(f"임포트 목록 삭제 되돌리기 실패: {e}")
-            failures.append(f"{stem}: 목록 삭제 실패")
-            continue
-        drop = set(map(str, keys))
-        kept = [x for x in old
-                if not (isinstance(x, dict) and _row_key(x, key)[0] in drop)]
-        gone = len(old) - len(kept)
-        if gone:
-            atomic_write_json(path, kept, indent=None)
-            said.append(f"{stem}: {gone}건 뺌")
-    for d, names in (hit.get("files") or {}).items():
-        root = dirs.get(d, (None, ()))[0]
-        if not root:
-            continue
-        gone = 0
-        for nm in names:
-            p = root / nm
-            try:
-                if p.exists():
-                    # 가져온 판을 되돌릴 때도 즉시 삭제하지 않는다. 잘못 고른 판이면
-                    # 같은 폴더의 목록 밖 백업에서 원본 파일을 되찾을 수 있다.
-                    recoverable_remove(p, label="자료팩되돌리기")
-                    gone += 1
-            except Exception as e:
-                log.warning(f"자료팩 파일 되돌리기 실패: {e}")
-                failures.append(f"{d}/{nm}: 파일 이동 실패")
-        if gone:
-            said.append(f"{d}: {gone}개 지움")
-    for item in reversed(hit.get("installed") or []):
-        try:
-            rel = Path(item.get("path", ""))
-            dest = (BASE_DIR / rel).resolve()
-            # 기록 파일을 사람이 고쳐도 앱 폴더 밖은 절대 만지지 않는다.
-            if BASE_DIR.resolve() not in dest.parents:
-                continue
-            if not dest.exists():
-                continue
-            current = hashlib.sha256(dest.read_bytes()).hexdigest()
-            if current != item.get("sha256"):
-                said.append(f"{rel.as_posix()}: 가져온 뒤 수정되어 그대로 둠")
-                continue
-            backup_rel = item.get("backup")
-            if backup_rel:
-                backup = (BASE_DIR / backup_rel).resolve()
-                if backup.exists() and BASE_DIR.resolve() in backup.parents:
-                    _atomic_write_bytes(dest, backup.read_bytes())
-                    backup.unlink()
-                    said.append(f"{rel.as_posix()}: 이전 자료 복구")
-                else:
-                    failures.append(f"{rel.as_posix()}: 이전 자료 백업 없음")
-            else:
-                recoverable_remove(dest, label="자료팩되돌리기")
-                said.append(f"{rel.as_posix()}: 가져온 파일 뺌")
-        except Exception as e:
-            log.warning(f"자료팩 전체파일 되돌리기 실패: {e}")
-            failures.append(
-                f"{Path(item.get('path', '')).as_posix()}: 전체파일 복구 실패"
-            )
-    changed_config = False
-    char_records = hit.get("characters") or []
-    if cfg is not None and char_records:
-        wanted = {
-            str(item.get("id")): str(item.get("after_signature") or "")
-            for item in char_records if isinstance(item, dict) and item.get("id")
-        }
-        removed_ids = set()
-        kept = []
-        for char in cfg.get("characters") or []:
-            cid = str(char.get("id") or "")
-            if cid not in wanted:
-                kept.append(char)
-                continue
-            if wanted[cid] and character_bundle_signature(char) != wanted[cid]:
-                kept.append(char)
-                said.append(f"캐릭터 {char.get('name') or cid}: 가져온 뒤 수정되어 그대로 둠")
-                continue
-            removed_ids.add(cid)
-        if removed_ids:
-            cfg["characters"] = kept
-            delete_char_files(cfg, removed_ids)
-            sync_chars_to_files(cfg)
-            save_config(cfg)
-            changed_config = True
-            said.append(f"캐릭터: {len(removed_ids)}건 뺌")
-    # ⚠ **되돌린 그 판만** 뺀다. 예전에는 id 가 같은 것을 모두 걸러냈는데,
-    #   이미 겹쳐 있는 옛 기록(위 참조)에서는 손대지도 않은 판의 기록까지 사라져
-    #   그 자료를 **영영 되돌릴 수 없게** 됐다. 객체로 견주면 옛 기록도 한 번에 한 판씩
-    #   차례로 되돌릴 수 있다.
-    forget_collection_caches()
-    if failures:
-        return {
-            "ok": False,
-            "partial": bool(said),
-            "error": "일부 항목을 되돌리지 못했습니다. 같은 기록으로 다시 시도할 수 있습니다.",
-            "report": said + failures,
-            "log": pack_log_brief(),
-            "changed_config": changed_config,
-        }
-    save_pack_log([b for b in rows if b is not hit])
-    return {"ok": True, "report": said or ["되돌릴 것이 없었습니다"],
-            "log": pack_log_brief(), "changed_config": changed_config}
-
+    return _datapack_store.undo_datapack(
+        _datapack_paths(), _datapack_operations(), batch_id, cfg)
 
 # ══ 내 자료 전체 백업 ═════════════════════════════════════════════════
 BACKUP_SCHEMA = "nais-user-backup/v1"
