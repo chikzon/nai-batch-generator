@@ -136,6 +136,107 @@ def _output_material(value: Mapping[str, Any]) -> tuple[dict, dict]:
     return _secret_free(legacy), _secret_free(passthrough)
 
 
+def _single_character_material(
+    plan: Mapping[str, Any],
+    final: Mapping[str, Any],
+    use_coords: bool,
+) -> tuple[list, list, list, list, list]:
+    final_characters = final.get("character_prompts")
+    final_characters = (
+        list(final_characters)
+        if isinstance(final_characters, (list, tuple)) else []
+    )
+    slots, slot_centers, calls, call_centers, positions = [], [], [], [], []
+    enabled_index = 0
+    for character in plan.get("characters") or []:
+        if not isinstance(character, Mapping) or character.get("enabled") is False:
+            continue
+        legacy_slot, _unused_center = _character_slot(character)
+        slot = _mapping(_secret_free(character))
+        slot.update(legacy_slot)
+        resolved = (
+            _mapping(final_characters[enabled_index])
+            if enabled_index < len(final_characters)
+            and isinstance(final_characters[enabled_index], Mapping)
+            else {}
+        )
+        enabled_index += 1
+        prompt = _text(_value(
+            resolved, "prompt",
+            character.get("resolved_prompt")
+            if character.get("resolved_prompt") is not None
+            else _join_prompt_parts(
+                character.get("appearance"), character.get("clothed")
+            ),
+        ))
+        negative = _text(_value(
+            resolved, "negative", character.get("negative")
+        ))
+        position = _mapping(_value(
+            resolved, "position", character.get("position")
+        ))
+        center = {
+            key: deepcopy(position[key]) for key in ("x", "y") if key in position
+        }
+        slot.update({
+            "prompt": _text(character.get("appearance")),
+            "outfit": _text(character.get("clothed")),
+            "negative": negative,
+            "enabled": True,
+            "position": _secret_free(position),
+        })
+        slots.append(_secret_free(slot))
+        slot_centers.append(_secret_free(center))
+        if prompt.strip():
+            calls.append({"prompt": prompt, "negative": negative})
+            call_centers.append(_secret_free(center))
+            positions.append({
+                "enabled": bool(_value(position, "enabled", use_coords)),
+                **_secret_free(center),
+            })
+    return slots, slot_centers, calls, call_centers, positions
+
+
+def _single_passthrough(
+    raw: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    style: Mapping[str, Any],
+    generation: Mapping[str, Any],
+    output_passthrough: Mapping[str, Any],
+) -> dict:
+    top = {
+        key: deepcopy(item)
+        for key, item in raw.items()
+        if key not in _KNOWN_BLUEPRINT_FIELDS
+    }
+    generation_extra = {
+        key: deepcopy(item)
+        for key, item in generation.items()
+        if key not in {
+            "resolution", "settings", "final", "schedule", "provenance", "seed",
+            *_DIRECT_GENERATION_FIELDS,
+        }
+    }
+    style_extra = {
+        key: deepcopy(item)
+        for key, item in style.items()
+        if key not in {
+            "id", "name", "base", "negative", "parts",
+            "generation_settings", "evidence", "provenance",
+        }
+    }
+    return _secret_free({
+        "blueprint": top,
+        "source": plan.get("source"),
+        "style": style_extra,
+        "generation": generation_extra,
+        "output": output_passthrough,
+        "setting": plan.get("setting"),
+        "experiment": plan.get("experiment"),
+        "provenance": plan.get("provenance"),
+    })
+
+
 def single_generation_legacy_material(
     blueprint: Mapping[str, Any],
 ) -> dict:
@@ -168,80 +269,9 @@ def single_generation_legacy_material(
         _value(settings, "use_coords", generation.get("use_coords", False))
     )
 
-    final_characters = final.get("character_prompts")
-    final_characters = (
-        list(final_characters)
-        if isinstance(final_characters, (list, tuple))
-        else []
+    char_slots, char_centers, call_characters, call_centers, positions = (
+        _single_character_material(plan, final, use_coords)
     )
-    char_slots = []
-    char_centers = []
-    call_characters = []
-    call_centers = []
-    positions = []
-    enabled_index = 0
-    for character in plan.get("characters") or []:
-        if not isinstance(character, Mapping) or character.get("enabled") is False:
-            continue
-        legacy_slot, _unused_center = _character_slot(character)
-        # The shared experiment projection knows the legacy aliases.  Begin
-        # with the complete canonical character so fields from a newer schema
-        # are not lost, then overlay those normalized legacy names.
-        slot = _mapping(_secret_free(character))
-        slot.update(legacy_slot)
-        final_character = (
-            _mapping(final_characters[enabled_index])
-            if enabled_index < len(final_characters)
-            and isinstance(final_characters[enabled_index], Mapping)
-            else {}
-        )
-        enabled_index += 1
-
-        resolved_prompt = _text(
-            _value(
-                final_character,
-                "prompt",
-                character.get("resolved_prompt")
-                if character.get("resolved_prompt") is not None
-                else _join_prompt_parts(
-                    character.get("appearance"), character.get("clothed")
-                ),
-            )
-        )
-        character_negative = _text(
-            _value(final_character, "negative", character.get("negative"))
-        )
-        position = _mapping(
-            _value(final_character, "position", character.get("position"))
-        )
-        position_enabled = bool(
-            _value(position, "enabled", use_coords)
-        )
-        center = {
-            key: deepcopy(position[key])
-            for key in ("x", "y")
-            if key in position
-        }
-
-        # Keep the source split for editing, and the resolved value for the
-        # exact legacy call.  Unknown character fields survive in ``slot``.
-        slot["prompt"] = _text(character.get("appearance"))
-        slot["outfit"] = _text(character.get("clothed"))
-        slot["negative"] = character_negative
-        slot["enabled"] = True
-        slot["position"] = _secret_free(position)
-        char_slots.append(_secret_free(slot))
-        char_centers.append(_secret_free(center))
-        if resolved_prompt.strip():
-            call_characters.append({
-                "prompt": resolved_prompt,
-                "negative": character_negative,
-            })
-            call_centers.append(_secret_free(center))
-            positions.append({
-                "enabled": position_enabled,
-                **_secret_free(center),
-            })
 
     output, output_passthrough = _output_material(
         _mapping(plan.get("output"))
@@ -267,24 +297,6 @@ def single_generation_legacy_material(
     if seed is not None:
         config_overrides["nai_seed"] = deepcopy(seed)
 
-    top_passthrough = {
-        key: deepcopy(item)
-        for key, item in raw.items()
-        if key not in _KNOWN_BLUEPRINT_FIELDS
-    }
-    generation_passthrough = {
-        key: deepcopy(item)
-        for key, item in generation.items()
-        if key not in {
-            "resolution",
-            "settings",
-            "final",
-            "schedule",
-            "provenance",
-            "seed",
-            *_DIRECT_GENERATION_FIELDS,
-        }
-    }
     result = {
         "schema": MATERIAL_SCHEMA,
         "config_overrides": _secret_free(config_overrides),
@@ -304,28 +316,8 @@ def single_generation_legacy_material(
             },
         },
         "output": deepcopy(output),
-        "passthrough": _secret_free({
-            "blueprint": top_passthrough,
-            "source": plan.get("source"),
-            "style": {
-                key: deepcopy(item)
-                for key, item in style.items()
-                if key not in {
-                    "id",
-                    "name",
-                    "base",
-                    "negative",
-                    "parts",
-                    "generation_settings",
-                    "evidence",
-                    "provenance",
-                }
-            },
-            "generation": generation_passthrough,
-            "output": output_passthrough,
-            "setting": plan.get("setting"),
-            "experiment": plan.get("experiment"),
-            "provenance": plan.get("provenance"),
-        }),
+        "passthrough": _single_passthrough(
+            raw, plan, style, generation, output_passthrough
+        ),
     }
     return _secret_free(result)
