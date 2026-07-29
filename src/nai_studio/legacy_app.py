@@ -182,6 +182,7 @@ from src.nai_studio.services import (
     artist_workspace as _artist_workspace,
     catalog_search as _catalog_search,
     character_storage as _character_storage,
+    collection_handlers as _collection_handlers,
     comparison_execution as _comparison_execution,
     comparison_planning as _comparison_planning,
     comparison_promotion as _comparison_promotion,
@@ -3993,6 +3994,39 @@ def _image_tool_operations():
     )
 
 
+def _collection_handler_operations():
+    """단건 복원·변형 저장의 기존 데이터 경계를 호출 시점에 연결한다."""
+    return _collection_handlers.CollectionHandlerOperations(
+        output_root=globals()["out_root"],
+        character_asset_from_legacy_record=globals()[
+            "character_asset_from_legacy_record"
+        ],
+        accept_variation=globals()["accept_variation"],
+        approved_variation_candidates=globals()[
+            "approved_proposal_to_legacy_candidates"
+        ],
+        apply_variation_candidates=globals()[
+            "apply_character_variation_candidates"
+        ],
+        local_import_image=globals()["_local_import_image"],
+        sync_chars_to_files=globals()["sync_chars_to_files"],
+        save_config=globals()["save_config"],
+        extract_nai_metadata=globals()["extract_nai_metadata"],
+        parse_artist_combo=globals()["parse_artist_combo"],
+        model_id_from_metadata=globals()["model_id_from_metadata"],
+        split_uc_preset=globals()["split_uc_preset"],
+        restore_quality_prompt=globals()["restore_quality_prompt"],
+        image_cache=globals()["IMG_CACHE"],
+        atomic_write_bytes=globals()["_atomic_write_bytes"],
+        evidence_from_image_record=globals()["evidence_from_image_record"],
+        style_asset_from_record=globals()["style_asset_from_record"],
+        add_style=globals()["add_style"],
+        image_inspect_queue=globals()["image_inspect_queue"],
+        summarize_restore_queue=globals()["summarize_restore_queue"],
+        warning=globals()["log"].warning,
+    )
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -5585,87 +5619,11 @@ class ConfigServer:
             self, data, _generation_handler_operations())
 
     def handle_character_variation_save(self, body):
-        """완료된 고정 결과를 명시 선택한 캐릭터 자산 항목에만 추가한다."""
-        try:
-            request = json.loads(body or b"{}")
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-        save_as = str(request.get("save_as") or "").strip()
-        if save_as not in ("representative", "evidence", "variation"):
-            return {"ok": False, "error": "대표·근거·variation 중 저장 위치를 골라주세요."}
-        with self.config_lock:
-            pending = copy.deepcopy(self.pending_variation)
-            if not isinstance(pending, dict) or not pending.get("result_path"):
-                return {"ok": False, "error": "저장할 완료 결과가 없습니다."}
-            result_path = Path(str(pending["result_path"])).resolve()
-            latest = self.latest_config_from_disk()
-            root = out_root(latest).resolve()
-            try:
-                inside = result_path.is_relative_to(root)
-            except AttributeError:
-                inside = str(result_path).startswith(str(root))
-            if not inside or not result_path.is_file():
-                return {"ok": False, "error": "고정된 생성 결과 파일을 확인할 수 없습니다."}
-            actual_hash = hashlib.sha256(result_path.read_bytes()).hexdigest()
-            if actual_hash != str(pending.get("result_hash") or ""):
-                return {"ok": False, "error": "생성 뒤 결과 파일이 바뀌어 저장하지 않았습니다."}
-            character = next((
-                item for item in (latest.get("characters") or [])
-                if str(item.get("id") or "") == str(pending.get("character_id") or "")
-            ), None)
-            if character is None:
-                return {"ok": False, "error": "대상 캐릭터가 없어졌습니다."}
-            try:
-                asset = character_asset_from_legacy_record(
-                    character,
-                    char_refs=latest.get("char_refs") or [],
-                    vibes=latest.get("vibes") or [],
-                )
-                proposal = accept_variation(
-                    asset,
-                    pending.get("plan") or {},
-                    {
-                        "image_ref": {"content_hash": actual_hash},
-                        "name": str(request.get("name") or "").strip(),
-                        "metadata": {
-                            key: copy.deepcopy(pending.get(key))
-                            for key in (
-                                "mode", "job_id", "seed", "width", "height",
-                                "started_at", "completed_at",
-                            )
-                        },
-                    },
-                )
-                candidates = approved_proposal_to_legacy_candidates(
-                    character, proposal, approved=True)
-            except Exception as e:
-                return {"ok": False, "conflict": True, "error": str(e)}
-            content_type = (
-                "image/png" if result_path.suffix.lower() == ".png"
-                else "image/webp"
-            )
-            local_ref, _ = _local_import_image(
-                result_path.read_bytes(), content_type)
-            updated_character = apply_character_variation_candidates(
-                character,
-                candidates,
-                local_ref=local_ref,
-                save_as=save_as,
-            )
-            character.clear()
-            character.update(updated_character)
-            self.cfg.clear()
-            self.cfg.update(latest)
-            sync_chars_to_files(self.cfg)
-            save_config(self.cfg)
-            self.config_revision += 1
-            return {
-                "ok": True,
-                "save_as": save_as,
-                "character": copy.deepcopy(character),
-                "revision": self.config_revision,
-                "local_ref": local_ref,
-            }
+        return _collection_handlers.handle_character_variation_save(
+            self,
+            {"body": body},
+            _collection_handler_operations(),
+        )
 
     def handle_regen(self, body):
         try:
@@ -5931,135 +5889,15 @@ class ConfigServer:
         return {"ok": True, "path": path}
 
     def handle_inspect(self, body, filename="", save_flag=""):
-        """이미지에서 NAI 메타데이터를 뽑아 그림체 레코드로. (novelai.net/inspect 대체)
-        X-Save: 1 이면 그림체 라이브러리에도 넣는다."""
-        try:
-            from urllib.parse import unquote
-            name = Path(unquote(filename or "")).name or "붙여넣은 이미지"
-            if not body:
-                result = {"ok": False, "error": "이미지가 비어 있습니다."}
-                queue = image_inspect_queue(result, filename=name)
-                result["restoration"] = summarize_restore_queue(queue)
-                result["restoration_queue"] = queue
-                return result
-            ct = "image/webp" if body[:4] == b"RIFF" else "image/png"
-            m = extract_nai_metadata(body, ct)
-            if m["metadata_status"] != "ok":
-                result = {
-                    "ok": False,
-                    "error": (
-                        "이 이미지에는 NAI 생성 정보가 없습니다. "
-                        "(카톡·디스코드 등을 거치면 지워집니다 — 원본 파일을 넣어주세요)"
-                    ),
-                }
-                queue = image_inspect_queue(result, filename=name)
-                result["restoration"] = summarize_restore_queue(queue)
-                result["restoration_queue"] = queue
-                return result
-            artists, rest = parse_artist_combo(m["base"])
-            # 새 결과에는 우리가 ucPreset·qualityToggle 을 Comment JSON에 직접 기록한다.
-            # 옛 NAI 파일처럼 값이 없을 때만 문구에서 역추적한다.
-            params = dict(m["params"] or {})
-            source_model = model_id_from_metadata(
-                params.get("model"),
-                self.cfg.get("model") or "nai-diffusion-4-5-full",
-            )
-            ucp, user_neg = split_uc_preset(m["negative"], source_model)
-            if "uc_preset" not in params and ucp is not None:
-                params["uc_preset"] = ucp
-                params["uc_preset_guessed"] = True
-            # 퀄리티 접미사도 UC 프리셋처럼 **떼고** 토글만 켠다.
-            # 안 떼면 프롬프트 칸에 구워진 채 남아, 토글을 꺼도 접미사가 계속 전송된다
-            # (외부 감사 nais_blue B-2 와 같은 계열 — 우리는 이중 추가는 가드가 막았지만
-            #  '끄기가 안 듣는' 쪽이 남아 있었다. ai-review/외부감사/ 참고)
-            base_txt, qt = restore_quality_prompt(m["base"], source_model, params)
-            if "quality_toggle" not in params:
-                params["quality_toggle"] = qt
-                params["quality_toggle_guessed"] = True
-            rec = {
-                # 파이썬 hash()는 프로세스마다 달라 같은 파일이 재실행 뒤 다른 id가 된다.
-                # 전체 원본 바이트의 SHA-256을 써 모든 임포트 경로에서 안정적으로 식별한다.
-                "id": f"file-{hashlib.sha256(body).hexdigest()[:20]}",
-                "content_sha256": hashlib.sha256(body).hexdigest(),
-                "title": Path(name).stem[:80], "source": "내 이미지",
-                "tab": "", "posted_at": "", "recommend": None, "views": None, "url": "",
-                "count": len(artists),
-                "combo": ", ".join(f"{w:g}::artist:{n}::" if w is not None else f"artist:{n}"
-                                   for w, n in artists),
-                "artists": [n for _, n in artists],
-                "weights": {n: (w if w is not None else 1.0) for w, n in artists},
-                # ⚠ 프롬프트는 **자르지 않는다.** `rest` 는 `base` 에서 작가 태그를 뺀
-                #   파생값이라 예전엔 1,200자에서 잘랐는데, 사용자 원본 자료를 말없이
-                #   줄이는 셈이라 없앴다. 원본은 `base` 에 온전히 있고 크기 문제도 없다.
-                "base": base_txt, "rest": ", ".join(rest),
-                # 네거티브는 프리셋을 뗀 '사용자가 쓴 부분' 만 담는다
-                "negative": user_neg if ucp is not None else m["negative"],
-                "negative_full": m["negative"],
-                "characters": m["characters"],
-                # 지금 버전이 모르는 필드도 버리지 않는다. 생성 요청에는 보내지 않고
-                # 원본 메타데이터 보존·후속 버전의 재해석에만 쓴다.
-                "metadata_raw": m["raw"],
-                "params": params, "images": [],
-            }
-            # 썸네일도 캐시에 넣어 목록에서 바로 보이게
-            thumb_created = False
-            key = ""
-            try:
-                # local: 이름은 실제로 저장하는 WebP 바이트의 SHA-256이다.
-                # 원본 PNG의 SHA-1으로 이름을 만들면 같은 내용 해시라는 자료팩 규칙과
-                # 달라지고, 파일 무결성도 이름만으로 확인할 수 없다.
-                thumb_io = io.BytesIO()
-                with Image.open(io.BytesIO(body)) as im:
-                    im = im.convert("RGB")
-                    im.thumbnail((512, 512), Image.LANCZOS)
-                    im.save(thumb_io, "WEBP", quality=74, method=4)
-                thumb = thumb_io.getvalue()
-                key = hashlib.sha256(thumb).hexdigest() + ".webp"
-                out = IMG_CACHE / key
-                if not out.exists():
-                    _atomic_write_bytes(out, thumb, keep_backup=False)
-                    thumb_created = True
-                rec["images"] = [f"local:{key}"]
-            except Exception as e:
-                log.warning(f"추출 썸네일 실패: {e}")
-            # 옛 그림체 레코드는 그대로 읽을 수 있게 유지하고, 새 단건 임포트에는
-            # 같은 원본을 증거·지식 자산 계약으로도 함께 보존한다.
-            evidence_record = evidence_from_image_record(rec)
-            knowledge_asset = style_asset_from_record(
-                rec,
-                evidence_refs=[evidence_record["id"]],
-                lifecycle="candidate",
-            )
-            rec["evidence_records"] = [evidence_record]
-            rec["knowledge_asset"] = knowledge_asset
-            saved = None
-            if save_flag in ("1", "true"):
-                files = ({"수집/이미지캐시": [key]}
-                         if thumb_created and key else {})
-                saved = add_style(
-                    rec,
-                    import_info={"kind": "image", "file": name, "files": files},
-                    return_detail=True,
-                )
-            result = {
-                "ok": True, "style": rec,
-                "saved": saved.get("total") if saved else None,
-                "import": saved,
-            }
-            queue = image_inspect_queue(result, filename=name)
-            result["restoration"] = summarize_restore_queue(queue)
-            result["restoration_queue"] = queue
-            return result
-        except Exception as e:
-            log.warning(f"메타데이터 추출 실패: {traceback.format_exc()}")
-            result = {"ok": False, "error": str(e)}
-            queue = image_inspect_queue(
-                result,
-                filename=Path(str(filename or "")).name,
-            )
-            result["restoration"] = summarize_restore_queue(queue)
-            result["restoration_queue"] = queue
-            return result
+        return _collection_handlers.handle_inspect(
+            self,
+            {
+                "body": body,
+                "filename": filename,
+                "save_flag": save_flag,
+            },
+            _collection_handler_operations(),
+        )
 
     def handle_resource_import(self, body, filename=""):
         """Vibe 교환 문서를 기존 저장소에 비활성 자원으로 안전하게 추가."""
