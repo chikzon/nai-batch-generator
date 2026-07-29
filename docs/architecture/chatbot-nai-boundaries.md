@@ -44,6 +44,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 프롬프트 조각 POST 라우트 | `web/routes/fragments_post.py` |
 | 세팅·장면 편집 POST 라우트 | `web/routes/settings_post.py` |
 | 생성·비교·이미지 도구 POST 라우트 | `web/routes/generation_post.py` |
+| 설계도·설정·비용·토큰 POST 라우트 | `web/routes/runtime_post.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
@@ -55,7 +56,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 
 점진 분리는 **완료되지 않았다**. 다음 큰 경계가 `legacy_app.py`에 남아 있다.
 
-- `ConfigServer`: POST API endpoint 조정
+- `ConfigServer`: route 의존성 조립과 레거시 호환 메서드
 - 자료실 검색·그림체·작가 평가·태그 자동완성
 - 세팅·자료팩·전체 백업·휴지통
 - 비교 계획·결과 승격·재실행

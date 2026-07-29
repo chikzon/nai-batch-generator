@@ -276,6 +276,10 @@ from src.nai_studio.web.routes.settings_post import (
     handle_settings_post,
 )
 from src.nai_studio.web.routes.runtime import handle_runtime_get
+from src.nai_studio.web.routes.runtime_post import (
+    RuntimePostOperations,
+    handle_runtime_post,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -12891,6 +12895,18 @@ class ConfigServer:
             director=server.handle_director,
             inspect_image=server.handle_inspect,
         )
+        runtime_post = RuntimePostOperations(
+            blueprint_project=server.handle_blueprint_project,
+            save_config=server.handle_save,
+            fetch_balance=lambda token: fetch_anlas_balance(token),
+            vibe_paths=vibe_paths,
+            load_asset_config=load_asset_config,
+            compute_pending=compute_pending,
+            estimate_anlas=anlas_estimate,
+            finalize_tokens=finalized_token_texts,
+            token_count=nai_tokens,
+            tokens_exact=tokens_exact,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12928,149 +12944,10 @@ class ConfigServer:
                     return
                 if handle_generation_post(self, server, generation_post, body):
                     return
-                if self.path.startswith("/api/blueprint_project"):
-                    try:
-                        self._json(server.handle_blueprint_project(body))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/save"):
-                    self._json(server.handle_save(body))
-                elif self.path.startswith("/api/anlas"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        token = str(server.cfg.get("token") or "")
-                        token_key = hashlib.sha256(token.encode("utf-8")).hexdigest() \
-                            if token else None
-                        with server.config_lock:
-                            if token_key != server.anlas_balance_token_key:
-                                server.anlas_balance_cache = None
-                                server.anlas_balance_token_key = token_key
-                        fresh_balance = fetch_anlas_balance(token) \
-                            if d.get("balance") else None
-                        with server.config_lock:
-                            # 조회 중 사용자가 토큰을 바꿨다면 이전 계정 응답을 캐시하지 않는다.
-                            if (fresh_balance
-                                    and token_key == server.anlas_balance_token_key):
-                                server.anlas_balance_cache = fresh_balance
-                            known_balance = (server.anlas_balance_cache
-                                             if token_key == server.anlas_balance_token_key
-                                             else None)
-                        opus = bool(known_balance and known_balance.get("opus"))
-                        cfg = server.cfg
-                        # 켜진 캐릭터 레퍼런스 수 — Opus 무료 생성은 유지되고 장당 +5만 별도 과금
-                        refs = (
-                            max(0, int(d.get("char_refs")))
-                            if "char_refs" in d
-                            else sum(
-                                1 for r in cfg.get("char_refs", [])
-                                if r.get("enabled"))
-                        )
-                        # 아직 인코딩 안 된 바이브 — 처음 한 번만 2 Anlas
-                        vibe_new = 0
-                        for v in cfg.get("vibes", []):
-                            if not v.get("enabled"):
-                                continue
-                            _, ep = vibe_paths(v.get("id", ""))
-                            ie = float(v.get("info_extracted", 0.7))
-                            if (not ep.exists()) or abs(float(
-                                    v.get("encoded_ie", -1) or -1) - ie) > 1e-9:
-                                vibe_new += 1
-                        if d.get("batch"):
-                            # 일괄 생성은 씬마다 해상도가 달라서 씬별로 더해야 정확하다
-                            # (예: 체위 세팅은 1024²·832×1216·1216×832 이 섞여 있다)
-                            acfg = load_asset_config(cfg)
-                            pend = compute_pending(cfg, acfg, {}, set())
-                            total = 0
-                            eligible_all = True
-                            generation_free_all = True
-                            for _, _, num, _ in pend:
-                                sc = acfg["scenes"].get(str(num)) or {}
-                                e1 = anlas_estimate(cfg, 1, sc.get("width"), sc.get("height"),
-                                                    opus=opus, char_refs=refs)
-                                total += e1["total"]
-                                eligible_all = eligible_all and e1["free_eligible"]
-                                generation_free_all = (
-                                    generation_free_all and e1["generation_free"])
-                            total += 2 * vibe_new        # 바이브 첫 인코딩 (한 번만)
-                            if total == 0:
-                                batch_why = "Opus 무료 (모든 씬이 1024² 이하 · 28스텝 이하)"
-                            elif eligible_all:
-                                parts = []
-                                if known_balance is None:
-                                    parts.append("무료 크기·스텝 범위 · Opus 등급 미확인")
-                                elif not opus:
-                                    parts.append("무료 크기·스텝 범위 · 비Opus 등급")
-                                else:
-                                    parts.append("Opus 무료 생성")
-                                if refs:
-                                    parts.append(
-                                        f"캐릭터 레퍼런스 {refs}개 장당 {5*refs} Anlas")
-                                if vibe_new:
-                                    parts.append(
-                                        f"새 바이브 {vibe_new}개 인코딩 {2*vibe_new} Anlas")
-                                batch_why = " + ".join(parts)
-                            else:
-                                batch_why = (
-                                    f"{cfg.get('steps')}스텝 / 일부 씬 해상도가 무료 조건"
-                                    f"(1024² 이하·28스텝 이하)을 넘습니다")
-                            est = {"per_image": None, "total": total, "count": len(pend),
-                                   "free": total == 0,
-                                   "free_eligible": eligible_all,
-                                   "generation_free": generation_free_all,
-                                   "batch": True,
-                                   "width": None, "height": None,
-                                   "steps": int(cfg.get("steps", 28)),
-                                   "vibe_encode": 2 * vibe_new, "char_refs": refs,
-                                   "why": batch_why}
-                        else:
-                            # mode 를 받아 img2img·인페인트면 Opus 무료를 빼고 센다 (CQA-008)
-                            est = anlas_estimate(cfg, int(d.get("count") or 1),
-                                                 width=d.get("width"), height=d.get("height"),
-                                                 opus=opus, char_refs=refs,
-                                                 mode=(d.get("mode") or "t2i"),
-                                                 strength=float(d.get("strength") or 1.0))
-                            est["total"] += 2 * vibe_new
-                            est["vibe_encode"] = 2 * vibe_new
-                        est["subscription_known"] = known_balance is not None
-                        est["opus"] = (bool(known_balance.get("opus"))
-                                       if known_balance is not None else None)
-                        self._json({
-                            "ok": True,
-                            "est": est,
-                            # 잔액 숫자는 사용자가 조회 버튼을 눌렀을 때만 보낸다.
-                            "balance": fresh_balance if d.get("balance") else None,
-                        })
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/tokens"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        if d.get("finalize"):
-                            final = finalized_token_texts(
-                                d.get("base", ""), d.get("negative", ""),
-                                d.get("chars") or [], d.get("char_negatives") or [],
-                                server.cfg)
-                        else:
-                            final = {
-                                "base": d.get("base", ""),
-                                "negative": d.get("negative", ""),
-                                "chars": d.get("chars") or [],
-                                "char_negatives": d.get("char_negatives") or [],
-                            }
-                        base = nai_tokens(final["base"])
-                        chars = [nai_tokens(c) for c in final["chars"]]
-                        neg = nai_tokens(final["negative"])
-                        cnegs = [nai_tokens(c) for c in final["char_negatives"]]
-                        self._json({"ok": True, "exact": tokens_exact(), "base": base,
-                                    "negative": neg,
-                                    "chars": chars, "char_negatives": cnegs,
-                                    "shared": base + sum(chars),
-                                    "shared_negative": neg + sum(cnegs), "limit": 512,
-                                    "finalized": bool(d.get("finalize"))})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                else:
-                    self.send_response(404); self.end_headers()
+                if handle_runtime_post(self, server, runtime_post, body):
+                    return
+                self.send_response(404)
+                self.end_headers()
 
         self.httpd, self.url = start_http_server(
             self,

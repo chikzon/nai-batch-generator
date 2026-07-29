@@ -2,22 +2,22 @@
 
 ## 목적
 
-설계도·설정 저장·비용·토큰 POST 라우트를
-`src/nai_studio/web/routes/runtime_post.py`로 옮긴다.
+`page_template.py`의 인라인 CSS·JavaScript를
+`src/nai_studio/web/static/` 파일로 옮긴다.
 
 ## 구현 범위
 
-- 설계도 프로젝트 저장
-- 설정 저장
-- Anlas 비용·잔액 계산과 토큰별 캐시 격리
-- Base·Negative·캐릭터별 토큰 계산
+- 인라인 `<style>` 본문을 `base.css`로 이동
+- 인라인 `<script>` 본문을 `studio.js`로 이동
+- 동적 초기값은 안전한 bootstrap 값으로 주입
+- 기존 `studio.css` 뒤집어쓰기 순서와 정적 파일 빌드 포함 유지
 - 기존 서비스 호출 순서와 응답 schema 유지
 - 충돌하는 prefix는 긴 경로를 먼저 판정
 
 ## 완료 조건
 
-- `do_POST`가 기능 구현 없이 route 위임만 수행
-- 비용·토큰 응답과 설정 revision 유지
+- CSS·JavaScript가 인라인 대형 문자열에서 제거됨
+- 앱 기동·정적 응답·JavaScript 구문·주요 UI 테스트 통과
 - 관련 기존 회귀 테스트 통과
 
 ## 금지 범위
@@ -29,4 +29,4 @@
 
 ## 다음 경계
 
-POST 분리 완료 뒤 정적 CSS·JavaScript를 `ui/` 파일로 이동한다.
+정적 자산 분리 뒤 데이터 손실 위험 예외 처리 세 곳을 수정한다.
