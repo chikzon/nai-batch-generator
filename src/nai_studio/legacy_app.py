@@ -181,8 +181,10 @@ from src.nai_studio.services import (
     artist_workspace as _artist_workspace,
     catalog_search as _catalog_search,
     character_storage as _character_storage,
+    comparison_execution as _comparison_execution,
     comparison_planning as _comparison_planning,
     comparison_promotion as _comparison_promotion,
+    comparison_runtime as _comparison_runtime,
     datapack_store as _datapack_store,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
@@ -7666,57 +7668,107 @@ def comparison_progress_summary(cfg):
     }
 
 
+def _comparison_runtime_operations():
+    """비교 manifest·재실행 의존성을 호출 시점의 APP 경계에 연결한다."""
+    return _comparison_runtime.ComparisonRuntimeOperations(
+        output_root=globals()["out_root"],
+        comparison_signature=globals()["comparison_signature"],
+        load_progress=globals()["_comparison_progress_load"],
+        load_json=globals()["load_json_recover"],
+        path_is_inside=globals()["_path_is_inside"],
+        output_file_for_preview=globals()["output_file_for_preview"],
+        output_subdir=globals()["out_sub"],
+        now=lambda: globals()["datetime"].now(),
+        random_bytes=globals()["os"].urandom,
+        now_text=lambda: globals()["time"].strftime("%Y-%m-%d %H:%M:%S"),
+        random_seed=globals()["random"].randint,
+        comparison_recipe_context=globals()["comparison_recipe_context"],
+        save_progress=globals()["_comparison_progress_save"],
+        info=globals()["log"].info,
+        warning=globals()["log"].warning,
+        selected_comparison_record=globals()["_selected_comparison_record"],
+        regenerate_execution_material=globals()[
+            "regenerate_legacy_execution_material"
+        ],
+        selected_config=globals()["_comparison_selected_cfg"],
+        load_asset_config=globals()["load_asset_config"],
+        compute_pending=globals()["compute_pending"],
+        selected_job_values=globals()["comparison_selected_job_values"],
+        generation_blueprint=globals()["generation_blueprint"],
+        pace_gate=globals()["pace_gate"],
+        runtime_generation_params=globals()["runtime_generation_params"],
+        call_nai_api=globals()["call_nai_api"],
+        with_centers=globals()["with_centers"],
+        pace_complete=globals()["pace_complete"],
+        output_format=globals()["out_format"],
+        available_output_path=globals()["available_output_path"],
+        output_clean_args=globals()["out_clean"],
+        save_with_meta=globals()["save_with_meta"],
+        record_job_result=globals()["record_job_result"],
+        uuid4=globals()["uuid"].uuid4,
+        comparison_job_recipe_snapshot=globals()[
+            "comparison_job_recipe_snapshot"
+        ],
+        load_state=globals()["load_state"],
+        bump_daily=globals()["bump_daily"],
+        save_state=globals()["save_state"],
+    )
+
+
+def _comparison_execution_operations():
+    """비교 큐·NAI·결과 저장 의존성을 호출 시점의 APP 경계에 연결한다."""
+    return _comparison_execution.ComparisonExecutionOperations(
+        progress_start=globals()["_comparison_progress_start"],
+        save_progress=globals()["_comparison_progress_save"],
+        link_job_ancestor=globals()["link_job_ancestor"],
+        record_job_result=globals()["record_job_result"],
+        output_file_for_preview=globals()["output_file_for_preview"],
+        redact_diagnostic_text=globals()["redact_diagnostic_text"],
+        warning=globals()["log"].warning,
+        info=globals()["log"].info,
+        error=globals()["log"].error,
+        iter_character_setting_jobs=globals()[
+            "iter_character_setting_jobs"
+        ],
+        iter_selected_jobs=globals()["iter_selected_comparison_jobs"],
+        iter_comparison_jobs=globals()["iter_comparison_jobs"],
+        comparison_job_values=globals()["comparison_job_values"],
+        comparison_job_recipe_snapshot=globals()[
+            "comparison_job_recipe_snapshot"
+        ],
+        generation_blueprint=globals()["generation_blueprint"],
+        safe_name=globals()["_safe_name"],
+        available_output_path=globals()["available_output_path"],
+        output_format=globals()["out_format"],
+        output_root=globals()["out_root"],
+        output_clean_args=globals()["out_clean"],
+        pace=globals()["pace"],
+        pace_gate=globals()["pace_gate"],
+        pace_complete=globals()["pace_complete"],
+        runtime_generation_params=globals()["runtime_generation_params"],
+        call_nai_api=globals()["call_nai_api"],
+        with_centers=globals()["with_centers"],
+        save_with_meta=globals()["save_with_meta"],
+        load_state=globals()["load_state"],
+        daily_count=globals()["daily_count"],
+        bump_daily=globals()["bump_daily"],
+        save_state=globals()["save_state"],
+        now_text=lambda: globals()["time"].strftime("%Y-%m-%d %H:%M:%S"),
+        rate_limit_error=globals()["RateLimitError"],
+        account_errors=(
+            globals()["AccountBannedError"],
+            globals()["AuthError"],
+        ),
+        api_error=globals()["APIError"],
+    )
+
+
 def comparison_runs(cfg, limit=50):
-    """결과 폴더의 manifest를 읽어 최근 비교 실험과 재개 가능 여부를 돌려준다."""
-    root = out_root(cfg).resolve()
-    runs_root = (root / "비교생성").resolve()
-    if not runs_root.is_dir():
-        return {"ok": True, "runs": []}
-    found = []
-    for folder in runs_root.iterdir():
-        if not folder.is_dir() or not _path_is_inside(folder, runs_root):
-            continue
-        manifest_path = folder / "manifest.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            progress = load_json_recover(manifest_path)
-        except Exception as e:
-            log.warning("비교 실험 기록을 읽지 못했습니다(%s): %s", folder.name, e)
-            continue
-        if not isinstance(progress, dict):
-            continue
-        plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
-        options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
-        completed = progress.get("completed")
-        completed_n = len(completed) if isinstance(completed, dict) else 0
-        total = int(plan.get("count") or completed_n)
-        status = str(progress.get("status") or "")
-        try:
-            mtime = manifest_path.stat().st_mtime
-        except OSError:
-            mtime = 0
-        found.append({
-            "folder": folder.relative_to(root).as_posix(),
-            "name": folder.name,
-            "status": status,
-            "mode_label": str(progress.get("mode_label") or ""),
-            "completed": completed_n,
-            "total": total,
-            "updated_at": str(progress.get("updated_at")
-                              or progress.get("created_at") or ""),
-            "resumable": bool(
-                status != "complete"
-                and progress.get("signature")
-                and isinstance(completed, dict)
-            ),
-            "options": options,
-            "_mtime": mtime,
-        })
-    found.sort(key=lambda x: (x["_mtime"], x["name"]), reverse=True)
-    for item in found:
-        item.pop("_mtime", None)
-    return {"ok": True, "runs": found[:max(1, min(int(limit or 50), 200))]}
+    return _comparison_runtime.comparison_runs(
+        _comparison_runtime_operations(),
+        cfg,
+        limit,
+    )
 
 
 def activate_comparison_run(cfg, folder):
@@ -7941,104 +7993,13 @@ def _comparison_progress_save(progress, folder):
 
 
 def _comparison_progress_start(cfg, plan, styles, chars):
-    root = out_root(cfg).resolve()
-    signature = comparison_signature(cfg, plan, styles, chars)
-    old = _comparison_progress_load()
-    same_plan = (
-        old.get("signature") == signature
-        and isinstance(old.get("completed"), dict)
+    return _comparison_runtime.comparison_progress_start(
+        _comparison_runtime_operations(),
+        cfg,
+        plan,
+        styles,
+        chars,
     )
-    folder = None
-    old_has_invalid_result = False
-    if same_plan:
-        rel = str(old.get("folder") or "")
-        candidate = (root / rel).resolve()
-        if (_path_is_inside(candidate, root) and candidate.is_dir()):
-            folder = candidate
-            for record in old["completed"].values():
-                rel_result = (
-                    record.get("file") if isinstance(record, dict) else record
-                )
-                result_path = output_file_for_preview(cfg, rel_result)
-                valid = (
-                    result_path is not None
-                    and result_path.is_file()
-                    and result_path.stat().st_size > 0
-                )
-                expected_hash = (
-                    str(record.get("content_sha256") or "")
-                    if isinstance(record, dict) else ""
-                )
-                if valid and expected_hash:
-                    try:
-                        valid = (
-                            hashlib.sha256(result_path.read_bytes()).hexdigest()
-                            == expected_hash
-                        )
-                    except OSError:
-                        valid = False
-                if not valid:
-                    old_has_invalid_result = True
-                    break
-    resumable = (
-        folder is not None
-        and (
-            old.get("status") not in ("complete",)
-            or old_has_invalid_result
-        )
-    )
-    if not resumable:
-        folder = None
-    if folder is None:
-        run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
-        folder = out_sub(cfg, "비교생성") / run_id
-        folder.mkdir(parents=True, exist_ok=True)
-        progress = {
-            "version": 1,
-            "signature": signature,
-            "status": "running",
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "folder": folder.relative_to(root).as_posix(),
-            "mode": plan["options"]["mode"],
-            "mode_label": plan["mode_label"],
-            "plan": {k: v for k, v in plan.items()
-                     if k not in ("sample_styles", "sample_characters")},
-            "base_seed": int(plan["options"].get("seed") or 0)
-                         or random.randint(1, 2**32 - 1),
-            "recipe_context": comparison_recipe_context(
-                cfg, plan, styles, chars),
-            "completed": {},
-            "errors": {},
-        }
-    else:
-        progress = old
-        progress["status"] = "running"
-        progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        if not isinstance(progress.get("recipe_context"), dict):
-            progress["recipe_context"] = comparison_recipe_context(
-                cfg, plan, styles, chars)
-        log.info("중단된 자료 비교 생성을 이어서 합니다: %s", folder)
-
-    # 기록만 있고 파일이 사라진 항목은 완료로 보지 않는다.
-    completed = progress.setdefault("completed", {})
-    for key, rec in list(completed.items()):
-        rel = rec.get("file") if isinstance(rec, dict) else rec
-        path = output_file_for_preview(cfg, rel)
-        valid = path is not None and path.is_file() and path.stat().st_size > 0
-        expected_hash = (
-            str(rec.get("content_sha256") or "")
-            if isinstance(rec, dict) else ""
-        )
-        if valid and expected_hash:
-            try:
-                valid = hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash
-            except OSError:
-                valid = False
-        if not valid:
-            completed.pop(key, None)
-    _comparison_progress_save(progress, folder)
-    return progress, folder
 
 
 def _selected_comparison_record(cfg, rel):
@@ -8066,511 +8027,23 @@ def _selected_comparison_record(cfg, rel):
 
 
 def _rerun_selected_comparison(server, cfg, rel):
-    """선택 실험의 한 canonical 셀만 같은 seed로 다시 실행해 새 결과로 남긴다."""
-    progress, folder, source_key, source = _selected_comparison_record(cfg, rel)
-    cell = source.get("canonical_cell")
-    if not isinstance(cell, dict):
-        raise ValueError("이 결과에는 한 셀 재실행 정보가 없습니다.")
-    plan = progress.get("plan")
-    if not isinstance(plan, dict):
-        raise ValueError("이 결과의 선택 실험 계획을 읽지 못했습니다.")
-    attempt = max(2, int(source.get("rerun_attempt") or 1) + 1)
-    material = regenerate_legacy_execution_material(
-        cell, cfg, attempt=attempt,
-        runtime_base_seed=int(progress.get("base_seed") or source.get("seed") or 1),
-    )
-    scratch = _comparison_selected_cfg(cfg, material)
-    job = {
-        "index": int(source.get("index") or 1),
-        "key": source_key,
-        "cell_id": material.get("cell_id"),
-        "cell_resume_key": material.get("resume_key"),
-        "canonical_cell": cell,
-        "material": material,
-        "scratch_cfg": scratch,
-        "style": (material.get("job") or {}).get("style"),
-        "character": (material.get("job") or {}).get("character"),
-        "setting": (material.get("job") or {}).get("setting"),
-        "style_name": source.get("style") or "현재 그림체",
-        "char_name": source.get("character") or "현재 캐릭터",
-        "setting_name": source.get("setting") or "",
-        "seed_index": int(source.get("seed_index") or 0),
-        "seed": int(source.get("seed") or material.get("seed") or 1),
-        "cid": str(source.get("cid") or source.get("cast_id") or ""),
-        "scene_num": int(source.get("scene") or 0),
-        "copy": int(source.get("copy") or 1),
-    }
-    if isinstance(job["setting"], dict) and job["scene_num"]:
-        acfg = load_asset_config(scratch)
-        matches = [
-            (derived, str(cid))
-            for derived, cid, scene_num, copy_num in compute_pending(
-                scratch, acfg, {}, set())
-            if int(scene_num) == job["scene_num"]
-            and int(copy_num) == job["copy"]
-            and (not job["cid"] or str(cid) == job["cid"])
-        ]
-        if len(matches) != 1:
-            raise ValueError("선택했던 세팅 씬을 현재 자료에서 찾지 못했습니다.")
-        job["asset_config"] = acfg
-        job["scene_character"] = copy.deepcopy(matches[0][0])
-        job["cid"] = matches[0][1]
-    used, base, negative, people, centers = comparison_selected_job_values(
-        cfg, plan, job)
-    execution_cfg = copy.deepcopy(used)
-    execution_cfg.update({
-        "base_prompt": base,
-        "negative_prompt": negative,
-        "char_slots": [
-            {
-                "prompt": str(person.get("prompt") or ""),
-                "negative": str(person.get("negative") or ""),
-                "enabled": True,
-            }
-            for person in people if isinstance(person, dict)
-        ],
-        "char_centers": copy.deepcopy(centers),
-        "nai_seed": job["seed"],
-    })
-    execution_blueprint = generation_blueprint(
-        execution_cfg,
-        source={
-            "kind": "comparison-rerun",
-            "cell": source_key,
-            "attempt": attempt,
-        },
-        experiment={"mode": "selected_groups"},
-    )
-    token = cfg["token"]
-    allowed, why = pace_gate(cfg, server.live, "비교 한 셀 재실행")
-    if not allowed:
-        raise ValueError(why)
-    params = runtime_generation_params(
-        used, token, include_refs=plan["options"].get("include_refs", False))
-    try:
-        image = call_nai_api(
-            token, base, negative,
-            int(used.get("width", 832)), int(used.get("height", 1216)),
-            chars=people,
-            scale=used.get("cfg_scale", 5.5),
-            cfg_rescale=used.get("cfg_rescale", 0.56),
-            steps=int(used.get("steps", 28)),
-            sampler=used.get("sampler", "k_euler_ancestral"),
-            scheduler=used.get("scheduler", "karras"),
-            variety=used.get("variety", False),
-            uc_preset=int(used.get("uc_preset", 4)),
-            seed=job["seed"], params=with_centers(params, centers),
-        )
-    finally:
-        pace_complete()
-    source_path = output_file_for_preview(cfg, source["file"])
-    stem = (
-        source_path.stem if source_path is not None
-        else f"{job['index']:06d}_selected")
-    target = available_output_path(
-        folder / f"{stem}_rerun{attempt}.webp", out_format(cfg))
-    image.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
-    saved = save_with_meta(
-        image, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-        max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-    server.live.set_image(image)
-    root = out_root(cfg).resolve()
-    rel_saved = saved.resolve().relative_to(root).as_posix()
-    record_job_result(
-        server.live.job_id, saved, artifact=rel_saved,
-        source_result_ids=[source_key],
-    )
-    rerun_key = f"{source_key}:rerun:{attempt}:{uuid.uuid4().hex[:8]}"
-    record = copy.deepcopy(source)
-    record.update({
-        "file": rel_saved,
-        "rerun_of": source_key,
-        "rerun_attempt": attempt,
-        "content_sha256": hashlib.sha256(saved.read_bytes()).hexdigest(),
-        "request_id": str(getattr(image, "nai_request_id", "") or ""),
-        "payload_hash": str(getattr(image, "nai_payload_hash", "") or ""),
-        "blueprint_fingerprint": execution_blueprint["fingerprint"],
-        "seed": job["seed"],
-        "recipe": comparison_job_recipe_snapshot(
-            cfg, plan, job, used, base, negative,
-            people, centers, job["seed"]),
-    })
-    progress.setdefault("reruns", {})[rerun_key] = record
-    progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    _comparison_progress_save(progress, folder)
-    state = load_state()
-    bump_daily(state)
-    save_state(state)
-    server.live.update(
-        index=1, total=1, completed=1, failed=0,
-        filename=saved.name, seed=job["seed"],
-        status_text=f"선택 실험 한 셀 재실행 완료 · {saved.name}",
-        phase="completed", can_retry=False,
+    return _comparison_runtime.rerun_selected_comparison(
+        _comparison_runtime_operations(),
+        server,
+        cfg,
+        rel,
     )
 
 
 def _run_comparison(server, cfg, plan, styles, chars):
-    """자료 비교 큐. 한 번에 한 요청만 보내고 중지·일일 상한·재개를 모두 지킨다."""
-    progress, folder = _comparison_progress_start(cfg, plan, styles, chars)
-    previous_job_id = str(progress.get("job_id") or "")
-    # 실행권을 잡을 때 만든 durable Job과 비교 manifest가 같은 작업을 가리킨다.
-    # 옛 manifest에는 이 필드가 없으므로 새 실행에서만 보강하고 결과는 건드리지 않는다.
-    if server.live.job_id and progress.get("job_id") != server.live.job_id:
-        if previous_job_id:
-            try:
-                link_job_ancestor(server.live.job_id, previous_job_id)
-            except Exception as error:
-                log.warning("이전 비교 Job 계보 연결 실패: %s", error)
-        attempts = progress.setdefault("attempt_job_ids", [])
-        for identifier in (previous_job_id, server.live.job_id):
-            if identifier and identifier not in attempts:
-                attempts.append(identifier)
-        progress["job_id"] = server.live.job_id
-        progress["request_id"] = server.live.job_id
-        _comparison_progress_save(progress, folder)
-    completed = progress["completed"]
-    lineage_errors = progress.setdefault("lineage_errors", {})
-    if server.live.job_id:
-        for key, record in completed.items():
-            if not isinstance(record, dict):
-                continue
-            path = output_file_for_preview(cfg, record.get("file"))
-            if path is None:
-                continue
-            try:
-                record_job_result(
-                    server.live.job_id,
-                    path,
-                    artifact=str(record.get("file") or ""),
-                    result_id=(
-                        "result-comparison-"
-                        + hashlib.sha256(
-                            f"{key}\0{record.get('blueprint_fingerprint') or ''}"
-                            .encode("utf-8")
-                        ).hexdigest()[:24]
-                    ),
-                )
-                lineage_errors.pop(str(key), None)
-            except Exception as error:
-                log.warning("검증된 비교 결과의 Job 계보 연결 실패: %s", error)
-                lineage_errors[str(key)] = redact_diagnostic_text(error)
-    errors = progress.setdefault("errors", {})
-    options = plan["options"]
-    token = cfg["token"]
-    base_seed = int(progress["base_seed"])
-    state = load_state()
-    if options.get("mode") == "character_setting":
-        jobs = iter_character_setting_jobs(cfg, plan, chars)
-    elif options.get("mode") == "selected":
-        jobs = iter_selected_comparison_jobs(
-            cfg, plan, styles, chars, runtime_base_seed=base_seed)
-    else:
-        jobs = iter_comparison_jobs(cfg, plan, styles, chars)
-    done_n = len(completed)
-    run_failed = set()
-    server.live.update(
-        index=done_n, total=plan["count"], char_name=plan["mode_label"],
-        filename="", status_text=(f"자료 비교 생성 준비 중 — {done_n:,}/{plan['count']:,}"),
-        daily=daily_count(state), daily_cap=pace(cfg)["daily_cap"],
-        completed=done_n, eta_base_completed=done_n)
-
-    final_status = "complete"
-    fatal = False
-    for job in jobs:
-        key = job["key"]
-        if key in completed:
-            continue
-        if server.live.stop_req:
-            final_status = "stopped"
-            break
-        if daily_count(state) >= pace(cfg)["daily_cap"]:
-            final_status = "daily_limit"
-            server.live.update(status_text="일일 상한 도달 — 내일 같은 계획을 누르면 이어집니다.")
-            break
-
-        used, base, negative, people, centers = comparison_job_values(cfg, plan, job)
-        seed_index = int(job.get("seed_index") or 0)
-        seed = (
-            int(job.get("seed") or 0)
-            if options.get("mode") == "selected"
-            else (
-                (base_seed + seed_index * 100003) & 0xffffffff
-                if options["same_seed"]
-                else (base_seed + (job["index"] - 1) * 100003) & 0xffffffff
-            )
-        )
-        seed = seed or 1
-        execution_cfg = copy.deepcopy(used)
-        execution_cfg.update({
-            "base_prompt": base,
-            "negative_prompt": negative,
-            "char_slots": [
-                {
-                    "name": f"비교 인물 {index + 1}",
-                    "prompt": str(person.get("prompt") or ""),
-                    "outfit": "",
-                    "negative": str(person.get("negative") or ""),
-                    "enabled": True,
-                }
-                for index, person in enumerate(people)
-                if isinstance(person, dict)
-            ],
-            "char_centers": copy.deepcopy(centers),
-            "nai_seed": seed,
-        })
-        execution_blueprint = generation_blueprint(
-            execution_cfg,
-            source={
-                "kind": "comparison",
-                "mode": options.get("mode"),
-                "cell": str(job.get("key") or ""),
-            },
-            experiment={
-                "mode": options.get("mode") or "comparison",
-            },
-        )
-        style_label = job["style_name"]
-        char_label = job["char_name"]
-        seed_suffix = (
-            f"_S{seed_index + 1}"
-            if int(options.get("seed_count") or 1) > 1 else ""
-        )
-        stem = (f"{job['index']:06d}_"
-                f"{_safe_name(style_label)[:38]}__{_safe_name(char_label)[:32]}"
-                f"{seed_suffix}")
-        target = available_output_path(folder / f"{stem}.webp", out_format(cfg))
-        done_n = len(completed) + len(run_failed)
-        server.live.update(
-            index=done_n + 1, total=plan["count"], filename=target.name,
-            char_name=f"{style_label} × {char_label}",
-            status_text=f"자료 비교 생성 중 — {done_n + 1:,}/{plan['count']:,}",
-            seed=seed)
-        log.info("[비교 %d/%d] %s × %s · %dx%d · 시드 %d",
-                 done_n + 1, plan["count"], style_label, char_label,
-                 used["width"], used["height"], seed)
-
-        ok = False
-        last_error = ""
-        for attempt in range(3):
-            if server.live.stop_req:
-                final_status = "stopped"
-                break
-            allowed, why = pace_gate(cfg, server.live, "자료 비교")
-            if not allowed:
-                last_error = why
-                if "일일 상한" in why:
-                    final_status = "daily_limit"
-                break
-            try:
-                params = runtime_generation_params(
-                    used, token, include_refs=options["include_refs"])
-                try:
-                    img = call_nai_api(
-                        token, base, negative,
-                        int(used.get("width", 832)), int(used.get("height", 1216)),
-                        chars=people,
-                        scale=used.get("cfg_scale", 5.5),
-                        cfg_rescale=used.get("cfg_rescale", 0.56),
-                        steps=int(used.get("steps", 28)),
-                        sampler=used.get("sampler", "k_euler_ancestral"),
-                        scheduler=used.get("scheduler", "karras"),
-                        variety=used.get("variety", False),
-                        uc_preset=int(used.get("uc_preset", 4)),
-                        seed=seed, params=with_centers(params, centers))
-                finally:
-                    pace_complete()
-                img.nai_blueprint_fingerprint = execution_blueprint["fingerprint"]
-                saved = save_with_meta(
-                    img, target, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-                    max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-                server.live.set_image(img)
-                rel = saved.resolve().relative_to(out_root(cfg).resolve()).as_posix()
-                try:
-                    record_job_result(
-                        server.live.job_id,
-                        saved,
-                        artifact=rel,
-                        result_id=(
-                            "result-comparison-"
-                            + hashlib.sha256(
-                                f"{key}\0{execution_blueprint['fingerprint']}"
-                                .encode("utf-8")
-                            ).hexdigest()[:24]
-                        ),
-                    )
-                    lineage_errors.pop(str(key), None)
-                except Exception as error:
-                    lineage_errors[str(key)] = redact_diagnostic_text(error)
-                    log.warning(
-                        "비교 결과는 저장했지만 Job 계보 연결에 실패: %s",
-                        error,
-                    )
-                completed[key] = {
-                    "index": job["index"], "file": rel,
-                    "style": style_label, "character": char_label,
-                    "style_id": ((job.get("style") or {}).get("_compare_id")),
-                    "character_id": (
-                        (job.get("character") or {}).get("_compare_id")),
-                    "seed_index": seed_index,
-                    "seed": seed, "width": int(used["width"]),
-                    "height": int(used["height"]),
-                    "content_sha256": hashlib.sha256(
-                        saved.read_bytes()).hexdigest(),
-                    "request_id": str(
-                        getattr(img, "nai_request_id", "") or ""),
-                    "payload_hash": str(
-                        getattr(img, "nai_payload_hash", "") or ""),
-                    "blueprint_fingerprint": execution_blueprint["fingerprint"],
-                }
-                if options.get("mode") in ("character_setting", "selected"):
-                    completed[key].update({
-                        "cell_id": job.get("cell_id"),
-                        "cell_resume_key": job.get("cell_resume_key"),
-                        "setting": job.get("setting_name"),
-                        "setting_id": (
-                            (job.get("setting") or {}).get("id")
-                            or (job.get("setting") or {}).get("name")
-                        ),
-                        "scene": int(job.get("scene_num") or 0),
-                        "copy": int(job.get("copy") or 1),
-                        "recipe": comparison_job_recipe_snapshot(
-                            cfg, plan, job, used, base, negative,
-                            people, centers, seed,
-                        ),
-                    })
-                    if options.get("mode") == "selected":
-                        cell = job.get("canonical_cell") or {}
-                        completed[key]["cid"] = str(job.get("cid") or "")
-                        completed[key]["cast_id"] = str(job.get("cid") or "")
-                        completed[key]["canonical_cell"] = {
-                            name: copy.deepcopy(cell.get(name))
-                            for name in (
-                                "id", "legacy_resume_key",
-                                "legacy_job_key", "seed_material",
-                                "legacy_material",
-                            )
-                            if cell.get(name) is not None
-                        }
-                        completed[key]["canonical_cell"]["blueprint"] = {
-                            "experiment": {
-                                "mode": "selected_groups",
-                            },
-                        }
-                errors.pop(key, None)
-                bump_daily(state)
-                try:
-                    save_state(state)
-                except Exception as error:
-                    lineage_errors[str(key)] = redact_diagnostic_text(error)
-                    log.warning(
-                        "비교 결과는 저장했지만 생성량 장부 저장에 실패: %s",
-                        error,
-                    )
-                progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    _comparison_progress_save(progress, folder)
-                except Exception as error:
-                    lineage_errors[str(key)] = redact_diagnostic_text(error)
-                    log.warning(
-                        "비교 결과는 저장했지만 재개 manifest 저장에 실패: %s",
-                        error,
-                    )
-                server.live.update(
-                    daily=daily_count(state),
-                    completed=len(completed),
-                    failed=len(run_failed),
-                    index=len(completed) + len(run_failed),
-                )
-                ok = True
-                break
-            except RateLimitError as e:
-                last_error = str(e)
-                if attempt >= 2:
-                    break
-                server.live.note_retry(e)
-                server.live.update(status_text=f"429 — {e.retry_after:g}초 뒤 재시도")
-                if server.live.wait_cancelable(e.retry_after):
-                    final_status = "stopped"
-                    break
-            except (AccountBannedError, AuthError) as e:
-                last_error = str(e)
-                server.live.update(status_text=f"즉시 중단: {e}")
-                final_status, fatal = "fatal", True
-                break
-            except APIError as e:
-                last_error = str(e)
-                if not e.retryable:
-                    break
-                if attempt >= 2:
-                    break
-                wait = min(5 * (2 ** attempt), 30)
-                server.live.note_retry(e)
-                server.live.update(status_text=f"서버 오류 — {wait}초 뒤 재시도")
-                if server.live.wait_cancelable(wait):
-                    final_status = "stopped"
-                    break
-            except Exception as e:
-                last_error = str(e)
-                log.error("자료 비교 %s 실패(%d/3): %s", target.name, attempt + 1, e)
-                if attempt < 2:
-                    server.live.note_retry(e)
-                if attempt < 2 and server.live.wait_cancelable(30):
-                    final_status = "stopped"
-                    break
-
-        if not ok:
-            errors[key] = {
-                "index": job["index"], "style": style_label,
-                "character": char_label, "error": last_error or "중지됨",
-            }
-            run_failed.add(key)
-            server.live.update(
-                index=len(completed) + len(run_failed),
-                failed=len(run_failed),
-                last_error=last_error or "중지됨",
-                can_retry=True,
-            )
-            progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            _comparison_progress_save(progress, folder)
-            if fatal or final_status in ("stopped", "daily_limit"):
-                break
-
-    if final_status == "complete" and lineage_errors:
-        final_status = "partial"
-    if final_status == "complete" and len(completed) < plan["count"]:
-        final_status = "partial" if errors else "stopped"
-    progress["status"] = final_status
-    progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    progress["completed_count"] = len(completed)
-    _comparison_progress_save(progress, folder)
-
-    rel_folder = folder.resolve().relative_to(out_root(cfg).resolve()).as_posix()
-    if final_status == "complete":
-        text = f"자료 비교 완료 — {len(completed):,}장 · {rel_folder}"
-    elif final_status == "partial":
-        text = (f"자료 비교 부분 완료 — 성공 {len(completed):,}장 · "
-                f"실패 {len(errors):,}장 (같은 계획으로 실패분 재시도)")
-    elif final_status == "stopped":
-        text = f"자료 비교 중지 — {len(completed):,}/{plan['count']:,}장 (같은 계획으로 이어짐)"
-    elif final_status == "daily_limit":
-        text = f"일일 상한 도달 — {len(completed):,}/{plan['count']:,}장 (내일 이어짐)"
-    else:
-        text = f"자료 비교 중단 — {len(completed):,}/{plan['count']:,}장"
-    phase = {
-        "complete": "completed",
-        "partial": "partial",
-        "stopped": "stopped",
-        "daily_limit": "stopped",
-        "fatal": "failed",
-    }.get(final_status, "failed")
-    server.live.update(
-        index=len(completed), total=plan["count"], status_text=text,
-        completed=len(completed), failed=len(errors), phase=phase,
-        last_error=(next(reversed(errors.values())).get("error", "")
-                    if errors else ""),
-        can_retry=final_status != "complete")
-    log.info(text)
-
+    return _comparison_execution.run_comparison(
+        _comparison_execution_operations(),
+        server,
+        cfg,
+        plan,
+        styles,
+        chars,
+    )
 
 def main():
     cfg = load_or_init_config()
