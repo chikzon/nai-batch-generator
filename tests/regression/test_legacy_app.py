@@ -193,12 +193,16 @@ class RegressionTests(unittest.TestCase):
             'data-latest-action="vibe"',
             'data-latest-action="cref"',
             'data-latest-action="i2i"',
+            'data-latest-action="outpaint"',
             'data-exp-result="vibe"',
             'data-exp-result="cref"',
             'data-exp-result="i2i"',
+            'data-exp-result="outpaint"',
             "async function resultFile(url, name)",
             "async function resultToReference(url, name, kind, msg)",
             "async function resultToI2I(",
+            "function i2iRender()",
+            "operation: outpaint ? 'outpaint' : 'edit'",
             "await addRefs([file], kind)",
             "i2iLoad(file)",
         ):
@@ -208,6 +212,94 @@ class RegressionTests(unittest.TestCase):
             page,
         )
         self.assertIn("인코딩에 2 Anlas", page)
+
+    def test_outpaint_reuses_infill_with_only_expanded_area_masked(self):
+        """Outpaint는 원본 해시·확장값을 남기고 기존 infill 경계로 실행한다."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update({
+                "token": "pst-fixture",
+                "out_dir": str(root / "output"),
+                "base_prompt": "scenery",
+            })
+
+            original = io.BytesIO()
+            Image.new("RGB", (128, 128), "#336699").save(original, "PNG")
+            expanded = Image.new("RGBA", (256, 128), (0, 0, 0, 0))
+            expanded.paste(Image.open(io.BytesIO(original.getvalue())).convert("RGBA"),
+                           (64, 0))
+            expanded_bytes = io.BytesIO()
+            expanded.save(expanded_bytes, "PNG")
+            mask = Image.new("L", (256, 128), 255)
+            mask.paste(0, (64, 0, 192, 128))
+            mask_bytes = io.BytesIO()
+            mask.save(mask_bytes, "PNG")
+
+            data_url = lambda raw: (
+                "data:image/png;base64,"
+                + APP.base64.b64encode(raw).decode())
+            body = json.dumps({
+                "image": data_url(expanded_bytes.getvalue()),
+                "mask": data_url(mask_bytes.getvalue()),
+                "original": data_url(original.getvalue()),
+                "operation": "outpaint",
+                "expansion": {
+                    "left": 64, "right": 64, "top": 0, "bottom": 0},
+                "strength": 1,
+                "seed": 123,
+            }).encode()
+            server = APP.ConfigServer(cfg)
+            captured = {}
+
+            def generate(_token, _base, _female, _male, _negative,
+                         width, height, **kwargs):
+                captured["width"] = width
+                captured["height"] = height
+                captured["i2i"] = copy.deepcopy(kwargs["params"]["_i2i"])
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kwargs["seed"]
+                return image
+
+            saved_path = root / "output" / "Outpaint" / "0001.webp"
+            with (
+                patch.object(APP, "runtime_generation_params",
+                             return_value={}),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=generate),
+                patch.object(APP, "save_with_meta", return_value=saved_path),
+                patch.object(APP, "record_job_result", return_value=None),
+                patch.object(APP, "load_state",
+                             return_value={"daily": {}, "total_generated": 0}),
+                patch.object(APP, "save_state", return_value=None),
+            ):
+                started = server.handle_i2i(body)
+                self.assertTrue(started["ok"], started)
+                self.assertEqual(started["mode"], "Outpaint")
+                self.assertEqual(started["expansion"]["left"], 64)
+                deadline = time.time() + 3
+                while server.live.running and time.time() < deadline:
+                    time.sleep(0.01)
+
+            self.assertFalse(server.live.running)
+            self.assertEqual((captured["width"], captured["height"]), (256, 128))
+            self.assertEqual(captured["i2i"]["strength"], 1)
+            sent_mask = Image.open(io.BytesIO(
+                APP.base64.b64decode(captured["i2i"]["mask"]))).convert("L")
+            self.assertGreater(sent_mask.getpixel((0, 64)), 240)
+            self.assertLess(sent_mask.getpixel((128, 64)), 15)
+            self.assertGreater(sent_mask.getpixel((255, 64)), 240)
+            blueprint = server.live.frozen_blueprint()
+            self.assertEqual(blueprint["source"]["kind"], "outpaint")
+            self.assertEqual(
+                blueprint["source"]["content_hash"],
+                hashlib.sha256(original.getvalue()).hexdigest(),
+            )
+            self.assertEqual(
+                blueprint["source"]["expansion"],
+                {"left": 64, "right": 64, "top": 0, "bottom": 0},
+            )
 
     def test_builder_routes_character_variants_and_negative_separately(self):
         """캐릭터 외형을 바꾸는 후보는 베이스에, 네거티브 후보는 양성에 섞지 않는다."""

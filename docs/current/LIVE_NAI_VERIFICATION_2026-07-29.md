@@ -4,8 +4,10 @@
 
 ## 결론
 
-- 실제 NAI 호출 5회와 Vibe 인코딩 1회를 성공했다.
-- 총 예상 27 Anlas와 실제 잔액 감소 27 Anlas가 일치했다.
+- 실제 NAI 생성 호출 6회와 Vibe 인코딩 1회를 성공했다.
+- 처음 5회+인코딩은 총 예상 27 Anlas와 실제 잔액 감소 27 Anlas가 일치했다.
+- Outpaint 1회는 2 Anlas 예상으로 성공했다. 이 호출은 직전·직후 잔액을 따로
+  측정하지 않았으므로 실제 감소량 일치로 과장하지 않는다.
 - AI 자동과 좌표 위치, 28/29 steps 비용 경계, Vibe, Precise Reference가 실제
   NAI 응답과 PNG 메타데이터로 확인됐다.
 - Base·Negative·캐릭터별 Prompt·Negative·좌표·해상도·Seed·Steps·Sampler·CFG
@@ -24,8 +26,10 @@
 | 좌우 좌표, 29 steps | 성공 | 20 / 20 | 4.448초 |
 | Vibe 인코딩+생성 | 인코딩·생성 성공, Vibe 1개 기록 | 2 / 2 | 1.835+7.917초 |
 | Precise Reference 1개 | 1024×1536 레터박스·생성 성공 | 5 / 5 | 7.511초 |
+| Outpaint 좌우 64px | 256×256 원본 보존, 384×256 바깥 생성 성공 | 예상 2 / 미측정 | 별도 1회 |
 
-증거: `ai-review/live-nai-2026-07-29/metrics.json`과 PNG 5장.
+증거: `ai-review/live-nai-2026-07-29/metrics.json`,
+`ai-review/live-nai-2026-07-29/outpaint-metrics.json`, PNG 6장.
 
 ## PNG만으로 복원되는 것과 안 되는 것
 
@@ -69,8 +73,8 @@ PNG만으로는 구분하지 못함:
 
 현재 통합됨:
 
-- 실제 NAI 생성, 다중 캐릭터, 세 위치 방식, Vibe·Reference, img2img·Inpaint,
-  Director, 비용 미리보기
+- 실제 NAI 생성, 다중 캐릭터, 세 위치 방식, Vibe·Reference,
+  img2img·Inpaint·Outpaint, Director, 비용 미리보기
 - 단건·다중 이미지 복원, 공개자료 수집, 자료팩·보유 폴더, 500개 단위 메타 감사
 - 그림체 묶음, 캐릭터 전체 Prompt, 작가 조합, 조각, Blind ELO·월드컵
 - 세팅 단계·옵션·캐스트·순회/동시 출연, 비교 실험, 재개·재시도·한 셀 재생성
@@ -86,10 +90,8 @@ PNG만으로는 구분하지 못함:
 아직 미구현·미흡:
 
 - 스마트폰 앱·PC 연동
-- Outpaint
 - blue식 시각적 3-way 충돌 해결과 전체 store snapshot 선택 복원
 - SDStudio식 프로젝트 계층·템플릿 상속 편집 화면
-- MM식 완전한 6칸 Organizer와 자동 다음 칸·키보드 분류
 - 완성된 캐릭터 이미지 제작 Bench·Reference inset
 - 범용 조건 규칙/DSL과 완전한 X/Y 실험 라벨 그리드
 - 다중 증거 병합과 weighted prompt 중복 검토 전용 화면
@@ -103,5 +105,5 @@ PNG만으로는 구분하지 못함:
 - Marketplace·R2·일반 웹브라우저
 - Grok·Gemini·WebUI 등 NAI 밖 생성 백엔드
 
-`168/168` 회귀 통과는 현재 계약의 안정성 증거이지 위 미구현 기능까지 흡수했다는
+현재 회귀 통과는 현재 계약의 안정성 증거이지 위 미구현 기능까지 흡수했다는
 증거가 아니다.

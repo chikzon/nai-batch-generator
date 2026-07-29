@@ -1,8 +1,8 @@
 # Claude push 인계
 
-최신 `main`은 실제 NAI 검증까지 끝난 안정 기준점이지만, 외부 기능 재감사에서
-Outpaint 등 남은 데스크톱 항목이 확인됐다. 사용자가 현재 기준점을 먼저 공개하라고
-명시하지 않는 한 **아직 push하지 않는다.** 다음 작업은 `NEXT_TASK.md` 한 건씩 진행한다.
+최신 로컬 `main`은 Outpaint 실제 NAI 검증과 최신 설치본 빌드까지 끝난 기준점이다.
+사용자가 현재 기준점을 먼저 공개하라고 명시하지 않는 한 **아직 push하지 않는다.**
+다음 작업은 `NEXT_TASK.md` 한 건씩 진행한다.
 
 ## 최종 구현
 
@@ -17,6 +17,8 @@ Outpaint 등 남은 데스크톱 항목이 확인됐다. 사용자가 현재 기
   같은 의미로 연결하고 위치판 키보드 조작 지원
 - 보유 폴더 페이지 탐색, 메타데이터 감사 후보의 안전한 저장, 결과 도구 단일 열기,
   접힌 출력 설정과 모바일 32px 위치판
+- 결과 활용 도구 안의 Outpaint. 좌·우·상·하 64px 단위 확장, 최종 크기 확인,
+  원본 밖 자동 mask, 비용·Queue·Request ID·Payload Hash·설계도 계보 연결
 - 세팅·씬·비교 완료 파일의 내용 해시 검증과 Job 계보 backfill. 계보·재개 장부가
   실패한 결과를 완료로 오인하거나 같은 유료 요청을 즉시 반복하지 않음
 - 50건 이후 메타데이터 후보 UI, strict 키가 하나라도 있는 손상 결과의 구형 fallback
@@ -34,14 +36,16 @@ Outpaint 등 남은 데스크톱 항목이 확인됐다. 사용자가 현재 기
 ## 검증 결과
 
 - `python 검증.py`: 계약 **10/10**, 모듈 경계 **3/3**, 무과금 회귀
-  **168/168 통과**
+  **169/169 통과**
 - 최종 EXE 직접 기동: `/`, `/ui/studio.css` HTTP 200. 최신 위치 UI와
   프롬프트 도구 마크업 포함 확인
 - 실제 브라우저: 1600×1000·390×844 가로 넘침 0, 편집 도구 겹침 0,
   위치 모드·키보드 이동·캐스트 지연 렌더·결과 도구·클래식 호환 확인
 - 개인 토큰 정규식 검사: 배포 폴더 0건. 저장소의 일치 문자열은 계약 시험용 가짜 값뿐
-- 실제 NAI: 생성 5회와 Vibe 인코딩 1회 성공. 예상 27 Anlas와 실제 감소
-  27 Anlas 일치. AI 자동·좌표·29 steps·Vibe·Precise Reference 확인
+- 실제 NAI: 생성 6회와 Vibe 인코딩 1회 성공. 처음 5회+인코딩은 예상 27 Anlas와
+  실제 감소 27 Anlas 일치. 추가 Outpaint 1회는 예상 2 Anlas로 256×256 원본을
+  384×256으로 확장해 성공
+- 최신 EXE 직접 기동: HTTP 200, Outpaint 화면·최근 결과 전달 버튼 포함 확인
 - 앱 내 브라우저 연결은 로컬 자산 경로 오류로 실패했으나 설치된 Playwright로 실제
   Chromium 조작과 최신 1600·390 스크린샷 촬영을 완료
 
@@ -55,9 +59,9 @@ Outpaint 등 남은 데스크톱 항목이 확인됐다. 사용자가 현재 기
 SHA-256:
 
 ```text
-48c1397bd2e4df6c3f42fb8a2d51c1a5ba0f8f7ab3919c79727d69052aa70d6b  NAI-batch-generator-1.0.0-portable-win-x64.zip
-66f3b98ec1b6ea36435ab2c04131412bce7dc094f536865d89e3ffc3c0ac94a05  NAI-batch-generator-1.0.0-datapack.zip
-c7ed6bcc60e3e0496348add02f27ce4abf7353bfb11365304437741407f70360  NAI-batch-generator-1.0.0-setup.exe
+dc5add0eb15c625ffc81c7119ffb728f98af37b8d8ca178b14673d0d15361f21  NAI-batch-generator-1.0.0-portable-win-x64.zip
+90c0eb677984c58583187315a4af0b98414edd666e4e663eec49324952cc0902  NAI-batch-generator-1.0.0-datapack.zip
+71298fa2fc54a0bc27e5d884ab459cd162ebb6c4ea6589e3a267c5eca0925f74  NAI-batch-generator-1.0.0-setup.exe
 ```
 
 ## Claude가 할 일

@@ -11404,6 +11404,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <button type="button" data-latest-action="vibe">바이브</button>
             <button type="button" data-latest-action="cref">캐릭터 레퍼런스</button>
             <button type="button" data-latest-action="i2i">img2img·인페인트</button>
+            <button type="button" data-latest-action="outpaint">Outpaint</button>
             <span class="result-action-msg" id="pvResultMsg"></span>
           </div>
           <details class="blueprint-plan" id="blueprintPlan">
@@ -11428,17 +11429,34 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       </details>
       <div class="result-tool-switcher" id="resultToolSwitcher" aria-label="이미지 결과 활용">
         <span><b>이미지 결과 활용</b><small>필요한 도구 하나만 펼칩니다</small></span>
-        <button type="button" data-result-tool="i2i">고쳐 그리기</button>
+        <button type="button" data-result-tool="i2i">고쳐·이어 그리기</button>
         <button type="button" data-result-tool="director">디렉터</button>
         <button type="button" data-result-tool="mosaic">모자이크</button>
       </div>
-      <!-- img2img · 인페인트 — 왼쪽 프롬프트·파라미터를 그대로 쓰고 원본만 더한다 -->
+      <!-- img2img · 인페인트 · Outpaint — 왼쪽 프롬프트·파라미터를 그대로 쓰고 원본만 더한다 -->
       <div class="card" id="resultToolI2I" data-result-tool-panel="i2i">
-        <h2><span class="n">고쳐 그리기</span>img2img · 인페인트
+        <h2><span class="n">고쳐·이어 그리기</span>img2img · 인페인트 · Outpaint
           <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">왼쪽 프롬프트·파라미터를 그대로 씁니다</span></h2>
         <p class="hint">그림을 넣고 <b>변화 강도</b>만 주면 <b>img2img</b>(전체를 다시 그림),
-        칠한 곳이 있으면 <b>인페인트</b>(칠한 곳만 다시 그림)로 나갑니다.
-        결과는 <b>output/img2img/</b> · <b>output/인페인트/</b> 에 저장됩니다.</p>
+        칠한 곳이 있으면 <b>인페인트</b>(칠한 곳만 다시 그림), 캔버스를 넓히면
+        <b>Outpaint</b>(바깥만 이어 그림)로 나갑니다.
+        결과는 <b>output/img2img/</b> · <b>output/인페인트/</b> · <b>output/Outpaint/</b> 에 저장됩니다.</p>
+        <div class="filterbar" id="i2iOperation" style="margin-bottom:8px;">
+          <span class="hint">작업</span>
+          <button type="button" id="i2iEditMode" class="primary">원본 안쪽 고치기</button>
+          <button type="button" id="i2iOutpaintMode">바깥 이어 그리기</button>
+          <span class="hint" id="i2iOperationHint">붓을 칠하지 않으면 img2img, 칠하면 인페인트</span>
+        </div>
+        <div class="filterbar hidden" id="outpaintControls" style="margin-bottom:8px;">
+          <span class="hint">확장</span>
+          <label>왼쪽 <input type="number" id="outpaintLeft" min="0" max="1536" step="64" value="256" style="width:82px;"></label>
+          <label>오른쪽 <input type="number" id="outpaintRight" min="0" max="1536" step="64" value="256" style="width:82px;"></label>
+          <label>위 <input type="number" id="outpaintTop" min="0" max="1536" step="64" value="0" style="width:82px;"></label>
+          <label>아래 <input type="number" id="outpaintBottom" min="0" max="1536" step="64" value="0" style="width:82px;"></label>
+          <button type="button" id="outpaintHorizontal">좌우</button>
+          <button type="button" id="outpaintVertical">상하</button>
+          <span class="n" id="outpaintSize">원본을 넣으면 최종 크기를 계산합니다</span>
+        </div>
         <div id="i2iDrop" class="row" style="text-align:center;padding:18px 14px;border-style:dashed;cursor:pointer;">
           <b>🖌️ 고칠 그림을 여기에 놓거나 눌러서 고르세요</b>
           <div class="hint" style="margin-top:4px;">PNG / WebP · 넣으면 아래에 뜹니다</div>
@@ -11459,7 +11477,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <input type="range" id="i2iStrength" min="0.1" max="1" step="0.01" value="0.7" style="flex:1;"
               title="인페인트는 1.00 까지 · img2img 는 0.99 까지 (1.00 이면 원본을 아예 안 보므로 NAI 가 막습니다)">
             <span class="n" id="i2iStrengthN">0.70</span>
-            <span class="hint" style="white-space:nowrap;">붓 굵기</span>
+            <span class="hint i2i-brush-tool" style="white-space:nowrap;">붓 굵기</span>
             <input type="range" id="i2iBrush" min="2" max="300" step="1" value="48" style="width:110px;">
             <span class="n" id="i2iBrushN">48px</span>
             <button id="i2iErase" title="지우개로 바꿔 칠한 것을 부분만 지웁니다">🧽 지우개</button>
@@ -12406,6 +12424,14 @@ async function init(){
   const d = await (await fetch('/api/config')).json();
   STATE = d.config;
   SAVED_STATE = JSON.parse(JSON.stringify(STATE));
+  const savedOutpaint = ((STATE.ui || {}).outpaint) || {};
+  for(const [id, key, fallback] of [
+    ['outpaintLeft','left',256], ['outpaintRight','right',256],
+    ['outpaintTop','top',0], ['outpaintBottom','bottom',0]
+  ]){
+    if($(id)) $(id).value = String(Number.isFinite(Number(savedOutpaint[key]))
+      ? Number(savedOutpaint[key]) : fallback);
+  }
   SETTINGS = d.settings || [];
   STYLES = d.styles || [];
   SPEC = d.spec || {};
@@ -15361,29 +15387,97 @@ $('scenePresetSave').addEventListener('click', async () => {
   if(r.ok){ SCENE_PRESETS = r.scene_presets; renderScenePresets(); alert('저장됨'); } else alert(r.error);
 });
 
-/* ── img2img · 인페인트 ─────────────────────────────────────────────
-   마스크는 흰색이 '다시 그릴 곳'. NAI 는 64 배수 크기를 원하므로 맞춰서 보낸다. */
-let I2I = {img:null, painting:false, erase:false, undo:[], variationCharacter:null};
+/* ── img2img · 인페인트 · Outpaint ──────────────────────────────────
+   마스크는 흰색이 '다시 그릴 곳'. NAI 는 64 배수 크기를 원하므로 맞춰서 보낸다.
+   Outpaint도 별도 생성기가 아니라 원본 바깥을 자동 마스킹한 같은 infill 작업이다. */
+let I2I = {img:null, painting:false, erase:false, undo:[],
+  variationCharacter:null, operation:'edit', sourceWidth:0, sourceHeight:0};
+function outpaintValue(id){
+  const raw = Math.max(0, Math.min(1536, Number($(id).value) || 0));
+  const value = Math.round(raw / 64) * 64;
+  $(id).value = String(value);
+  return value;
+}
+function outpaintMargins(){
+  return {
+    left:outpaintValue('outpaintLeft'), right:outpaintValue('outpaintRight'),
+    top:outpaintValue('outpaintTop'), bottom:outpaintValue('outpaintBottom')
+  };
+}
+function i2iSourceCanvas(){
+  const t = document.createElement('canvas');
+  t.width = I2I.sourceWidth; t.height = I2I.sourceHeight;
+  if(I2I.img) t.getContext('2d').drawImage(I2I.img, 0, 0, t.width, t.height);
+  return t;
+}
+function i2iRender(){
+  if(!I2I.img) return;
+  const margins = outpaintMargins();
+  const outpaint = I2I.operation === 'outpaint';
+  const w = I2I.sourceWidth + (outpaint ? margins.left + margins.right : 0);
+  const h = I2I.sourceHeight + (outpaint ? margins.top + margins.bottom : 0);
+  if(w > 2048 || h > 2048){
+    $('i2iMsg').textContent = `최종 크기 ${w}×${h}는 2048px 한도를 넘습니다. 확장값을 줄여주세요.`;
+    return;
+  }
+  const b = $('i2iBase'), m = $('i2iMask');
+  b.width = m.width = w; b.height = m.height = h;
+  const base = b.getContext('2d');
+  base.clearRect(0, 0, w, h);
+  base.drawImage(I2I.img, outpaint ? margins.left : 0, outpaint ? margins.top : 0,
+    I2I.sourceWidth, I2I.sourceHeight);
+  const mask = m.getContext('2d');
+  mask.clearRect(0, 0, w, h);
+  if(outpaint){
+    mask.fillStyle = '#fff';
+    if(margins.top) mask.fillRect(0, 0, w, margins.top);
+    if(margins.bottom) mask.fillRect(0, h - margins.bottom, w, margins.bottom);
+    if(margins.left) mask.fillRect(0, margins.top, margins.left, I2I.sourceHeight);
+    if(margins.right) mask.fillRect(w - margins.right, margins.top,
+      margins.right, I2I.sourceHeight);
+  }
+  I2I.undo = [];
+  $('outpaintSize').textContent = outpaint
+    ? `원본 ${I2I.sourceWidth}×${I2I.sourceHeight} → 최종 ${w}×${h}`
+    : `원본 ${I2I.sourceWidth}×${I2I.sourceHeight}`;
+  i2iZoom(); i2iMode();
+}
+function setI2IOperation(operation, persist=false){
+  I2I.operation = operation === 'outpaint' ? 'outpaint' : 'edit';
+  const outpaint = I2I.operation === 'outpaint';
+  $('i2iEditMode').classList.toggle('primary', !outpaint);
+  $('i2iOutpaintMode').classList.toggle('primary', outpaint);
+  $('outpaintControls').classList.toggle('hidden', !outpaint);
+  $('i2iOperationHint').textContent = outpaint
+    ? '원본은 그대로 두고 넓힌 바깥 영역만 생성'
+    : '붓을 칠하지 않으면 img2img, 칠하면 인페인트';
+  $('i2iMask').style.cursor = outpaint ? 'default' : 'crosshair';
+  $('i2iMask').style.pointerEvents = outpaint ? 'none' : 'auto';
+  ['i2iBrush','i2iErase','i2iUndo','i2iClear'].forEach(id => {
+    const el = $(id); if(el) el.disabled = outpaint;
+  });
+  if(I2I.img) i2iRender();
+  if(persist && STATE){
+    STATE.ui = STATE.ui || {};
+    STATE.ui.outpaint = Object.assign({}, outpaintMargins());
+    save();
+  }
+}
 function i2iLoad(file){
   const fr = new FileReader();
   fr.onload = () => {
     const im = new Image();
     im.onload = () => {
       I2I.img = im;
-      const w = Math.max(64, Math.floor(im.width / 64) * 64);
-      const h = Math.max(64, Math.floor(im.height / 64) * 64);
-      const b = $('i2iBase'), m = $('i2iMask');
-      b.width = m.width = w; b.height = m.height = h;
-      b.getContext('2d').drawImage(im, 0, 0, w, h);
-      m.getContext('2d').clearRect(0, 0, w, h);
-      I2I.undo = [];
+      I2I.sourceWidth = Math.max(64, Math.floor(im.width / 64) * 64);
+      I2I.sourceHeight = Math.max(64, Math.floor(im.height / 64) * 64);
       $('i2iStage').classList.remove('hidden');
-      i2iZoom();
-      $('i2iMsg').textContent = `${im.width}×${im.height} → ${w}×${h} 로 맞춰 보냅니다`
+      i2iRender();
+      $('i2iMsg').textContent = `${im.width}×${im.height} → ${I2I.sourceWidth}×${I2I.sourceHeight} 원본으로 맞춥니다`
         + (I2I.variationCharacter
           ? ` · '${I2I.variationCharacter.name}' 전체 프롬프트·착의·네거티브로 임시 변형`
-          : ' (NAI 는 64 배수만 받습니다)');
-      i2iMode();
+          : ' (NAI 는 64 배수만 받습니다)')
+        + (I2I.operation === 'outpaint' ? ' · 흰 바깥 영역만 이어 그립니다' : '');
       if(window.i2iCostRefresh) window.i2iCostRefresh();
     };
     im.src = fr.result;
@@ -15423,10 +15517,11 @@ async function resultToReference(url, name, kind, msg){
     return false;
   }
 }
-async function resultToI2I(url, name, msg, variationCharacter=null){
+async function resultToI2I(url, name, msg, variationCharacter=null, operation='edit'){
   if(msg) msg.textContent = '결과 그림을 준비하는 중...';
   try{
     I2I.variationCharacter = variationCharacter;
+    setI2IOperation(operation);
     const file = await resultFile(url, name);
     expClose();
     setMode('preview');
@@ -15434,7 +15529,8 @@ async function resultToI2I(url, name, msg, variationCharacter=null){
     STATE.ui.result_tool = 'i2i';
     arrangeResultTools((STATE.ui || {}).layout !== 'classic');
     i2iLoad(file);
-    if(msg) msg.textContent = 'img2img·인페인트에 넣었습니다.';
+    if(msg) msg.textContent = operation === 'outpaint'
+      ? 'Outpaint에 넣었습니다.' : 'img2img·인페인트에 넣었습니다.';
     setTimeout(() => $('i2iStage').scrollIntoView({behavior:'smooth', block:'start'}), 80);
     return true;
   }catch(e){
@@ -15452,6 +15548,7 @@ function bindLatestResultActions(){
     const msg = $('pvResultMsg');
     const action = button.dataset.latestAction;
     if(action === 'i2i') await resultToI2I(url, name, msg);
+    else if(action === 'outpaint') await resultToI2I(url, name, msg, null, 'outpaint');
     else await resultToReference(url, name, action, msg);
   }));
 }
@@ -15466,13 +15563,16 @@ function i2iMode(){
   /* 강도 상한이 모드마다 다르다.
      인페인트는 1.00 까지 쓸 수 있다 (칠한 곳을 완전히 새로 그림).
      img2img 는 0.99 가 끝이다 — 1.00 이면 원본을 아예 안 보게 되어 NAI 가 막는다. */
-  const cap = painted ? 1 : 0.99;
+  const outpaint = I2I.operation === 'outpaint';
+  const cap = (painted || outpaint) ? 1 : 0.99;
   const sl = $('i2iStrength');
   sl.max = String(cap);
   /* ⚠ max 를 바꾸면 브라우저가 value 를 **먼저** 잘라낸다.
      그래서 '넘쳤나' 를 따로 재면 안 걸린다 — 표시는 늘 현재 값으로 맞춘다. */
   $('i2iStrengthN').textContent = Number(sl.value).toFixed(2);
-  $('i2iMode').textContent = (painted
+  $('i2iMode').textContent = (outpaint
+    ? '넓힌 바깥만 이어 그림 → Outpaint (원본 영역 보존)'
+    : painted
     ? '칠한 곳만 다시 그림 → 인페인트 (강도 1.00 까지)'
     : '칠하지 않음 → img2img (전체를 다시 그림 · 강도 0.99 까지)');
   if(window.i2iCostRefresh) window.i2iCostRefresh();   // 모드가 바뀌면 비용도 (CQA-008)
@@ -15508,6 +15608,7 @@ if($('i2iDrop')){
     }catch(e){}
   };
   m.addEventListener('pointerdown', e => {
+    if(I2I.operation === 'outpaint') return;
     pushUndo(); I2I.painting = true; m.setPointerCapture(e.pointerId); dab(...at(e));
   });
   m.addEventListener('pointermove', e => { if(I2I.painting) dab(...at(e)); });
@@ -15538,6 +15639,25 @@ if($('i2iDrop')){
   $('i2iBrush').addEventListener('input', () => $('i2iBrushN').textContent = $('i2iBrush').value + 'px');
   $('i2iStrength').addEventListener('input', () =>
     $('i2iStrengthN').textContent = Number($('i2iStrength').value).toFixed(2));
+  $('i2iEditMode').addEventListener('click', () => setI2IOperation('edit', true));
+  $('i2iOutpaintMode').addEventListener('click', () => setI2IOperation('outpaint', true));
+  ['outpaintLeft','outpaintRight','outpaintTop','outpaintBottom'].forEach(id =>
+    $(id).addEventListener('change', () => {
+      if(I2I.img) i2iRender();
+      STATE.ui = STATE.ui || {};
+      STATE.ui.outpaint = Object.assign({}, outpaintMargins());
+      save();
+    }));
+  $('outpaintHorizontal').addEventListener('click', () => {
+    $('outpaintLeft').value = $('outpaintRight').value = '256';
+    $('outpaintTop').value = $('outpaintBottom').value = '0';
+    if(I2I.img) i2iRender();
+  });
+  $('outpaintVertical').addEventListener('click', () => {
+    $('outpaintLeft').value = $('outpaintRight').value = '0';
+    $('outpaintTop').value = $('outpaintBottom').value = '256';
+    if(I2I.img) i2iRender();
+  });
   $('i2iDrop').addEventListener('click', () => $('i2iFile').click());
   $('i2iDrop2').addEventListener('click', () => $('i2iFile').click());
   $('i2iFile').addEventListener('change', () => {
@@ -15560,21 +15680,32 @@ if($('i2iDrop')){
     const el = $('i2iCost');
     if(!el || !I2I.img) return;
     const painted = i2iPainted();
+    const outpaint = I2I.operation === 'outpaint';
     const b = $('i2iBase');
     const w = Math.max(64, Math.floor(b.width / 64) * 64), h = Math.max(64, Math.floor(b.height / 64) * 64);
     try{
       const r = await (await fetch('/api/anlas', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({count:1, mode: painted ? 'infill' : 'img2img', width:w, height:h,
+        body: JSON.stringify({count:1, mode: (painted || outpaint) ? 'infill' : 'img2img', width:w, height:h,
           strength: Number($('i2iStrength').value)})})).json();
       if(r.ok) el.textContent = r.est.total > 0
-        ? `💰 ${r.est.total} Anlas (${painted ? '인페인트' : 'img2img'} — 원본을 쓰면 무료가 아닙니다)`
-        : `${painted ? '인페인트' : 'img2img'} — ${r.est.why}`;
+        ? `💰 ${r.est.total} Anlas (${outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img'} — 원본을 쓰면 무료가 아닙니다)`
+        : `${outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img'} — ${r.est.why}`;
     }catch(e){}
   };
   if($('i2iStrength')) $('i2iStrength').addEventListener('change', () => window.i2iCostRefresh());
   $('i2iGo').addEventListener('click', async () => {
     if(!I2I.img){ $('i2iMsg').textContent = '먼저 그림을 넣어주세요.'; return; }
     const painted = i2iPainted();
+    const outpaint = I2I.operation === 'outpaint';
+    const margins = outpaintMargins();
+    if(outpaint && !(margins.left || margins.right || margins.top || margins.bottom)){
+      $('i2iMsg').textContent = '이어 그릴 방향의 확장 크기를 하나 이상 입력해주세요.';
+      return;
+    }
+    if($('i2iBase').width > 2048 || $('i2iBase').height > 2048){
+      $('i2iMsg').textContent = '최종 크기는 가로·세로 2048px를 넘을 수 없습니다.';
+      return;
+    }
     /* 마스크는 흑백 PNG 로 보낸다 — 칠한 곳이 흰색 */
     let mask = null;
     if(painted){
@@ -15585,10 +15716,16 @@ if($('i2iDrop')){
       c.drawImage(m, 0, 0);
       mask = t.toDataURL('image/png');
     }
-    $('i2iMsg').textContent = (painted ? '인페인트' : 'img2img') + ' 보내는 중...';
+    $('i2iMsg').textContent = (outpaint ? 'Outpaint' : painted ? '인페인트' : 'img2img') + ' 보내는 중...';
+    STATE.ui = STATE.ui || {};
+    STATE.ui.outpaint = Object.assign({}, margins);
+    await doSave();
     const r = await (await fetch('/api/i2i', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({image: $('i2iBase').toDataURL('image/png'), mask,
+        original: outpaint ? i2iSourceCanvas().toDataURL('image/png') : null,
+        operation: outpaint ? 'outpaint' : 'edit',
+        expansion: outpaint ? margins : null,
         strength: Number($('i2iStrength').value),
         variation_character_id:(I2I.variationCharacter||{}).id || ''})})).json();
     $('i2iMsg').textContent = r.ok
@@ -16133,6 +16270,7 @@ function expOpen(i){
       <button type="button" data-exp-result="vibe">바이브</button>
       <button type="button" data-exp-result="cref">캐릭터 레퍼런스</button>
       <button type="button" data-exp-result="i2i">img2img·인페인트</button>
+      <button type="button" data-exp-result="outpaint">Outpaint</button>
       <button type="button" id="expRerunCell"
         title="직접 고른 자료·축 비교 결과만 같은 seed로 한 장 더 만듭니다">이 셀 다시 생성</button>
       <span class="result-action-msg" id="expResultMsg"></span>
@@ -16175,6 +16313,7 @@ function expOpen(i){
     const url = '/setout?p=' + encodeURIComponent(f.path);
     const msg = $('expResultMsg');
     if(action === 'i2i') await resultToI2I(url, f.name, msg);
+    else if(action === 'outpaint') await resultToI2I(url, f.name, msg, null, 'outpaint');
     else {
       const done = await resultToReference(url, f.name, action, msg);
       if(done) expClose();
@@ -21775,8 +21914,9 @@ class ConfigServer:
         return {"ok": True}
 
     def handle_i2i(self, body):
-        """img2img · 인페인트 — 왼쪽 프롬프트/파라미터를 그대로 쓰고 원본 그림만 더한다.
-        body: {image: dataURL, mask: dataURL|없음, strength, noise, seed}"""
+        """img2img · 인페인트 · Outpaint.
+        Outpaint는 넓힌 캔버스와 바깥 마스크를 기존 infill 실행 계층에 태운다.
+        body: {image, mask, original?, operation, expansion?, strength, noise, seed}"""
         if self.live.running:
             return {"ok": False, "error": "이미 생성 중입니다."}
         with self.config_lock:
@@ -21787,19 +21927,50 @@ class ConfigServer:
             d = json.loads(body or b"{}")
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        operation = str(d.get("operation") or "edit").strip().lower()
+        if operation not in ("edit", "outpaint"):
+            return {"ok": False, "error": "알 수 없는 이미지 편집 작업입니다."}
         img_b64 = (d.get("image") or "").split(",", 1)[-1]
         if not img_b64:
             return {"ok": False, "error": "원본 그림이 없습니다."}
         mask_b64 = (d.get("mask") or "").split(",", 1)[-1] or None
-        mode = "인페인트" if mask_b64 else "img2img"
+        if operation == "outpaint" and not mask_b64:
+            return {"ok": False, "error": "Outpaint 확장 영역 마스크가 없습니다."}
+        mode = "Outpaint" if operation == "outpaint" else (
+            "인페인트" if mask_b64 else "img2img")
+        expansion = {}
+        for key in ("left", "right", "top", "bottom"):
+            try:
+                value = int((d.get("expansion") or {}).get(key, 0))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"Outpaint {key} 확장값이 올바르지 않습니다."}
+            if value < 0 or value > 1536 or value % 64:
+                return {"ok": False, "error": "Outpaint 확장값은 0~1536의 64px 단위여야 합니다."}
+            expansion[key] = value
+        if operation == "outpaint" and not any(expansion.values()):
+            return {"ok": False, "error": "Outpaint 확장 방향과 크기가 없습니다."}
         try:
             raw = base64.b64decode(img_b64)
             with Image.open(io.BytesIO(raw)) as im:
                 w, h = im.size
+            if mask_b64:
+                with Image.open(io.BytesIO(base64.b64decode(mask_b64))) as mask:
+                    if mask.size != (w, h):
+                        return {"ok": False, "error": "원본과 마스크 크기가 다릅니다."}
         except Exception as e:
             return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
         # NAI 는 64 의 배수를 원한다
         w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
+        if w > 2048 or h > 2048:
+            return {"ok": False, "error": "최종 크기는 가로·세로 2048px를 넘을 수 없습니다."}
+        original_b64 = (d.get("original") or "").split(",", 1)[-1] or None
+        try:
+            source_raw = base64.b64decode(original_b64) if original_b64 else raw
+            with Image.open(io.BytesIO(source_raw)) as source:
+                source_size = {"width": source.width, "height": source.height}
+        except Exception as e:
+            return {"ok": False, "error": f"Outpaint 원본을 못 읽었습니다: {e}"}
+        source_hash = hashlib.sha256(source_raw).hexdigest()
         seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
         job_cfg = cfg
         variation_id = str(d.get("variation_character_id") or "").strip()
@@ -21845,16 +22016,23 @@ class ConfigServer:
             blueprint=generation_blueprint(
                 job_cfg,
                 source={
-                    "kind": "character-variation" if variation_id else "image-edit",
+                    "kind": "character-variation" if variation_id else (
+                        "outpaint" if operation == "outpaint" else "image-edit"),
                     "mode": mode,
                     "character_id": variation_id,
+                    "content_hash": source_hash,
+                    "source_size": source_size,
+                    "expansion": expansion if operation == "outpaint" else None,
                 },
             ),
             payload_identity={
-                "kind": "inpaint" if mask_b64 else "img2img",
+                "kind": operation if operation == "outpaint" else (
+                    "inpaint" if mask_b64 else "img2img"),
                 "width": w,
                 "height": h,
                 "has_mask": bool(mask_b64),
+                "source_hash": source_hash,
+                "expansion": expansion if operation == "outpaint" else None,
                 "character_id": variation_id,
             },
         )
@@ -21907,7 +22085,7 @@ class ConfigServer:
                 self.live.set_image(img)
                 st = load_state(); bump_daily(st); save_state(st)
                 self.live.update(
-                    status_text=f"{label} 완료 ✓ (output/{out_dir.name}/{n:04d}.webp · 시드 {seed})",
+                    status_text=f"{label} 완료 ✓ (output/{out_dir.name}/{saved.name} · 시드 {seed})",
                     seed=seed, completed=1, phase="completed")
             except Exception as e:
                 log.error(f"{mode} 실패: {e}")
@@ -21920,6 +22098,8 @@ class ConfigServer:
         threading.Thread(target=run, daemon=True).start()
         return {
             "ok": True, "mode": mode, "width": w, "height": h,
+            "source_hash": source_hash, "expansion": (
+                expansion if operation == "outpaint" else None),
             "variation_character": variation_name,
         }
 

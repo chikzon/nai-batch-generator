@@ -34,9 +34,9 @@
 
 ## 아직 없거나 별도 단계인 것
 
-스마트폰 앱·PC 연동 · Outpaint · 자동 업데이트 · 스트리밍 중간 미리보기 ·
+스마트폰 앱·PC 연동 · 자동 업데이트 · 스트리밍 중간 미리보기 ·
 blue식 시각적 3-way 충돌 해결 · SDStudio식 프로젝트 계층 편집 ·
-MM식 완전한 6칸 Organizer · 범용 조건 DSL · 다국어 UI.
+범용 조건 DSL · 다국어 UI.
 
 Electron/Tauri/ComfyUI graph, Marketplace·R2·일반 웹브라우저, NAI 밖 생성 백엔드는
 현재 독립 Windows NAI 작업실의 목적과 겹치지 않아 제품 구조 자체를 복제하지 않는다.
