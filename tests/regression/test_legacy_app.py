@@ -4417,6 +4417,21 @@ class RegressionTests(unittest.TestCase):
                     "paths": ["비교/A.webp", "비교/B.webp"],
                     "outcome": "first",
                 })
+                APP.apply_evaluation_action({
+                    "action": "fixed-board",
+                    "paths": ["비교/A.webp", "비교/B.webp"],
+                    "board": "고정 비교판",
+                    "member": True,
+                })
+                APP.apply_evaluation_action({
+                    "action": "lifecycle",
+                    "paths": ["비교/A.webp"],
+                    "state": "confirmed",
+                })
+                memo = "검증 조건과 이유\n" + ("긴 메모 원문 " * 700)
+                pending = APP.load_picks()
+                pending.setdefault("memos", {})["비교/A.webp"] = memo
+                APP.save_picks(pending)
                 saved = APP.load_picks()
 
         self.assertTrue(result["ok"])
@@ -4424,9 +4439,15 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(saved["elo_matches"]["비교/B.webp"], 1)
         self.assertGreater(saved["elo"]["비교/A.webp"], 1000)
         self.assertLess(saved["elo"]["비교/B.webp"], 1000)
-        self.assertEqual(len(saved["evaluation_events"]), 1)
+        self.assertEqual(len(saved["evaluation_events"]), 4)
         self.assertEqual(
             saved["evaluation_events"][0]["kind"], "blind-match")
+        self.assertEqual(
+            saved["folders"]["고정 비교판"],
+            ["비교/A.webp", "비교/B.webp"],
+        )
+        self.assertEqual(saved["review_states"]["비교/A.webp"], "confirmed")
+        self.assertEqual(saved["memos"]["비교/A.webp"], memo)
         page = APP.render_page()
         self.assertIn("/api/evaluation_action", page)
         self.assertNotIn("const delta = 24 *", page)

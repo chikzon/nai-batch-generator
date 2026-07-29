@@ -8195,12 +8195,15 @@ def load_picks():
                 d.setdefault("elo", {})         # 경로 → 블라인드 비교 ELO
                 d.setdefault("elo_matches", {}) # 경로 → 누적 비교 횟수
                 d.setdefault("tags", {})        # 경로 → [짧은 판단 태그…]
+                d.setdefault("memos", {})       # 경로 → 사용자 원문 메모
+                d.setdefault("review_states", {}) # 경로 → 후보·확정·공유·보관
                 return normalize_picks(d)
         except Exception as e:
             log.warning(f"선별.json 읽기 실패: {e}")
     return {
         "picked": [], "fav": [], "folders": {}, "ranks": {},
         "ratings": {}, "elo": {}, "elo_matches": {}, "tags": {},
+        "memos": {}, "review_states": {},
     }
 
 
@@ -8262,6 +8265,17 @@ def normalize_picks(d):
         if cleaned:
             clean_tags[str(path).replace("\\", "/")] = cleaned
     d["tags"] = clean_tags
+    d["memos"] = {
+        str(path).replace("\\", "/"): str(memo)
+        for path, memo in (d.get("memos") or {}).items()
+        if str(path).strip() and isinstance(memo, str) and memo
+    }
+    allowed_states = {"candidate", "confirmed", "shared", "archived"}
+    d["review_states"] = {
+        str(path).replace("\\", "/"): str(state)
+        for path, state in (d.get("review_states") or {}).items()
+        if str(path).strip() and str(state) in allowed_states
+    }
     return d
 
 
@@ -8290,50 +8304,56 @@ def apply_evaluation_action(data):
             str((item.get("subject") or {}).get("path") or ""): item
             for item in projection["evaluations"]
         }
+        events = []
         if action == "blind-match":
             if len(paths) != 2 or paths[0] == paths[1]:
                 raise ValueError("블라인드 비교에는 서로 다른 결과 두 개가 필요합니다.")
-            event = blind_match_event(
+            events.append(blind_match_event(
                 by_path[paths[0]],
                 by_path[paths[1]],
                 outcome=str(data.get("outcome") or "first"),
                 k_factor=24,
-            )
+            ))
+            event = events[0]
             for path, values in (
                 event.get("payload", {}).get("legacy_projection") or {}
             ).items():
                 picks.setdefault("elo", {})[path] = values["elo"]
                 picks.setdefault("elo_matches", {})[path] = values["elo_matches"]
         elif action == "fixed-board":
-            if len(paths) != 1:
-                raise ValueError("고정 비교판에는 결과 한 개가 필요합니다.")
+            if not paths:
+                raise ValueError("고정 비교판에는 결과가 필요합니다.")
             board = str(data.get("board") or "").strip()[:40]
             member = bool(data.get("member", True))
-            event = fixed_board_event(by_path[paths[0]], board, member=member)
+            events = [
+                fixed_board_event(by_path[path], board, member=member)
+                for path in paths
+            ]
             members = picks.setdefault("folders", {}).setdefault(board, [])
-            if member and paths[0] not in members:
-                members.append(paths[0])
-            elif not member:
+            if member:
+                members[:] = list(dict.fromkeys([*members, *paths]))
+            else:
                 picks["folders"][board] = [
-                    item for item in members if item != paths[0]]
+                    item for item in members if item not in set(paths)]
         elif action == "lifecycle":
             if len(paths) != 1:
                 raise ValueError("생명주기 변경에는 결과 한 개가 필요합니다.")
             state = str(data.get("state") or "")
-            event = lifecycle_event(by_path[paths[0]], state)
+            events.append(lifecycle_event(by_path[paths[0]], state))
             picks.setdefault("review_states", {})[paths[0]] = state
         elif action == "promotion":
             if len(paths) != 1:
                 raise ValueError("승격 제안에는 결과 한 개가 필요합니다.")
-            event = promotion_event(
-                by_path[paths[0]], str(data.get("target") or ""))
+            events.append(promotion_event(
+                by_path[paths[0]], str(data.get("target") or "")))
         else:
             raise ValueError("지원하지 않는 평가 작업입니다.")
-        appended = append_evaluation_events(picks, [event])
+        appended = append_evaluation_events(picks, events)
         saved = save_picks(appended["picks"])
     return {
         "ok": True,
-        "event": event,
+        "event": events[0] if len(events) == 1 else None,
+        "events": events,
         "appended": appended["appended"],
         "duplicate": bool(appended["duplicates"]),
         "picks": {
@@ -8702,6 +8722,8 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
             "elo": picks.get("elo", {}),
             "elo_matches": picks.get("elo_matches", {}),
             "tags": picks.get("tags", {}),
+            "memos": picks.get("memos", {}),
+            "review_states": picks.get("review_states", {}),
             "evaluations": evaluation_projection["evaluations"],
             "evaluation_issues": evaluation_projection["issues"],
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
@@ -13665,7 +13687,8 @@ if($('i2iDrop')){
 const EXP_CHUNK = 120;
 let EXP = {dir:'', files:[], dirs:[], total:0, loading:false,
   loadSeq:0, picked:new Set(), fav:new Set(), cmp:new Set(), open:-1,
-  folders:{}, ranks:{}, ratings:{}, elo:{}, elo_matches:{}, tags:{}};
+  folders:{}, ranks:{}, ratings:{}, elo:{}, elo_matches:{}, tags:{},
+  memos:{}, review_states:{}};
 function expListUrl(dir, offset=0){
   const q = new URLSearchParams({
     dir: dir ?? EXP.dir, limit: String(EXP_CHUNK), offset: String(offset)
@@ -13694,6 +13717,7 @@ async function expLoad(dir){
   EXP.picked = new Set(r.picked); EXP.fav = new Set(r.fav); EXP.ranks = r.ranks || {};
   EXP.folders = r.folders || {}; EXP.ratings = r.ratings || {};
   EXP.elo = r.elo || {}; EXP.elo_matches = r.elo_matches || {}; EXP.tags = r.tags || {};
+  EXP.memos = r.memos || {}; EXP.review_states = r.review_states || {};
   $('expPath').textContent = 'output/' + (r.dir ? r.dir + '/' : '');
   /* 최상위에서는 위로 갈 곳이 없다 — 눌려도 아무 일 없으면 고장으로 보인다 */
   const up = $('expUp');
@@ -13984,7 +14008,8 @@ async function picksSave(){
       picked:[...EXP.picked], fav:[...EXP.fav],
       folders:EXP.folders || {}, ranks:EXP.ranks || {},
       ratings:EXP.ratings || {}, elo:EXP.elo || {},
-      elo_matches:EXP.elo_matches || {}, tags:EXP.tags || {}
+      elo_matches:EXP.elo_matches || {}, tags:EXP.tags || {},
+      memos:EXP.memos || {}, review_states:EXP.review_states || {}
     })});
 }
 let EXP_RECIPE_UNDO = null;
@@ -14135,6 +14160,8 @@ function expOpen(i){
   const elo = Number((EXP.elo || {})[f.path] || 0);
   const eloMatches = Number((EXP.elo_matches || {})[f.path] || 0);
   const tags = (EXP.tags || {})[f.path] || [];
+  const memo = (EXP.memos || {})[f.path] || '';
+  const reviewState = (EXP.review_states || {})[f.path] || 'candidate';
   ov.innerHTML = `<img src="/setout?p=${encodeURIComponent(f.path)}" alt=""
       style="max-width:96vw;max-height:82vh;object-fit:contain;border-radius:var(--radius);">
     <div class="bar" style="background:var(--paper);padding:7px 11px;border-radius:var(--radius);flex-wrap:wrap;">
@@ -14152,6 +14179,18 @@ function expOpen(i){
         placeholder="판단 태그 (쉼표로 구분)" style="width:220px;">
       <button type="button" id="expTagSave">태그 저장</button>
       <span class="hint">←→ 넘기기 · Esc 닫기</span>
+    </div>
+    <div class="bar" style="max-width:96vw;width:min(920px,96vw);background:var(--paper);
+      padding:7px 11px;border-radius:var(--radius);align-items:flex-start;">
+      <textarea id="expMemo" rows="2" placeholder="이 결과에서 확인한 점"
+        style="flex:1;min-width:220px;resize:vertical;">${esc(memo)}</textarea>
+      <select id="expLifecycle" aria-label="결과 검토 상태" style="width:auto;">
+        <option value="candidate"${reviewState==='candidate'?' selected':''}>후보</option>
+        <option value="confirmed"${reviewState==='confirmed'?' selected':''}>확정</option>
+        <option value="shared"${reviewState==='shared'?' selected':''}>공유</option>
+        <option value="archived"${reviewState==='archived'?' selected':''}>보관</option>
+      </select>
+      <button type="button" id="expEvaluationSave">메모·상태 저장</button>
     </div>
     <div class="result-actions" style="max-width:96vw;background:var(--paper);padding:7px 11px;
       margin:0;border:0;border-radius:var(--radius);">
@@ -14174,6 +14213,25 @@ function expOpen(i){
     if(values.length) EXP.tags[f.path] = values;
     else delete EXP.tags[f.path];
     await picksSave(); expDraw(); expOpen(EXP.open);
+  });
+  $('expEvaluationSave').addEventListener('click', async () => {
+    const nextMemo = $('expMemo').value;
+    const nextState = $('expLifecycle').value;
+    if(nextMemo) EXP.memos[f.path] = nextMemo;
+    else delete EXP.memos[f.path];
+    await picksSave();
+    if(nextState !== reviewState){
+      const r = await (await fetch('/api/evaluation_action', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          action:'lifecycle', paths:[f.path], state:nextState
+        })
+      })).json();
+      if(!r.ok){ alert(r.error || '검토 상태를 저장하지 못했습니다.'); return; }
+      EXP.review_states = Object.assign(
+        {}, EXP.review_states || {}, (r.picks || {}).review_states || {});
+    }
+    $('expEvaluationSave').textContent = '저장됨';
   });
   ov.querySelectorAll('[data-exp-result]').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.expResult;
@@ -14240,8 +14298,14 @@ if($('expUp')){
     const visible = await expEnsureAll();
     const chosen = visible.map(file => file.path).filter(path => EXP.picked.has(path));
     if(!chosen.length){ $('expStat').textContent = '이 폴더에서 후보군에 넣을 그림을 먼저 선별해주세요.'; return; }
-    EXP.folders[name] = [...new Set([...(EXP.folders[name] || []), ...chosen])];
-    await picksSave();
+    const r = await (await fetch('/api/evaluation_action', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'fixed-board', paths:chosen, board:name, member:true
+      })
+    })).json();
+    if(!r.ok){ $('expStat').textContent = r.error || '후보군 저장 실패'; return; }
+    EXP.folders = (r.picks || {}).folders || EXP.folders;
     expPaintGroups(); $('expGroupFilter').value = name; expDraw();
     $('expStat').textContent = `'${name}' 후보군에 선별 ${chosen.length}장을 이름표로 연결했습니다.`;
   });
@@ -14249,6 +14313,15 @@ if($('expUp')){
     const name = $('expGroupFilter').value;
     if(!name){ $('expStat').textContent = '삭제할 후보군 이름표를 선택해주세요.'; return; }
     if(!confirm(`후보군 '${name}' 이름표를 지울까요? 원본 그림과 선별 표시는 그대로 남습니다.`)) return;
+    const members = [...(EXP.folders[name] || [])];
+    const r = members.length ? await (await fetch('/api/evaluation_action', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'fixed-board', paths:members, board:name, member:false
+      })
+    })).json() : {ok:true, picks:{folders:EXP.folders}};
+    if(!r.ok){ $('expStat').textContent = r.error || '후보군 삭제 실패'; return; }
+    EXP.folders = (r.picks || {}).folders || EXP.folders;
     delete EXP.folders[name];
     await picksSave(); expPaintGroups(); expDraw();
     $('expStat').textContent = `'${name}' 후보군 이름표만 지웠습니다.`;
@@ -21420,7 +21493,7 @@ class ConfigServer:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/evaluation_action"):
                     try:
-                        if len(body or b"") > 64 * 1024:
+                        if len(body or b"") > 4 * 1024 * 1024:
                             self._json({
                                 "ok": False, "error": "요청이 너무 큽니다."})
                             return
@@ -21437,6 +21510,7 @@ class ConfigServer:
                             for k in (
                                 "picked", "fav", "folders", "ranks",
                                 "ratings", "elo", "elo_matches", "tags",
+                                "memos", "review_states",
                             ):
                                 if k in d:
                                     cur[k] = d[k]
@@ -21476,6 +21550,13 @@ class ConfigServer:
                                     if k not in gone}
                                 picks["tags"] = {
                                     k: v for k, v in picks.get("tags", {}).items()
+                                    if k not in gone}
+                                picks["memos"] = {
+                                    k: v for k, v in picks.get("memos", {}).items()
+                                    if k not in gone}
+                                picks["review_states"] = {
+                                    k: v for k, v in
+                                    picks.get("review_states", {}).items()
                                     if k not in gone}
                                 picks["folders"] = {
                                     name: [x for x in paths if x not in gone]
