@@ -251,6 +251,10 @@ from src.nai_studio.web.routes.evaluation_post import (
     EvaluationPostOperations,
     handle_evaluation_post,
 )
+from src.nai_studio.web.routes.fragments_post import (
+    FragmentPostOperations,
+    handle_fragment_post,
+)
 from src.nai_studio.web.routes.generation import (
     GenerationGetOperations,
     handle_generation_get,
@@ -12818,6 +12822,20 @@ class ConfigServer:
             atomic_write=_atomic_write_bytes,
             strip_and_save=strip_and_save,
         )
+        fragment_post = FragmentPostOperations(
+            fragment_dir=FRAG_DIR,
+            save_fragment=save_fragment,
+            list_fragments=list_fragments,
+            recoverable_remove=recoverable_remove,
+            load_state=load_state,
+            save_state=save_state,
+            import_fragments=import_fragments_bytes,
+            reroll_components=reroll_legacy_components,
+            resolve_prompt=resolve_legacy_prompt,
+            sequence_text=legacy_sequence_text,
+            resolve_fragments=resolve_fragments,
+            random_factory=random.Random,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12848,6 +12866,8 @@ class ConfigServer:
                 if handle_catalog_post(self, catalog_post, body):
                     return
                 if handle_evaluation_post(self, server, evaluation_post, body):
+                    return
+                if handle_fragment_post(self, server, fragment_post, body):
                     return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
@@ -13135,70 +13155,6 @@ class ConfigServer:
                     self._json(server.handle_regen(body))
                 elif self.path.startswith("/api/scenes_run"):
                     self._json(server.handle_scene_run())
-                elif self.path.startswith("/api/frag_save"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        old = (d.get("old") or "").strip()
-                        name = save_fragment(d.get("name", ""), d.get("lines") or [])
-                        if old and old != name:
-                            old_path = FRAG_DIR / f"{old}.txt"
-                            if old_path.exists():
-                                recoverable_remove(old_path, label="이름변경")
-                        self._json({"ok": True, "name": name,
-                                    "fragments": list_fragments()})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/frag_del"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        path = FRAG_DIR / f"{Path(d.get('name','')).name}.txt"
-                        if path.exists():
-                            recoverable_remove(path)
-                        self._json({"ok": True, "fragments": list_fragments()})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/frag_reset"):
-                    # 순차(<*이름>) 순번을 0 으로
-                    try:
-                        st = load_state()
-                        st["frag_seq"] = {}
-                        save_state(st)
-                        server.cfg["_frag_counters"] = st["frag_seq"]
-                        self._json({"ok": True})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/frag_import"):
-                    from urllib.parse import unquote
-                    try:
-                        self._json(import_fragments_bytes(
-                            body, unquote(self.headers.get("X-Filename", ""))))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/frag_try"):
-                    # 미리보기 — 실제 순번은 건드리지 않는다
-                    try:
-                        d = json.loads(body or b"{}")
-                        seed = d.get("seed", 0)
-                        if d.get("previous") and d.get("reroll_ids"):
-                            result = reroll_legacy_components(
-                                d["previous"], d["reroll_ids"], seed)
-                        else:
-                            result = resolve_legacy_prompt(
-                                d.get("text", ""), list_fragments(), seed)
-                        # 순차 조각은 지금까지의 상태를 복사해 화면에만 투영한다.
-                        # 저장된 순번은 바꾸지 않는다.
-                        outs, _ = resolve_fragments(
-                            [legacy_sequence_text(result)],
-                            counters=dict(load_state().get("frag_seq", {})),
-                            rng=random.Random(str(seed)))
-                        self._json({
-                            "ok": True,
-                            "text": outs[0],
-                            "result": result,
-                            "ui_state": result["ui_state"],
-                        })
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/sb_new"):
                     try:
                         d = json.loads(body or b"{}")
