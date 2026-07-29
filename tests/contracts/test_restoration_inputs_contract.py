@@ -6,11 +6,13 @@ import json
 import unittest
 
 from src.nai_studio.services.restoration_inputs import (
+    folder_inventory_summary,
     folder_inventory_queue,
     image_batch_queue,
     image_inspect_queue,
     pack_import_queue,
     public_collection_queue,
+    public_collection_summary,
     restoration_queue_from_input,
     retry_restoration_inputs,
 )
@@ -195,6 +197,35 @@ class RestorationInputsContractTests(unittest.TestCase):
         self.assertNotIn("also-secret", text)
         self.assertNotIn("/home/private", text)
         self.assertNotIn("/tmp/private", text)
+
+    def test_polling_summaries_do_not_materialize_items_or_claim_folder_metadata(self):
+        state = {
+            "status": "paused",
+            "queue": ["https://example.invalid/current"],
+            "articles": {
+                "https://example.invalid/history": {
+                    "metadata_images": 2,
+                    "image_count": 3,
+                },
+            },
+            "failures": {
+                "https://example.invalid/failed": {"attempts": 1},
+            },
+            "cursor": 1,
+        }
+        summary = public_collection_summary(state)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["recognized"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["pending"], 1)
+        self.assertNotIn("items", summary)
+        inventory = folder_inventory_summary({
+            "files": 10000,
+            "fingerprint": "a" * 64,
+        })
+        self.assertEqual(inventory["pending"], 10000)
+        self.assertEqual(inventory["recognized"], 0)
+        self.assertTrue(inventory["inventory_only"])
 
     def test_pack_import_keeps_manifest_lineage_and_report_without_archive(self):
         result = {

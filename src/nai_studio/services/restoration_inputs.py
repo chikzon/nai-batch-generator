@@ -558,6 +558,97 @@ def public_collection_queue(value: Mapping[str, Any]) -> dict:
     return enqueue_restore_items(queue, items)
 
 
+def public_collection_summary(value: Mapping[str, Any]) -> dict:
+    """상태 polling용 O(n) 경량 요약. 큰 canonical item 사본은 만들지 않는다."""
+    state = value if isinstance(value, Mapping) else {}
+    articles = state.get("articles")
+    articles = articles if isinstance(articles, Mapping) else {}
+    failures = state.get("failures")
+    failures = failures if isinstance(failures, Mapping) else {}
+    urls = list(dict.fromkeys([
+        *list(state.get("queue") or []),
+        *[str(url) for url in articles],
+        *[str(url) for url in failures],
+    ]))
+    counts = {
+        "pending": 0,
+        "recognized": 0,
+        "unrecognized": 0,
+        "failed": 0,
+    }
+    images = 0
+    for url in urls:
+        article = articles.get(url)
+        failure = failures.get(url)
+        if isinstance(failure, Mapping):
+            counts["failed"] += 1
+        elif isinstance(article, Mapping):
+            if int(article.get("metadata_images") or 0) > 0:
+                counts["recognized"] += 1
+            else:
+                counts["unrecognized"] += 1
+            images += int(
+                article.get("image_count")
+                or len(article.get("image_urls") or [])
+            )
+        else:
+            counts["pending"] += 1
+    identity = {
+        "schema": state.get("schema"),
+        "keyword": state.get("keyword"),
+        "started_at": state.get("started_at"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return {
+        "schema": "nai-restore-queue/v1",
+        "id": f"restore-queue-{digest}",
+        "status": str(state.get("status") or "idle"),
+        "total": len(urls),
+        "images": images,
+        **counts,
+        "other": 0,
+        "duplicates": 0,
+        "changes": int(state.get("changed_posts") or 0),
+        "cursor": _json_copy(state.get("cursor")),
+        "date_range": _json_copy(state.get("date_range") or {
+            "from": state.get("date_from"),
+            "to": state.get("date_to"),
+        }),
+    }
+
+
+def folder_inventory_summary(value: Mapping[str, Any]) -> dict:
+    """자료 색인의 저장된 집계만 읽는 경량 요약. 내용 판독 완료를 주장하지 않는다."""
+    index = value if isinstance(value, Mapping) else {}
+    total = max(0, int(index.get("files") or 0))
+    digest = str(index.get("fingerprint") or "")[:24]
+    return {
+        "schema": "nai-restore-queue/v1",
+        "id": f"folder-index-{digest or 'empty'}",
+        "status": "indexed" if total else "idle",
+        "total": total,
+        "images": 0,
+        "pending": total,
+        "recognized": 0,
+        "unrecognized": 0,
+        "failed": 0,
+        "other": 0,
+        "duplicates": 0,
+        "changes": 0,
+        "cursor": None,
+        "date_range": {},
+        "inventory_only": True,
+    }
+
+
 def pack_import_queue(
     value: Mapping[str, Any],
     *,
