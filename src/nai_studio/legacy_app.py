@@ -239,6 +239,10 @@ from src.nai_studio.web.routes.catalog import (
     CatalogGetOperations,
     handle_catalog_get,
 )
+from src.nai_studio.web.routes.collection_post import (
+    CollectionPostOperations,
+    handle_collection_post,
+)
 from src.nai_studio.web.routes.generation import (
     GenerationGetOperations,
     handle_generation_get,
@@ -12766,6 +12770,24 @@ class ConfigServer:
             image_batch_queue=image_batch_queue,
             summarize_queue=summarize_restore_queue,
         )
+        collection_post = CollectionPostOperations(
+            preview_pack=preview_datapack_bytes,
+            import_pack=import_datapack_bytes,
+            pack_queue=pack_import_queue,
+            summarize_queue=summarize_restore_queue,
+            forget_caches=forget_collection_caches,
+            load_spec=load_spec,
+            options=OPTIONS,
+            load_options=load_options,
+            public_start=PUBLIC_COLLECTION.start,
+            public_retry=PUBLIC_COLLECTION.retry_failed,
+            public_control=PUBLIC_COLLECTION.control,
+            undo_pack=undo_datapack,
+            import_settings=import_settings_bytes,
+            resource_import=server.handle_resource_import,
+            reference_add=server.handle_ref_add,
+            reference_save=server.handle_ref_save,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12790,6 +12812,8 @@ class ConfigServer:
                 if body is None:
                     return
                 if handle_recovery_post(self, server, recovery_post, body):
+                    return
+                if handle_collection_post(self, server, collection_post, body):
                     return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
@@ -13316,152 +13340,10 @@ class ConfigServer:
                         self._json(setting_delete(d.get("name", "")))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/setting_import"):
-                    from urllib.parse import unquote
-                    try:
-                        r = import_settings_bytes(
-                            body, unquote(self.headers.get("X-Filename", "")))
-                        # 세팅은 list_settings() 가 매번 파일을 다시 읽으므로
-                        # 따로 되불러올 것이 없다. 화면만 새로 그리면 된다.
-                        self._json(r)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/pack_preview_cancel"):
-                    server.pack_preview_blob = None
-                    server.pack_preview_sha256 = ""
-                    server.pack_preview_filename = ""
-                    self._json({"ok": True})
-                elif self.path.startswith("/api/pack_preview"):
-                    from urllib.parse import unquote
-                    try:
-                        filename = unquote(
-                            self.headers.get("X-Filename", ""))
-                        result = preview_datapack_bytes(body, filename)
-                        if result.get("ok"):
-                            server.pack_preview_blob = bytes(body)
-                            server.pack_preview_sha256 = str(
-                                result.get("sha256") or "")
-                            server.pack_preview_filename = filename
-                        else:
-                            server.pack_preview_blob = None
-                            server.pack_preview_sha256 = ""
-                            server.pack_preview_filename = ""
-                        self._json(result)
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/pack_import"):
-                    # 자료팩(수집물)은 배포본에 넣지 않는다. 따로 받아 여기서 합친다.
-                    from urllib.parse import unquote
-                    try:
-                        if "application/json" in self.headers.get(
-                                "Content-Type", ""):
-                            request = json.loads(body or b"{}")
-                            expected_sha = str(request.get("sha256") or "")
-                            if (not server.pack_preview_blob
-                                    or expected_sha != server.pack_preview_sha256):
-                                r = {
-                                    "ok": False,
-                                    "error": "검사한 자료팩 원문이 메모리에 없습니다. 다시 골라 주세요.",
-                                }
-                            else:
-                                r = import_datapack_bytes(
-                                    server.pack_preview_blob,
-                                    server.pack_preview_filename,
-                                    selected_conflicts=request.get(
-                                        "selected") or [],
-                                    expected_diff=str(
-                                        request.get("diff_fingerprint") or ""),
-                                )
-                        else:
-                            # 구형 화면·API 호환: 원문 POST는 기존처럼 신규만 합친다.
-                            r = import_datapack_bytes(
-                                body,
-                                unquote(self.headers.get("X-Filename", "")),
-                                overwrite="overwrite=1" in self.path,
-                            )
-                        if "restoration_queue" not in r:
-                            queue = pack_import_queue(
-                                {
-                                    **r,
-                                    "archive_sha256": (
-                                        server.pack_preview_sha256
-                                        if "application/json" in self.headers.get(
-                                            "Content-Type", "")
-                                        else hashlib.sha256(body).hexdigest()
-                                    ),
-                                },
-                                filename=unquote(
-                                    self.headers.get("X-Filename", "")
-                                ),
-                            )
-                            r["restoration"] = summarize_restore_queue(queue)
-                            r["restoration_queue"] = queue
-                        if r.get("ok"):
-                            server.pack_preview_blob = None
-                            server.pack_preview_sha256 = ""
-                            server.pack_preview_filename = ""
-                            # 그림체·레시피·태그색인은 한 번 읽고 메모리에 두므로
-                            # 깃발을 내려 줘야 새로 들어온 자료가 화면에 나온다.
-                            forget_collection_caches()
-                            # 기본 자료팩에는 규격·옵션도 있다. 서버를 껐다 켜지 않아도
-                            # 가져오기 직후 빌더와 새 세팅에 반영되게 메모리 사본도 갱신한다.
-                            self.spec = load_spec()
-                            OPTIONS.clear()
-                            OPTIONS.update(load_options())
-                        self._json(r)
-                    except Exception as e:
-                        result = {"ok": False, "error": str(e)}
-                        queue = pack_import_queue(
-                            {
-                                **result,
-                                "archive_sha256": hashlib.sha256(body).hexdigest(),
-                            },
-                            filename=unquote(
-                                self.headers.get("X-Filename", "")
-                            ),
-                        )
-                        result["restoration"] = summarize_restore_queue(queue)
-                        result["restoration_queue"] = queue
-                        self._json(result)
                 elif self.path.startswith("/api/library_organize"):
                     try:
                         payload = json.loads(body or b"{}")
                         self._json(organize_library_items(payload))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/public_collection_start"):
-                    try:
-                        payload = json.loads(body or b"{}")
-                        self._json(PUBLIC_COLLECTION.start(payload))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/public_collection_retry"):
-                    try:
-                        payload = json.loads(body or b"{}")
-                        self._json(PUBLIC_COLLECTION.retry_failed(payload))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/public_collection_control"):
-                    try:
-                        payload = json.loads(body or b"{}")
-                        self._json(PUBLIC_COLLECTION.control(payload.get("action")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/pack_undo"):
-                    # 이미지·자료팩·비교 승격 어느 경로든 그 판이 바꾼 것만 물린다.
-                    try:
-                        d = json.loads(body or b"{}")
-                        with server.config_lock:
-                            server.use_latest_config()
-                            r = undo_datapack(d.get("id"), server.cfg)
-                            if r.get("changed_config"):
-                                server.config_revision += 1
-                            r["revision"] = server.config_revision
-                        if r.get("ok"):
-                            self.spec = load_spec()
-                            OPTIONS.clear()
-                            OPTIONS.update(load_options())
-                        self._json(r)
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/style_del"):
@@ -13491,16 +13373,6 @@ class ConfigServer:
                         self._json(duplicate_setting_group(d.get("name", ""), sid))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/ref_bundle_import"):
-                    self._json(server.handle_resource_import(
-                        body, self.headers.get("X-Filename", "")))
-                elif self.path.startswith("/api/ref_add"):
-                    from urllib.parse import unquote
-                    self._json(server.handle_ref_add(
-                        body, self.headers.get("X-Kind", "vibe"),
-                        self.headers.get("X-Filename", "")))
-                elif self.path.startswith("/api/ref_save"):
-                    self._json(server.handle_ref_save(body))
                 elif self.path.startswith("/api/director"):
                     # 이미지 원본을 그대로 POST 받고, 옵션은 헤더로
                     from urllib.parse import unquote

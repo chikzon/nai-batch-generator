@@ -38,6 +38,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 비교·실시간 생성 상태 GET 라우트 | `web/routes/generation.py` |
 | 이미지·내보내기·진단·HTML GET 라우트 | `web/routes/assets.py` |
 | 백업·로컬 자료·메타데이터 감사 POST 라우트 | `web/routes/recovery_post.py` |
+| 자료팩·공개자료·Reference 임포트 POST 라우트 | `web/routes/collection_post.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
