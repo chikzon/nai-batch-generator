@@ -259,6 +259,10 @@ from src.nai_studio.web.routes.generation import (
     GenerationGetOperations,
     handle_generation_get,
 )
+from src.nai_studio.web.routes.generation_post import (
+    GenerationPostOperations,
+    handle_generation_post,
+)
 from src.nai_studio.web.routes.recovery import (
     RecoveryGetOperations,
     handle_recovery_get,
@@ -12869,6 +12873,24 @@ class ConfigServer:
             duplicate_group=duplicate_setting_group,
             log_warning=log.warning,
         )
+        generation_post = GenerationPostOperations(
+            activate_comparison=activate_comparison_run,
+            compare_rerun=server.handle_compare_rerun,
+            comparison_recipe=comparison_recipe_for_output,
+            compare_promote=server.handle_compare_promote,
+            compare_preview=server.handle_compare_preview,
+            compare_run=server.handle_compare_run,
+            start=server.handle_start,
+            generate_one=server.handle_generate_one,
+            request_stop=server.live.request_stop,
+            job_command=server.handle_job_command,
+            image_to_image=server.handle_i2i,
+            variation_save=server.handle_character_variation_save,
+            regenerate=server.handle_regen,
+            scene_run=server.handle_scene_run,
+            director=server.handle_director,
+            inspect_image=server.handle_inspect,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12904,6 +12926,8 @@ class ConfigServer:
                     return
                 if handle_settings_post(self, server, settings_post, body):
                     return
+                if handle_generation_post(self, server, generation_post, body):
+                    return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
                         self._json(server.handle_blueprint_project(body))
@@ -12911,32 +12935,6 @@ class ConfigServer:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/save"):
                     self._json(server.handle_save(body))
-                elif self.path.startswith("/api/compare_activate"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(activate_comparison_run(
-                            server.cfg, data.get("folder")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/compare_rerun"):
-                    self._json(server.handle_compare_rerun(body))
-                elif self.path.startswith("/api/compare_recipe"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(comparison_recipe_for_output(
-                            server.cfg, data.get("path")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/compare_promote"):
-                    self._json(server.handle_compare_promote(body))
-                elif self.path.startswith("/api/compare_preview"):
-                    self._json(server.handle_compare_preview(body))
-                elif self.path.startswith("/api/compare_run"):
-                    self._json(server.handle_compare_run(body))
-                elif self.path.startswith("/api/start"):
-                    self._json(server.handle_start())
-                elif self.path.startswith("/api/generate_one"):
-                    self._json(server.handle_generate_one())
                 elif self.path.startswith("/api/anlas"):
                     try:
                         d = json.loads(body or b"{}")
@@ -13044,19 +13042,6 @@ class ConfigServer:
                         })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/stop"):
-                    # 중지 — 취소 **플래그**만 세운다 (CQA-001: running 을 직접 끄면
-                    # 옛 작업이 마저 도는 동안 새 작업이 실행권을 얻어 겹친다).
-                    self._json({"ok": server.live.request_stop()})
-                elif self.path.startswith("/api/job_command"):
-                    try:
-                        if len(body or b"") > 128 * 1024:
-                            self._json({
-                                "ok": False, "error": "요청이 너무 큽니다."})
-                            return
-                        self._json(server.handle_job_command(body))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/tokens"):
                     try:
                         d = json.loads(body or b"{}")
@@ -13084,27 +13069,6 @@ class ConfigServer:
                                     "finalized": bool(d.get("finalize"))})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/i2i"):
-                    self._json(server.handle_i2i(body))
-                elif self.path.startswith("/api/character_variation_save"):
-                    self._json(server.handle_character_variation_save(body))
-                elif self.path.startswith("/api/regen"):
-                    self._json(server.handle_regen(body))
-                elif self.path.startswith("/api/scenes_run"):
-                    self._json(server.handle_scene_run())
-                elif self.path.startswith("/api/director"):
-                    # 이미지 원본을 그대로 POST 받고, 옵션은 헤더로
-                    from urllib.parse import unquote
-                    self._json(server.handle_director(
-                        body, self.headers.get("X-Tool", ""),
-                        unquote(self.headers.get("X-Prompt", "") or ""),
-                        self.headers.get("X-Defry", "0"),
-                        self.headers.get("X-Scale", "4"),
-                        unquote(self.headers.get("X-Filename", "") or "")))
-                elif self.path.startswith("/api/inspect"):
-                    self._json(server.handle_inspect(
-                        body, self.headers.get("X-Filename", ""),
-                        self.headers.get("X-Save", "")))
                 else:
                     self.send_response(404); self.end_headers()
 
