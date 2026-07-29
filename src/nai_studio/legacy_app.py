@@ -180,6 +180,7 @@ from src.nai_studio.services.experiment_bridge import (
 from src.nai_studio.services import (
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
+    output_lifecycle as _output_lifecycle,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
     legacy_execution_material,
@@ -6100,398 +6101,106 @@ def apply_evaluation_action(data):
 
 
 TRASH_DIR_NAME = ".NAI-휴지통"
+_DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각)
+
+
+def _output_lifecycle_paths():
+    """레거시 상수와 서비스의 파일·휴지통 계약을 한곳에서 연결한다."""
+    return _output_lifecycle.OutputLifecyclePaths(
+        trash_dir_name=TRASH_DIR_NAME,
+        image_extensions=IMG_EXT,
+        trash_schema="nais-output-trash/v2",
+        directory_count_ttl=30.0,
+    )
+
+
+def _output_lifecycle_operations():
+    """호출 시점의 저장·시간 의존성을 주입해 기존 monkeypatch 계약을 보존한다."""
+    return _output_lifecycle.OutputLifecycleOperations(
+        output_root=out_root,
+        atomic_write_json=atomic_write_json,
+        load_json=load_json_recover,
+        load_picks=load_picks,
+        save_picks=save_picks,
+        picks_lock=_JSON_IO_LOCK,
+        project_evaluations=project_legacy_evaluations,
+        move_file=shutil.move,
+        now=datetime.now,
+        uuid4=uuid.uuid4,
+        clock=time.time,
+        directory_count_cache=_DIR_COUNT_CACHE,
+        warning=log.warning,
+    )
 
 
 def _path_is_inside(path, root):
-    path, root = Path(path).resolve(), Path(root).resolve()
-    try:
-        return path.is_relative_to(root)
-    except AttributeError:
-        return os.path.commonpath((str(path), str(root))) == str(root)
+    return _output_lifecycle.path_is_inside(path, root)
 
 
 def output_file_for_preview(cfg, rel):
-    """탐색기에서 보여 줄 출력 파일만 돌려준다.
-
-    휴지통은 목록뿐 아니라 `/setout` 직접 URL에서도 열리지 않아야 한다.
-    원래 경로를 복원하기 전까지는 삭제된 파일로 취급한다.
-    """
-    rel = str(rel or "").replace("\\", "/")
-    if (not rel
-            or TRASH_DIR_NAME.casefold() in
-            {part.casefold() for part in Path(rel).parts}):
-        return None
-    root = out_root(cfg).resolve()
-    trash_root = (root / TRASH_DIR_NAME).resolve()
-    candidate = (root / rel).resolve()
-    if (not _path_is_inside(candidate, root)
-            or _path_is_inside(candidate, trash_root)
-            or not candidate.is_file()):
-        return None
-    return candidate
+    return _output_lifecycle.output_file_for_preview(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        cfg,
+        rel,
+    )
 
 
 def trash_output_files(cfg, targets, keep=()):
-    """출력물을 즉시 지우지 않고 같은 출력 루트의 복구 가능한 묶음으로 옮긴다."""
-    root = out_root(cfg).resolve()
-    trash_root = (root / TRASH_DIR_NAME).resolve()
-    keep = set(keep or ())
-    planned = []
-    seen = set()
-    for rel in targets or ():
-        rel = str(rel or "").replace("\\", "/").lstrip("/")
-        if (not rel or rel in seen or rel in keep
-                or rel.startswith(TRASH_DIR_NAME + "/")):
-            continue
-        source = (root / rel).resolve()
-        if not _path_is_inside(source, root) or not source.is_file():
-            continue
-        # batch id가 정해지기 전에도 목적지는 항상 같은 상대 경로다.
-        planned.append({"original": rel})
-        seen.add(rel)
-    if not planned:
-        return {"deleted": 0, "batch_id": None, "paths": []}
-
-    trash_root.mkdir(parents=True, exist_ok=True)
-    for _attempt in range(8):
-        batch_id = (datetime.now().strftime("%Y%m%d-%H%M%S")
-                    + "-" + uuid.uuid4().hex[:12])
-        batch_dir = trash_root / batch_id
-        try:
-            batch_dir.mkdir(parents=False, exist_ok=False)
-            break
-        except FileExistsError:
-            continue
-    else:
-        raise FileExistsError("고유한 휴지통 묶음 폴더를 만들지 못했습니다.")
-
-    for item in planned:
-        dest = (batch_dir / item["original"]).resolve()
-        if not _path_is_inside(dest, batch_dir):
-            raise ValueError("휴지통 밖을 가리키는 경로가 포함되어 있습니다.")
-        item["trashed"] = dest.relative_to(root).as_posix()
-
-    picks = load_picks()
-    labels = {}
-    for item in planned:
-        rel = item["original"]
-        record = {}
-        if rel in picks.get("picked", []):
-            record["picked"] = True
-        if rel in picks.get("fav", []):
-            record["fav"] = True
-        folders = [
-            name for name, paths in picks.get("folders", {}).items()
-            if rel in paths
-        ]
-        if folders:
-            record["folders"] = folders
-        for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
-            if rel in picks.get(key, {}):
-                record[key] = picks[key][rel]
-        if record:
-            labels[rel] = record
-
-    manifest_path = batch_dir / "manifest.json"
-    manifest = {
-        "schema": "nais-output-trash/v2",
-        "batch_id": batch_id,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "moving",
-        "items": planned,
-        "labels": labels,
-    }
-    # 이동보다 장부를 먼저 쓴다. 이후 어느 지점에서 꺼져도 이미 옮긴 파일은
-    # 목록에 다시 나타나며, 장부 쓰기 자체가 실패하면 원본은 한 장도 움직이지 않는다.
-    atomic_write_json(manifest_path, manifest, indent=2)
-    moved = []
-    for item in planned:
-        source = (root / item["original"]).resolve()
-        dest = (root / item["trashed"]).resolve()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(dest))
-        moved.append(item)
-    manifest["status"] = "ready"
-    manifest["moved"] = len(moved)
-    atomic_write_json(manifest_path, manifest, indent=2)
-    return {
-        "deleted": len(moved),
-        "batch_id": batch_id,
-        # 호출자가 실제로 옮기지 못한 경로의 이름표까지 지우지 않도록 근거를 돌려준다.
-        "paths": [item["original"] for item in moved],
-    }
+    return _output_lifecycle.trash_output_files(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        cfg,
+        targets,
+        keep,
+    )
 
 
 def restore_trash_batch(cfg, batch_id):
-    """지운 묶음을 원래 위치로 복원한다. 충돌하면 번호를 붙여 기존 파일을 보존한다."""
-    root = out_root(cfg).resolve()
-    trash_root = (root / TRASH_DIR_NAME).resolve()
-    batch = (trash_root / str(batch_id or "")).resolve()
-    if not _path_is_inside(batch, trash_root):
-        raise ValueError("잘못된 휴지통 묶음입니다.")
-    manifest_path = batch / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError("복원할 휴지통 묶음을 찾을 수 없습니다.")
-    manifest = load_json_recover(manifest_path)
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
-        raise ValueError("휴지통 장부 형식이 올바르지 않습니다.")
-    items = [item for item in manifest["items"] if isinstance(item, dict)]
-    plan = manifest.get("restore_plan")
-    if not isinstance(plan, dict):
-        plan = {}
-    plan_changed = False
-
-    def unused_target(original):
-        target = (root / original).resolve()
-        if (not _path_is_inside(target, root)
-                or _path_is_inside(target, trash_root)):
-            return None
-        if not target.exists():
-            return target
-        stem, suffix, serial = target.stem, target.suffix, 2
-        while target.exists():
-            target = target.with_name(f"{stem}_{serial}{suffix}")
-            serial += 1
-        return target
-
-    # 모든 복원 목적지를 이동 전에 기록한다. 파일 이동 뒤 이름표 저장이 실패해도
-    # 다음 실행은 이 계획으로 이미 복원된 파일을 찾아 이름표만 다시 붙일 수 있다.
-    for item in items:
-        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
-        source = (root / str(item.get("trashed") or "")).resolve()
-        if not original or not _path_is_inside(source, batch):
-            continue
-        planned_rel = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
-        planned = (root / planned_rel).resolve() if planned_rel else None
-        if planned is not None and (
-                not _path_is_inside(planned, root)
-                or _path_is_inside(planned, trash_root)):
-            planned = None
-        if planned is None and source.is_file():
-            planned = unused_target(original)
-            if planned is not None:
-                plan[original] = planned.relative_to(root).as_posix()
-                plan_changed = True
-    if plan_changed or manifest.get("restore_plan") != plan:
-        manifest["restore_plan"] = plan
-        manifest["restore_status"] = "moving"
-        atomic_write_json(manifest_path, manifest, indent=2)
-
-    restored = []
-    restored_map = {}
-    for item in items:
-        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
-        planned_rel = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
-        if not original or not planned_rel:
-            continue
-        source = (root / str(item.get("trashed") or "")).resolve()
-        target = (root / planned_rel).resolve()
-        if (not _path_is_inside(source, batch)
-                or not _path_is_inside(target, root)
-                or _path_is_inside(target, trash_root)):
-            continue
-        if source.is_file() and target.exists():
-            # 계획 기록 뒤 외부에서 같은 이름을 만들었으면 절대 덮어쓰지 않는다.
-            target = unused_target(original)
-            if target is None:
-                continue
-            planned_rel = target.relative_to(root).as_posix()
-            plan[original] = planned_rel
-            manifest["restore_plan"] = plan
-            atomic_write_json(manifest_path, manifest, indent=2)
-        if source.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(target))
-        elif not target.is_file():
-            continue
-        restored.append(planned_rel)
-        restored_map[original] = planned_rel
-    # 지울 때 함께 보관한 가상 이름표도 실제 복원 경로에 되붙인다.
-    # 경로 충돌로 `(2)`가 붙었으면 옛 원래 경로가 아니라 새 파일에 붙여야 한다.
-    labels = manifest.get("labels") or {}
-    if restored_map and isinstance(labels, dict):
-        with _JSON_IO_LOCK:
-            picks = load_picks()
-            for original, restored_rel in restored_map.items():
-                record = labels.get(original) or {}
-                if not isinstance(record, dict):
-                    record = {}
-                # 이동 직후 프로세스가 꺼져 이름표 정리가 끝나지 못한 경우도 있다.
-                # 원래 경로의 낡은 이름표를 먼저 떼고 실제 복원된 경로로 옮긴다.
-                picks["picked"] = [x for x in picks["picked"] if x != original]
-                picks["fav"] = [x for x in picks["fav"] if x != original]
-                for paths in picks["folders"].values():
-                    paths[:] = [x for x in paths if x != original]
-                for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
-                    picks[key].pop(original, None)
-                if record.get("picked") and restored_rel not in picks["picked"]:
-                    picks["picked"].append(restored_rel)
-                if record.get("fav") and restored_rel not in picks["fav"]:
-                    picks["fav"].append(restored_rel)
-                for name in record.get("folders") or []:
-                    paths = picks["folders"].setdefault(str(name)[:40], [])
-                    if restored_rel not in paths:
-                        paths.append(restored_rel)
-                for key in ("ranks", "ratings", "elo", "elo_matches", "tags"):
-                    if key in record:
-                        picks[key][restored_rel] = record[key]
-            save_picks(picks)
-    manifest["restored_at"] = datetime.now().isoformat(timespec="seconds")
-    manifest["restored"] = restored
-    manifest["restore_status"] = "complete"
-    atomic_write_json(manifest_path, manifest, indent=2)
-    return {"restored": len(restored), "paths": restored}
+    return _output_lifecycle.restore_trash_batch(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        cfg,
+        batch_id,
+    )
 
 
 def list_trash_batches(cfg):
-    """앱을 다시 연 뒤에도 복원할 수 있도록 휴지통 묶음의 가벼운 목록만 만든다."""
-    root = out_root(cfg).resolve()
-    trash_root = (root / TRASH_DIR_NAME).resolve()
-    if not trash_root.is_dir():
-        return {"ok": True, "batches": [], "total_files": 0, "total_bytes": 0}
-    rows = []
-    for batch in sorted(trash_root.iterdir(), reverse=True):
-        manifest_path = batch / "manifest.json"
-        if not batch.is_dir() or not manifest_path.is_file():
-            continue
-        try:
-            manifest = load_json_recover(manifest_path)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
-            continue
-        items = [item for item in manifest["items"] if isinstance(item, dict)]
-        available, size = 0, 0
-        for item in items:
-            path = (root / str(item.get("trashed") or "")).resolve()
-            if _path_is_inside(path, batch) and path.is_file():
-                available += 1
-                try:
-                    size += path.stat().st_size
-                except OSError:
-                    pass
-        rows.append({
-            "batch_id": str(manifest.get("batch_id") or batch.name),
-            "created_at": str(manifest.get("created_at") or ""),
-            "available": available,
-            "total": len(items),
-            "bytes": size,
-            "status": str(manifest.get("restore_status")
-                          or manifest.get("status") or ""),
-        })
-    return {
-        "ok": True,
-        "batches": rows,
-        "total_files": sum(row["available"] for row in rows),
-        "total_bytes": sum(row["bytes"] for row in rows),
-    }
-
-
-_DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각) — CQA-002 부분 조치
+    return _output_lifecycle.list_trash_batches(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        cfg,
+    )
 
 
 def _dir_img_count(p):
-    """하위 폴더의 재귀 이미지 수 — 30초 캐시. 탐색기를 오갈 때마다
-    전체 트리를 다시 걷는 낭비를 막는다 (완전한 서버측 페이징은 필터
-    의미가 바뀌는 문제라 사용자 결정 대기)."""
-    now = time.time()
-    hit = _DIR_COUNT_CACHE.get(str(p))
-    if hit and now - hit[1] < 30:
-        return hit[0]
-    n = sum(1 for f in p.rglob("*") if f.suffix.lower() in IMG_EXT)
-    _DIR_COUNT_CACHE[str(p)] = (n, now)
-    return n
+    return _output_lifecycle.dir_image_count(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        p,
+    )
 
 
 def comparison_manifests_for_output_dir(cfg, sub):
-    """현재 출력 폴더를 감싸는 비교 manifest만 안전하게 읽는다."""
-    root = out_root(cfg).resolve()
-    current = (root / str(sub or "")).resolve()
-    if not _path_is_inside(current, root):
-        return []
-    manifests = []
-    while current != root:
-        path = current / "manifest.json"
-        if path.is_file():
-            try:
-                value = load_json_recover(path)
-                if isinstance(value, dict):
-                    value = copy.deepcopy(value)
-                    value.setdefault(
-                        "folder",
-                        current.relative_to(root).as_posix(),
-                    )
-                    manifests.append(value)
-            except Exception as error:
-                log.warning(
-                    "비교 결과 계보를 읽지 못했습니다(%s): %s",
-                    path.name, error,
-                )
-            break
-        current = current.parent
-    return manifests
+    return _output_lifecycle.comparison_manifests_for_output_dir(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        cfg,
+        sub,
+    )
 
 
 def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=False):
-    """생성물 뿌리 아래를 훑는다. sub 가 비면 최상위.
-    저장 폴더를 바꿨으면(out_dir) 그쪽을 본다 — 탐색기와 저장이 어긋나면 안 된다.
-    limit>0 이면 정렬·필터 뒤 해당 페이지만 반환한다. 기본 0은 내부 호환용 전체 반환."""
-    root = out_root(cfg).resolve()
-    base = (root / sub).resolve() if sub else root
-    trash_root = (root / TRASH_DIR_NAME).resolve()
-    try:
-        inside = base.is_relative_to(root)
-    except AttributeError:
-        inside = str(base).startswith(str(root))
-    if (not (inside and base.is_dir())
-            or base == trash_root or _path_is_inside(base, trash_root)):
-        return {"ok": False, "error": "그런 폴더가 없습니다."}
-    dirs, files = [], []
-    for p in sorted(base.iterdir()):
-        if p.name == TRASH_DIR_NAME:
-            continue
-        rel = str(p.relative_to(root)).replace("\\", "/")
-        if p.is_dir():
-            dirs.append({"name": p.name, "path": rel, "count": _dir_img_count(p)})
-        elif p.suffix.lower() in IMG_EXT:
-            st = p.stat()
-            files.append({"name": p.name, "path": rel,
-                          "bytes": st.st_size, "mtime": int(st.st_mtime)})
-    files.sort(key=lambda x: -x["mtime"])
-    picks = load_picks()
-    if only_pick:
-        chosen = set(picks["picked"])
-        files = [f for f in files if f["path"] in chosen]
-    if only_fav:
-        chosen = set(picks["fav"])
-        files = [f for f in files if f["path"] in chosen]
-    total = len(files)
-    offset = max(0, int(offset or 0))
-    limit = max(0, min(500, int(limit or 0)))
-    if limit:
-        files = files[offset:offset + limit]
-    else:
-        offset = 0
-    evaluation_projection = project_legacy_evaluations(
-        picks,
-        comparison_manifests=comparison_manifests_for_output_dir(cfg, sub),
-        result_records=[{"path": item["path"]} for item in files],
+    return _output_lifecycle.list_output(
+        _output_lifecycle_paths(),
+        _output_lifecycle_operations(),
+        sub,
+        cfg,
+        limit,
+        offset,
+        only_pick,
+        only_fav,
     )
-    return {"ok": True, "dir": sub, "dirs": dirs, "files": files,
-            "total": total, "offset": offset,
-            "has_more": bool(limit and offset + len(files) < total),
-            "picked": picks["picked"], "fav": picks["fav"],
-            "folders": picks["folders"], "ranks": picks.get("ranks", {}),
-            "ratings": picks.get("ratings", {}),
-            "elo": picks.get("elo", {}),
-            "elo_matches": picks.get("elo_matches", {}),
-            "tags": picks.get("tags", {}),
-            "memos": picks.get("memos", {}),
-            "review_states": picks.get("review_states", {}),
-            "evaluations": evaluation_projection["evaluations"],
-            "evaluation_issues": evaluation_projection["issues"],
-            "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
-
 
 def strip_metadata(data, filename="image.png", max_side=0, quality=95, force_webp=False):
     """메타를 지운 이미지 바이트를 돌려준다. (bytes, 확장자)
