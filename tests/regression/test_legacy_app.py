@@ -5667,6 +5667,46 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("pst-never-cross", json.dumps(
             snapshot, ensure_ascii=False))
 
+        parent_cfg = copy.deepcopy(cfg)
+        parent_cfg["base_prompt"] = "project base"
+        parent_cfg["negative_prompt"] = "project negative"
+        parent = APP.blueprint_common(APP.generation_blueprint(parent_cfg))
+        parent_fingerprint = APP.fingerprint_blueprint(parent)
+        cfg["blueprint_projects"] = [{
+            "id": "project-a", "name": "Project A",
+            "blueprint": parent, "fingerprint": parent_fingerprint,
+        }]
+        cfg["blueprint_inheritance"] = {
+            "project_id": "project-a",
+            "accepted_blueprint": parent,
+            "accepted_fingerprint": parent_fingerprint,
+            "local_overrides": APP.local_overrides(
+                APP.generation_blueprint(cfg), parent),
+        }
+        linked = APP.ConfigServer(
+            json.loads(json.dumps(cfg, ensure_ascii=False))
+        ).snapshot_blueprint()
+        self.assertTrue(linked["inheritance"]["active"])
+        self.assertFalse(linked["inheritance"]["parent_changed"])
+        self.assertEqual(
+            linked["blueprint"]["style"]["base"], cfg["base_prompt"])
+
+        changed_parent = copy.deepcopy(parent)
+        changed_parent["style"]["negative"] = "new parent negative"
+        cfg["blueprint_projects"][0]["blueprint"] = changed_parent
+        cfg["blueprint_projects"][0]["fingerprint"] = (
+            APP.fingerprint_blueprint(changed_parent))
+        restarted = APP.ConfigServer(
+            json.loads(json.dumps(cfg, ensure_ascii=False))
+        ).snapshot_blueprint()
+        self.assertTrue(restarted["inheritance"]["parent_changed"])
+        self.assertEqual(
+            restarted["blueprint"]["style"]["negative"],
+            linked["blueprint"]["style"]["negative"],
+        )
+        self.assertNotIn("pst-never-cross", json.dumps(
+            restarted, ensure_ascii=False))
+
     def test_metadata_thumbnail_local_name_matches_saved_webp_sha256(self):
         metadata = PngInfo()
         metadata.add_text("Comment", json.dumps({

@@ -83,10 +83,14 @@ PNG만으로는 구분하지 못함:
   항목만 원자적으로 복원한 뒤 한 번에 되돌리는 흐름
 - 자료팩의 그림체·레시피·캐릭터 충돌을 먼저 비교하고 고른 자산만 교체하는 흐름.
   신규 항목·내용 주소 이미지는 기존처럼 자동 합치고, 목록 교체도 이전 행까지 Undo
+- 프로젝트 공통 설계도를 승인 사본으로 연결하고 세팅·실험·현재 변경을 우선순위로
+  합치는 흐름. 원본 공통판이 바뀌어도 자동 반영하지 않고 사용자가 적용할 때만
+  현재 생성값과 최종 payload를 갱신
 
 동등한 큰 엔진에 흡수:
 
-- SceneCast·Composition·Project/Template·Scene Sequence → 생성 설계도와 세팅
+- SceneCast·Composition·Project/Template·Scene Sequence → 생성 설계도와 세팅.
+  프로젝트는 별도 SDStudio 화면 복제가 아니라 기존 최종 설계도 안의 상속 레이어
 - Batch·Rotation·Comparison Group·Tournament → 세팅의 실험 규칙
 - Queue·Idempotency·Resume → 공통 Job 실행 계층
 - Style Lab·Organizer·ELO·Snapshot → 평가·승격·보존 흐름
@@ -98,7 +102,6 @@ PNG만으로는 구분하지 못함:
   충돌을 먼저 검사하고 파일별 원자 저장·판별 Undo를 사용
 - 실제 공통 기준본까지 보이는 완전한 3-way 병합. 현재 백업에 기준 해시가 있으면
   표시하지만, 기존 백업은 현재값/들어오는 값의 2-way 선택 복원
-- SDStudio식 프로젝트 계층·템플릿 상속 편집 화면
 - 완성된 캐릭터 이미지 제작 Bench·Reference inset
 - 범용 조건 규칙/DSL과 완전한 X/Y 실험 라벨 그리드
 - 다중 증거 병합과 weighted prompt 중복 검토 전용 화면

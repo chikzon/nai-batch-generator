@@ -18,6 +18,11 @@ from src.nai_studio.domain.experiment import (
     expand_experiment,
     regeneration_identity,
 )
+from src.nai_studio.domain.project_inheritance import (
+    blueprint_common,
+    local_overrides,
+    resolve_inheritance,
+)
 
 
 class BlueprintExperimentContractTests(unittest.TestCase):
@@ -110,19 +115,30 @@ class BlueprintExperimentContractTests(unittest.TestCase):
         resolved = resolve_blueprint_layers(
             [
                 {
-                    "source": {"id": "style"},
+                    "source": {"id": "project"},
                     "priority": 10,
                     "blueprint": {
-                        "style": {"base": "artist"},
+                        "style": {
+                            "base": "artist",
+                            "negative": "project negative",
+                        },
                         "generation": {"seed": 1, "width": 832},
                     },
                 },
                 {
-                    "source": {"id": "user"},
-                    "priority": 100,
+                    "source": {"id": "setting"},
+                    "priority": 20,
                     "blueprint": {
-                        "generation": {"seed": 99},
+                        "generation": {"seed": 55},
                         "setting": {"scene_values": {"place": "park"}},
+                    },
+                },
+                {
+                    "source": {"id": "current"},
+                    "priority": 30,
+                    "blueprint": {
+                        "style": {"negative": ""},
+                        "generation": {"seed": 99},
                     },
                 },
             ],
@@ -130,9 +146,13 @@ class BlueprintExperimentContractTests(unittest.TestCase):
         )
         self.assertEqual(resolved["blueprint"]["generation"]["seed"], 99)
         self.assertEqual(resolved["blueprint"]["generation"]["height"], 1216)
+        self.assertEqual(resolved["blueprint"]["style"]["base"], "artist")
+        self.assertEqual(resolved["blueprint"]["style"]["negative"], "")
+        self.assertEqual(
+            resolved["blueprint"]["setting"]["scene_values"]["place"], "park")
         self.assertEqual(
             resolved["provenance"]["/generation/seed"]["source"]["id"],
-            "user",
+            "current",
         )
         conflict = next(
             item for item in resolved["conflicts"]
@@ -140,6 +160,37 @@ class BlueprintExperimentContractTests(unittest.TestCase):
         )
         self.assertEqual(conflict["rule"], "higher-priority")
         self.assertEqual(conflict["winner"]["value"], 99)
+
+        parent = blueprint_common({
+            "style": {"base": "parent", "negative": "keep"},
+            "generation": {"seed": 1, "width": 832},
+        })
+        current = canonical_generation_plan(copy.deepcopy(parent))
+        current["style"]["base"] = "local"
+        overrides = local_overrides(current, parent)
+        inherited = resolve_inheritance(
+            current,
+            [{
+                "id": "p", "name": "P", "blueprint": parent,
+                "fingerprint": fingerprint_blueprint(parent),
+            }],
+            {
+                "project_id": "p",
+                "accepted_blueprint": parent,
+                "accepted_fingerprint": fingerprint_blueprint(parent),
+                "local_overrides": overrides,
+            },
+        )
+        self.assertEqual(inherited["blueprint"]["style"]["base"], "local")
+        self.assertEqual(inherited["blueprint"]["style"]["negative"], "keep")
+        self.assertEqual(
+            inherited["provenance"]["/style/base"]["source"]["kind"],
+            "current-overrides",
+        )
+        self.assertEqual(
+            inherited["provenance"]["/style/negative"]["source"]["kind"],
+            "project",
+        )
 
     def test_style_character_seed_cross_is_deterministic_and_resumable(self):
         blueprint = {

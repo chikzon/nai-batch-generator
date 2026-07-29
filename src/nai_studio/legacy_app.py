@@ -54,6 +54,14 @@ from src.nai_studio.domain.blueprint import (
     fingerprint_blueprint,
     summarize_blueprint,
 )
+from src.nai_studio.domain.project_inheritance import (
+    blueprint_common,
+    local_overrides,
+    normalize_link,
+    normalize_projects,
+    project_by_id,
+    resolve_inheritance,
+)
 from src.nai_studio.domain.experiment import canonical_experiment_rule
 from src.nai_studio.domain.positioning import (
     normalize_position_mode,
@@ -758,6 +766,10 @@ DEFAULT_CONFIG = {
     "char_slots": [],        # ① 설정의 캐릭터 칸들 (한 그림에 함께 들어갈 인물): [{name, prompt, negative}]
     "setting_state": {},        # 세팅 이름 → {use, selected, opts, cast: [{name, prompt, negative}]}
     "cast_presets": [],         # 세팅 사이에서 재사용하는 캐릭터 조합: [{id, name, members}]
+    # 프로젝트 공통 설계도는 기존 생성값을 대체하는 새 저장소가 아니다. 사용자가
+    # 명시적으로 연결한 경우에만 승인 사본을 물려받고, 이후 현재 변경은 별도로 남긴다.
+    "blueprint_projects": [],
+    "blueprint_inheritance": {},
     "ui": {},                   # 화면 설정 {theme, accent, fs, radius}
 }
 
@@ -7948,7 +7960,7 @@ def comparison_recipe_context(cfg, plan, styles, chars):
     }
     # 기존 비교 기록 필드는 그대로 두고 같은 내용을 생성 설계도 관점에서도 남긴다.
     # 과거 기록을 읽는 코드는 영향을 받지 않고, 새 화면·챗봇 계약은 한 경계를 사용한다.
-    context["blueprint"] = generation_blueprint(
+    context["blueprint"] = inherited_blueprint(
         cfg,
         source={"kind": "comparison-plan"},
         experiment={
@@ -9353,6 +9365,53 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
     blueprint["fingerprint"] = fingerprint_blueprint(blueprint)
     blueprint["summary"] = summarize_blueprint(blueprint)
     return blueprint
+
+
+def inherited_blueprint_resolution(cfg, *, source=None, setting=None,
+                                   experiment=None, runtime=None):
+    """현재 cfg를 프로젝트 승인 사본과 합친 생성 전 판정.
+
+    연결이 없으면 기존 ``generation_blueprint``를 그대로 돌려주므로 레거시
+    생성·세팅·비교 경로의 값은 달라지지 않는다.
+    """
+    current = generation_blueprint(
+        cfg, source=source, setting=setting, experiment=experiment)
+    return resolve_inheritance(
+        current,
+        cfg.get("blueprint_projects") or [],
+        cfg.get("blueprint_inheritance") or {},
+        runtime=runtime,
+    )
+
+
+def inherited_blueprint(cfg, *, source=None, setting=None,
+                        experiment=None, runtime=None):
+    return inherited_blueprint_resolution(
+        cfg, source=source, setting=setting, experiment=experiment,
+        runtime=runtime,
+    )["blueprint"]
+
+
+def sync_blueprint_local_overrides(cfg):
+    """승인 뒤 현재 화면에서 실제로 바꾼 공통값만 연결 계약에 기록한다."""
+    link = normalize_link(cfg.get("blueprint_inheritance") or {})
+    if not link:
+        cfg["blueprint_inheritance"] = {}
+        return {}
+    link["local_overrides"] = local_overrides(
+        generation_blueprint(cfg),
+        link.get("accepted_blueprint") or {},
+    )
+    cfg["blueprint_inheritance"] = link
+    return link
+
+
+def materialize_blueprint_into_config(cfg, blueprint):
+    """resolved plan을 기존 실행 설정에 투영하되 원본 cfg는 바꾸지 않는다."""
+    result = copy.deepcopy(cfg or {})
+    material = single_generation_legacy_material(blueprint)
+    result.update(copy.deepcopy(material.get("config_overrides") or {}))
+    return result
 
 
 def with_centers(cfg, ctrs):
@@ -11873,8 +11932,26 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             <span class="result-action-msg" id="pvResultMsg"></span>
           </div>
           <details class="blueprint-plan" id="blueprintPlan">
-            <summary>최종 생성 설계도 <span class="hint">Prompt·캐릭터·자료·세팅·실험·출력</span></summary>
+            <summary>최종 생성 설계도 <span class="hint">Prompt·캐릭터·자료·세팅·실험·출력</span>
+              <span class="count" id="blueprintProjectBadge"></span></summary>
+            <div class="filterbar" style="margin:8px 0;">
+              <select id="blueprintProjectSelect" aria-label="프로젝트 공통 설계도">
+                <option value="">프로젝트 없음</option>
+              </select>
+              <input id="blueprintProjectName" maxlength="120" placeholder="공통 설계도 이름"
+                     style="min-width:160px;flex:1;">
+              <button type="button" id="blueprintProjectCreate">현재값 새로 저장</button>
+              <button type="button" id="blueprintProjectUpdate">선택 공통값 갱신</button>
+              <button type="button" id="blueprintProjectActivate" class="primary">연결하고 적용</button>
+              <button type="button" id="blueprintProjectAccept" class="hidden">새 공통판 적용</button>
+              <button type="button" id="blueprintProjectDisconnect" class="hidden">연결 해제</button>
+            </div>
+            <div class="hint" id="blueprintProjectState">
+              프로젝트를 쓰지 않으면 지금까지의 생성 흐름이 그대로 유지됩니다.
+            </div>
             <div class="blueprint-summary" id="blueprintSummary">현재 값을 해석하는 중입니다.</div>
+            <div class="hint" id="blueprintLayers"></div>
+            <div class="hint" id="blueprintConflicts"></div>
             <pre class="blueprint-json" id="blueprintJson"></pre>
           </details>
           <div class="pbar"><div id="pvBar"></div></div>
@@ -12862,6 +12939,7 @@ window.addEventListener('unhandledrejection', event => showFatalError(event.reas
 
 let STATE = null, SAVED_STATE = null, SETTINGS = [], STYLES = [], SPEC = {}, BUILDER = {}, SCENE_PRESETS = [], HIST = [];
 let LAST_STUDIO_LAYOUT = null;
+let BLUEPRINT_INHERITANCE = {};
 let FRAGS = {};
 const RES_PRESETS = __RESJSON__;   // 해상도 프리셋 (파이썬 RESOLUTIONS 와 같은 목록)
 
@@ -12887,22 +12965,105 @@ function showStartupRecovery(notice){
 
 async function loadBlueprint(){
   const host = $('blueprintPlan');
-  if(!host || !host.open) return;
+  if(!host) return;
   $('blueprintSummary').textContent = '현재 저장값을 생성 설계도로 해석하는 중입니다.';
   try{
     const result = await (await fetch('/api/blueprint')).json();
     if(!result.ok) throw new Error(result.error || '설계도를 만들지 못했습니다.');
     const bp = result.blueprint || {};
+    const inheritance = result.inheritance || {};
+    BLUEPRINT_INHERITANCE = inheritance;
     const s = bp.summary || {};
     const size = s.width && s.height ? `${s.width}×${s.height}` : '크기 미정';
     $('blueprintSummary').textContent =
       `${s.model || '모델 미정'} · ${size} · 캐릭터 ${Number(s.characters||0)}명`
       + ` · 바이브 ${Number(s.vibes||0)} · 레퍼런스 ${Number(s.references||0)}`
       + ` · ${s.experiment_mode || 'single'} · 지문 ${(s.fingerprint||'').slice(0,12)}`;
-    $('blueprintJson').textContent = JSON.stringify(bp, null, 2);
+    const select = $('blueprintProjectSelect');
+    const oldSelection = select.value;
+    select.innerHTML = '<option value="">프로젝트 없음</option>'
+      + (inheritance.projects || []).map(project =>
+        `<option value="${escA(project.id)}">${esc(project.name)} · ${(project.fingerprint||'').slice(0,8)}</option>`
+      ).join('');
+    select.value = inheritance.id || oldSelection || '';
+    const active = !!inheritance.active;
+    const changed = !!inheritance.parent_changed;
+    $('blueprintProjectBadge').textContent = active
+      ? `${inheritance.name || '프로젝트'}${changed ? ' · 갱신 확인 필요' : ' · 연결됨'}`
+      : '';
+    $('blueprintProjectAccept').classList.toggle('hidden', !changed);
+    $('blueprintProjectDisconnect').classList.toggle('hidden', !active);
+    $('blueprintProjectState').textContent = active
+      ? `${inheritance.name || '이름 없는 프로젝트'} 연결 · 물려받은 값 ${Number(inheritance.inherited_paths||0)}개`
+        + ` · 현재·세팅 변경 ${Number(inheritance.override_paths||0)}개`
+        + (inheritance.missing ? ' · 원본 없음(승인 사본은 유지)' : '')
+        + (changed ? ' · 새 공통판 있음 — 적용 전까지 기존 판 유지' : ' · 승인 판과 일치')
+      : '프로젝트를 쓰지 않음 · 지금까지의 생성 흐름 그대로';
+    $('blueprintLayers').textContent = active
+      ? '우선순위: 프로젝트 공통값 → 세팅·실험 → 현재 변경값 → 최종 전송값'
+      : '현재 생성값 → 최종 전송값';
+    const conflicts = inheritance.conflicts || [];
+    $('blueprintConflicts').textContent = conflicts.length
+      ? `충돌 ${conflicts.length}개 · ${conflicts.slice(0,6).map(item => item.path).join(' · ')}`
+      : '충돌 없음';
+    $('blueprintJson').textContent = JSON.stringify({
+      resolved: bp,
+      provenance: inheritance.provenance || {},
+      conflicts,
+    }, null, 2);
   }catch(error){
     $('blueprintSummary').textContent = String(error);
     $('blueprintJson').textContent = '';
+  }
+}
+
+async function blueprintProjectAction(action){
+  const select = $('blueprintProjectSelect');
+  const name = ($('blueprintProjectName').value || '').trim();
+  const body = {action, id: select.value || '', name};
+  if(action === 'accept') body.fingerprint =
+    BLUEPRINT_INHERITANCE.current_fingerprint || '';
+  if((action === 'create' || action === 'update') && !name){
+    flash('공통 설계도 이름을 적어주세요.'); return;
+  }
+  if((action === 'update' || action === 'activate') && !body.id){
+    flash('프로젝트를 먼저 골라주세요.'); return;
+  }
+  try{
+    const result = await (await fetch('/api/blueprint_project', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    })).json();
+    if(!result.ok) throw new Error(result.error || '프로젝트 작업에 실패했습니다.');
+    location.reload();
+  }catch(error){
+    flash(String(error));
+  }
+}
+
+function bindBlueprintProjects(){
+  const bindings = {
+    blueprintProjectCreate:'create',
+    blueprintProjectUpdate:'update',
+    blueprintProjectActivate:'activate',
+    blueprintProjectAccept:'accept',
+    blueprintProjectDisconnect:'disconnect',
+  };
+  Object.entries(bindings).forEach(([id, action]) => {
+    const button = $(id);
+    if(button && !button._bound){
+      button._bound = true;
+      button.addEventListener('click', () => blueprintProjectAction(action));
+    }
+  });
+  const select = $('blueprintProjectSelect');
+  if(select && !select._bound){
+    select._bound = true;
+    select.addEventListener('change', () => {
+      const project = (BLUEPRINT_INHERITANCE.projects || [])
+        .find(item => item.id === select.value);
+      if(project) $('blueprintProjectName').value = project.name || '';
+    });
   }
 }
 
@@ -12934,6 +13095,8 @@ async function init(){
     $('blueprintPlan')._bound = true;
     $('blueprintPlan').addEventListener('toggle', loadBlueprint);
   }
+  bindBlueprintProjects();
+  loadBlueprint();
 }
 
 /* 세팅 파일이 디스크에서 바뀐 뒤 목록만 다시 받는다.
@@ -21177,6 +21340,10 @@ def validate_config_value(key, value, current):
                 fixed["pace.delay_max"] = {"sent": sent, "used": used["delay_max"]}
         elif key == "cast_presets":
             used = normalize_cast_presets(value)
+        elif key == "blueprint_projects":
+            used = normalize_projects(value)
+        elif key == "blueprint_inheritance":
+            used = normalize_link(value)
         elif key == "position_mode":
             used = str(value or "").strip().lower()
             if used not in ("", "ai", "grid", "coordinate"):
@@ -22344,11 +22511,128 @@ class ConfigServer:
     def snapshot_blueprint(self):
         """현재 화면값의 파생 설계도. 토큰과 전체 사용자 자료는 포함하지 않는다."""
         with self.config_lock:
+            resolution = inherited_blueprint_resolution(self.cfg)
             return {
                 "ok": True,
-                "blueprint": generation_blueprint(self.cfg),
+                # 기존 소비자는 계속 blueprint 하나만 읽어도 된다.
+                "blueprint": resolution["blueprint"],
+                "inheritance": {
+                    **copy.deepcopy(resolution.get("project") or {}),
+                    "projects": [
+                        {
+                            "id": item.get("id"),
+                            "name": item.get("name"),
+                            "fingerprint": item.get("fingerprint"),
+                            "updated_at": item.get("updated_at"),
+                        }
+                        for item in (self.cfg.get("blueprint_projects") or [])
+                        if isinstance(item, dict)
+                    ],
+                    "provenance": copy.deepcopy(
+                        resolution.get("provenance") or {}),
+                    "conflicts": copy.deepcopy(
+                        resolution.get("conflicts") or []),
+                },
                 "knowledge_assets": knowledge_assets_from_config(self.cfg),
             }
+
+    @serialized_data_write(lambda: CHAR_DIR.parent)
+    def handle_blueprint_project(self, body):
+        """프로젝트 공통값 저장·연결·갱신은 자동저장과 분리해 명시적으로 처리."""
+        try:
+            request = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "잘못된 프로젝트 요청입니다."}
+        action = str(request.get("action") or "").strip().lower()
+        if action not in ("create", "update", "activate", "accept", "disconnect"):
+            return {"ok": False, "error": "알 수 없는 프로젝트 작업입니다."}
+        with self.config_lock:
+            cfg = self.latest_config_from_disk()
+            projects = normalize_projects(cfg.get("blueprint_projects") or [])
+            link = normalize_link(cfg.get("blueprint_inheritance") or {})
+            project_id = str(request.get("id") or link.get("project_id") or "")
+            current = generation_blueprint(cfg)
+
+            if action in ("create", "update"):
+                name = str(request.get("name") or "").strip()
+                if not name or len(name) > 120:
+                    return {"ok": False, "error": "프로젝트 이름을 1~120자로 적어주세요."}
+                if action == "create":
+                    project_id = f"project-{uuid.uuid4().hex}"
+                existing = project_by_id(projects, project_id)
+                if action == "update" and existing is None:
+                    return {"ok": False, "error": "갱신할 프로젝트를 찾지 못했습니다."}
+                common = blueprint_common(current)
+                record = {
+                    "id": project_id,
+                    "name": name,
+                    "blueprint": common,
+                    "fingerprint": fingerprint_blueprint(common),
+                    "updated_at": datetime.now().astimezone().isoformat(
+                        timespec="seconds"),
+                }
+                projects = [
+                    item for item in projects if item.get("id") != project_id
+                ] + [record]
+                cfg["blueprint_projects"] = normalize_projects(projects)
+
+            elif action == "activate":
+                project = project_by_id(projects, project_id)
+                if project is None:
+                    return {"ok": False, "error": "연결할 프로젝트를 찾지 못했습니다."}
+                accepted = blueprint_common(project["blueprint"])
+                new_link = {
+                    "schema": "nai-blueprint-inheritance/v1",
+                    "project_id": project_id,
+                    "accepted_fingerprint": project["fingerprint"],
+                    "accepted_blueprint": accepted,
+                    "local_overrides": {},
+                }
+                resolution = resolve_inheritance(
+                    current, projects, new_link)
+                cfg = materialize_blueprint_into_config(
+                    cfg, resolution["blueprint"])
+                cfg["blueprint_projects"] = projects
+                cfg["blueprint_inheritance"] = normalize_link(new_link)
+
+            elif action == "accept":
+                if not link:
+                    return {"ok": False, "error": "연결된 프로젝트가 없습니다."}
+                project = project_by_id(projects, link["project_id"])
+                if project is None:
+                    return {"ok": False, "error": "프로젝트 원본을 찾지 못했습니다."}
+                expected = str(request.get("fingerprint") or "")
+                if expected and expected != str(project.get("fingerprint") or ""):
+                    return {
+                        "ok": False,
+                        "conflict": True,
+                        "error": "확인 뒤 프로젝트 공통값이 다시 바뀌었습니다. 내용을 다시 확인해 주세요.",
+                    }
+                new_link = copy.deepcopy(link)
+                new_link["accepted_blueprint"] = blueprint_common(
+                    project["blueprint"])
+                new_link["accepted_fingerprint"] = project["fingerprint"]
+                # 명시해 둔 현재 변경만 새 부모보다 위에 유지한다.
+                resolution = resolve_inheritance(
+                    current, projects, new_link)
+                cfg = materialize_blueprint_into_config(
+                    cfg, resolution["blueprint"])
+                cfg["blueprint_projects"] = projects
+                cfg["blueprint_inheritance"] = normalize_link(new_link)
+
+            else:  # disconnect
+                cfg["blueprint_inheritance"] = {}
+
+            save_config(cfg)
+            self.cfg.clear()
+            self.cfg.update(cfg)
+            self.config_revision += 1
+            snapshot = self.snapshot_blueprint()
+            snapshot.update({
+                "revision": self.config_revision,
+                "project_id": project_id,
+            })
+            return snapshot
 
     def snapshot_sequence(self, name=""):
         """기존 세팅 파일을 바꾸지 않고 공통 순서 계획으로 보여 준다."""
@@ -22381,7 +22665,7 @@ class ConfigServer:
                         live.get("operation"), live.get("retry_mode")),
                     job_id=live.get("job_id") or "",
                     blueprint=(
-                        frozen_blueprint or generation_blueprint(
+                        frozen_blueprint or inherited_blueprint(
                             self.cfg,
                             source={"kind": "live-state-projection-fallback"},
                         )
@@ -22492,7 +22776,7 @@ class ConfigServer:
             cfg = copy.deepcopy(self.cfg)
         if not cfg.get("token", "").startswith("pst-"):
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-        blueprint = generation_blueprint(
+        blueprint = inherited_blueprint(
             cfg, source={"kind": "single-generate"})
         material = single_generation_legacy_material(blueprint)
         job_cfg = copy.deepcopy(cfg)
@@ -22673,7 +22957,7 @@ class ConfigServer:
         tok = self.live.try_claim(
             mode,
             "preview",
-            blueprint=generation_blueprint(
+            blueprint=inherited_blueprint(
                 job_cfg,
                 source={
                     "kind": "character-variation" if variation_id else (
@@ -22808,7 +23092,7 @@ class ConfigServer:
         tok = self.live.try_claim(
             "그림체 복구",
             "library",
-            blueprint=generation_blueprint(
+            blueprint=inherited_blueprint(
                 cfg,
                 source={"kind": "metadata-recovery", "items": len(jobs)},
             ),
@@ -22944,7 +23228,7 @@ class ConfigServer:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-        run_blueprint = generation_blueprint(
+        run_blueprint = inherited_blueprint(
             cfg,
             source={"kind": "scene-run"},
             setting={"name": "씬 모드", "steps": copy.deepcopy(jobs)},
@@ -23337,7 +23621,7 @@ class ConfigServer:
         tok = self.live.try_claim(
             "자료 비교 생성",
             "library",
-            blueprint=generation_blueprint(
+            blueprint=inherited_blueprint(
                 run_cfg,
                 source={"kind": "comparison-plan"},
                 experiment={
@@ -23732,7 +24016,7 @@ class ConfigServer:
             tok = self.live.try_claim(
                 f"디렉터 · {tool}",
                 "director",
-                blueprint=generation_blueprint(
+                blueprint=inherited_blueprint(
                     self.cfg,
                     source={"kind": "director", "tool": tool},
                 ),
@@ -23908,6 +24192,9 @@ class ConfigServer:
                 accepted.append(key)
             new_ids = {c.get("id") for c in self.cfg.get("characters", [])}
             sync_chars_to_files(self.cfg)
+            # 프로젝트 연결 뒤의 일반 편집은 부모 전체를 복제하지 않고 실제로
+            # 달라진 leaf만 override로 기록한다.
+            sync_blueprint_local_overrides(self.cfg)
             # 새 설정과 남은 캐릭터 파일이 먼저 디스크에 확정된 뒤 삭제본을 목록 밖
             # 백업으로 옮긴다. 중간 종료 시 삭제가 취소될 수는 있어도 원문이 사라지지 않는다.
             save_config(self.cfg)
@@ -24672,6 +24959,11 @@ class ConfigServer:
                             "restoration": summarize_restore_queue(queue),
                             "restoration_queue": queue,
                         })
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/blueprint_project"):
+                    try:
+                        self._json(server.handle_blueprint_project(body))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/save"):
@@ -26849,7 +27141,7 @@ def main():
         tok = server.live.try_claim(
             "세팅 배치 생성",
             "settings",
-            blueprint=generation_blueprint(
+            blueprint=inherited_blueprint(
                 run_cfg,
                 source={"kind": "settings-batch"},
             ),

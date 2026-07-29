@@ -102,6 +102,12 @@ class BlueprintExecutionBridgeContractTests(unittest.TestCase):
         cfg = self.fixture()
         blueprint = APP.generation_blueprint(cfg)
         material = single_generation_legacy_material(blueprint)
+        disconnected = APP.inherited_blueprint_resolution(cfg)
+        self.assertEqual(disconnected["blueprint"], blueprint)
+        self.assertEqual(
+            single_generation_legacy_material(disconnected["blueprint"]),
+            material,
+        )
         people, centers = APP.active_people(
             cfg["char_slots"], cfg["char_centers"]
         )
@@ -139,6 +145,41 @@ class BlueprintExecutionBridgeContractTests(unittest.TestCase):
         )
         self.assertEqual(
             material["config_overrides"]["out_dir"], "D:/results"
+        )
+
+        parent_cfg = self.fixture()
+        parent_cfg["base_prompt"] = "project base"
+        parent_cfg["negative_prompt"] = "project negative"
+        parent_cfg["nai_seed"] = 17
+        parent = APP.generation_blueprint(parent_cfg)
+        parent_common = APP.blueprint_common(parent)
+        cfg["blueprint_projects"] = [{
+            "id": "project-a",
+            "name": "Project A",
+            "blueprint": parent_common,
+            "fingerprint": APP.fingerprint_blueprint(parent_common),
+        }]
+        cfg["blueprint_inheritance"] = {
+            "project_id": "project-a",
+            "accepted_blueprint": parent_common,
+            "accepted_fingerprint": APP.fingerprint_blueprint(parent_common),
+            "local_overrides": APP.local_overrides(blueprint, parent_common),
+        }
+        inherited = APP.inherited_blueprint_resolution(cfg)
+        inherited_material = single_generation_legacy_material(
+            inherited["blueprint"])
+        self.assertEqual(
+            inherited_material["call"]["base_prompt"], cfg["base_prompt"])
+        self.assertEqual(
+            inherited_material["call"]["negative_prompt"],
+            cfg["negative_prompt"],
+        )
+        self.assertEqual(inherited_material["call"]["seed"], cfg["nai_seed"])
+        self.assertEqual(
+            inherited_material["call"]["width"], cfg["width"])
+        self.assertEqual(
+            inherited_material["call"]["generation_settings"]["cfg_scale"],
+            cfg["cfg_scale"],
         )
 
     def test_character_split_unknowns_and_resource_selection_are_lossless(self):
