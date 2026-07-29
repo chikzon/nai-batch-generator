@@ -12,8 +12,9 @@
    - [NEXT_TASK.md](NEXT_TASK.md)
 5. 사용자 판단이 필요한 사항
    - [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)
-6. 현재 릴리스 후보와 Claude push 인계
+6. 과거 릴리스 후보와 Claude push 인계
    - [CLAUDE_PUSH_HANDOFF.md](CLAUDE_PUSH_HANDOFF.md)
 
 과거 문서와 archive 자료는 역사·증거이며 현재 지시보다 우선하지 않는다. 문서가
-충돌하면 최신 사용자 지시, `NEXT_TASK.md`, push 인계서를 우선한다.
+충돌하면 최신 사용자 지시와 `NEXT_TASK.md`를 우선한다. push 인계서는 현재
+데스크톱 통합 작업이 끝나기 전에는 실행 지시가 아니라 과거 릴리스 후보 기록이다.
