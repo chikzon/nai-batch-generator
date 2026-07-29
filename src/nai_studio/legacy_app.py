@@ -192,20 +192,27 @@ from src.nai_studio.services import (
     comparison_planning as _comparison_planning,
     comparison_promotion as _comparison_promotion,
     comparison_runtime as _comparison_runtime,
+    data_inventory as _data_inventory,
     datapack_store as _datapack_store,
     generation_commit as _generation_commit,
     generation_execution as _generation_execution,
     generation_handlers as _generation_handlers,
+    generation_pacing as _generation_pacing,
+    generation_progress as _generation_progress,
     generation_retry as _generation_retry,
     generation_step as _generation_step,
     image_tool_handlers as _image_tool_handlers,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
+    management_state as _management_state,
     metadata_candidate_store as _metadata_candidate_store,
+    nai_auxiliary as _nai_auxiliary,
     output_lifecycle as _output_lifecycle,
     program_data_migration as _program_data_migration,
     public_style_import as _public_style_import,
+    reference_preparation as _reference_preparation,
     remote_image_cache as _remote_image_cache,
+    resource_bridge as _resource_bridge,
     setting_runtime as _setting_runtime,
     setting_store as _setting_store,
     settings_handlers as _settings_handlers,
@@ -323,6 +330,7 @@ from src.nai_studio.services.variation_bridge import (
 from src.nai_studio.domain.variations import accept_variation
 from src.nai_studio.web import (
     app_wiring as _app_wiring,
+    page_renderer as _page_renderer,
     server_runtime as _server_runtime,
 )
 from src.nai_studio.web.http_server import (
@@ -481,17 +489,7 @@ PACE_DEFAULT = {"delay_min": 5.5, "delay_max": 11.5,
 
 
 def pace(cfg):
-    """밴 예방 설정 — 없는 값은 기본값으로 채운다."""
-    p = dict(PACE_DEFAULT)
-    for k, v in (cfg.get("pace") or {}).items():
-        if k in p:
-            try:
-                p[k] = float(v) if k.startswith("delay") else int(v)
-            except (TypeError, ValueError):
-                pass
-    if p["delay_max"] < p["delay_min"]:
-        p["delay_max"] = p["delay_min"]
-    return p
+    return _generation_pacing.normalize_pace(cfg, PACE_DEFAULT)
 PREVIEW_PORT_RANGE = range(8787, 8797)   # 설정 UI / 실시간 미리보기 서버 포트 후보
 
 log = configure_application_logging(LOG_FILE, stream=sys.stdout)
@@ -749,127 +747,80 @@ def resource_file_index(cfg):
     return files
 
 
+def _resource_import_paths():
+    return _resource_bridge.LegacyResourceImportPaths(
+        vibe_dir=VIBE_DIR,
+        transaction_root=VIBE_DIR.parent.parent,
+    )
+
+
+def _resource_import_operations():
+    return _resource_bridge.LegacyResourceImportOperations(
+        transaction=shared_data_transaction,
+        atomic_write_bytes=_atomic_write_bytes,
+        save_config=save_config,
+    )
+
+
+def _reference_operations():
+    """현재 프로필 파일·HTTP·원자 저장을 Reference 서비스에 연결한다."""
+    return _reference_preparation.ReferenceOperations(
+        vibe_dir=VIBE_DIR,
+        settings_file=SETTINGS_FILE,
+        default_config=DEFAULT_CONFIG,
+        vibe_paths=globals()["vibe_paths"],
+        encode_vibe=globals()["encode_vibe"],
+        atomic_write_text=globals()["atomic_write_text"],
+        transaction=globals()["shared_data_transaction"],
+        load_json=globals()["load_json_recover"],
+        save_config=globals()["save_config"],
+        http_post=globals()["requests"].post,
+        warning=globals()["log"].warning,
+        info=globals()["log"].info,
+    )
+
+
 def encode_vibe(token, image_bytes, information_extracted=0.7,
                 model="nai-diffusion-4-5-full"):
-    """그림 → 인코딩된 바이브(base64). 2 Anlas 소모. 결과는 캐시해서 재사용한다."""
-    import base64
-    b64, _, _ = _b64_png(image_bytes)
-    r = requests.post(ENCODE_VIBE_URL, timeout=180, headers={
-        "Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"image": b64, "information_extracted": float(information_extracted),
-              "model": model})
-    if r.status_code == 401:
-        raise AuthError("401 — 토큰을 확인하세요.")
-    if r.status_code == 429:
-        raise RateLimitError("429 Too Many Requests")
-    if r.status_code != 200:
-        raise APIError(f"바이브 인코딩 실패 HTTP {r.status_code}: {r.text[:200]}")
-    return base64.b64encode(r.content).decode("ascii")
+    return _reference_preparation.encode_vibe(
+        _reference_operations(),
+        ENCODE_VIBE_URL,
+        token,
+        image_bytes,
+        information_extracted,
+        model,
+    )
 
 
 def prepare_vibes(cfg, token):
-    """켜진 바이브들을 준비. 인코딩이 없거나 information_extracted 가 바뀌면 다시 인코딩.
-    반환: ([encoded base64...], [strength...], [information_extracted...], 새로 인코딩한 개수)"""
-    encoded, strengths, ies, newly = [], [], [], 0
-    changed = False
-    for v in cfg.get("vibes", []):
-        if not v.get("enabled"):
-            continue
-        img_p, enc_p = vibe_paths(v.get("id", ""))
-        ie = float(v.get("info_extracted", 0.7))
-        need = (not enc_p.exists()) or abs(float(v.get("encoded_ie", -1)) - ie) > 1e-9
-        if need:
-            if not img_p.exists():
-                log.warning(f"바이브 원본이 없습니다: {img_p.name}")
-                continue
-            enc = encode_vibe(token, img_p.read_bytes(), ie,
-                              cfg.get("model") or "nai-diffusion-4-5-full")
-            atomic_write_text(
-                enc_p, enc, encoding="ascii", keep_backup=False)
-            v["encoded_ie"] = ie
-            newly += 1
-            changed = True
-            log.info(f"바이브 인코딩: {v.get('name')} (정보추출 {ie}) — 2 Anlas")
-        encoded.append(enc_p.read_text(encoding="ascii"))
-        strengths.append(float(v.get("strength", 0.6)))
-        ies.append(ie)
-    if changed:
-        with shared_data_transaction(VIBE_DIR.parent.parent):
-            # 인코딩은 최대 180초가 걸린다. 그 사이 다른 실행본이 저장한 설정을
-            # 시작 시점의 cfg 전체로 덮지 않고, 같은 id의 캐시 상태만 최신판에 합친다.
-            latest = dict(DEFAULT_CONFIG)
-            if SETTINGS_FILE.is_file():
-                loaded = load_json_recover(SETTINGS_FILE)
-                if isinstance(loaded, dict):
-                    latest.update(loaded)
-            encoded_ie = {
-                item.get("id"): item.get("encoded_ie")
-                for item in cfg.get("vibes", [])
-                if item.get("id") and item.get("encoded_ie") is not None
-            }
-            for item in latest.get("vibes", []):
-                if item.get("id") in encoded_ie:
-                    item["encoded_ie"] = encoded_ie[item.get("id")]
-            save_config(latest)      # 캐시 상태를 남겨 다음엔 공짜로 쓴다
-    return encoded, strengths, ies, newly
+    return _reference_preparation.prepare_vibes(
+        _reference_operations(),
+        cfg,
+        token,
+    )
 
 
 # ★ 캐릭터 레퍼런스 참조 이미지는 **이 세 캔버스 중 하나**여야 한다.
 #   다른 크기를 보내면 NAI 가 400 "Error encoding v4 director references" 를 준다.
 #   (512·832×1216·1024² 전부 실패했고 이 셋만 통과했다 — 실측)
 #   비율을 지켜 넣고 남는 곳은 검게 채운다(레터박스).
-CR_CANVAS = ((1024, 1536), (1536, 1024), (1472, 1472))
+CR_CANVAS = _reference_preparation.REFERENCE_CANVASES
 
 
 def _cr_canvas_for(w, h):
-    """비율이 가장 가까운 캔버스를 고른다."""
-    ar = (w / h) if h else 1.0
-    return min(CR_CANVAS, key=lambda c: abs((c[0] / c[1]) - ar))
+    return _reference_preparation.reference_canvas(w, h)
 
 
 def letterbox_ref(raw):
-    """참조 이미지를 허용 캔버스에 레터박스로 넣어 PNG base64 로."""
-    with Image.open(io.BytesIO(raw)) as im:
-        im = im.convert("RGB")
-        cw, ch = _cr_canvas_for(im.width, im.height)
-        r = min(cw / im.width, ch / im.height)
-        nw, nh = max(1, round(im.width * r)), max(1, round(im.height * r))
-        out = Image.new("RGB", (cw, ch), (0, 0, 0))
-        out.paste(im.resize((nw, nh), Image.LANCZOS), ((cw - nw) // 2, (ch - nh) // 2))
-    b = io.BytesIO()
-    out.save(b, "PNG")
-    return base64.b64encode(b.getvalue()).decode("ascii"), (cw, ch)
+    return _reference_preparation.letterbox_reference(raw)
 
 
 def prepare_char_refs(cfg):
-    """켜진 캐릭터 레퍼런스. 반환: (images b64, types, strengths, fidelities)"""
-    imgs, types, strengths, fids = [], [], [], []
-    for r in cfg.get("char_refs", []):
-        if not r.get("enabled"):
-            continue
-        raw = r.get("_image_bytes")
-        p = VIBE_DIR / f"{r.get('id','')}.ref.png"
-        if raw is None:
-            if not p.exists():
-                if r.get("_required"):
-                    raise ValueError("시험용 Character Reference 원본을 찾지 못했습니다.")
-                continue
-            raw = p.read_bytes()
-        try:
-            b64, cv = letterbox_ref(raw)
-        except Exception as e:
-            if r.get("_required"):
-                raise ValueError(
-                    f"시험용 Character Reference를 준비하지 못했습니다: {e}"
-                ) from e
-            log.warning(f"캐릭터 레퍼런스 준비 실패({p.name}): {e}")
-            continue
-        log.info(f"캐릭터 레퍼런스 {p.stem} → {cv[0]}×{cv[1]} 로 맞춤")
-        imgs.append(b64)
-        types.append(r.get("ref_type") or "character&style")
-        strengths.append(float(r.get("strength", 0.6)))
-        fids.append(float(r.get("fidelity", 0.6)))
-    return imgs, types, strengths, fids
+    return _reference_preparation.prepare_character_references(
+        _reference_operations(),
+        cfg,
+        letterbox=globals()["letterbox_ref"],
+    )
 
 
 def runtime_generation_params(cfg, token, include_refs=True):
@@ -1027,89 +978,53 @@ def verify_tags(text, low=100):
     )
 
 def _b64_png(img_bytes_or_image):
-    """디렉터 툴은 PNG base64 를 받는다."""
-    import base64
-    if isinstance(img_bytes_or_image, (bytes, bytearray)):
-        raw = bytes(img_bytes_or_image)
-        try:
-            im = Image.open(io.BytesIO(raw))
-            if (im.format or "").upper() == "PNG":
-                return base64.b64encode(raw).decode("ascii"), im.width, im.height
-        except Exception:
-            pass
-        im = Image.open(io.BytesIO(raw))
-    else:
-        im = img_bytes_or_image
-    buf = io.BytesIO()
-    im.convert("RGBA" if im.mode == "RGBA" else "RGB").save(buf, "PNG")
-    return __import__("base64").b64encode(buf.getvalue()).decode("ascii"), im.width, im.height
+    return _reference_preparation.image_png_base64(
+        img_bytes_or_image
+    )
 
 
 def _last_from_zip(content):
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        names = [n for n in zf.namelist() if not n.endswith("/")]
-        if not names:
-            raise APIError("응답 zip 이 비어 있습니다.")
-        return zf.read(names[-1])          # 마지막 항목이 결과물
+    return _nai_auxiliary.last_zip_item(content)
+
+
+def _auxiliary_operations():
+    """보조 NAI 호출의 HTTP·이미지 변환·로그를 늦게 연결한다."""
+    return _nai_auxiliary.AuxiliaryOperations(
+        http_post=globals()["requests"].post,
+        http_get=globals()["requests"].get,
+        image_png_base64=globals()["_b64_png"],
+        info=globals()["log"].info,
+        warning=globals()["log"].warning,
+    )
 
 
 def call_director(token, image_bytes, method, prompt=None, defry=0):
-    """augment-image 호출. 결과 이미지 bytes 를 돌려준다."""
-    b64, w, h = _b64_png(image_bytes)
-    body = {"req_type": method, "image": b64, "width": w, "height": h}
-    if prompt is not None:
-        body["prompt"] = prompt
-        body["defry"] = int(defry or 0)
-    r = requests.post(AUGMENT_URL, json=body, timeout=180, headers={
-        "Authorization": f"Bearer {token}", "Content-Type": "application/json",
-        "Accept": "application/x-zip-compressed"})
-    if r.status_code == 429:
-        raise RateLimitError("429 Too Many Requests")
-    if r.status_code == 401:
-        raise AuthError("401 — 토큰을 확인하세요.")
-    if r.status_code != 200:
-        raise APIError(f"HTTP {r.status_code}: {r.text[:200]}")
-    return _last_from_zip(r.content)
+    return _nai_auxiliary.call_director(
+        _auxiliary_operations(),
+        AUGMENT_URL,
+        token,
+        image_bytes,
+        method,
+        prompt,
+        defry,
+    )
 
 
 def call_upscale(token, image_bytes, scale=4):
-    """업스케일. api 호스트가 400 을 주면 image 호스트로 다시 시도한다."""
-    b64, w, h = _b64_png(image_bytes)
-    body = {"image": b64, "width": w, "height": h, "scale": int(scale)}
-    last = ""
-    for url in UPSCALE_URLS:
-        r = requests.post(url, json=body, timeout=180, headers={
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json",
-            "Accept": "application/x-zip-compressed"})
-        if r.status_code == 200:
-            return _last_from_zip(r.content)
-        if r.status_code == 401:
-            raise AuthError("401 — 토큰을 확인하세요.")
-        last = f"HTTP {r.status_code}: {r.text[:160]}"
-        log.info(f"업스케일 {url} → {last}")
-    raise APIError(last or "업스케일 실패")
+    return _nai_auxiliary.call_upscale(
+        _auxiliary_operations(),
+        UPSCALE_URLS,
+        token,
+        image_bytes,
+        scale,
+    )
 
 
 def fetch_anlas_balance(token):
-    """남은 Anlas 조회. 실패하면 None.
-    구 호스트(api.novelai.net)는 400 + 'update to the image URL' 을 준다 — image 호스트를 써야 한다."""
-    if not token:
-        return None
-    try:
-        r = requests.get("https://image.novelai.net/user/subscription", timeout=15,
-                         headers={"Authorization": f"Bearer {token}"})
-        if r.status_code != 200:
-            return None
-        d = r.json()
-        tr = (d.get("trainingStepsLeft") or {})
-        fixed = int(tr.get("fixedTrainingStepsLeft") or 0)
-        purchased = int(tr.get("purchasedTrainingSteps") or 0)
-        tier = d.get("tier")
-        return {"fixed": fixed, "purchased": purchased, "total": fixed + purchased,
-                "tier": tier, "opus": tier == 3, "active": bool(d.get("active"))}
-    except Exception as e:
-        log.warning(f"Anlas 조회 실패: {e}")
-        return None
+    return _nai_auxiliary.fetch_anlas_balance(
+        _auxiliary_operations(),
+        token,
+    )
 
 
 def nai_tokens(text):
@@ -1293,6 +1208,7 @@ def _style_store_paths():
     return _style_store.StyleStorePaths(
         style_file=STYLE_FILE,
         transaction_root=STYLE_FILE.parent.parent,
+        trash_file=_trashed_style_path(),
     )
 
 
@@ -1306,6 +1222,8 @@ def _style_store_operations():
         normalize_model=model_id_from_metadata,
         forget_caches=forget_collection_caches,
         record_import_batch=record_import_batch,
+        load_json=load_json_recover,
+        deletion_stamp=lambda: time.strftime("%Y-%m-%d %H:%M:%S"),
     )
 
 
@@ -1447,147 +1365,67 @@ def _trashed_style_path():
 
 
 def _load_styles_raw():
-    if not STYLE_FILE.exists():
-        return []
-    try:
-        d = load_json_recover(STYLE_FILE)
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    return _style_store.load_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+    )
 
 
 def _write_styles_raw(rows):
-    STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(STYLE_FILE, rows, indent=None)
-    forget_collection_caches()
+    return _style_store.write_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+        rows,
+    )
 
 
-@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def delete_styles(ids):
     """고른 그림체를 지운다 → 지운그림체.json 으로 옮긴다."""
-    with _STYLE_TX_LOCK:
-        return _delete_styles_locked(ids)
+    return _style_store.delete_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+        ids,
+    )
 
 
 def _delete_styles_locked(ids):
-    want = {str(x) for x in (ids or []) if str(x)}
-    if not want:
-        return {"ok": False, "error": "고른 것이 없습니다."}
-    rows = _load_styles_raw()
-    keep = [r for r in rows if str(r.get("id")) not in want]
-    gone = [r for r in rows if str(r.get("id")) in want]
-    if not gone:
-        return {"ok": False, "error": "그 그림체를 못 찾았습니다."}
-    p = _trashed_style_path()
-    old = []
-    if p.exists():
-        try:
-            got = load_json_recover(p)
-            old = got if isinstance(got, list) else []
-        except Exception:
-            old = []
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    for r in gone:
-        r = dict(r)
-        r["_지운때"] = stamp
-        old.append(r)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(p, old[-5000:], indent=None)
-    _write_styles_raw(keep)
-    return {"ok": True, "지움": len(gone), "남음": len(keep), "되살릴수있음": len(old)}
+    return _style_store._delete_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+        ids,
+    )
 
 
-@serialized_data_write(lambda: STYLE_FILE.parent.parent)
 def restore_styles(ids=None):
     """지운 것을 되살린다. ids 가 없으면 **가장 최근에 지운 묶음** 전부."""
-    with _STYLE_TX_LOCK:
-        return _restore_styles_locked(ids)
+    return _style_store.restore_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+        ids,
+    )
 
 
 def _restore_styles_locked(ids=None):
-    p = _trashed_style_path()
-    if not p.exists():
-        return {"ok": False, "error": "지운 그림체가 없습니다."}
-    try:
-        trash = load_json_recover(p)
-    except Exception:
-        return {"ok": False, "error": "지운 목록을 읽지 못했습니다."}
-    if not isinstance(trash, list) or not trash:
-        return {"ok": False, "error": "지운 그림체가 없습니다."}
-    if ids:
-        want = {str(x) for x in ids}
-    else:
-        last = trash[-1].get("_지운때")          # 마지막 묶음만 되살린다
-        want = {str(r.get("id")) for r in trash if r.get("_지운때") == last}
-    back = [r for r in trash if str(r.get("id")) in want]
-    if not back:
-        return {"ok": False, "error": "되살릴 것을 못 찾았습니다."}
-    rows = _load_styles_raw()
-    have = {str(r.get("id")) for r in rows}
-    added, conflicts, rest = 0, 0, []
-    for r in trash:
-        rid = str(r.get("id"))
-        if rid not in want:
-            rest.append(r)
-            continue
-        if rid in have:
-            # 같은 id의 새 자료를 덮지 않고, 옛 자료도 휴지통에서 잃지 않는다.
-            # 사용자가 새 자료를 지우거나 id를 정리한 뒤 다시 복원할 수 있다.
-            rest.append(r)
-            conflicts += 1
-            continue
-        clean = {k: v for k, v in r.items() if k != "_지운때"}
-        rows.insert(0, clean)
-        have.add(rid)
-        added += 1
-    _write_styles_raw(rows)
-    atomic_write_json(p, rest, indent=None)
-    return {"ok": True, "되살림": added, "충돌": conflicts, "남은휴지통": len(rest)}
+    return _style_store._restore_styles(
+        _style_store_paths(),
+        _style_store_operations(),
+        ids,
+    )
 
 
 def _combo_fingerprint(r):
     """같은 그림체인지 보는 지문 — 작가 조합을 **가중치·순서 빼고** 본다.
     id 는 출처마다 다르게 붙으므로(`arca-3297` · `dorang-…`) id 로는 못 잡는다."""
-    arts = r.get("artists")
-    if arts:
-        return " ".join(sorted((str(a) or "").strip().lower() for a in arts if a))
-    combo = (r.get("combo") or "").lower()
-    names = re.findall(r"artist:([^,:]+)", combo)
-    if names:
-        return " ".join(sorted(n.strip() for n in names))
-    return re.sub(r"\s+", "", combo)
+    return _style_store.combo_fingerprint(r)
 
 
 def find_style_dupes():
     """같은 작가 조합인데 여러 건인 것을 묶어서 돌려준다.
     출처가 다른 자료를 합치면 반드시 생긴다 — id 가 달라 자동 병합이 못 잡는다."""
-    rows = _load_styles_raw()
-    groups = {}
-    for r in rows:
-        fp = _combo_fingerprint(r)
-        if not fp:
-            continue
-        groups.setdefault(fp, []).append(r)
-    out = []
-    for fp, rs in groups.items():
-        if len(rs) < 2:
-            continue
-        # 설정값이 있고 정보가 많은 것을 앞에 둔다 — '남길 것' 을 고르기 쉽게
-        rs = sorted(rs, key=lambda r: (
-            0 if (r.get("params") or {}).get("seed") else 1,
-            -len(json.dumps(r, ensure_ascii=False))))
-        out.append({
-            "지문": fp[:120],
-            "건수": len(rs),
-            "항목": [{"id": r.get("id"), "title": r.get("title"),
-                      "source": r.get("source"),
-                      "설정값": bool((r.get("params") or {}).get("seed")),
-                      "작가수": r.get("count") or len(r.get("artists") or [])}
-                     for r in rs],
-        })
-    out.sort(key=lambda g: -g["건수"])
-    return {"ok": True, "묶음": len(out),
-            "겹친항목": sum(g["건수"] for g in out), "전체": len(rows), "목록": out[:300]}
+    return _style_store.find_style_dupes(
+        _style_store_paths(),
+        _style_store_operations(),
+    )
 
 
 STYLE_SORTS = {
@@ -2379,63 +2217,42 @@ def _data_index_path():
     return BASE_DIR / "수집" / "자료색인.json"
 
 
+def _data_inventory_paths():
+    return _data_inventory.DataInventoryPaths(
+        base_dir=BASE_DIR,
+        program_dir=PROGRAM_DIR,
+        index_file=_data_index_path(),
+        schema=DATA_INDEX_SCHEMA,
+        profile=PROFILE,
+    )
+
+
+def _data_inventory_operations():
+    return _data_inventory.DataInventoryOperations(
+        load_json=load_json_recover,
+        atomic_write_json=atomic_write_json,
+        now=datetime.now,
+        redact=redact_diagnostic_text,
+        folder_queue=folder_inventory_queue,
+        folder_summary=folder_inventory_summary,
+        summarize_queue=summarize_restore_queue,
+    )
+
+
 def _load_data_index_cached():
     """큰 색인을 요청마다 다시 역직렬화하지 않고 파일 변경 때만 새로 읽는다."""
-    path = _data_index_path()
-    if not path.is_file():
-        return None
-    stamp = path.stat().st_mtime_ns
-    key = str(path.resolve())
-    if (
-        _DATA_INDEX_CACHE["path"] == key
-        and _DATA_INDEX_CACHE["mtime_ns"] == stamp
-        and isinstance(_DATA_INDEX_CACHE["value"], dict)
-    ):
-        return _DATA_INDEX_CACHE["value"]
-    value = load_json_recover(path)
-    _DATA_INDEX_CACHE.update(
-        {"path": key, "mtime_ns": stamp, "value": value})
-    return value
+    return _data_inventory.load_data_index_cached(
+        _data_inventory_paths(),
+        _data_inventory_operations(),
+        _DATA_INDEX_CACHE,
+    )
 
 
 def _iter_indexed_data_files():
     """다시 만들 수 있는 캐시·기록은 빼고 실제 자료 파일만 순회한다."""
-    roots = [
-        BASE_DIR / name for name in (
-            "후보사전.json", "규격.json", "옵션.json",
-            "태그", "세팅", "캐릭터", "그림체", "씬규격", "씬프리셋", "조각", "수집",
-        )
-    ]
-    blocked_parts = {
-        "원격", "가져온백업", "이미지무결성기록", "사용자복원기록",
-        "__pycache__", ".NAI-휴지통",
-    }
-    blocked_names = {
-        "자료색인.json", "가져온기록.json", "태그색인.pickle",
-    }
-    seen = set()
-    for root in roots:
-        candidates = [root] if root.is_file() else (
-            sorted(root.rglob("*")) if root.is_dir() else [])
-        for path in candidates:
-            if (not path.is_file() or path.is_symlink()
-                    or path.name in blocked_names):
-                continue
-            try:
-                if BASE_DIR.resolve() not in path.resolve().parents:
-                    continue
-            except OSError:
-                continue
-            rel = path.relative_to(BASE_DIR)
-            if any(part in blocked_parts for part in rel.parts):
-                continue
-            if path.suffix.lower() in (".bak", ".tmp", ".log", ".pyc", ".pickle"):
-                continue
-            key = rel.as_posix()
-            if key in seen:
-                continue
-            seen.add(key)
-            yield path, key
+    yield from _data_inventory.iter_indexed_data_files(
+        _data_inventory_paths(),
+    )
 
 
 def rebuild_data_index():
@@ -2443,68 +2260,21 @@ def rebuild_data_index():
 
     색인은 원본이 아니라 파생 목록이다. 지워져도 원자료를 다시 훑어 만들 수 있다.
     """
-    entries, by_root, total = [], {}, 0
-    for path, rel in _iter_indexed_data_files():
-        if len(entries) >= 250_000:
-            raise ValueError("자료 파일이 250,000개를 넘어 색인 생성을 중단했습니다.")
-        raw = path.read_bytes()
-        size = len(raw)
-        digest = hashlib.sha256(raw).hexdigest()
-        top = rel.split("/", 1)[0]
-        stat = by_root.setdefault(top, {"files": 0, "bytes": 0})
-        stat["files"] += 1
-        stat["bytes"] += size
-        total += size
-        entries.append({"path": rel, "size": size, "sha256": digest})
-    fingerprint = hashlib.sha256("\n".join(
-        f"{item['path']}\t{item['size']}\t{item['sha256']}" for item in entries
-    ).encode("utf-8")).hexdigest()
-    index = {
-        "schema": DATA_INDEX_SCHEMA,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "data_dir": str(BASE_DIR),
-        "files": len(entries),
-        "bytes": total,
-        "by_root": by_root,
-        "fingerprint": fingerprint,
-        "entries": entries,
-    }
-    atomic_write_json(_data_index_path(), index, indent=1, keep_backup=False)
-    _DATA_INDEX_CACHE.update({
-        "path": str(_data_index_path().resolve()),
-        "mtime_ns": _data_index_path().stat().st_mtime_ns,
-        "value": index,
-    })
-    return index
+    return _data_inventory.rebuild_data_index(
+        _data_inventory_paths(),
+        _data_inventory_operations(),
+        _DATA_INDEX_CACHE,
+    )
 
 
 def data_storage_status():
     """화면용 저장 위치와 마지막 색인 요약. 토큰·프롬프트 내용은 내보내지 않는다."""
-    index = None
-    restoration = None
-    path = _data_index_path()
-    if path.is_file():
-        try:
-            loaded = _load_data_index_cached()
-            if isinstance(loaded, dict) and loaded.get("schema") == DATA_INDEX_SCHEMA:
-                restoration = folder_inventory_summary(loaded)
-                index = {key: loaded.get(key) for key in (
-                    "generated_at", "files", "bytes", "by_root", "fingerprint")}
-        except Exception:
-            pass
-    return {
-        "ok": True,
-        "program_dir": str(PROGRAM_DIR),
-        "data_dir": str(BASE_DIR),
-        "separated": PROGRAM_DIR.resolve() != BASE_DIR.resolve(),
-        "profile": PROFILE or "기본",
-        "migration": {
-            key: _DATA_MIGRATION.get(key)
-            for key in ("status", "copied", "skipped", "conflicts")
-        },
-        "index": index,
-        "restoration": restoration,
-    }
+    return _data_inventory.data_storage_status(
+        _data_inventory_paths(),
+        _data_inventory_operations(),
+        _DATA_INDEX_CACHE,
+        _DATA_MIGRATION,
+    )
 
 
 _METADATA_AUDIT_ADAPTER = None
@@ -2641,52 +2411,13 @@ def metadata_audit_save_candidate(body):
 
 def folder_inventory_page(offset=0, limit=50):
     """대형 자료 색인을 한 번에 펼치지 않고 공통 복원 큐 계약으로 나눠 보여 준다."""
-    index = _load_data_index_cached()
-    if not isinstance(index, dict) or index.get("schema") != DATA_INDEX_SCHEMA:
-        return {"ok": True, "empty": True, "items": [], "total": 0}
-    entries = index.get("entries") if isinstance(index.get("entries"), list) else []
-    start = max(0, int(offset or 0))
-    page_size = max(1, min(100, int(limit or 50)))
-    page = [
-        item for item in entries[start:start + page_size]
-        if isinstance(item, dict)
-    ]
-    safe_rows = [
-        {
-            "path": f"index-item:{str(item.get('sha256') or '')}",
-            "filename": redact_diagnostic_text(
-                Path(str(item.get("path") or "")).name),
-            "content_sha256": item.get("sha256"),
-            "size": item.get("size"),
-            "cursor": start + index_no,
-            "status": "pending",
-        }
-        for index_no, item in enumerate(page)
-    ]
-    queue = folder_inventory_queue(
-        safe_rows,
-        folder_label="개인 자료",
-        cursor=start + len(page),
-        status="indexed",
+    return _data_inventory.folder_inventory_page(
+        _data_inventory_paths(),
+        _data_inventory_operations(),
+        _DATA_INDEX_CACHE,
+        offset,
+        limit,
     )
-    return {
-        "ok": True,
-        "empty": not entries,
-        "total": len(entries),
-        "offset": start,
-        "more": min(start + page_size, len(entries)) < len(entries),
-        "next_offset": min(start + page_size, len(entries)),
-        "restoration_queue": queue,
-        "restoration": summarize_restore_queue(queue),
-        "items": [
-            {
-                "name": safe_rows[index_no]["filename"],
-                "size": int(item.get("size") or 0),
-                "cursor": start + index_no,
-            }
-            for index_no, item in enumerate(page)
-        ],
-    }
 
 
 def _validate_datapack_manifest(archive):
@@ -2739,6 +2470,23 @@ def _user_backup_paths():
     return _user_backup_store.UserBackupPaths(
         base_dir=BASE_DIR,
         profile_dir=PROFILE_DIR,
+        sources=_user_backup_store.UserBackupSourcePaths(
+            settings_file=SETTINGS_FILE,
+            builder_file=BUILDER_FILE,
+            spec_file=SPEC_FILE,
+            options_file=OPTIONS_FILE,
+            tag_dir=TAG_DIR,
+            settings_dir=SETTINGS_DIR,
+            schema_dir=SCHEMA_DIR,
+            sceneset_dir=SCENESET_DIR,
+            style_dir=STYLE_DIR,
+            character_dir=CHAR_DIR,
+            fragment_dir=FRAG_DIR,
+            vibe_dir=VIBE_DIR,
+            picks_file=PICKS_FILE,
+            scenes_file=SCENES_FILE,
+        ),
+        profile_name=PROFILE,
         schema=BACKUP_SCHEMA,
         journal_schema="nais-restore-journal/v1",
         journal_dir_name="복원기록",
@@ -2756,131 +2504,50 @@ def _user_backup_operations():
         after_restore=forget_collection_caches,
         now=datetime.now,
         random_bytes=os.urandom,
+        warning=log.warning,
+        recoverable_remove=recoverable_remove,
     )
 
 
 def _backup_clean_settings(raw):
-    data = dict(raw or {}) if isinstance(raw, dict) else {}
-    for key in BACKUP_SECRET_KEYS:
-        data.pop(key, None)
-    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+    return _user_backup_store.clean_settings(raw)
 
 
 def _backup_sources(cfg):
     """토큰·생성물·재생성 가능한 캐시를 빼고 사용자 원본만 모은다."""
-    files = {}
-
-    def put(logical, path):
-        try:
-            if path.is_file() and not path.name.endswith((".bak", ".tmp")):
-                files[logical] = path.read_bytes()
-        except OSError as e:
-            log.warning("백업에서 건너뜀 %s: %s", path, e)
-
-    def tree(prefix, root, skip=()):
-        if not root.is_dir():
-            return
-        resolved = root.resolve()
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.name.endswith((".bak", ".tmp")):
-                continue
-            rel = path.relative_to(root)
-            if any(part in skip for part in rel.parts):
-                continue
-            try:
-                if resolved not in path.resolve().parents:
-                    continue
-            except OSError:
-                continue
-            put(f"common/{prefix}/{rel.as_posix()}", path)
-
-    for name, path in (("후보사전.json", BUILDER_FILE), ("규격.json", SPEC_FILE),
-                       ("옵션.json", OPTIONS_FILE)):
-        put(f"common/{name}", path)
-    for prefix, root in (
-        ("태그", TAG_DIR), ("세팅", SETTINGS_DIR), ("씬규격", SCHEMA_DIR),
-        ("씬프리셋", SCENESET_DIR), ("그림체", STYLE_DIR),
-        ("캐릭터", CHAR_DIR), ("조각", FRAG_DIR), ("수집/바이브", VIBE_DIR),
-    ):
-        tree(prefix, root)
-    collect = BASE_DIR / "수집"
-    if collect.is_dir():
-        for path in sorted(collect.glob("*.json")):
-            put(f"common/수집/{path.name}", path)
-        # local: 그림은 원본 자료다. 다시 받을 수 있는 원격/ 하위만 캐시로 제외한다.
-        tree("수집/이미지캐시", collect / "이미지캐시", skip=("원격",))
-    files["profile/설정.json"] = _backup_clean_settings(cfg)
-    for name, path in (("선별.json", PICKS_FILE), ("씬.json", SCENES_FILE)):
-        put(f"profile/{name}", path)
-    return files
+    return _user_backup_store.backup_sources(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        cfg,
+    )
 
 
 def export_user_backup(cfg):
-    payloads = _backup_sources(cfg)
-    manifest = {
-        "schema": BACKUP_SCHEMA,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "profile": PROFILE or "기본",
-        "files": [{"path": p, "size": len(raw),
-                   "sha256": hashlib.sha256(raw).hexdigest()}
-                  for p, raw in sorted(payloads.items())],
-        "excluded": ["API 토큰", "생성 결과(output)", "로그·진행상태",
-                     "태그 검색 색인", "다운로드한 원격 이미지 캐시",
-                     "자료팩 되돌리기 임시백업"],
-    }
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.writestr("manifest.json",
-                   json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
-        for logical, raw in sorted(payloads.items()):
-            z.writestr("data/" + logical, raw)
-    return out.getvalue()
+    return _user_backup_store.export_user_backup(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        cfg,
+    )
 
 
 def _backup_safe_logical(value):
-    value = str(value or "").replace("\\", "/").strip("/")
-    parts = value.split("/") if value else []
-    if (len(parts) < 2 or parts[0] not in ("common", "profile")
-            or any(p in ("", ".", "..") or ":" in p for p in parts)):
-        return None
-    return "/".join(parts)
+    return _user_backup_store.safe_logical(value)
 
 
 def _backup_destination(logical):
-    logical = _backup_safe_logical(logical)
-    if not logical:
-        raise ValueError("위험한 백업 경로입니다.")
-    scope, rel = logical.split("/", 1)
-    if scope == "profile":
-        if rel not in {"설정.json", "선별.json", "씬.json"}:
-            raise ValueError(f"허용하지 않는 프로필 자료입니다: {rel}")
-        root = PROFILE_DIR.resolve()
-    else:
-        allowed_files = {"후보사전.json", "규격.json", "옵션.json"}
-        allowed_dirs = {"태그", "세팅", "씬규격", "씬프리셋", "그림체",
-                        "캐릭터", "조각", "수집"}
-        if rel not in allowed_files and rel.split("/", 1)[0] not in allowed_dirs:
-            raise ValueError(f"허용하지 않는 공용 자료입니다: {rel}")
-        root = BASE_DIR.resolve()
-    target = (root / rel).resolve()
-    if target != root and root not in target.parents:
-        raise ValueError("백업 경로가 앱 자료 폴더를 벗어납니다.")
-    return target
+    return _user_backup_store.destination(
+        _user_backup_paths(),
+        logical,
+    )
 
 
 def _backup_merge_secrets(logical, raw, target):
-    if logical != "profile/설정.json":
-        return raw
-    incoming = json.loads(raw.decode("utf-8"))
-    if not isinstance(incoming, dict):
-        raise ValueError("복원할 설정의 최상위 값은 JSON 객체여야 합니다.")
-    current = {}
-    if target.is_file():
-        current = load_settings_recover(target)
-    for key in BACKUP_SECRET_KEYS:
-        if key in current:
-            incoming[key] = current[key]
-    return json.dumps(incoming, ensure_ascii=False, indent=1).encode("utf-8")
+    return _user_backup_store.merge_secrets(
+        _user_backup_operations(),
+        logical,
+        raw,
+        target,
+    )
 
 
 def _backup_diff_plan(blob):
@@ -2891,33 +2558,15 @@ def _backup_diff_plan(blob):
     )
 
 def _backup_change_public(change):
-    if change["current_exists"] and change["incoming_exists"]:
-        action = "변경"
-    elif change["incoming_exists"]:
-        action = "추가"
-    else:
-        action = "제거"
-    return {
-        key: copy.deepcopy(change[key])
-        for key in (
-            "id", "logical", "pointer", "file_status", "json",
-            "current_exists", "incoming_exists", "current", "incoming",
-            "current_sha256", "incoming_sha256", "base_sha256",
-        )
-    } | {
-        "action": action,
-        "base_available": bool(change.get("base_sha256")),
-    }
+    return _user_backup_store.backup_change_public(change)
 
 
 def preview_user_backup(blob):
-    (manifest, payloads, archive_sha, plans, counts,
-     total, fingerprint) = _backup_diff_plan(blob)
-    return {"ok": True, "sha256": archive_sha, "files": len(payloads),
-            "bytes": total, "counts": counts, "created_at": manifest.get("created_at"),
-            "profile": manifest.get("profile"), "excluded": manifest.get("excluded") or [],
-            "diff_fingerprint": fingerprint,
-            "changes": [_backup_change_public(change) for change in plans]}
+    return _user_backup_store.preview_user_backup(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        blob,
+    )
 
 
 def restore_user_backup(blob, expected_sha="", selected=None, expected_diff=""):
@@ -2930,43 +2579,12 @@ def restore_user_backup(blob, expected_sha="", selected=None, expected_diff=""):
         expected_diff,
     )
 
-@serialized_data_write(lambda: BASE_DIR)
 def rollback_user_backup(batch_id):
-    if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{6}", str(batch_id or "")):
-        return {"ok": False, "error": "복원 기록 번호가 올바르지 않습니다."}
-    root = (PROFILE_DIR / "복원기록").resolve()
-    journal = (root / str(batch_id)).resolve()
-    if root not in journal.parents or not (journal / "journal.json").is_file():
-        return {"ok": False, "error": "복원 기록을 찾지 못했습니다."}
-    record = load_json_recover(journal / "journal.json")
-    if record.get("status") == "rolled_back":
-        return {"ok": False, "error": "이미 되돌린 복원입니다."}
-    done, restored, skipped = set(record.get("completed") or []), 0, 0
-    for op in reversed(record.get("operations") or []):
-        logical = op.get("path")
-        if logical not in done:
-            continue
-        target = _backup_destination(logical)
-        if (not target.is_file()
-                or hashlib.sha256(target.read_bytes()).hexdigest()
-                != op.get("applied_sha256")):
-            # 복원 뒤 사용자가 다시 고친 파일은 옛 상태로 덮어쓰지 않는다.
-            skipped += 1
-            continue
-        if op.get("new"):
-            recoverable_remove(target, label="복원취소")
-            restored += 1
-        else:
-            saved = journal / "before" / logical
-            if saved.is_file():
-                raw = _backup_merge_secrets(logical, saved.read_bytes(), target)
-                _atomic_write_bytes(target, raw)
-                restored += 1
-    record.update(status="rolled_back",
-                  rolled_back_at=datetime.now().isoformat(timespec="seconds"))
-    atomic_write_json(journal / "journal.json", record, indent=1)
-    forget_collection_caches()
-    return {"ok": True, "restored": restored, "skipped": skipped}
+    return _user_backup_store.rollback_user_backup(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        batch_id,
+    )
 
 
 def setting_path(name):
@@ -4714,30 +4332,30 @@ def bump_daily(state):
 _LAST_CALL = {"t": 0.0}
 
 
-def pace_gate(cfg, live=None, label=""):
-    """Wait until the configured gap since the previous API completion.
+def _pacing_operations():
+    """현재 상태 장부와 patch 가능한 시계를 호출 간격 서비스에 연결한다."""
+    return _generation_pacing.PacingOperations(
+        load_state=globals()["load_state"],
+        daily_count=globals()["daily_count"],
+        random_uniform=globals()["random"].uniform,
+        now=globals()["time"].time,
+        sleep=globals()["time"].sleep,
+        last_call=globals()["_LAST_CALL"],
+    )
 
-    The completion timestamp is written by ``pace_complete`` in each call
-    site's ``finally`` block. Measuring from request start can collapse the
-    real gap to zero when a slow API call lasts longer than the configured gap.
-    """
-    pc = pace(cfg)
-    st = load_state()
-    if daily_count(st) >= pc["daily_cap"]:
-        return False, f"일일 상한 {pc['daily_cap']}장에 도달했습니다 — 내일 이어서 하세요."
-    gap = random.uniform(pc["delay_min"], pc["delay_max"])
-    while True:
-        wait = _LAST_CALL["t"] + gap - time.time()
-        if wait <= 0:
-            return True, ""
-        if live is not None and getattr(live, "stop_req", False):
-            return False, "중지되었습니다."
-        time.sleep(min(0.5, wait))
+
+def pace_gate(cfg, live=None, label=""):
+    del label
+    return _generation_pacing.wait_for_slot(
+        _pacing_operations(),
+        cfg,
+        PACE_DEFAULT,
+        live,
+    )
 
 
 def pace_complete():
-    """Mark the end of an attempted NAI generation request."""
-    _LAST_CALL["t"] = time.time()
+    return _generation_pacing.mark_complete(_pacing_operations())
 
 # ═══════════════ 브라우저 UI (설정 + 실시간 미리보기) ═══════════════
 
@@ -4746,25 +4364,18 @@ def pace_complete():
 
 def render_page():
     """파라미터 선택지를 파이썬 상수에서 채워 넣는다 (목록을 한 곳에서만 관리)."""
-    def opts(pairs):
-        return "".join(f'<option value="{v}">{esc_html(l)}</option>' for v, l in pairs)
-    profile = esc_html(PROFILE)
-    return (PAGE_TEMPLATE
-            .replace("__MODELS__", opts(MODELS))
-            .replace("__SAMPLERS__", opts((s, s.replace("k_", "")) for s in SAMPLERS))
-            .replace("__SCHEDS__", opts((s, s) for s in NOISE_SCHEDULES))
-            .replace("__UCP__", opts((str(v), f"{v} · {l}") for v, l in UC_PRESETS))
-            .replace("__RES__", opts((f"{w}x{h}", f"{lbl} {w}×{h}") for w, h, lbl in RESOLUTIONS))
-            .replace("__RESJSON__", json.dumps(
-                [{"w": w, "h": h, "label": lbl} for w, h, lbl in RESOLUTIONS], ensure_ascii=False))
-            .replace("__DIRTOOLS__", opts((t, lbl) for t, lbl, _ in DIRECTOR_TOOLS))
-            .replace("__EMOTIONS__", opts((e, e) for e in EMOTIONS))
-            .replace("__BOORUS__", opts((k, v["name"] + v.get("note", ""))
-                                       for k, v in BOORUS.items()))
-            .replace("__PROFNOW__", f"프로필 「{profile}」" if profile else "기본 (첫째 계정)")
-            .replace("__PROFTITLE__", f" — {profile}" if profile else "")
-            .replace("__PROFBADGE__", (f'<span class="badge" style="margin-left:7px;">'
-                                       f'프로필 {profile}</span>') if profile else ""))
+    model = _page_renderer.PageRenderModel(
+        profile=PROFILE,
+        models=MODELS,
+        samplers=SAMPLERS,
+        schedules=NOISE_SCHEDULES,
+        uc_presets=UC_PRESETS,
+        resolutions=RESOLUTIONS,
+        director_tools=DIRECTOR_TOOLS,
+        emotions=EMOTIONS,
+        boorus=BOORUS,
+    )
+    return _page_renderer.render_page(PAGE_TEMPLATE, model, esc_html)
 
 
 def esc_html(s):
@@ -4848,194 +4459,95 @@ _COMMON_JOB_STORE = None
 _COMMON_JOB_STORE_ROOT = None
 
 
+def _job_ledger_paths():
+    return _management_state.JobLedgerPaths(
+        ledger_file=JOB_LEDGER_FILE,
+    )
+
+
+def _job_ledger_operations():
+    """현재 프로필 저장소와 patch 가능한 장부 의존성을 늦게 연결한다."""
+    return _management_state.JobLedgerOperations(
+        lock=_JSON_IO_LOCK,
+        load_json=globals()["load_json_recover"],
+        atomic_write_json=globals()["atomic_write_json"],
+        common_job_store=lambda: globals()["common_job_store"](),
+        now=lambda: datetime.now().isoformat(timespec="seconds"),
+        uuid_hex=lambda: uuid.uuid4().hex,
+        redact=globals()["redact_diagnostic_text"],
+        log_error=globals()["log"].error,
+    )
+
+
 def common_job_store():
-    """현재 프로필의 공통 실행 장부. 테스트의 임시 장부 경로도 그대로 따른다."""
     global _COMMON_JOB_STORE, _COMMON_JOB_STORE_ROOT
-    root = (JOB_LEDGER_FILE.parent / "작업기록").resolve()
-    if _COMMON_JOB_STORE is None or _COMMON_JOB_STORE_ROOT != root:
-        _COMMON_JOB_STORE = JobStore(root)
-        _COMMON_JOB_STORE_ROOT = root
+    _COMMON_JOB_STORE, _COMMON_JOB_STORE_ROOT = (
+        _management_state.resolve_common_job_store(
+            _job_ledger_paths(),
+            _COMMON_JOB_STORE,
+            _COMMON_JOB_STORE_ROOT,
+            JobStore,
+        )
+    )
     return _COMMON_JOB_STORE
 
 
 def _runtime_kind(operation, legacy_kind):
-    text = f"{operation} {legacy_kind}".casefold()
-    if "비교" in text or "comparison" in text:
-        return "comparison"
-    if "img2img" in text:
-        return "img2img"
-    if "인페인트" in text or "inpaint" in text:
-        return "inpaint"
-    if "director" in text or "디렉터" in text:
-        return "director"
-    if "vibe" in text or "바이브" in text:
-        return "vibe_encoding"
-    if legacy_kind in ("settings", "generation") or "씬" in text or "세팅" in text:
-        return "setting"
-    return "single"
+    return _management_state.runtime_kind(operation, legacy_kind)
 
 
 def load_job_ledger():
-    """모든 생성 경로의 최근 실행 기록. 실제 재개 자료는 각 기능의 기존 장부가 기준이다."""
-    if not JOB_LEDGER_FILE.is_file():
-        return {"schema": "nais-job-ledger/v1", "jobs": []}
-    data = load_json_recover(JOB_LEDGER_FILE)
-    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        raise ValueError("작업대기열 기록 형식이 올바르지 않습니다.")
-    jobs = [
-        dict(item) for item in data["jobs"][-200:]
-        if isinstance(item, dict) and item.get("id")
-    ]
-    return {"schema": "nais-job-ledger/v1", "jobs": jobs}
+    return _management_state.load_job_ledger(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+    )
 
 
 def _save_job_ledger(data):
-    data = {
-        "schema": "nais-job-ledger/v1",
-        "jobs": list(data.get("jobs") or [])[-200:],
-    }
-    atomic_write_json(JOB_LEDGER_FILE, data, indent=1)
-    return data
+    return _management_state.save_job_ledger(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+        data,
+    )
 
 
 def recover_job_ledger():
-    """프로세스가 꺼진 채 남은 running 기록만 interrupted로 닫는다."""
-    with _JSON_IO_LOCK:
-        data = load_job_ledger()
-        changed = False
-        now = datetime.now().isoformat(timespec="seconds")
-        for job in data["jobs"]:
-            if job.get("status") in ("running", "stopping"):
-                job["status"] = "interrupted"
-                job["updated_at"] = now
-                job["can_resume"] = job.get("kind") in (
-                    "settings", "comparison", "collection", "recovery")
-                changed = True
-        data = _save_job_ledger(data) if changed else data
-        try:
-            common_job_store().recover_all()
-        except Exception as error:
-            # 손상 장부를 초기화하거나 덮지 않는다. 관리 화면의 기존 장부는 계속
-            # 열고, 공통 장부 오류는 진단 로그로 남긴다.
-            log.error("공통 작업 장부 복구 실패: %s", error)
-        return data
+    return _management_state.recover_job_ledger(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+    )
 
 
 def start_job_record(operation, kind, *, blueprint=None, payload_identity=None):
-    with _JSON_IO_LOCK:
-        data = recover_job_ledger()
-        now = datetime.now().isoformat(timespec="seconds")
-        record = {
-            "id": f"job-{uuid.uuid4().hex}",
-            "operation": str(operation or "생성")[:120],
-            "kind": str(kind or "preview")[:40],
-            "status": "running",
-            "created_at": now,
-            "updated_at": now,
-            "completed": 0,
-            "failed": 0,
-            "can_resume": False,
-        }
-        data["jobs"].append(record)
-        _save_job_ledger(data)
-        blueprint_digest = fingerprint_blueprint(
-            blueprint or {"source": {"kind": str(kind or "preview")}}
-        )
-        payload_digest = fingerprint_payload(
-            payload_identity or {
-                "operation": str(operation or "생성"),
-                "kind": str(kind or "preview"),
-                "blueprint_fingerprint": blueprint_digest,
-            }
-        )
-        runtime_job = new_job(
-            _runtime_kind(operation, kind),
-            blueprint_fingerprint=blueprint_digest,
-            payload_hash=payload_digest,
-            request_id=record["id"],
-            job_id=record["id"],
-            metadata={
-                "legacy_kind": str(kind or "preview"),
-                "operation": str(operation or "생성"),
-            },
-            now=now,
-        )
-        runtime_job = transition_job(runtime_job, "preparing", now=now)
-        common_job_store().save(runtime_job)
-        return record["id"]
+    return _management_state.start_job_record(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+        operation,
+        kind,
+        blueprint=blueprint,
+        payload_identity=payload_identity,
+    )
 
 
 def _finish_durable_job(existing, projected):
-    """legacy 진행 관찰값만 합치고 시작 때 확정한 durable identity는 보존한다."""
-    if not isinstance(existing, dict):
-        return projected
-    if (
-        existing.get("phase") == "cancelled"
-        and projected.get("phase") != "cancelled"
-    ):
-        return existing
-    target = str(projected.get("phase") or "")
-    progress = copy.deepcopy(projected.get("progress") or {})
-    if target == "completed":
-        has_verified_result = bool(existing.get("results"))
-        merged = reconcile_job(
-            existing,
-            {
-                "progress": progress,
-                # 실행 스레드가 완료라고 말해도 저장 뒤 해시를 확인해 장부에
-                # 등록한 결과가 하나도 없으면 완료로 닫지 않는다.
-                "confirmed_complete": has_verified_result,
-                "artifacts_intact": has_verified_result,
-            },
-            now=str(projected.get("updated_at") or ""),
-        )
-    else:
-        merged = update_progress(
-            existing,
-            completed=progress.get("completed"),
-            failed=progress.get("failed"),
-            total=progress.get("total"),
-            message=progress.get("message"),
-            now=str(projected.get("updated_at") or ""),
-        )
-        if target in ("paused", "failed", "cancelled"):
-            if merged.get("phase") != target:
-                merged = transition_job(
-                    merged,
-                    target,
-                    error=(copy.deepcopy(projected.get("error"))
-                           if target == "failed" else None),
-                    now=str(projected.get("updated_at") or ""),
-                )
-    return merged
+    return _management_state.finish_durable_job(
+        existing,
+        projected,
+    )
 
 
 def finish_job_record(job_id, *, status, completed=0, failed=0,
                       can_resume=False, message=""):
-    if not job_id:
-        return
-    with _JSON_IO_LOCK:
-        data = load_job_ledger()
-        for job in reversed(data["jobs"]):
-            if job.get("id") != job_id:
-                continue
-            job.update({
-                "status": str(status or "completed"),
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "completed": max(0, int(completed or 0)),
-                "failed": max(0, int(failed or 0)),
-                "can_resume": bool(can_resume),
-                "message": str(message or "")[:500],
-            })
-            projected = from_legacy_job_record(job)
-            try:
-                existing = common_job_store().get(job_id)
-            except Exception:
-                existing = None
-            common_job_store().save(
-                _finish_durable_job(existing, projected))
-            break
-        _save_job_ledger(data)
+    return _management_state.finish_job_record(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+        job_id,
+        status=status,
+        completed=completed,
+        failed=failed,
+        can_resume=can_resume,
+        message=message,
+    )
 
 
 def record_job_result(
@@ -5046,90 +4558,45 @@ def record_job_result(
     source_result_ids=(),
     result_id="",
 ):
-    """저장된 결과 파일을 실행 중인 공통 Job에 연결한다.
-
-    파일 저장이 끝난 뒤에만 호출하며, 절대경로·토큰·프롬프트는 장부에 넣지 않는다.
-    기존 기능별 progress/manifest는 그대로 유지하는 호환 투영이다.
-    """
-    if not job_id:
-        return None
-    result_path = Path(path)
-    if not result_path.is_file():
-        raise ValueError("결과 파일을 확인할 수 없어 Job에 완료로 기록하지 않았습니다.")
-    content_hash = hashlib.sha256(result_path.read_bytes()).hexdigest()
-    safe_artifact = str(artifact or result_path.name).replace("\\", "/")
-    if Path(safe_artifact).is_absolute() or ".." in Path(safe_artifact).parts:
-        safe_artifact = result_path.name
-    stable_result_id = str(result_id or "").strip()
-    if not stable_result_id:
-        stable_result_id = "result-" + hashlib.sha256(
-            f"{job_id}\0{safe_artifact}\0{content_hash}".encode("utf-8")
-        ).hexdigest()[:32]
-    store = common_job_store()
-    job = store.get(job_id)
-    changed = add_result(
-        job,
-        stable_result_id,
-        artifact=safe_artifact,
-        content_hash=content_hash,
+    return _management_state.record_job_result(
+        _job_ledger_operations(),
+        job_id,
+        path,
+        artifact=artifact,
         source_result_ids=source_result_ids,
+        result_id=result_id,
     )
-    store.save(changed)
-    return next(
-        item for item in changed["results"]
-        if item.get("id") == stable_result_id)
 
 
 def link_job_ancestor(job_id, source_job_id):
-    """재개 시 이전 실행 Job을 현재 실행의 부모 계보로만 연결한다."""
-    current = str(job_id or "")
-    source = str(source_job_id or "")
-    if not current or not source or current == source:
-        return None
-    store = common_job_store()
-    job = store.get(current)
-    ancestry = job.setdefault("lineage", {}).setdefault(
-        "source_job_ids", [])
-    if source not in ancestry:
-        ancestry.append(source)
-        store.save(job)
-    return job
+    return _management_state.link_job_ancestor(
+        _job_ledger_operations(),
+        job_id,
+        source_job_id,
+    )
 
 
 def job_ledger_summary():
-    data = load_job_ledger()
-    jobs = list(reversed(data["jobs"]))
-    try:
-        durable = common_job_store().list()
-        durable_by_id = {str(item.get("id") or ""): item for item in durable}
-        durable_error = ""
-    except Exception as error:
-        durable = []
-        durable_by_id = {}
-        durable_error = redact_diagnostic_text(error)
-    contracts = []
-    for item in jobs:
-        stored = durable_by_id.get(str(item.get("id") or ""))
-        if stored:
-            contracts.append(stored)
-            continue
-        try:
-            contracts.append(from_legacy_job_record(item))
-        except Exception as error:
-            contracts.append({
-                "schema": "nai-runtime-job/v1",
-                "id": str(item.get("id") or ""),
-                "phase": "invalid",
-                "error": redact_diagnostic_text(error),
-            })
-    return {
-        "ok": True,
-        **data,
-        "jobs": jobs,
-        "contracts": contracts,
-        "durable_jobs": list(reversed(durable)),
-        "durable_error": durable_error,
-    }
+    return _management_state.job_ledger_summary(
+        _job_ledger_paths(),
+        _job_ledger_operations(),
+    )
+
+
+def _config_projection_operations():
+    """ConfigServer의 읽기 전용 설정·Job 투영 의존성을 늦게 연결한다."""
+    return _management_state.ConfigProjectionOperations(
+        load_settings=globals()["load_settings_recover"],
+        migrate_selections=globals()["migrate_legacy_selections"],
+        migrate_char_slots=globals()["migrate_char_slots"],
+        job_summary=lambda: globals()["job_ledger_summary"](),
+        runtime_kind=globals()["_runtime_kind"],
+        inherited_blueprint=globals()["inherited_blueprint"],
+        project_live_state=globals()["project_live_state"],
+        comparison_progress=lambda: globals()["_comparison_progress_load"](),
+        project_comparison_progress=globals()["project_comparison_progress"],
+        redact=globals()["redact_diagnostic_text"],
+    )
 
 
 class LiveState(RuntimeLiveState):
@@ -5169,23 +4636,12 @@ class ConfigServer:
         self.pending_variation = None
 
     def latest_config_from_disk(self):
-        """프로세스 잠금 안에서 공용 설정 최신판과 런타임 전용 값을 합친다."""
-        runtime = {
-            key: value for key, value in self.cfg.items()
-            if str(key).startswith("_")
-        }
-        latest = {
-            key: value for key, value in self.cfg.items()
-            if not str(key).startswith("_")
-        }
-        if SETTINGS_FILE.is_file():
-            latest = load_settings_recover(SETTINGS_FILE)
-        merged = dict(DEFAULT_CONFIG)
-        merged.update(latest)
-        merged.update(runtime)
-        migrate_legacy_selections(merged)
-        migrate_char_slots(merged)
-        return merged
+        return _management_state.latest_config_from_disk(
+            self.cfg,
+            SETTINGS_FILE,
+            DEFAULT_CONFIG,
+            _config_projection_operations(),
+        )
 
     def use_latest_config(self):
         merged = self.latest_config_from_disk()
@@ -5269,52 +4725,10 @@ class ConfigServer:
         }
 
     def snapshot_jobs(self):
-        """기존 장부와 현재 실행·비교 진행을 공통 Job 계약으로 함께 보여 준다."""
-        summary = job_ledger_summary()
-        active_contracts = []
-        issues = []
-        live = self.live.snapshot()
-        if live.get("running") or live.get("phase") not in ("", "idle"):
-            try:
-                frozen_blueprint = self.live.frozen_blueprint()
-                active_contracts.append(project_live_state(
-                    live,
-                    kind=_runtime_kind(
-                        live.get("operation"), live.get("retry_mode")),
-                    job_id=live.get("job_id") or "",
-                    blueprint=(
-                        frozen_blueprint or inherited_blueprint(
-                            self.cfg,
-                            source={"kind": "live-state-projection-fallback"},
-                        )
-                    ),
-                    payload_identity={
-                        "operation": live.get("operation"),
-                        "seed_key": live.get("seed_key"),
-                        "total": live.get("total"),
-                    },
-                ))
-            except Exception as error:
-                issues.append({
-                    "source": "live-state",
-                    "error": redact_diagnostic_text(error),
-                })
-        progress = _comparison_progress_load()
-        live_is_current_comparison = (
-            bool(live.get("running"))
-            and "비교" in str(live.get("operation") or "")
+        return _management_state.snapshot_jobs(
+            self,
+            _config_projection_operations(),
         )
-        if progress.get("signature") and not live_is_current_comparison:
-            try:
-                active_contracts.append(project_comparison_progress(progress))
-            except Exception as error:
-                issues.append({
-                    "source": "comparison-progress",
-                    "error": redact_diagnostic_text(error),
-                })
-        summary["active_contracts"] = active_contracts
-        summary["projection_issues"] = issues
-        return summary
 
     def handle_job_command(self, body):
         data = json.loads(body or b"{}")
@@ -5461,49 +4875,13 @@ class ConfigServer:
     def handle_resource_import(self, body, filename=""):
         """Vibe 교환 문서를 기존 저장소에 비활성 자원으로 안전하게 추가."""
         try:
-            from urllib.parse import unquote
-            if not body:
-                return {"ok": False, "error": "가져올 묶음이 비어 있습니다."}
-            with shared_data_transaction(VIBE_DIR.parent.parent):
-                with self.config_lock:
-                    self.use_latest_config()
-                    plan = legacy_resource_import_plan(
-                        body,
-                        filename=unquote(filename or ""),
-                        existing_config=self.cfg,
-                    )
-                    VIBE_DIR.mkdir(parents=True, exist_ok=True)
-                    for write in plan["writes"]:
-                        name = Path(str(write.get("filename") or "")).name
-                        if not name or name != write.get("filename"):
-                            raise ValueError("안전하지 않은 자원 파일 이름입니다.")
-                        target = VIBE_DIR / name
-                        content = write.get("content")
-                        raw = (content.encode(write.get("encoding") or "utf-8")
-                               if write.get("kind") == "text"
-                               else bytes(content or b""))
-                        if target.exists():
-                            if target.read_bytes() != raw:
-                                raise FileExistsError(
-                                    f"같은 이름의 다른 자원 파일이 있습니다: {name}")
-                            continue
-                        _atomic_write_bytes(target, raw, keep_backup=False)
-                    self.cfg.setdefault("vibes", []).extend(
-                        plan["additions"]["vibes"])
-                    self.cfg.setdefault("char_refs", []).extend(
-                        plan["additions"]["char_refs"])
-                    save_config(self.cfg)
-                    self.config_revision += 1
-            return {
-                "ok": True,
-                "added_vibes": len(plan["additions"]["vibes"]),
-                "added_char_refs": len(plan["additions"]["char_refs"]),
-                "skipped": plan["skipped"],
-                "issues": plan["issues"],
-                "vibes": self.cfg.get("vibes", []),
-                "char_refs": self.cfg.get("char_refs", []),
-                "revision": self.config_revision,
-            }
+            return _resource_bridge.import_legacy_resources(
+                self,
+                _resource_import_paths(),
+                _resource_import_operations(),
+                body,
+                filename,
+            )
         except Exception as e:
             log.warning(f"Vibe·Reference 묶음 가져오기 실패: {e}")
             return {"ok": False, "error": str(e)}
@@ -5567,25 +4945,11 @@ class ConfigServer:
         )
 
     def handle_start(self):
-        if self.live.running:
-            return {"ok": False, "error": "이미 생성 중입니다."}
-        if not self.cfg.get("token", "").startswith("pst-"):
-            return {"ok": False, "error": "NAI 토큰을 입력해주세요 (pst-... 형식)."}
-        has_slot = any(slot_prompt(s).strip() for s in self.cfg.get("char_slots", []))
-        has_cast = any(slot_prompt(c).strip()
-                       for st in (self.cfg.get("setting_state") or {}).values()
-                       for c in st.get("cast", []))
-        if not (has_slot or has_cast):
-            return {"ok": False, "error": "설정의 캐릭터 칸 또는 세팅의 캐스트에 인물을 1명 이상 넣어주세요."}
-        if not any((st.get("use") is not False and st.get("selected"))
-                   for st in (self.cfg.get("setting_state") or {}).values()):
-            return {"ok": False, "error": "세팅 탭에서 씬을 1개 이상 선택해주세요."}
-        # 시작 버튼을 누른 순간의 계획을 고정한다. 진행 중 화면 저장은 다음 실행에만
-        # 반영되어 한 batch 안에서 프롬프트·캐스트·세팅이 섞이지 않는다.
-        with self.config_lock:
-            self.pending_batch_config = copy.deepcopy(self.cfg)
-        self.start_event.set()
-        return {"ok": True}
+        return _generation_handlers.handle_start(
+            self,
+            None,
+            _generation_handler_operations(),
+        )
 
     def start(self, open_browser=True):
         paths = _server_runtime.ServerRuntimePaths(
@@ -5618,76 +4982,49 @@ def char_folder_id(char):
 # ═══════════════ 메인 ═══════════════
 
 def generation_context_fingerprint(cfg, acfg):
-    """Stable digest of inputs that can change a batch image.
-
-    Secrets and display-only settings are excluded. Private runtime keys such
-    as fragment counters are also excluded so finishing one image does not
-    invalidate every earlier image in the same run.
-    """
-    ignored = {"token", "booru_keys", "ui"}
-    clean_cfg = {
-        k: v for k, v in (cfg or {}).items()
-        if not str(k).startswith("_") and k not in ignored
-    }
-    raw = json.dumps(
-        {"config": clean_cfg, "assets": acfg}, ensure_ascii=False,
-        sort_keys=True, separators=(",", ":"), default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    return _generation_progress.context_fingerprint(cfg, acfg)
 
 
 def generation_task_fingerprint(context_fingerprint, char, cid, num, copy):
-    raw = json.dumps(
-        {"context": context_fingerprint, "char": char, "cid": cid,
-         "scene": int(num), "copy": int(copy)},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    return _generation_progress.task_fingerprint(
+        context_fingerprint,
+        char,
+        cid,
+        num,
+        copy,
+    )
 
 
 def make_progress_record(cfg, num, copy, saved_path, fingerprint):
-    root = out_root(cfg).resolve()
-    path = Path(saved_path).resolve()
-    try:
-        stored = path.relative_to(root).as_posix()
-    except ValueError:
-        stored = str(path)
-    return {"scene": int(num), "copy": int(copy), "path": stored,
-            "bytes": path.stat().st_size, "fingerprint": fingerprint}
+    return _generation_progress.make_record(
+        cfg,
+        num,
+        copy,
+        saved_path,
+        fingerprint,
+        globals()["out_root"],
+    )
 
 
 def progress_item_key(item):
-    try:
-        if isinstance(item, dict):
-            return int(item["scene"]), int(item.get("copy", 1))
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            return int(item[0]), int(item[1])
-        return int(item), 1
-    except (KeyError, TypeError, ValueError):
-        return None
+    return _generation_progress.item_key(item)
 
 
 def progress_record_path(record, cfg):
-    value = record.get("path") if isinstance(record, dict) else None
-    if not isinstance(value, str) or not value.strip():
-        return None
-    path = Path(value)
-    return path if path.is_absolute() else out_root(cfg).resolve() / path
+    return _generation_progress.record_path(
+        record,
+        cfg,
+        globals()["out_root"],
+    )
 
 
 def progress_record_valid(record, cfg, expected_fingerprint):
-    if not isinstance(record, dict):
-        return False
-    if record.get("fingerprint") != expected_fingerprint:
-        return False
-    path = progress_record_path(record, cfg)
-    if path is None:
-        return False
-    try:
-        return (path.is_file() and path.stat().st_size > 0
-                and path.stat().st_size == int(record.get("bytes", -1)))
-    except (OSError, TypeError, ValueError):
-        return False
+    return _generation_progress.record_valid(
+        record,
+        cfg,
+        expected_fingerprint,
+        globals()["out_root"],
+    )
 
 def compute_pending(cfg, acfg, done_this_run, skip_set):
     return _setting_runtime.compute_pending(

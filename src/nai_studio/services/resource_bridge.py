@@ -12,7 +12,11 @@ import base64
 import hashlib
 import re
 from copy import deepcopy
-from typing import Any, Mapping, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import unquote
 
 from src.nai_studio.domain.resources import (
     canonical_resource,
@@ -22,6 +26,23 @@ from src.nai_studio.domain.resources import (
 
 
 LEGACY_IMPORT_PLAN_SCHEMA = "nai-legacy-resource-import-plan/v1"
+
+
+@dataclass(frozen=True)
+class LegacyResourceImportPaths:
+    """교환 자원 파일과 공유 저장 트랜잭션의 기존 위치 계약."""
+
+    vibe_dir: Path
+    transaction_root: Path
+
+
+@dataclass(frozen=True)
+class LegacyResourceImportOperations:
+    """파일·설정 원자 저장을 현재 앱 환경에 늦게 연결한다."""
+
+    transaction: Callable[[Path], AbstractContextManager[Any]]
+    atomic_write_bytes: Callable[..., None]
+    save_config: Callable[[dict], Any]
 
 
 def _mapping(value: Any, field: str) -> dict:
@@ -475,4 +496,73 @@ def legacy_resource_import_plan(
         "skipped": skipped,
         "issues": issues,
         "applied": False,
+    }
+
+
+def import_legacy_resources(
+    application: Any,
+    paths: LegacyResourceImportPaths,
+    operations: LegacyResourceImportOperations,
+    body: Any,
+    filename: str = "",
+) -> dict:
+    """교환 문서를 비활성 자원으로 원자 저장하고 현재 설정에 연결한다."""
+    if not body:
+        return {"ok": False, "error": "가져올 묶음이 비어 있습니다."}
+    with operations.transaction(paths.transaction_root):
+        with application.config_lock:
+            application.use_latest_config()
+            plan = legacy_resource_import_plan(
+                body,
+                filename=unquote(filename or ""),
+                existing_config=application.cfg,
+            )
+            _write_import_files(paths, operations, plan["writes"])
+            application.cfg.setdefault("vibes", []).extend(
+                plan["additions"]["vibes"]
+            )
+            application.cfg.setdefault("char_refs", []).extend(
+                plan["additions"]["char_refs"]
+            )
+            operations.save_config(application.cfg)
+            application.config_revision += 1
+    return _import_result(application, plan)
+
+
+def _write_import_files(
+    paths: LegacyResourceImportPaths,
+    operations: LegacyResourceImportOperations,
+    writes: Sequence[Mapping[str, Any]],
+) -> None:
+    paths.vibe_dir.mkdir(parents=True, exist_ok=True)
+    for write in writes:
+        name = Path(str(write.get("filename") or "")).name
+        if not name or name != write.get("filename"):
+            raise ValueError("안전하지 않은 자원 파일 이름입니다.")
+        target = paths.vibe_dir / name
+        content = write.get("content")
+        raw = (
+            content.encode(write.get("encoding") or "utf-8")
+            if write.get("kind") == "text"
+            else bytes(content or b"")
+        )
+        if target.exists():
+            if target.read_bytes() != raw:
+                raise FileExistsError(
+                    f"같은 이름의 다른 자원 파일이 있습니다: {name}"
+                )
+            continue
+        operations.atomic_write_bytes(target, raw, keep_backup=False)
+
+
+def _import_result(application: Any, plan: Mapping[str, Any]) -> dict:
+    return {
+        "ok": True,
+        "added_vibes": len(plan["additions"]["vibes"]),
+        "added_char_refs": len(plan["additions"]["char_refs"]),
+        "skipped": plan["skipped"],
+        "issues": plan["issues"],
+        "vibes": application.cfg.get("vibes", []),
+        "char_refs": application.cfg.get("char_refs", []),
+        "revision": application.config_revision,
     }

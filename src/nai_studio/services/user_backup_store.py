@@ -7,6 +7,7 @@ import copy
 import hashlib
 import io
 import json
+import re
 import zipfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -34,6 +35,8 @@ _COMMON_DIRS = frozenset({
 class UserBackupPaths:
     base_dir: Path
     profile_dir: Path
+    sources: "UserBackupSourcePaths"
+    profile_name: str = ""
     schema: str = "nais-user-backup/v1"
     journal_schema: str = "nais-restore-journal/v1"
     journal_dir_name: str = "복원기록"
@@ -49,6 +52,28 @@ class UserBackupOperations:
     after_restore: Callable[[], Any]
     now: Callable[[], Any]
     random_bytes: Callable[[int], bytes]
+    warning: Callable[..., Any]
+    recoverable_remove: Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class UserBackupSourcePaths:
+    """백업에 포함할 사용자 원본의 기존 파일·폴더 위치 계약."""
+
+    settings_file: Path
+    builder_file: Path
+    spec_file: Path
+    options_file: Path
+    tag_dir: Path
+    settings_dir: Path
+    schema_dir: Path
+    sceneset_dir: Path
+    style_dir: Path
+    character_dir: Path
+    fragment_dir: Path
+    vibe_dir: Path
+    picks_file: Path
+    scenes_file: Path
 
 
 def _clean_settings(raw: Any) -> bytes:
@@ -56,6 +81,11 @@ def _clean_settings(raw: Any) -> bytes:
     for key in _SECRET_KEYS:
         data.pop(key, None)
     return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def clean_settings(raw: Any) -> bytes:
+    """API 토큰·로컬 출력 위치를 제외한 설정 JSON 바이트를 만든다."""
+    return _clean_settings(raw)
 
 
 def _safe_logical(value: Any) -> str | None:
@@ -68,6 +98,10 @@ def _safe_logical(value: Any) -> str | None:
     ):
         return None
     return "/".join(parts)
+
+
+def safe_logical(value: Any) -> str | None:
+    return _safe_logical(value)
 
 
 def _read_backup(
@@ -131,6 +165,10 @@ def _destination(paths: UserBackupPaths, logical: Any) -> Path:
     return target
 
 
+def destination(paths: UserBackupPaths, logical: Any) -> Path:
+    return _destination(paths, logical)
+
+
 def _merge_secrets(
     operations: UserBackupOperations,
     logical: str,
@@ -147,6 +185,159 @@ def _merge_secrets(
         if key in current:
             incoming[key] = current[key]
     return json.dumps(incoming, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def merge_secrets(
+    operations: UserBackupOperations,
+    logical: str,
+    raw: bytes,
+    target: Path,
+) -> bytes:
+    return _merge_secrets(operations, logical, raw, target)
+
+
+def backup_sources(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    config: Any,
+) -> dict[str, bytes]:
+    """토큰·생성물·재생성 캐시를 제외하고 사용자 원본만 모은다."""
+    files: dict[str, bytes] = {}
+    source = paths.sources
+    for name, path in (
+        ("후보사전.json", source.builder_file),
+        ("규격.json", source.spec_file),
+        ("옵션.json", source.options_file),
+    ):
+        _put_source(files, operations, f"common/{name}", path)
+    for prefix, root in (
+        ("태그", source.tag_dir),
+        ("세팅", source.settings_dir),
+        ("씬규격", source.schema_dir),
+        ("씬프리셋", source.sceneset_dir),
+        ("그림체", source.style_dir),
+        ("캐릭터", source.character_dir),
+        ("조각", source.fragment_dir),
+        ("수집/바이브", source.vibe_dir),
+    ):
+        _put_tree(files, operations, prefix, root)
+    _put_collection_sources(paths, operations, files)
+    files["profile/설정.json"] = _clean_settings(config)
+    for name, path in (
+        ("선별.json", source.picks_file),
+        ("씬.json", source.scenes_file),
+    ):
+        _put_source(files, operations, f"profile/{name}", path)
+    return files
+
+
+def _put_source(
+    files: dict[str, bytes],
+    operations: UserBackupOperations,
+    logical: str,
+    path: Path,
+) -> None:
+    try:
+        if path.is_file() and not path.name.endswith((".bak", ".tmp")):
+            files[logical] = path.read_bytes()
+    except OSError as exc:
+        operations.warning("백업에서 건너뜀 %s: %s", path, exc)
+
+
+def _put_tree(
+    files: dict[str, bytes],
+    operations: UserBackupOperations,
+    prefix: str,
+    root: Path,
+    skip: tuple[str, ...] = (),
+) -> None:
+    if not root.is_dir():
+        return
+    resolved = root.resolve()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.name.endswith((".bak", ".tmp")):
+            continue
+        relative = path.relative_to(root)
+        if any(part in skip for part in relative.parts):
+            continue
+        try:
+            if resolved not in path.resolve().parents:
+                continue
+        except OSError:
+            continue
+        _put_source(
+            files,
+            operations,
+            f"common/{prefix}/{relative.as_posix()}",
+            path,
+        )
+
+
+def _put_collection_sources(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    files: dict[str, bytes],
+) -> None:
+    collection = paths.base_dir / "수집"
+    if not collection.is_dir():
+        return
+    for path in sorted(collection.glob("*.json")):
+        _put_source(files, operations, f"common/수집/{path.name}", path)
+    _put_tree(
+        files,
+        operations,
+        "수집/이미지캐시",
+        collection / "이미지캐시",
+        skip=("원격",),
+    )
+
+
+def export_user_backup(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    config: Any,
+) -> bytes:
+    """사용자 원본과 비밀값 제외 내역을 기존 ZIP schema로 내보낸다."""
+    payloads = backup_sources(paths, operations, config)
+    manifest = {
+        "schema": paths.schema,
+        "created_at": operations.now().isoformat(timespec="seconds"),
+        "profile": paths.profile_name or "기본",
+        "files": [
+            {
+                "path": logical,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+            for logical, raw in sorted(payloads.items())
+        ],
+        "excluded": [
+            "API 토큰",
+            "생성 결과(output)",
+            "로그·진행상태",
+            "태그 검색 색인",
+            "다운로드한 원격 이미지 캐시",
+            "자료팩 되돌리기 임시백업",
+        ],
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(
+        output,
+        "w",
+        zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                indent=1,
+            ).encode("utf-8"),
+        )
+        for logical, raw in sorted(payloads.items()):
+            archive.writestr("data/" + logical, raw)
+    return output.getvalue()
 
 
 def _list_key(current: Any, incoming: Any) -> str:
@@ -334,6 +525,65 @@ def backup_diff_plan(
     return manifest, payloads, archive_sha, plans, counts, total, fingerprint
 
 
+def backup_change_public(change: Mapping[str, Any]) -> dict:
+    """내부 대상 경로·원문 바이트를 제외한 선택 복원 항목만 공개한다."""
+    if change["current_exists"] and change["incoming_exists"]:
+        action = "변경"
+    elif change["incoming_exists"]:
+        action = "추가"
+    else:
+        action = "제거"
+    return {
+        key: copy.deepcopy(change[key])
+        for key in (
+            "id",
+            "logical",
+            "pointer",
+            "file_status",
+            "json",
+            "current_exists",
+            "incoming_exists",
+            "current",
+            "incoming",
+            "current_sha256",
+            "incoming_sha256",
+            "base_sha256",
+        )
+    } | {
+        "action": action,
+        "base_available": bool(change.get("base_sha256")),
+    }
+
+
+def preview_user_backup(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    blob: bytes,
+) -> dict:
+    """백업을 쓰지 않고 검증해 기존 미리보기 응답과 변경 지문을 만든다."""
+    (
+        manifest,
+        payloads,
+        archive_sha,
+        plans,
+        counts,
+        total,
+        fingerprint,
+    ) = backup_diff_plan(paths, operations, blob)
+    return {
+        "ok": True,
+        "sha256": archive_sha,
+        "files": len(payloads),
+        "bytes": total,
+        "counts": counts,
+        "created_at": manifest.get("created_at"),
+        "profile": manifest.get("profile"),
+        "excluded": manifest.get("excluded") or [],
+        "diff_fingerprint": fingerprint,
+        "changes": [backup_change_public(change) for change in plans],
+    }
+
+
 def restore_user_backup(
     paths: UserBackupPaths,
     operations: UserBackupOperations,
@@ -496,9 +746,99 @@ def _restore_user_backup(
     }
 
 
+def rollback_user_backup(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    batch_id: Any,
+) -> dict:
+    """복원 뒤 수정되지 않은 파일만 이전 상태로 안전하게 되돌린다."""
+    with operations.transaction(paths.base_dir):
+        return _rollback_user_backup(paths, operations, batch_id)
+
+
+def _rollback_user_backup(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    batch_id: Any,
+) -> dict:
+    if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{6}", str(batch_id or "")):
+        return {"ok": False, "error": "복원 기록 번호가 올바르지 않습니다."}
+    root = (paths.profile_dir / paths.journal_dir_name).resolve()
+    journal = (root / str(batch_id)).resolve()
+    journal_file = journal / "journal.json"
+    if root not in journal.parents or not journal_file.is_file():
+        return {"ok": False, "error": "복원 기록을 찾지 못했습니다."}
+    record = operations.load_settings(journal_file)
+    if record.get("status") == "rolled_back":
+        return {"ok": False, "error": "이미 되돌린 복원입니다."}
+    restored, skipped = _rollback_operations(
+        paths,
+        operations,
+        journal,
+        record,
+    )
+    record.update(
+        status="rolled_back",
+        rolled_back_at=operations.now().isoformat(timespec="seconds"),
+    )
+    operations.atomic_write_json(journal_file, record, indent=1)
+    operations.after_restore()
+    return {"ok": True, "restored": restored, "skipped": skipped}
+
+
+def _rollback_operations(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+    journal: Path,
+    record: dict,
+) -> tuple[int, int]:
+    completed = set(record.get("completed") or [])
+    restored = skipped = 0
+    for item in reversed(record.get("operations") or []):
+        logical = item.get("path")
+        if logical not in completed:
+            continue
+        target = _destination(paths, logical)
+        if not _matches_applied(target, item):
+            skipped += 1
+        elif item.get("new"):
+            operations.recoverable_remove(target, label="복원취소")
+            restored += 1
+        else:
+            saved = journal / "before" / logical
+            if saved.is_file():
+                raw = _merge_secrets(
+                    operations,
+                    logical,
+                    saved.read_bytes(),
+                    target,
+                )
+                operations.atomic_write_bytes(target, raw)
+                restored += 1
+    return restored, skipped
+
+
+def _matches_applied(target: Path, operation: Mapping[str, Any]) -> bool:
+    return (
+        target.is_file()
+        and hashlib.sha256(target.read_bytes()).hexdigest()
+        == operation.get("applied_sha256")
+    )
+
+
 __all__ = [
     "UserBackupOperations",
     "UserBackupPaths",
+    "UserBackupSourcePaths",
+    "backup_change_public",
     "backup_diff_plan",
+    "backup_sources",
+    "clean_settings",
+    "destination",
+    "export_user_backup",
+    "merge_secrets",
+    "preview_user_backup",
     "restore_user_backup",
+    "rollback_user_backup",
+    "safe_logical",
 ]

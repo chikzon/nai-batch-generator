@@ -68,6 +68,57 @@ class GenerationHandlerOperations:
     warning: Callable[..., Any]
 
 
+def handle_start(
+    server: Any,
+    data: Any,
+    operations: GenerationHandlerOperations,
+) -> dict[str, Any]:
+    """현재 세팅 계획을 한 배치의 불변 입력으로 고정해 worker에 넘긴다."""
+    del data
+    if server.live.running:
+        return {"ok": False, "error": "이미 생성 중입니다."}
+    if not server.cfg.get("token", "").startswith("pst-"):
+        return {
+            "ok": False,
+            "error": "NAI 토큰을 입력해주세요 (pst-... 형식).",
+        }
+    has_slot = any(
+        operations.slot_prompt(slot).strip()
+        for slot in server.cfg.get("char_slots", [])
+    )
+    has_cast = any(
+        operations.slot_prompt(character).strip()
+        for setting in (
+            server.cfg.get("setting_state") or {}
+        ).values()
+        for character in setting.get("cast", [])
+    )
+    if not (has_slot or has_cast):
+        return {
+            "ok": False,
+            "error": (
+                "설정의 캐릭터 칸 또는 세팅의 캐스트에 "
+                "인물을 1명 이상 넣어주세요."
+            ),
+        }
+    selected = any(
+        setting.get("use") is not False
+        and setting.get("selected")
+        for setting in (
+            server.cfg.get("setting_state") or {}
+        ).values()
+    )
+    if not selected:
+        return {
+            "ok": False,
+            "error": "세팅 탭에서 씬을 1개 이상 선택해주세요.",
+        }
+    with server.config_lock:
+        server.pending_batch_config = copy.deepcopy(server.cfg)
+    server.start_event.set()
+    return {"ok": True}
+
+
 def handle_job_command(
     server: Any,
     data: dict[str, Any],
