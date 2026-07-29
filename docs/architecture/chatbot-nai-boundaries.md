@@ -38,6 +38,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 비교·실시간 생성 상태 GET 라우트 | `web/routes/generation.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
+| 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |
 
 `legacy_app.py`는 위 이름을 import하거나 얇은 호환 어댑터로 노출한다. 저장 schema,
 사용자 자료 위치, HTTP endpoint와 `start.py` 진입점은 바꾸지 않았다.

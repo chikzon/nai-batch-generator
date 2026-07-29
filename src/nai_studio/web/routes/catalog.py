@@ -18,6 +18,7 @@ class CatalogGetOperations:
     prewarm: Any
     autocomplete: Any
     tags: Any
+    scenes: Any
 
 
 def _one(query: dict, name: str, default: str = "") -> str:
@@ -63,6 +64,23 @@ def _recipes(operations: CatalogGetOperations, query: dict) -> dict:
     return {"ok": True, **result}
 
 
+def _scenes(
+    application: Any,
+    operations: CatalogGetOperations,
+    query: dict,
+) -> dict:
+    scene_ids = [
+        value
+        for value in _one(query, "ids").split(",")
+        if value.strip().isdigit()
+    ]
+    return operations.scenes(
+        application.cfg,
+        scene_ids,
+        _one(query, "setting").strip(),
+    )
+
+
 def _payload(
     path: str,
     application: Any,
@@ -104,6 +122,8 @@ def _payload(
                 int(_one(query, "limit", "60")),
             ),
         }
+    if path.startswith("/api/scenes"):
+        return _scenes(application, operations, query)
     return None
 
 
@@ -120,6 +140,7 @@ def handle_catalog_get(
         "/api/recipes",
         "/api/ac",
         "/api/tags",
+        "/api/scenes",
     )
     if not request.path.startswith(prefixes):
         return False

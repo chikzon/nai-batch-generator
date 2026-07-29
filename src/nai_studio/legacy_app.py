@@ -212,6 +212,7 @@ from src.nai_studio.services.restoration_inputs import (
     image_inspect_queue,
     pack_import_queue,
 )
+from src.nai_studio.services.scene_catalog import scene_catalog
 from src.nai_studio.services.result_promotion import (
     append_promotion_events,
     build_result_promotion,
@@ -12686,6 +12687,17 @@ class ConfigServer:
             prewarm=lambda *args, **kwargs: prewarm_images(*args, **kwargs),
             autocomplete=lambda *args: autocomplete_tags(*args),
             tags=lambda *args: search_tags(*args),
+            scenes=lambda cfg, ids, setting: scene_catalog(
+                cfg,
+                ids,
+                setting,
+                setting_path=setting_path,
+                load_json=load_json_recover,
+                load_asset_config=load_asset_config,
+                content_revision=setting_content_revision,
+                normalize_refs=normalize_scene_reference_ids,
+                normalize_centers=normalize_scene_centers,
+            ),
         )
         generation_get = GenerationGetOperations(
             comparison_catalog=lambda cfg, spec: comparison_catalog(cfg, spec),
@@ -12877,75 +12889,6 @@ class ConfigServer:
                             "ok": False,
                             "error": redact_diagnostic_text(e),
                         })
-                elif self.path.startswith("/api/scenes"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    ids = [x for x in (q.get("ids", [""])[0]).split(",") if x.strip().isdigit()]
-                    try:
-                        setting_name = (q.get("setting", [""])[0] or "").strip()
-                        if setting_name:
-                            path = setting_path(setting_name)
-                            if not path:
-                                raise ValueError(f"'{setting_name}' 세팅을 찾을 수 없습니다.")
-                            pack = load_json_recover(path)
-                            source_scenes = pack.get("씬") or {}
-                            mode = pack.get("방식", "단독")
-                            revision = setting_content_revision(pack)
-                        else:
-                            ac = load_asset_config(server.cfg)
-                            source_scenes = ac["scenes"]
-                            mode = ""
-                            revision = ""
-                        out = []
-                        for i in ids:
-                            sc = source_scenes.get(i)
-                            if sc:
-                                out.append({"id": int(i), "name": sc.get("name", ""),
-                                            "setting": setting_name or sc.get("_setting", ""),
-                                            "mode": mode or sc.get("_mode", ""),
-                                            "female_prompt": sc.get("female_prompt", ""),
-                                            "male_prompt": sc.get("male_prompt", ""),
-                                            "partner_prompt": sc.get("partner_prompt", ""),
-                                            "base_tags": sc.get("base_tags", ""),
-                                            "relationship_name": sc.get(
-                                                "relationship_name", sc.get("pair", "")),
-                                            "relationship_tags": sc.get("relationship_tags", ""),
-                                            "female_negative": sc.get("female_negative", ""),
-                                            "male_negative": sc.get("male_negative", ""),
-                                            "partner_negative": sc.get("partner_negative", ""),
-                                            "remove_char_tags": (
-                                                ", ".join(sc.get("remove_char_tags") or [])
-                                                if isinstance(sc.get("remove_char_tags"), list)
-                                                else str(sc.get("remove_char_tags") or "")),
-                                            "remove_male_tags": (
-                                                ", ".join(sc.get("remove_male_tags") or [])
-                                                if isinstance(sc.get("remove_male_tags"), list)
-                                                else str(sc.get("remove_male_tags") or "")),
-                                            "remove_partner_tags": (
-                                                ", ".join(sc.get("remove_partner_tags") or [])
-                                                if isinstance(sc.get("remove_partner_tags"), list)
-                                                else str(sc.get("remove_partner_tags") or "")),
-                                            "pair": sc.get("pair", ""),
-                                            "negative": sc.get("negative", ""),
-                                            "width": sc.get("width", 832),
-                                            "height": sc.get("height", 1216),
-                                            "use_character_refs": bool(
-                                                sc.get("use_character_refs", False)),
-                                            "character_refs": normalize_scene_reference_ids(
-                                                sc.get("character_refs")),
-                                            "char_centers": normalize_scene_centers(
-                                                sc.get("char_centers"))})
-                        self._json({
-                            "ok": True, "scenes": out, "revision": revision,
-                            "char_refs": [
-                                {"id": str(ref.get("id") or ""),
-                                 "name": str(ref.get("name") or ref.get("id") or "무제")}
-                                for ref in (server.cfg.get("char_refs") or [])
-                                if isinstance(ref, dict) and ref.get("id")
-                            ],
-                        })
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path == "/" or self.path.startswith("/?"):
                     body = render_page().encode("utf-8")
                     self.send_response(200)
