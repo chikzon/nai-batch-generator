@@ -26,10 +26,20 @@
 | web | localhost 보안·서버 수명·앱 조립·HTML·정적 UI | `src/nai_studio/web/` |
 | compatibility | 기존 전역 이름·`ConfigServer`·`start.py` 진입점 | `src/nai_studio/legacy_app.py`, `start.py` |
 
-`legacy_app.py`에 50줄 이상 기능 함수는 남아 있지 않다. `ConfigServer`는 32개
-호환 메서드와 Operations 조립을 한 객체로 노출하지만, 각 메서드는 49줄 이하이며
-실제 기능은 위 소유 모듈로 위임한다. 저장 schema, 사용자 자료 위치, HTTP endpoint,
-`start.py`와 `실행.bat` 진입점은 유지한다.
+`legacy_app.py`에 50줄 이상 기능 함수는 남아 있지 않지만, 줄 수만으로 완료를
+판정하지 않는다. `ConfigServer`의 자원 임포트·규격화 저장·세팅 snapshot과 클래스
+밖의 세팅 CRUD·캐시·태그 색인·작업 장부에는 짧은 실구현이 남아 있다. 이를 기능
+서비스로 이동하는 동안 저장 schema, 사용자 자료 위치, HTTP endpoint, `start.py`와
+`실행.bat` 진입점은 유지한다.
+
+## 남은 실제 경계
+
+- 생성: Vibe·Reference·Director·Upscale·Anlas 보조 호출, 진행 장부
+- 세팅: 저장소, CRUD·복제·undo·상대역·옵션·프리셋
+- 자료: 이미지 캐시·출처, 자원 임포트, 그림체 휴지통, 색인, 백업 오케스트레이션
+- 빌더: 태그 색인, 작가 평가 저장소, 규격화·그림체 저장 handler
+- 관리: 설정 저장소, 기존 작업 장부, 비교 manifest 투영
+- 공통 UI: page view-model과 renderer 경계
 
 ## 연결 계약
 
