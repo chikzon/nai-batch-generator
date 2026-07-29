@@ -42,6 +42,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 자료실·그림체 정리 POST 라우트 | `web/routes/catalog_post.py` |
 | 작가 평가·결과 선별 POST 라우트 | `web/routes/evaluation_post.py` |
 | 프롬프트 조각 POST 라우트 | `web/routes/fragments_post.py` |
+| 세팅·장면 편집 POST 라우트 | `web/routes/settings_post.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 | 선택 세팅 장면의 UI 조회 투영 | `services/scene_catalog.py` |

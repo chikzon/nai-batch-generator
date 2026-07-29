@@ -267,6 +267,10 @@ from src.nai_studio.web.routes.recovery_post import (
     RecoveryPostOperations,
     handle_recovery_post,
 )
+from src.nai_studio.web.routes.settings_post import (
+    SettingsPostOperations,
+    handle_settings_post,
+)
 from src.nai_studio.web.routes.runtime import handle_runtime_get
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -12836,6 +12840,35 @@ class ConfigServer:
             resolve_fragments=resolve_fragments,
             random_factory=random.Random,
         )
+        settings_post = SettingsPostOperations(
+            duplicate_scene_undo=undo_duplicate_setting_scene,
+            duplicate_scene=duplicate_setting_scene,
+            scene_save=server.handle_scene_save,
+            option_item=server.handle_option_item,
+            role_save=server.handle_role_save,
+            sceneset_save=server.handle_sceneset_save,
+            load_asset_config=load_asset_config,
+            setting_state=setting_state,
+            cast_members=setting_cast_members,
+            slot_prompt=slot_prompt,
+            character_run=character_run_from_group,
+            build_scene=build_scene,
+            reference_config=setting_reference_config,
+            scene_people=setting_scene_people,
+            seed_for=seed_for,
+            load_state=load_state,
+            normalize_prompt=normalize_prompt,
+            join_tags=_join_tags,
+            token_count=nai_tokens,
+            save_scenes=save_scenes,
+            new_setting=new_setting,
+            add_set=setting_add_set,
+            save_meta=setting_meta_save,
+            renumber=setting_renumber,
+            delete_setting=setting_delete,
+            duplicate_group=duplicate_setting_group,
+            log_warning=log.warning,
+        )
 
         class Handler(ConfigRequestHandler):
 
@@ -12869,6 +12902,8 @@ class ConfigServer:
                     return
                 if handle_fragment_post(self, server, fragment_post, body):
                     return
+                if handle_settings_post(self, server, settings_post, body):
+                    return
                 if self.path.startswith("/api/blueprint_project"):
                     try:
                         self._json(server.handle_blueprint_project(body))
@@ -12900,100 +12935,8 @@ class ConfigServer:
                     self._json(server.handle_compare_run(body))
                 elif self.path.startswith("/api/start"):
                     self._json(server.handle_start())
-                elif self.path.startswith("/api/scene_duplicate_undo"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(undo_duplicate_setting_scene(
-                            data.get("setting", ""), data.get("id", ""),
-                            data.get("scene_sha256", ""),
-                            data.get("expect_revision", "")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/scene_duplicate"):
-                    try:
-                        data = json.loads(body or b"{}")
-                        self._json(duplicate_setting_scene(
-                            data.get("setting", ""), data.get("id", ""),
-                            data.get("expect_revision", "")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/scene_save"):
-                    self._json(server.handle_scene_save(body))
-                elif self.path.startswith("/api/option_item"):
-                    self._json(server.handle_option_item(body))
-                elif self.path.startswith("/api/role_save"):
-                    self._json(server.handle_role_save(body))
                 elif self.path.startswith("/api/generate_one"):
                     self._json(server.handle_generate_one())
-                elif self.path.startswith("/api/sceneset_save"):
-                    self._json(server.handle_sceneset_save(body))
-                elif self.path.startswith("/api/scene_preview"):
-                    # 씬 번호 → NAI 로 실제 나갈 값을 그대로 조립해서 보여준다.
-                    # 565장 돌리기 전에 옵션 조합 실수를 여기서 잡는다.
-                    try:
-                        d = json.loads(body or b"{}")
-                        num = int(d.get("num"))
-                        cfg = server.cfg
-                        acfg = load_asset_config(cfg)
-                        scene = acfg["scenes"].get(str(num))
-                        if not scene:
-                            self._json({"ok": False, "error": f"{num}번 씬이 없습니다."}); return
-                        cast = None
-                        scene_state = setting_state(cfg, scene.get("_setting", ""))
-                        cast_members = [
-                            c for c in setting_cast_members(cfg, scene_state)
-                            if slot_prompt(c).strip()
-                        ]
-                        if cast_members:
-                            used_members = (
-                                cast_members if scene_state.get("cast_mode") == "together"
-                                else cast_members[:1])
-                            cast = character_run_from_group(
-                                used_members,
-                                position_mode=scene_state.get("position_mode"))
-                        if cast is None:
-                            slots = [s for s in (cfg.get("char_slots") or [])
-                                     if slot_prompt(s).strip()]
-                            cast = (character_run_from_group(
-                                slots, position_mode=cfg.get("position_mode"))
-                                    if slots else {"name": "(캐릭터 없음)", "female": "", "negative": ""})
-                        base, fem, male, cneg, mneg, w, h = build_scene(acfg, cast, cfg, num)
-                        _, scene_ref_override, scene_ref_names = \
-                            setting_reference_config(cfg, scene)
-                        preview_people, preview_centers, preview_use_positions = \
-                            setting_scene_people(
-                                scene, fem, male, cneg, mneg, cast, cfg)
-                        seed = seed_for(cfg, load_state()["seeds"].get(
-                            f"{int(cfg.get('seed', 1) or 1):02d}", 0), num)
-                        self._json({"ok": True, "num": num, "name": scene.get("name", ""),
-                                    "setting": scene.get("_setting", ""),
-                                    "mode": scene.get("_mode", ""),
-                                    "cast": cast["name"],
-                                    "relationship_name": scene.get(
-                                        "relationship_name", scene.get("pair", "")),
-                                    "base": normalize_prompt(base),
-                                    "female": normalize_prompt(fem),
-                                    "male": normalize_prompt(male),
-                                    # 미리보기도 씬 전용 네거티브를 합쳐 보여준다
-                                    # (안 그러면 실제 전송값과 어긋난다)
-                                    "negative": normalize_prompt(_join_tags(
-                                        acfg["base"].get("nsfw_negative_prompt",
-                                                         acfg["base"]["negative_prompt"]),
-                                        (scene.get("negative") or "").strip())),
-                                    "char_negative": normalize_prompt(cneg),
-                                    "male_negative": normalize_prompt(mneg),
-                                    "people": len(preview_people),
-                                    "use_positions": preview_use_positions,
-                                    "char_centers": preview_centers,
-                                    "scene_reference_override": scene_ref_override,
-                                    "reference_names": scene_ref_names,
-                                    "width": w, "height": h, "seed": seed,
-                                    "tokens": {"base": nai_tokens(base),
-                                               "female": nai_tokens(fem),
-                                               "male": nai_tokens(male)}})
-                    except Exception as e:
-                        log.warning(f"씬 미리보기 실패: {traceback.format_exc()}")
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/anlas"):
                     try:
                         d = json.loads(body or b"{}")
@@ -13141,12 +13084,6 @@ class ConfigServer:
                                     "finalized": bool(d.get("finalize"))})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/scenes_save"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json({"ok": True, "scenes": save_scenes(d.get("scenes") or [])})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/i2i"):
                     self._json(server.handle_i2i(body))
                 elif self.path.startswith("/api/character_variation_save"):
@@ -13155,52 +13092,6 @@ class ConfigServer:
                     self._json(server.handle_regen(body))
                 elif self.path.startswith("/api/scenes_run"):
                     self._json(server.handle_scene_run())
-                elif self.path.startswith("/api/sb_new"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(new_setting(d.get("name", ""), d.get("mode", "단독"),
-                                               d.get("stages")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/sb_addset"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(setting_add_set(
-                            d.get("name", ""), d.get("label", ""), d.get("category", ""),
-                            int(d.get("width") or 832), int(d.get("height") or 1216),
-                            d.get("stages")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/sb_meta"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(setting_meta_save(d.get("name", ""), d.get("patch") or {}))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/sb_renumber"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(setting_renumber(d.get("name", ""), d.get("start")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/sb_del"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        self._json(setting_delete(d.get("name", "")))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/setting_dup"):
-                    try:
-                        d = json.loads(body or b"{}")
-                        # 씬 번호가 없거나 숫자가 아니면 파이썬 오류 대신 사람 말로 (세팅 빌더 점검)
-                        try:
-                            sid = int(d.get("id"))
-                        except (TypeError, ValueError):
-                            self._json({"ok": False, "error": "복제할 세트의 씬 번호(id)가 필요합니다."})
-                            return
-                        self._json(duplicate_setting_group(d.get("name", ""), sid))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/director"):
                     # 이미지 원본을 그대로 POST 받고, 옵션은 헤더로
                     from urllib.parse import unquote
