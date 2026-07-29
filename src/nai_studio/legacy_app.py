@@ -226,6 +226,7 @@ from src.nai_studio.services.result_store import (
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
     reroll_legacy_components,
+    resolve_legacy_fragments,
     resolve_legacy_prompt,
 )
 from src.nai_studio.services.public_collection import (
@@ -8712,57 +8713,14 @@ def import_fragments_bytes(data, filename=""):
 
 
 def resolve_fragments(texts, frags=None, counters=None, rng=None):
-    """여러 프롬프트 칸을 **한 번에** 푼다.
-    한 이미지에서 `<*표정>` 이 베이스와 캐릭터 칸에 함께 있어도 순번은 한 번만 는다.
-    반환: (푼 텍스트 목록, 바뀐 순번 dict)"""
-    import random as _random
-    frags = list_fragments() if frags is None else frags
-    counters = dict(counters or {})
-    rng = rng or _random
-    if not frags and not any("{" in (t or "") for t in texts):
-        return list(texts), counters
-
-    step = {}          # 이 이미지에서 <*이름> 이 이미 고른 값 (칸이 달라도 같은 값)
-    pick = {}          # 이 이미지에서 <이름> 이 이미 고른 값
-
-    def one(m):
-        seq = m.group(1) == "*"
-        name = m.group(2).strip()
-        opts = frags.get(name)
-        if not opts:
-            return m.group(0)          # 없는 조각은 건드리지 않는다 (오타를 눈에 띄게)
-        if len(opts) == 1:
-            return opts[0]
-        if seq:
-            if name not in step:
-                i = int(counters.get(name, 0))
-                step[name] = opts[i % len(opts)]
-                counters[name] = i + 1
-            return step[name]
-        if name not in pick:
-            pick[name] = rng.choice(opts)
-        return pick[name]
-
-    def inline(m):
-        parts = [x.strip() for x in m.group(1).split("|")]
-        # ⚠ `{| |}`(23,000장)·`{|_|}`(11,000장) 은 **실제 단부루 태그**다 (얼굴 표정).
-        #   빈 칸이 하나라도 있으면 인라인 선택이 아니라 태그로 보고 **원문을 그대로 둔다**.
-        #   예전엔 빈 조각을 걸러내 `{| |}` 가 통째로 사라졌다 (NAIS3 세션 지적).
-        if any(not x for x in parts) or len(parts) < 2:
-            return m.group(0)
-        return rng.choice(parts)
-
-    out = []
-    for t in texts:
-        s = t or ""
-        for _ in range(FRAG_MAX_DEPTH):
-            new = re.sub(r"<(\*?)([^<>]+)>", one, s)
-            new = re.sub(r"\{([^{}]*\|[^{}]*)\}", inline, new)
-            if new == s:
-                break
-            s = new
-        out.append(s)
-    return out, counters
+    """레거시 조각 저장소와 공통 prompt bridge를 연결한다."""
+    return resolve_legacy_fragments(
+        texts,
+        list_fragments() if frags is None else frags,
+        counters=counters,
+        rng=rng,
+        max_depth=FRAG_MAX_DEPTH,
+    )
 
 
 def finalized_token_texts(base, negative, chars, char_negatives, cfg):

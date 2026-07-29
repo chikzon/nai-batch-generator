@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
@@ -152,3 +153,60 @@ def legacy_sequence_text(value: Mapping[str, Any]) -> str:
         raise PromptBridgeError("legacy bridge 결과가 아닙니다.")
     return str(value.get("text") or "")
 
+
+def resolve_legacy_fragments(
+    texts: Sequence[str],
+    fragments: Mapping[str, Sequence[str]],
+    *,
+    counters: Mapping[str, int] | None = None,
+    rng: Any = None,
+    max_depth: int = 8,
+) -> tuple[list[str], dict]:
+    """여러 프롬프트 칸의 이름·순차·인라인 조각을 한 실행 단위로 푼다."""
+    counters = dict(counters or {})
+    rng = rng or random
+    if not fragments and not any("{" in (text or "") for text in texts):
+        return list(texts), counters
+    sequential_picks = {}
+    random_picks = {}
+
+    def named(match: re.Match) -> str:
+        sequential = match.group(1) == "*"
+        name = match.group(2).strip()
+        options = fragments.get(name)
+        if not options:
+            return match.group(0)
+        if len(options) == 1:
+            return options[0]
+        if sequential:
+            if name not in sequential_picks:
+                index = int(counters.get(name, 0))
+                sequential_picks[name] = options[index % len(options)]
+                counters[name] = index + 1
+            return sequential_picks[name]
+        if name not in random_picks:
+            random_picks[name] = rng.choice(options)
+        return random_picks[name]
+
+    def inline(match: re.Match) -> str:
+        options = [
+            value.strip() for value in match.group(1).split("|")
+        ]
+        # `{| |}`·`{|_|}`는 실제 태그이므로 빈 조각이 있으면 원문을 보존한다.
+        if any(not value for value in options) or len(options) < 2:
+            return match.group(0)
+        return rng.choice(options)
+
+    resolved = []
+    for text in texts:
+        current = text or ""
+        for _ in range(max_depth):
+            changed = re.sub(r"<(\*?)([^<>]+)>", named, current)
+            changed = re.sub(
+                r"\{([^{}]*\|[^{}]*)\}", inline, changed
+            )
+            if changed == current:
+                break
+            current = changed
+        resolved.append(current)
+    return resolved, counters
