@@ -9,6 +9,7 @@
    - [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)
 3. **현재 구조**
    - [모듈 경계](../architecture/chatbot-nai-boundaries.md)
+   - [기능 분류·최적화 색인](../architecture/functional-categories.md)
 
 ## 현재 공개 상태
 
