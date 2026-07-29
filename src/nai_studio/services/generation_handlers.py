@@ -852,6 +852,195 @@ def _expansion(data: dict[str, Any]) -> dict[str, int] | dict[str, Any]:
     return expansion
 
 
+def _i2i_request(
+    data: dict[str, Any],
+) -> tuple[str, str, str, str | None, str, dict[str, int]] | dict[str, Any]:
+    """화면 입력을 편집 종류·이미지·확장 계약으로만 정규화한다."""
+    variation_mode = str(
+        data.get("variation_mode") or "img2img"
+    ).strip().lower()
+    if variation_mode not in (
+        "img2img",
+        "inpaint",
+        "character-reference",
+        "reference-inset",
+    ):
+        return {"ok": False, "error": "알 수 없는 캐릭터 시험 방식입니다."}
+    operation = str(data.get("operation") or "edit").strip().lower()
+    if operation not in ("edit", "outpaint"):
+        return {"ok": False, "error": "알 수 없는 이미지 편집 작업입니다."}
+    image_b64 = (data.get("image") or "").split(",", 1)[-1]
+    if not image_b64:
+        return {"ok": False, "error": "원본 그림이 없습니다."}
+    mask_b64 = (data.get("mask") or "").split(",", 1)[-1] or None
+    if operation == "outpaint" and not mask_b64:
+        return {"ok": False, "error": "Outpaint 확장 영역 마스크가 없습니다."}
+    mode = (
+        "Outpaint" if operation == "outpaint"
+        else "Character Reference" if variation_mode == "character-reference"
+        else "Reference inset" if variation_mode == "reference-inset"
+        else "인페인트" if mask_b64 else "img2img"
+    )
+    expansion = _expansion(data)
+    if expansion.get("ok") is False:
+        return expansion
+    if operation == "outpaint" and not any(expansion.values()):
+        return {"ok": False, "error": "Outpaint 확장 방향과 크기가 없습니다."}
+    return variation_mode, operation, image_b64, mask_b64, mode, expansion
+
+
+def _i2i_source(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    operations: GenerationHandlerOperations,
+    variation_mode: str,
+    image_b64: str,
+    mask_b64: str | None,
+) -> tuple[int, int, bytes, str, str | None, bytes, str, dict] | dict:
+    """원본과 NAI 입력 캔버스를 읽고 크기·원본 지문을 함께 고정한다."""
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as error:
+        return {"ok": False, "error": f"그림을 못 읽었습니다: {error}"}
+    original_source = image_bytes
+    dimensions = _i2i_dimensions(
+        data, config, variation_mode, image_bytes, image_b64, mask_b64
+    )
+    if isinstance(dimensions, dict):
+        return dimensions
+    dimensions = _reference_inset(operations, variation_mode, dimensions)
+    if isinstance(dimensions, dict):
+        return dimensions
+    width, height, image_bytes, image_b64, mask_b64 = dimensions
+    width, height = max(64, width // 64 * 64), max(64, height // 64 * 64)
+    if width > 2048 or height > 2048:
+        return {
+            "ok": False,
+            "error": "최종 크기는 가로·세로 2048px를 넘을 수 없습니다.",
+        }
+    original_b64 = (data.get("original") or "").split(",", 1)[-1] or None
+    try:
+        source_raw = (
+            base64.b64decode(original_b64) if original_b64 else original_source
+        )
+        with Image.open(io.BytesIO(source_raw)) as source:
+            source_size = {"width": source.width, "height": source.height}
+    except Exception as error:
+        return {"ok": False, "error": f"Outpaint 원본을 못 읽었습니다: {error}"}
+    return (
+        width,
+        height,
+        image_bytes,
+        image_b64,
+        mask_b64,
+        original_source,
+        hashlib.sha256(source_raw).hexdigest(),
+        source_size,
+    )
+
+
+def _i2i_variation(
+    operations: GenerationHandlerOperations,
+    config: dict[str, Any],
+    data: dict[str, Any],
+    variation_mode: str,
+    image_bytes: bytes,
+    original_source: bytes,
+    mask_b64: str | None,
+    source_hash: str,
+    seed: int,
+    width: int,
+    height: int,
+) -> tuple[dict, str, dict | None, bytes | None, dict | None] | dict:
+    """선택된 캐릭터 시험만 별도 계획으로 투영하고 일반 편집은 원 설정을 쓴다."""
+    variation_id = str(data.get("variation_character_id") or "").strip()
+    if not variation_id:
+        return config, "", None, None, None
+    planned = _variation_material(
+        operations,
+        config,
+        data,
+        variation_mode,
+        variation_id,
+        image_bytes,
+        original_source,
+        mask_b64,
+        source_hash,
+        seed,
+        width,
+        height,
+    )
+    if isinstance(planned, dict):
+        return planned
+    job_config, variation_name, plan, transient_reference = planned
+    return (
+        job_config,
+        variation_name,
+        plan,
+        transient_reference,
+        copy.deepcopy(plan["variation_plan"]),
+    )
+
+
+def _store_pending_variation(
+    server: Any,
+    operations: GenerationHandlerOperations,
+    variation_id: str,
+    variation_name: str,
+    variation_mode: str,
+    variation_plan: dict | None,
+) -> None:
+    """임시 변형 저장 버튼이 같은 실행 결과만 가리키도록 시작 계획을 보관한다."""
+    with server.config_lock:
+        server.pending_variation = (
+            {
+                "character_id": variation_id,
+                "character_name": variation_name,
+                "asset_fingerprint": (
+                    variation_plan.get("character_asset_fingerprint")
+                    if variation_plan else ""
+                ),
+                "plan": copy.deepcopy(variation_plan),
+                "mode": variation_mode,
+                "started_at": operations.now().isoformat(timespec="seconds"),
+                "result_path": "",
+                "job_id": server.live.job_id,
+            }
+            if variation_id else None
+        )
+
+
+def _i2i_started(
+    operation: str,
+    mode: str,
+    variation_mode: str,
+    variation_id: str,
+    variation_name: str,
+    plan: dict | None,
+    width: int,
+    height: int,
+    mask_b64: str | None,
+    source_hash: str,
+    expansion: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "mode": mode,
+        "width": width,
+        "height": height,
+        "source_hash": source_hash,
+        "expansion": expansion if operation == "outpaint" else None,
+        "variation_character": variation_name,
+        "variation_mode": variation_mode if variation_id else "",
+        "temporary": bool(variation_id),
+        "vibe_suppressed": bool(
+            variation_id
+            and variation_mode == "character-reference"
+            and plan.get("vibes")
+        ),
+    }
+
+
 def handle_i2i(
     server: Any,
     data: dict[str, Any],
@@ -864,145 +1053,38 @@ def handle_i2i(
         config = copy.deepcopy(server.cfg)
     if not config.get("token", "").startswith("pst-"):
         return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
-    variation_mode = str(
-        data.get("variation_mode") or "img2img"
-    ).strip().lower()
-    if variation_mode not in (
-        "img2img",
-        "inpaint",
-        "character-reference",
-        "reference-inset",
-    ):
-        return {
-            "ok": False,
-            "error": "알 수 없는 캐릭터 시험 방식입니다.",
-        }
-    operation = str(
-        data.get("operation") or "edit"
-    ).strip().lower()
-    if operation not in ("edit", "outpaint"):
-        return {
-            "ok": False,
-            "error": "알 수 없는 이미지 편집 작업입니다.",
-        }
-    image_b64 = (data.get("image") or "").split(",", 1)[-1]
-    if not image_b64:
-        return {"ok": False, "error": "원본 그림이 없습니다."}
-    mask_b64 = (
-        (data.get("mask") or "").split(",", 1)[-1] or None
+    request = _i2i_request(data)
+    if isinstance(request, dict):
+        return request
+    variation_mode, operation, image_b64, mask_b64, mode, expansion = request
+    source = _i2i_source(
+        data, config, operations, variation_mode, image_b64, mask_b64
     )
-    if operation == "outpaint" and not mask_b64:
-        return {
-            "ok": False,
-            "error": "Outpaint 확장 영역 마스크가 없습니다.",
-        }
-    mode = (
-        "Outpaint"
-        if operation == "outpaint"
-        else "Character Reference"
-        if variation_mode == "character-reference"
-        else "Reference inset"
-        if variation_mode == "reference-inset"
-        else "인페인트"
-        if mask_b64
-        else "img2img"
-    )
-    expansion = _expansion(data)
-    if expansion.get("ok") is False:
-        return expansion
-    if operation == "outpaint" and not any(expansion.values()):
-        return {
-            "ok": False,
-            "error": "Outpaint 확장 방향과 크기가 없습니다.",
-        }
-    try:
-        image_bytes = base64.b64decode(image_b64)
-    except Exception as error:
-        return {
-            "ok": False,
-            "error": f"그림을 못 읽었습니다: {error}",
-        }
-    original_source = image_bytes
-    dimensions = _i2i_dimensions(
-        data,
-        config,
-        variation_mode,
+    if isinstance(source, dict):
+        return source
+    (
+        width,
+        height,
         image_bytes,
         image_b64,
         mask_b64,
-    )
-    if isinstance(dimensions, dict):
-        return dimensions
-    dimensions = _reference_inset(
-        operations, variation_mode, dimensions
-    )
-    if isinstance(dimensions, dict):
-        return dimensions
-    width, height, image_bytes, image_b64, mask_b64 = dimensions
-    width, height = (
-        max(64, width // 64 * 64),
-        max(64, height // 64 * 64),
-    )
-    if width > 2048 or height > 2048:
-        return {
-            "ok": False,
-            "error": "최종 크기는 가로·세로 2048px를 넘을 수 없습니다.",
-        }
-    original_b64 = (
-        (data.get("original") or "").split(",", 1)[-1] or None
-    )
-    try:
-        source_raw = (
-            base64.b64decode(original_b64)
-            if original_b64
-            else original_source
-        )
-        with Image.open(io.BytesIO(source_raw)) as source:
-            source_size = {
-                "width": source.width,
-                "height": source.height,
-            }
-    except Exception as error:
-        return {
-            "ok": False,
-            "error": f"Outpaint 원본을 못 읽었습니다: {error}",
-        }
-    source_hash = hashlib.sha256(source_raw).hexdigest()
+        original_source,
+        source_hash,
+        source_size,
+    ) = source
     seed = int(data.get("seed") or 0) or operations.random_seed(
         0, 2**32 - 1
     )
-    variation_id = str(
-        data.get("variation_character_id") or ""
-    ).strip()
-    job_config = config
-    variation_name = ""
-    variation_plan = None
-    transient_reference = None
-    plan = None
-    if variation_id:
-        planned = _variation_material(
-            operations,
-            config,
-            data,
-            variation_mode,
-            variation_id,
-            image_bytes,
-            original_source,
-            mask_b64,
-            source_hash,
-            seed,
-            width,
-            height,
-        )
-        if isinstance(planned, dict):
-            return planned
-        (
-            job_config,
-            variation_name,
-            plan,
-            transient_reference,
-        ) = planned
-        variation_plan = copy.deepcopy(plan["variation_plan"])
+    variation_id = str(data.get("variation_character_id") or "").strip()
+    variation = _i2i_variation(
+        operations, config, data, variation_mode, image_bytes,
+        original_source, mask_b64, source_hash, seed, width, height,
+    )
+    if isinstance(variation, dict):
+        return variation
+    job_config, variation_name, plan, transient_reference, variation_plan = (
+        variation
+    )
     blueprint = operations.inherited_blueprint(
         job_config,
         source={
@@ -1051,29 +1133,10 @@ def handle_i2i(
             "_image_bytes"
         ] = transient_reference
         job_config["char_refs"][0]["_required"] = True
-    with server.config_lock:
-        server.pending_variation = (
-            {
-                "character_id": variation_id,
-                "character_name": variation_name,
-                "asset_fingerprint": (
-                    variation_plan.get(
-                        "character_asset_fingerprint"
-                    )
-                    if variation_plan
-                    else ""
-                ),
-                "plan": copy.deepcopy(variation_plan),
-                "mode": variation_mode,
-                "started_at": operations.now().isoformat(
-                    timespec="seconds"
-                ),
-                "result_path": "",
-                "job_id": server.live.job_id,
-            }
-            if variation_id
-            else None
-        )
+    _store_pending_variation(
+        server, operations, variation_id, variation_name,
+        variation_mode, variation_plan,
+    )
     context = {
         "data": data,
         "mode": mode,
@@ -1092,26 +1155,10 @@ def handle_i2i(
             server, operations, token, context
         )
     )
-    return {
-        "ok": True,
-        "mode": mode,
-        "width": width,
-        "height": height,
-        "source_hash": source_hash,
-        "expansion": (
-            expansion if operation == "outpaint" else None
-        ),
-        "variation_character": variation_name,
-        "variation_mode": (
-            variation_mode if variation_id else ""
-        ),
-        "temporary": bool(variation_id),
-        "vibe_suppressed": bool(
-            variation_id
-            and variation_mode == "character-reference"
-            and plan.get("vibes")
-        ),
-    }
+    return _i2i_started(
+        operation, mode, variation_mode, variation_id, variation_name,
+        plan, width, height, mask_b64, source_hash, expansion,
+    )
 
 
 def _path_is_inside(path: Path, root: Path) -> bool:
