@@ -192,6 +192,7 @@ from src.nai_studio.services import (
     generation_handlers as _generation_handlers,
     generation_retry as _generation_retry,
     generation_step as _generation_step,
+    image_tool_handlers as _image_tool_handlers,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
     metadata_candidate_store as _metadata_candidate_store,
@@ -3971,6 +3972,27 @@ def _generation_handler_operations():
     )
 
 
+def _image_tool_operations():
+    """이미지 도구의 저장·NAI·계보 의존성을 호출 시점에 연결한다."""
+    return _image_tool_handlers.ImageToolOperations(
+        vibe_dir=globals()["VIBE_DIR"],
+        shared_data_transaction=globals()["shared_data_transaction"],
+        vibe_paths=globals()["vibe_paths"],
+        save_config=globals()["save_config"],
+        prepare_vibes=globals()["prepare_vibes"],
+        recoverable_remove=globals()["recoverable_remove"],
+        director_tools=globals()["DIRECTOR_TOOLS"],
+        call_upscale=globals()["call_upscale"],
+        call_director=globals()["call_director"],
+        inherited_blueprint=globals()["inherited_blueprint"],
+        output_sub=globals()["out_sub"],
+        record_job_result=globals()["record_job_result"],
+        output_root=globals()["out_root"],
+        info=globals()["log"].info,
+        warning=globals()["log"].warning,
+    )
+
+
 # ═══════════════ 설정 로드/저장 ═══════════════
 
 def _read_legacy_txt():
@@ -6090,204 +6112,40 @@ class ConfigServer:
             return {"ok": False, "error": str(e)}
 
     def handle_ref_add(self, body, kind, filename=""):
-        """바이브/캐릭터 레퍼런스에 그림을 추가. 바이브는 바로 인코딩까지 한다."""
-        try:
-            from urllib.parse import unquote
-            if not body:
-                return {"ok": False, "error": "이미지가 비어 있습니다."}
-            name = Path(unquote(filename or "")).stem[:40] or "레퍼런스"
-            VIBE_DIR.mkdir(parents=True, exist_ok=True)
-            rid = f"{kind}_{int(time.time()*1000) % 10**10}-{os.urandom(3).hex()}"
-            im = Image.open(io.BytesIO(body))
-            if kind == "vibe":
-                with shared_data_transaction(VIBE_DIR.parent.parent):
-                    with self.config_lock:
-                        self.use_latest_config()
-                        p, _ = vibe_paths(rid)
-                        converted = im.convert("RGB")
-                        _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
-                        item = {"id": rid, "name": name, "enabled": True,
-                                "strength": 0.6, "info_extracted": 0.7,
-                                "encoded_ie": None}
-                        self.cfg.setdefault("vibes", []).append(item)
-                        save_config(self.cfg)
-                        self.config_revision += 1
-                token = (self.cfg.get("token") or "").strip()
-                if token:
-                    # 최대 180초인 유료 인코딩 통신 중에는 다른 자료 저장을 막지 않는다.
-                    # 파일명에 난수가 있어 다른 프로필의 신규 참조와도 충돌하지 않는다.
-                    try:
-                        prepare_vibes(self.cfg, token)
-                        item["encoded"] = True
-                    except Exception as e:
-                        return {"ok": True, "item": item, "vibes": self.cfg["vibes"],
-                                "warn": f"등록은 됐지만 인코딩 실패: {e}",
-                                "revision": self.config_revision}
-                return {"ok": True, "item": item, "vibes": self.cfg["vibes"],
-                        "revision": self.config_revision}
-            else:
-                with shared_data_transaction(VIBE_DIR.parent.parent):
-                    with self.config_lock:
-                        self.use_latest_config()
-                        p = VIBE_DIR / f"{rid}.ref.png"
-                        converted = im.convert("RGB")
-                        _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
-                        item = {"id": rid, "name": name, "enabled": True,
-                                "ref_type": "character&style", "strength": 0.6,
-                                "fidelity": 0.6}
-                        self.cfg.setdefault("char_refs", []).append(item)
-                        save_config(self.cfg)
-                        self.config_revision += 1
-                return {"ok": True, "item": item, "char_refs": self.cfg["char_refs"],
-                        "revision": self.config_revision}
-        except Exception as e:
-            log.warning(f"레퍼런스 추가 실패: {traceback.format_exc()}")
-            return {"ok": False, "error": str(e)}
+        return _image_tool_handlers.handle_ref_add(
+            self,
+            {"body": body, "kind": kind, "filename": filename},
+            _image_tool_operations(),
+        )
 
-    @serialized_data_write(lambda: VIBE_DIR.parent.parent)
     def handle_ref_save(self, body):
-        """목록 갱신(강도·정보추출·켜기/끄기·삭제)."""
-        try:
-            d = json.loads(body or b"{}")
-            revision = d.pop("_revision", None)
-            base_values = d.pop("_base", {})
-            if not isinstance(base_values, dict):
-                base_values = {}
-            with self.config_lock:
-                if revision is not None:
-                    try:
-                        stale = int(revision) != self.config_revision
-                    except (TypeError, ValueError):
-                        stale = True
-                    if stale:
-                        return {"ok": False, "conflict": True,
-                                "revision": self.config_revision,
-                                "error": "다른 화면에서 참조 설정이 먼저 변경됐습니다. "
-                                         "새로고침 후 다시 시도하세요."}
-                merged = self.latest_config_from_disk()
-                conflicts = [
-                    key for key in ("vibes", "char_refs")
-                    if key in d and key in base_values
-                    and merged.get(key) != base_values.get(key)
-                    and d.get(key) != merged.get(key)
-                ]
-                if conflicts:
-                    self.cfg.clear()
-                    self.cfg.update(merged)
-                    self.config_revision += 1
-                    return {"ok": False, "conflict": True,
-                            "conflict_keys": conflicts,
-                            "revision": self.config_revision,
-                            "error": "다른 실행본이 같은 참조 목록을 먼저 변경했습니다. "
-                                     "새로고침 후 다시 시도하세요."}
-                self.cfg.clear()
-                self.cfg.update(merged)
-                for key in ("vibes", "char_refs"):
-                    if key not in d:
-                        continue
-                    old = {x.get("id"): x for x in self.cfg.get(key, [])}
-                    new = d[key]
-                    # 사라진 항목의 파일 정리
-                    for gone in set(old) - {x.get("id") for x in new}:
-                        for p in (VIBE_DIR / f"{gone}.png", VIBE_DIR / f"{gone}.vibe",
-                                  VIBE_DIR / f"{gone}.ref.png"):
-                            if p.exists():
-                                recoverable_remove(p)
-                    # 정보추출이 바뀌면 캐시를 버려 다음 생성에서 다시 인코딩
-                    for x in new:
-                        o = old.get(x.get("id"))
-                        if o and abs(float(x.get("info_extracted", 0.7))
-                                     - float(o.get("info_extracted", 0.7))) > 1e-9:
-                            x["encoded_ie"] = None
-                    self.cfg[key] = new
-                save_config(self.cfg)
-                self.config_revision += 1
-                return {"ok": True, "vibes": self.cfg.get("vibes", []),
-                        "char_refs": self.cfg.get("char_refs", []),
-                        "revision": self.config_revision}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return _image_tool_handlers.handle_ref_save(
+            self,
+            {"body": body},
+            _image_tool_operations(),
+        )
 
-    def handle_director(self, body, tool, prompt="", defry="0", scale="4", filename=""):
-        """디렉터 툴 실행 → 결과를 output/디렉터/ 에 저장하고 미리보기에 띄운다."""
-        tok = None
-        try:
-            if not body:
-                return {"ok": False, "error": "이미지가 비어 있습니다."}
-            token = (self.cfg.get("token") or "").strip()
-            if not token:
-                return {"ok": False, "error": "시스템에서 NAI 토큰을 먼저 넣어주세요."}
-            names = {t for t, _, _ in DIRECTOR_TOOLS} | {"upscale"}
-            if tool not in names:
-                return {"ok": False, "error": f"알 수 없는 도구: {tool}"}
-            tok = self.live.try_claim(
-                f"디렉터 · {tool}",
-                "director",
-                blueprint=inherited_blueprint(
-                    self.cfg,
-                    source={"kind": "director", "tool": tool},
-                ),
-                payload_identity={
-                    "kind": "director",
-                    "tool": tool,
-                    "input_sha256": hashlib.sha256(body).hexdigest(),
-                },
-            )
-            if tok is None:
-                return {"ok": False, "error": "이미 다른 NAI 작업이 실행 중입니다."}
-            self.live.update(
-                status_text=f"디렉터 · {tool} 처리 중...",
-                char_name=f"디렉터 · {tool}", index=1, total=1)
-
-            if tool == "upscale":
-                out = call_upscale(token, body, int(scale or 4))
-            else:
-                needs = next(n for t, _, n in DIRECTOR_TOOLS if t == tool)
-                out = call_director(token, body, tool,
-                                    prompt=(prompt or "") if needs else None,
-                                    defry=defry)
-
-            img = Image.open(io.BytesIO(out))
-            keep_alpha = tool == "bg-removal"        # 배경 제거는 투명도를 살려야 한다
-            d = out_sub(self.cfg, "디렉터")
-            d.mkdir(parents=True, exist_ok=True)
-            stem = _safe_name(Path(filename or "결과").stem)[:40] or "결과"
-            ext = "png" if keep_alpha else "webp"
-            p = d / f"{stem}_{tool}.{ext}"
-            i = 2
-            while p.exists():
-                p = d / f"{stem}_{tool}_{i}.{ext}"
-                i += 1
-            if keep_alpha:
-                converted = img.convert("RGBA")
-                _atomic_save_image(p, lambda tmp: converted.save(tmp, "PNG"))
-            else:
-                converted = img.convert("RGB")
-                _atomic_save_image(
-                    p, lambda tmp: converted.save(tmp, "WEBP", quality=95))
-            record_job_result(
-                self.live.job_id,
-                p,
-                artifact=p.resolve().relative_to(
-                    out_root(self.cfg).resolve()).as_posix(),
-            )
-            self.live.set_image(img.convert("RGB"))
-            self.live.update(filename=p.name, char_name=f"디렉터 · {tool}",
-                             status_text="디렉터 툴 완료", completed=1,
-                             phase="completed")
-            log.info(f"디렉터 {tool} → {p.name} ({img.width}×{img.height})")
-            return {"ok": True, "tool": tool, "file": p.name,
-                    "path": str(p), "width": img.width, "height": img.height}
-        except Exception as e:
-            log.warning(f"디렉터 툴 실패: {traceback.format_exc()}")
-            if tok is not None:
-                self.live.update(
-                    status_text=f"디렉터 툴 실패: {e}", failed=1,
-                    last_error=str(e), can_retry=True, phase="failed")
-            return {"ok": False, "error": str(e)}
-        finally:
-            if tok is not None:
-                self.live.release(tok)
+    def handle_director(
+        self,
+        body,
+        tool,
+        prompt="",
+        defry="0",
+        scale="4",
+        filename="",
+    ):
+        return _image_tool_handlers.handle_director(
+            self,
+            {
+                "body": body,
+                "tool": tool,
+                "prompt": prompt,
+                "defry": defry,
+                "scale": scale,
+                "filename": filename,
+            },
+            _image_tool_operations(),
+        )
 
     @serialized_data_write(lambda: CHAR_DIR.parent)
     def handle_norm_save(self, body):
