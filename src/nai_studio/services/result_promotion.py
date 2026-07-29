@@ -15,7 +15,10 @@ from copy import deepcopy
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
-from src.nai_studio.domain.evaluation import canonical_evaluation
+from src.nai_studio.domain.evaluation import (
+    PROMOTION_SCHEMA,
+    canonical_evaluation,
+)
 from src.nai_studio.domain.evidence import canonical_evidence
 from src.nai_studio.domain.knowledge import canonical_knowledge_asset
 from src.nai_studio.services.evaluation_bridge import (
@@ -331,47 +334,164 @@ def _first(*values: Any) -> Any:
     return None
 
 
+def _execution_values(
+    source: Mapping[str, Any],
+    field: str,
+    normalizer,
+    source_name: str,
+) -> list[Any]:
+    values = []
+    nested = source.get("execution")
+    candidates = [source.get(field)]
+    if isinstance(nested, Mapping):
+        candidates.append(nested.get(field))
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        value = normalizer(raw, f"{source_name}.{field}")
+        if value not in values:
+            values.append(value)
+    if len(values) > 1:
+        raise ValueError(
+            f"{source_name} contains conflicting {field} values"
+        )
+    return values
+
+
 def _execution_lineage(
     result: Mapping[str, Any],
     manifest_record: Mapping[str, Any],
     manifest: Mapping[str, Any],
 ) -> dict:
-    execution = result.get("execution")
-    if not isinstance(execution, Mapping):
-        execution = {}
-    request_id = _safe_text(
-        _first(
-            result.get("request_id"),
-            execution.get("request_id"),
-            manifest_record.get("request_id"),
-            manifest.get("request_id"),
+    specs = {
+        "request_id": lambda value, field: _safe_text(
+            value,
+            field,
+            required=True,
         ),
-        "request_id",
+        "payload_hash": _sha256,
+        "blueprint_fingerprint": _sha256,
+    }
+    output = {}
+    verified_fields = []
+    for field, normalizer in specs.items():
+        caller = _execution_values(
+            result,
+            field,
+            normalizer,
+            "result_record",
+        )
+        record = _execution_values(
+            manifest_record,
+            field,
+            normalizer,
+            "comparison_manifest.completed",
+        )
+        root = _execution_values(
+            manifest,
+            field,
+            normalizer,
+            "comparison_manifest",
+        )
+        manifest_values = []
+        for value in (*record, *root):
+            if value not in manifest_values:
+                manifest_values.append(value)
+        if len(manifest_values) > 1:
+            raise ValueError(
+                f"comparison manifest contains conflicting {field} values"
+            )
+        if caller and manifest_values and caller[0] != manifest_values[0]:
+            raise ValueError(
+                f"result_record {field} does not match comparison manifest"
+            )
+        value = _first(
+            caller[0] if caller else None,
+            manifest_values[0] if manifest_values else None,
+        )
+        if value in (None, ""):
+            raise ValueError(f"{field} is required")
+        output[field] = value
+        if manifest_values:
+            verified_fields.append(field)
+    output["manifest_verified"] = len(verified_fields) == len(specs)
+    return output
+
+
+def _canonical_promotion_decision(
+    value: Mapping[str, Any],
+    target: str,
+) -> dict:
+    raw = _mapping(value, "promotion decision")
+    lineage = _mapping(raw.get("lineage"), "promotion decision lineage")
+    if raw.get("schema") != PROMOTION_SCHEMA:
+        raise ValueError("invalid promotion decision schema")
+    if raw.get("target") != target:
+        raise ValueError("promotion decision target does not match")
+    if raw.get("status") != "proposed" or raw.get("automatic") is not False:
+        raise ValueError("promotion decision must be an explicit proposal")
+    expected = {
+        "schema": PROMOTION_SCHEMA,
+        "id": "promotion:" + _stable_hash({
+            "target": target,
+            "lineage": lineage,
+        })[:32],
+        "target": target,
+        "status": "proposed",
+        "automatic": False,
+        "lineage": lineage,
+    }
+    if raw != expected:
+        if raw.get("id") != expected["id"]:
+            raise ValueError("promotion decision id does not match its content")
+        raise ValueError("promotion decision is not canonical")
+    return expected
+
+
+def _canonical_promotion_event(
+    value: Mapping[str, Any],
+    target: str,
+) -> dict:
+    raw = _mapping(value, "promotion_event")
+    payload = _mapping(raw.get("payload"), "promotion_event.payload")
+    decision = _canonical_promotion_decision(
+        payload.get("decision"),
+        target,
+    )
+    decision_lineage = decision["lineage"]
+    evaluation_id = _safe_text(
+        payload.get("evaluation_id"),
+        "promotion_event.payload.evaluation_id",
         required=True,
     )
-    payload_hash = _sha256(
-        _first(
-            result.get("payload_hash"),
-            execution.get("payload_hash"),
-            manifest_record.get("payload_hash"),
-            manifest.get("payload_hash"),
-        ),
-        "payload_hash",
+    base_fingerprint = _sha256(
+        payload.get("base_fingerprint"),
+        "promotion_event.payload.base_fingerprint",
     )
-    blueprint_fingerprint = _sha256(
-        _first(
-            result.get("blueprint_fingerprint"),
-            execution.get("blueprint_fingerprint"),
-            manifest_record.get("blueprint_fingerprint"),
-            manifest.get("blueprint_fingerprint"),
-        ),
-        "blueprint_fingerprint",
-    )
-    return {
-        "request_id": request_id,
-        "payload_hash": payload_hash,
-        "blueprint_fingerprint": blueprint_fingerprint,
+    if decision_lineage.get("evaluation_id") != evaluation_id:
+        raise ValueError(
+            "promotion decision evaluation does not match event payload"
+        )
+    if decision_lineage.get("evaluation_fingerprint") != base_fingerprint:
+        raise ValueError(
+            "promotion decision fingerprint does not match event payload"
+        )
+    canonical_payload = {
+        "evaluation_id": evaluation_id,
+        "decision": decision,
+        "base_fingerprint": base_fingerprint,
     }
+    expected = {
+        "schema": EVALUATION_EVENT_SCHEMA,
+        "kind": "promotion-proposed",
+        "payload": canonical_payload,
+    }
+    expected["id"] = "evaluation-event:" + _stable_hash(expected)[:32]
+    if raw != expected:
+        if raw.get("id") != expected["id"]:
+            raise ValueError("promotion event id does not match its content")
+        raise ValueError("promotion event is not canonical")
+    return expected
 
 
 def _evaluation_summary(value: Mapping[str, Any]) -> dict:
@@ -512,20 +632,11 @@ def _canonical_promotion(value: Mapping[str, Any]) -> dict:
     target = raw.get("target")
     if target not in PROMOTION_TARGETS:
         raise ValueError("promotion target must be style or character")
-    promotion = _mapping(raw.get("promotion_event"), "promotion_event")
-    if (
-        promotion.get("schema") != EVALUATION_EVENT_SCHEMA
-        or promotion.get("kind") != "promotion-proposed"
-        or not promotion.get("id")
-    ):
-        raise ValueError("invalid evaluation promotion event")
-    decision = (
-        promotion.get("payload", {}).get("decision")
-        if isinstance(promotion.get("payload"), Mapping)
-        else None
+    promotion = _canonical_promotion_event(
+        raw.get("promotion_event"),
+        target,
     )
-    if not isinstance(decision, Mapping) or decision.get("target") != target:
-        raise ValueError("promotion decision target does not match")
+    decision = promotion["payload"]["decision"]
     evidence = canonical_evidence(_mapping(raw.get("evidence"), "evidence"))
     if evidence["raw_metadata"] not in (None, {}):
         raise ValueError("promotion evidence must not contain raw metadata")
@@ -549,8 +660,32 @@ def _canonical_promotion(value: Mapping[str, Any]) -> dict:
     lineage = _mapping(raw.get("lineage"), "lineage")
     if evidence.get("lineage") != lineage or asset.get("lineage") != lineage:
         raise ValueError("promotion lineage must match evidence and asset")
+    execution_lineage = lineage.get("execution")
+    if (
+        not isinstance(execution_lineage, Mapping)
+        or not isinstance(execution_lineage.get("manifest_verified"), bool)
+    ):
+        raise ValueError(
+            "promotion execution lineage must state manifest verification"
+        )
     if lineage.get("source_result_ref") != f"result:{evidence_path}":
         raise ValueError("promotion result lineage does not match image path")
+    evaluation_lineage = lineage.get("evaluation")
+    if not isinstance(evaluation_lineage, Mapping):
+        raise ValueError("promotion evaluation lineage is required")
+    decision_lineage = decision["lineage"]
+    if (
+        evaluation_lineage.get("id") != decision_lineage.get("evaluation_id")
+        or evaluation_lineage.get("fingerprint")
+        != decision_lineage.get("evaluation_fingerprint")
+        or lineage.get("source_result_ref")
+        != decision_lineage.get("source_result_ref")
+    ):
+        raise ValueError("promotion decision lineage does not match record")
+    if lineage.get("promotion_decision_id") != decision["id"]:
+        raise ValueError("promotion decision lineage id does not match")
+    if lineage.get("promotion_event_id") != promotion["id"]:
+        raise ValueError("promotion event lineage id does not match")
     _assert_safe_json(
         promotion,
         "promotion_event",

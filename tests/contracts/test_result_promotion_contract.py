@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 
@@ -151,6 +152,7 @@ class ResultPromotionContractTests(unittest.TestCase):
             "request_id": "req-result-one",
             "payload_hash": "b" * 64,
             "blueprint_fingerprint": "c" * 64,
+            "manifest_verified": False,
         })
         self.assertEqual(lineage["comparison"]["job_key"], "cell-one")
         self.assertEqual(lineage["comparison"]["style_id"], "style:one")
@@ -345,6 +347,110 @@ class ResultPromotionContractTests(unittest.TestCase):
                 target="style",
                 content=self.style_content(),
             )
+
+    def test_execution_lineage_verifies_manifest_or_marks_caller_only(self):
+        caller_only = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="style",
+            content=self.style_content(),
+        )
+        self.assertFalse(
+            caller_only["lineage"]["execution"]["manifest_verified"]
+        )
+
+        manifest = self.manifest()
+        manifest["completed"]["cell-one"].update({
+            "request_id": "req-result-one",
+            "payload_hash": "b" * 64,
+            "blueprint_fingerprint": "c" * 64,
+        })
+        verified = build_result_promotion(
+            self.result(),
+            manifest,
+            self.evaluation(),
+            target="style",
+            content=self.style_content(),
+        )
+        self.assertTrue(verified["lineage"]["execution"]["manifest_verified"])
+
+    def test_rejects_execution_lineage_conflicts_with_record_or_root(self):
+        cases = []
+        record_request = self.manifest()
+        record_request["completed"]["cell-one"]["request_id"] = "other-request"
+        cases.append(record_request)
+        record_payload = self.manifest()
+        record_payload["completed"]["cell-one"]["payload_hash"] = "e" * 64
+        cases.append(record_payload)
+        root_blueprint = self.manifest()
+        root_blueprint["blueprint_fingerprint"] = "f" * 64
+        cases.append(root_blueprint)
+        record_root = self.manifest()
+        record_root["completed"]["cell-one"]["payload_hash"] = "b" * 64
+        record_root["payload_hash"] = "e" * 64
+        cases.append(record_root)
+
+        for manifest in cases:
+            with self.subTest(manifest=manifest):
+                with self.assertRaises(ValueError):
+                    build_result_promotion(
+                        self.result(),
+                        manifest,
+                        self.evaluation(),
+                        target="style",
+                        content=self.style_content(),
+                    )
+
+    def test_append_rejects_forged_event_and_decision_ids(self):
+        event = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="style",
+            content=self.style_content(),
+        )
+        forged_event = copy.deepcopy(event)
+        forged_event["promotion_event"]["id"] = (
+            "evaluation-event:" + "0" * 32
+        )
+        with self.assertRaisesRegex(ValueError, "event id"):
+            append_promotion_events(None, [forged_event])
+
+        forged_decision = copy.deepcopy(event)
+        decision = forged_decision["promotion_event"]["payload"]["decision"]
+        decision["id"] = "promotion:" + "0" * 32
+        event_body = forged_decision["promotion_event"]
+        event_body["id"] = "evaluation-event:" + hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in event_body.items()
+                    if key != "id"
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        with self.assertRaisesRegex(ValueError, "decision id"):
+            append_promotion_events(None, [forged_decision])
+
+    def test_semantic_duplicate_does_not_trust_outer_record_id(self):
+        event = build_result_promotion(
+            self.result(),
+            self.manifest(),
+            self.evaluation(),
+            target="style",
+            content=self.style_content(),
+        )
+        first = append_promotion_events(None, [event])
+        duplicate = copy.deepcopy(event)
+        duplicate["id"] = "result-promotion:" + "f" * 40
+        second = append_promotion_events(first["ledger"], [duplicate])
+        self.assertEqual(len(second["ledger"]["events"]), 1)
+        self.assertEqual(second["appended"], [])
+        self.assertEqual(second["duplicates"], [event["id"]])
 
     def test_append_only_ledger_is_idempotent_and_inputs_are_immutable(self):
         style = build_result_promotion(
