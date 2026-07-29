@@ -663,98 +663,99 @@ def comparison_selected_job_values(
     return used, base, negative, people, centers
 
 
-def comparison_selected_plan(
+def _selected_plan_errors(
+    selection: dict,
+    styles: list,
+    characters: list,
+    settings: list,
+) -> list[str]:
+    errors = []
+    checks = (
+        (styles, "styles", "그림체"),
+        (characters, "characters", "캐릭터"),
+        (settings, "settings", "세팅"),
+    )
+    for chosen, key, label in checks:
+        if len(chosen) != len(selection.get(key) or []):
+            errors.append(
+                f"선택한 {label} 중 현재 찾을 수 없는 항목이 있습니다."
+            )
+    if not any(
+        (styles, characters, settings, selection.get("axes"))
+    ):
+        errors.append(
+            "그림체·캐릭터·세팅 또는 바꿀 생성 설정 축을 하나 이상 선택해주세요."
+        )
+    return errors
+
+
+def _selected_plan_costs(
     operations: ComparisonPlanningOperations,
     cfg: dict,
     options: dict,
     styles: list[dict],
     chars: list[dict],
     settings: list[dict],
-    opus: bool | None = None,
-    *,
-    job_values: Any = None,
-) -> dict:
-    selection = options.get("selection") or {}
-    chosen_styles, chosen_chars, chosen_settings = (
-        _comparison_selected_sources(
-            styles, chars, settings, selection
-        )
-    )
-    errors = []
-    if len(chosen_styles) != len(selection.get("styles") or []):
-        errors.append(
-            "선택한 그림체 중 현재 찾을 수 없는 항목이 있습니다."
-        )
-    if len(chosen_chars) != len(selection.get("characters") or []):
-        errors.append(
-            "선택한 캐릭터 중 현재 찾을 수 없는 항목이 있습니다."
-        )
-    if len(chosen_settings) != len(selection.get("settings") or []):
-        errors.append(
-            "선택한 세팅 중 현재 찾을 수 없는 항목이 있습니다."
-        )
-    if not any(
-        (
-            chosen_styles,
-            chosen_chars,
-            chosen_settings,
-            selection.get("axes"),
-        )
-    ):
-        errors.append(
-            "그림체·캐릭터·세팅 또는 바꿀 생성 설정 축을 하나 이상 선택해주세요."
-        )
-
+    value_builder: Any,
+) -> tuple[int, int, int, int]:
     probe = {
         "options": options,
-        "selection": selection,
+        "selection": options.get("selection") or {},
         "count": COMPARE_MAX_JOBS + 1,
     }
-    value_builder = job_values or (
-        lambda used_cfg, used_plan, job: comparison_selected_job_values(
-            operations, used_cfg, used_plan, job
-        )
-    )
     total = paid_total = opus_total = eligible = 0
     cost_cap = int(options.get("limit") or 0) or COMPARE_MAX_JOBS
-    if not errors:
-        for job in iter_selected_comparison_jobs(
-            operations,
-            cfg,
-            probe,
-            styles,
-            chars,
-            settings=settings,
-        ):
-            total += 1
-            if total <= cost_cap:
-                used, _, _, _, _ = value_builder(cfg, probe, job)
-                refs = (
-                    sum(
-                        1
-                        for item in (used.get("char_refs") or [])
-                        if item.get("enabled")
-                    )
-                    if options.get("include_refs")
-                    else 0
+    for job in iter_selected_comparison_jobs(
+        operations,
+        cfg,
+        probe,
+        styles,
+        chars,
+        settings=settings,
+    ):
+        total += 1
+        if total <= cost_cap:
+            used, _, _, _, _ = value_builder(cfg, probe, job)
+            refs = (
+                sum(
+                    1
+                    for item in (used.get("char_refs") or [])
+                    if item.get("enabled")
                 )
-                paid = anlas_estimate(
-                    used, 1, opus=False, char_refs=refs
-                )
-                free = anlas_estimate(
-                    used, 1, opus=True, char_refs=refs
-                )
-                paid_total += paid["per_image"]
-                opus_total += free["per_image"]
-                eligible += int(bool(free["free_eligible"]))
-            if total > COMPARE_MAX_JOBS:
-                break
+                if options.get("include_refs")
+                else 0
+            )
+            paid = anlas_estimate(
+                used, 1, opus=False, char_refs=refs
+            )
+            free = anlas_estimate(
+                used, 1, opus=True, char_refs=refs
+            )
+            paid_total += paid["per_image"]
+            opus_total += free["per_image"]
+            eligible += int(bool(free["free_eligible"]))
+        if total > COMPARE_MAX_JOBS:
+            break
+    return total, paid_total, opus_total, eligible
+
+
+def _selected_plan_result(
+    cfg: dict,
+    options: dict,
+    selection: dict,
+    chosen: tuple[list, list, list],
+    costs: tuple[int, int, int, int],
+    errors: list[str],
+    opus: bool | None,
+) -> dict:
+    chosen_styles, chosen_chars, chosen_settings = chosen
+    total, paid_total, opus_total, eligible = costs
     count = min(total, int(options.get("limit") or total))
     if count > COMPARE_MAX_JOBS:
         errors.append(
             f"한 계획은 최대 {COMPARE_MAX_JOBS:,}장까지 만들 수 있습니다."
         )
-    result = {
+    return {
         "ok": not errors,
         "errors": errors,
         "options": options,
@@ -797,31 +798,92 @@ def comparison_selected_plan(
         ],
         "sample_settings": [item["name"] for item in chosen_settings[:3]],
     }
-    if not errors:
-        experiment = expand_legacy_experiment_cells(
-            cfg,
-            {"options": dict(options, limit=0), "count": 0},
-            styles=chosen_styles,
-            characters=chosen_chars,
-            settings=chosen_settings,
-            selected=selection,
+
+
+def _attach_selected_experiment(
+    cfg: dict,
+    result: dict,
+    chosen: tuple[list, list, list],
+) -> None:
+    if result["errors"]:
+        return
+    styles, characters, settings = chosen
+    experiment = expand_legacy_experiment_cells(
+        cfg,
+        {
+            "options": dict(result["options"], limit=0),
+            "count": 0,
+        },
+        styles=styles,
+        characters=characters,
+        settings=settings,
+        selected=result["selection"],
+    )
+    result["experiment"] = {
+        "schema": experiment.get("schema"),
+        "id": experiment.get("id"),
+        "mode": experiment.get("legacy_mode"),
+        "cells": experiment.get("total", 0),
+        "total": result["total"],
+        "pending": result["total"],
+        "completed": 0,
+        "cell_ids": [
+            {
+                "id": cell.get("id"),
+                "resume_key": cell.get("legacy_resume_key"),
+            }
+            for cell in (experiment.get("cells") or [])[:10]
+        ],
+    }
+
+
+def comparison_selected_plan(
+    operations: ComparisonPlanningOperations,
+    cfg: dict,
+    options: dict,
+    styles: list[dict],
+    chars: list[dict],
+    settings: list[dict],
+    opus: bool | None = None,
+    *,
+    job_values: Any = None,
+) -> dict:
+    selection = options.get("selection") or {}
+    chosen = _comparison_selected_sources(
+        styles,
+        chars,
+        settings,
+        selection,
+    )
+    errors = _selected_plan_errors(selection, *chosen)
+    value_builder = job_values or (
+        lambda used_cfg, used_plan, job: comparison_selected_job_values(
+            operations, used_cfg, used_plan, job
         )
-        result["experiment"] = {
-            "schema": experiment.get("schema"),
-            "id": experiment.get("id"),
-            "mode": experiment.get("legacy_mode"),
-            "cells": experiment.get("total", 0),
-            "total": total,
-            "pending": total,
-            "completed": 0,
-            "cell_ids": [
-                {
-                    "id": cell.get("id"),
-                    "resume_key": cell.get("legacy_resume_key"),
-                }
-                for cell in (experiment.get("cells") or [])[:10]
-            ],
-        }
+    )
+    costs = (
+        _selected_plan_costs(
+            operations,
+            cfg,
+            options,
+            styles,
+            chars,
+            settings,
+            value_builder,
+        )
+        if not errors
+        else (0, 0, 0, 0)
+    )
+    result = _selected_plan_result(
+        cfg,
+        options,
+        selection,
+        chosen,
+        costs,
+        errors,
+        opus,
+    )
+    _attach_selected_experiment(cfg, result, chosen)
     return result
 
 
@@ -1363,6 +1425,135 @@ def comparison_plan(
     return result
 
 
+_SIGNATURE_CONFIG_KEYS = (
+    "base_prompt",
+    "negative_prompt",
+    "cfg_scale",
+    "cfg_rescale",
+    "steps",
+    "sampler",
+    "scheduler",
+    "variety",
+    "model",
+    "uc_preset",
+    "quality_toggle",
+    "smea",
+    "smea_dyn",
+    "dynamic_thresholding",
+    "uncond_scale",
+    "controlnet_strength",
+    "prefer_brownian",
+    "deliberate_euler_ancestral_bug",
+    "use_coords",
+    "position_mode",
+    "char_slots",
+    "char_centers",
+    "vibes",
+    "char_refs",
+    "out_dir",
+    "out_by_date",
+)
+
+
+def _signature_sources(
+    cfg: dict,
+    options: dict,
+    plan: dict,
+    styles: list,
+    characters: list,
+) -> tuple[list, list, list]:
+    settings = comparison_settings(cfg)
+    if options["mode"] != "selected":
+        return styles, characters, settings
+    return _comparison_selected_sources(
+        styles,
+        characters,
+        settings,
+        plan.get("selection")
+        or options.get("selection")
+        or {},
+    )
+
+
+def _signature_style_rows(styles: list) -> list[tuple]:
+    return [
+        (
+            item["_compare_id"],
+            item.get("base"),
+            item.get("combo"),
+            item.get("negative"),
+            item.get("params"),
+        )
+        for item in styles
+    ]
+
+
+def _signature_character_rows(
+    characters: list,
+    *,
+    selected: bool,
+) -> list[tuple]:
+    common = ("female", "clothed", "negative")
+    extra = (
+        "position",
+        "reference_ids",
+        "vibe_ids",
+    ) if selected else ()
+    return [
+        (
+            item["_compare_id"],
+            *(item.get(key) for key in common + extra),
+        )
+        for item in characters
+    ]
+
+
+def _signature_payload(
+    cfg: dict,
+    plan: dict,
+    styles: list,
+    characters: list,
+    settings: list,
+) -> dict:
+    options = plan["options"]
+    mode = options["mode"]
+    return {
+        "options": options,
+        "selection": (
+            plan.get("selection")
+            or options.get("selection")
+            or {}
+            if mode == "selected"
+            else {}
+        ),
+        "config": {
+            key: cfg.get(key)
+            for key in _SIGNATURE_CONFIG_KEYS
+        },
+        "styles": (
+            _signature_style_rows(styles)
+            if mode in ("styles", "both", "selected")
+            else []
+        ),
+        "characters": (
+            _signature_character_rows(
+                characters,
+                selected=mode == "selected",
+            )
+            if mode in (
+                "characters",
+                "both",
+                "character_setting",
+                "selected",
+            )
+            else []
+        ),
+        "settings": settings
+        if mode in ("character_setting", "selected")
+        else [],
+    }
+
+
 def comparison_signature(
     operations: ComparisonPlanningOperations,
     cfg: dict,
@@ -1370,114 +1561,15 @@ def comparison_signature(
     styles: list[dict],
     chars: list[dict],
 ) -> str:
-    options = plan["options"]
-    selected_settings = comparison_settings(cfg)
-    if options["mode"] == "selected":
-        selected_styles, selected_chars, selected_settings = (
-            _comparison_selected_sources(
-                styles,
-                chars,
-                selected_settings,
-                plan.get("selection")
-                or options.get("selection")
-                or {},
-            )
-        )
-    else:
-        selected_styles, selected_chars = styles, chars
-    relevant_cfg = {
-        key: cfg.get(key)
-        for key in (
-            "base_prompt",
-            "negative_prompt",
-            "cfg_scale",
-            "cfg_rescale",
-            "steps",
-            "sampler",
-            "scheduler",
-            "variety",
-            "model",
-            "uc_preset",
-            "quality_toggle",
-            "smea",
-            "smea_dyn",
-            "dynamic_thresholding",
-            "uncond_scale",
-            "controlnet_strength",
-            "prefer_brownian",
-            "deliberate_euler_ancestral_bug",
-            "use_coords",
-            "position_mode",
-            "char_slots",
-            "char_centers",
-            "vibes",
-            "char_refs",
-            "out_dir",
-            "out_by_date",
-        )
-    }
-    raw = {
-        "options": options,
-        "selection": (
-            plan.get("selection")
-            or options.get("selection")
-            or {}
-            if options["mode"] == "selected"
-            else {}
-        ),
-        "config": relevant_cfg,
-        "styles": [
-            (
-                item["_compare_id"],
-                item.get("base"),
-                item.get("combo"),
-                item.get("negative"),
-                item.get("params"),
-            )
-            for item in styles
-        ]
-        if options["mode"] in ("styles", "both")
-        else [
-            (
-                item["_compare_id"],
-                item.get("base"),
-                item.get("combo"),
-                item.get("negative"),
-                item.get("params"),
-            )
-            for item in selected_styles
-        ]
-        if options["mode"] == "selected"
-        else [],
-        "characters": [
-            (
-                item["_compare_id"],
-                item.get("female"),
-                item.get("clothed"),
-                item.get("negative"),
-            )
-            for item in chars
-        ]
-        if options["mode"]
-        in ("characters", "both", "character_setting")
-        else [
-            (
-                item["_compare_id"],
-                item.get("female"),
-                item.get("clothed"),
-                item.get("negative"),
-                item.get("position"),
-                item.get("reference_ids"),
-                item.get("vibe_ids"),
-            )
-            for item in selected_chars
-        ]
-        if options["mode"] == "selected"
-        else [],
-        "settings": selected_settings
-        if options["mode"] in ("character_setting", "selected")
-        else [],
-    }
+    del operations
+    selected = _signature_sources(
+        cfg,
+        plan["options"],
+        plan,
+        styles,
+        chars,
+    )
+    raw = _signature_payload(cfg, plan, *selected)
     return hashlib.sha256(
         json.dumps(
             raw,
@@ -1638,118 +1730,108 @@ def comparison_job_values(
     return used, base, negative, people, centers
 
 
-def comparison_job_recipe_snapshot(
+def _recipe_character_slot(character: dict) -> dict:
+    return {
+        "id": character.get("id")
+        or character.get("_compare_id")
+        or "",
+        "name": character.get("name")
+        or character.get("_compare_name")
+        or "",
+        "prompt": character.get("female", ""),
+        "outfit": character.get("clothed", ""),
+        "negative": character.get("negative", ""),
+        "variant": copy.deepcopy(character.get("variant") or {}),
+        "variants": copy.deepcopy(character.get("variants") or []),
+        "reference_ids": copy.deepcopy(
+            character.get("reference_ids") or []
+        ),
+        "vibe_ids": copy.deepcopy(
+            character.get("vibe_ids") or []
+        ),
+        "enabled": True,
+    }
+
+
+def _recipe_setting_source(
+    setting: dict,
+    job: dict,
+    *,
+    include_cid: bool,
+) -> dict:
+    source = {
+        "id": setting.get("id") or setting.get("name") or "",
+        "name": setting.get("name") or setting.get("id") or "",
+        "state": copy.deepcopy(setting.get("state") or {}),
+        "scene": int(job.get("scene_num") or 0),
+        "copy": int(job.get("copy") or 1),
+    }
+    if include_cid:
+        source["cid"] = str(job.get("cid") or "")
+    return source
+
+
+def _recipe_material(
     operations: ComparisonPlanningOperations,
     cfg: dict,
     plan: dict,
     job: dict,
-    used: dict,
-    base: str,
-    negative: str,
-    people: list,
-    centers: list,
-    seed: int,
-) -> dict:
-    """현재 자료가 나중에 바뀌어도 한 결과를 복원할 수 있는 비밀값 없는 사본."""
+) -> tuple[dict, dict, dict, list, list, dict]:
     character = job.get("character") or {}
     setting = job.get("setting") or {}
     style = job.get("style") or {}
     mode = plan["options"].get("mode")
     if mode == "character_setting":
-        slots = [
-            {
-                "id": character.get("id")
-                or character.get("_compare_id")
-                or "",
-                "name": character.get("name")
-                or character.get("_compare_name")
-                or "",
-                "prompt": character.get("female", ""),
-                "outfit": character.get("clothed", ""),
-                "negative": character.get("negative", ""),
-                "variant": copy.deepcopy(character.get("variant") or {}),
-                "variants": copy.deepcopy(
-                    character.get("variants") or []
-                ),
-                "reference_ids": copy.deepcopy(
-                    character.get("reference_ids") or []
-                ),
-                "vibe_ids": copy.deepcopy(
-                    character.get("vibe_ids") or []
-                ),
-                "enabled": True,
-            }
-        ]
+        slots = [_recipe_character_slot(character)]
         position = (
-            character.get("position") or character.get("center") or {}
+            character.get("position")
+            or character.get("center")
+            or {}
         )
-        char_centers = [copy.deepcopy(position)] if position else []
-        source_setting = {
-            "id": setting.get("id") or setting.get("name") or "",
-            "name": setting.get("name") or setting.get("id") or "",
-            "state": copy.deepcopy(setting.get("state") or {}),
-            "scene": int(job.get("scene_num") or 0),
-            "copy": int(job.get("copy") or 1),
-        }
+        centers = [copy.deepcopy(position)] if position else []
+        setting_source = _recipe_setting_source(
+            setting, job, include_cid=False
+        )
     elif mode == "selected":
         material = job.get("material") or {}
         slots = copy.deepcopy(material.get("char_slots") or [])
-        char_centers = copy.deepcopy(
+        centers = copy.deepcopy(
             material.get("char_centers") or []
         )
-        source_setting = (
-            {
-                "id": setting.get("id") or setting.get("name") or "",
-                "name": setting.get("name") or setting.get("id") or "",
-                "state": copy.deepcopy(setting.get("state") or {}),
-                "cid": str(job.get("cid") or ""),
-                "scene": int(job.get("scene_num") or 0),
-                "copy": int(job.get("copy") or 1),
-            }
+        setting_source = (
+            _recipe_setting_source(
+                setting, job, include_cid=True
+            )
             if setting
             else {}
         )
     elif character:
-        slots = [
-            {
-                "id": character.get("id")
-                or character.get("_compare_id")
-                or "",
-                "name": character.get("name")
-                or character.get("_compare_name")
-                or "",
-                "prompt": character.get("female", ""),
-                "outfit": character.get("clothed", ""),
-                "negative": character.get("negative", ""),
-                "variant": copy.deepcopy(character.get("variant") or {}),
-                "variants": copy.deepcopy(
-                    character.get("variants") or []
-                ),
-                "reference_ids": copy.deepcopy(
-                    character.get("reference_ids") or []
-                ),
-                "vibe_ids": copy.deepcopy(
-                    character.get("vibe_ids") or []
-                ),
-                "enabled": True,
-            }
-        ]
-        char_centers = [{"x": 0.5, "y": 0.5}]
-        source_setting = {}
+        slots = [_recipe_character_slot(character)]
+        centers = [{"x": 0.5, "y": 0.5}]
+        setting_source = {}
     else:
         slots = [
             copy.deepcopy(slot)
             for slot in (cfg.get("char_slots") or [])
-            if isinstance(slot, dict)
-            and slot.get("enabled") is not False
-            and slot_prompt(slot).strip()
+            if (
+                isinstance(slot, dict)
+                and slot.get("enabled") is not False
+                and slot_prompt(slot).strip()
+            )
         ][: operations.max_characters]
-        _, char_centers = active_people(
+        _, centers = active_people(
             cfg.get("char_slots") or [],
             cfg.get("char_centers"),
         )
-        source_setting = {}
-    include_refs = bool(plan["options"].get("include_refs"))
+        setting_source = {}
+    return character, setting, style, slots, centers, setting_source
+
+
+def _recipe_resources(
+    used: dict,
+    slots: list,
+    include_refs: bool,
+) -> tuple[list, list]:
     wanted_vibes = {
         str(value)
         for slot in slots
@@ -1767,23 +1849,105 @@ def comparison_job_recipe_snapshot(
     saved_vibes = [
         copy.deepcopy(item)
         for item in (used.get("vibes") or [])
-        if include_refs
-        and isinstance(item, dict)
-        and (
-            str(item.get("id") or "") in wanted_vibes
-            or (not wanted_vibes and item.get("enabled"))
+        if (
+            include_refs
+            and isinstance(item, dict)
+            and (
+                str(item.get("id") or "") in wanted_vibes
+                or (not wanted_vibes and item.get("enabled"))
+            )
         )
     ]
     saved_refs = [
         copy.deepcopy(item)
         for item in (used.get("char_refs") or [])
-        if include_refs
-        and isinstance(item, dict)
-        and (
-            str(item.get("id") or "") in wanted_refs
-            or (not wanted_refs and item.get("enabled"))
+        if (
+            include_refs
+            and isinstance(item, dict)
+            and (
+                str(item.get("id") or "") in wanted_refs
+                or (not wanted_refs and item.get("enabled"))
+            )
         )
     ]
+    return saved_vibes, saved_refs
+
+
+def _recipe_source(
+    job: dict,
+    style: dict,
+    character: dict,
+    setting: dict,
+) -> dict:
+    style_keys = (
+        "id",
+        "_compare_id",
+        "title",
+        "name",
+        "_compare_name",
+        "base",
+        "combo",
+        "negative",
+        "params",
+    )
+    character_keys = (
+        "id",
+        "_compare_id",
+        "name",
+        "_compare_name",
+        "female",
+        "clothed",
+        "negative",
+        "variant",
+        "variants",
+        "reference_ids",
+        "vibe_ids",
+        "position",
+    )
+    return {
+        "style": {
+            key: copy.deepcopy(style.get(key))
+            for key in style_keys
+            if style.get(key) is not None
+        },
+        "character": {
+            key: copy.deepcopy(character.get(key))
+            for key in character_keys
+            if character.get(key) is not None
+        },
+        "setting": setting,
+        "axes": copy.deepcopy(
+            (job.get("material") or {}).get("selected_axes")
+            or {}
+        ),
+    }
+
+
+def comparison_job_recipe_snapshot(
+    operations: ComparisonPlanningOperations,
+    cfg: dict,
+    plan: dict,
+    job: dict,
+    used: dict,
+    base: str,
+    negative: str,
+    people: list,
+    centers: list,
+    seed: int,
+) -> dict:
+    """현재 자료가 나중에 바뀌어도 한 결과를 복원할 수 있는 비밀값 없는 사본."""
+    (
+        character,
+        _setting,
+        style,
+        slots,
+        char_centers,
+        source_setting,
+    ) = _recipe_material(operations, cfg, plan, job)
+    include_refs = bool(plan["options"].get("include_refs"))
+    saved_vibes, saved_refs = _recipe_resources(
+        used, slots, include_refs
+    )
     return {
         "version": 2,
         "mode": plan["options"].get("mode") or "",
@@ -1805,45 +1969,12 @@ def comparison_job_recipe_snapshot(
         "include_refs": include_refs,
         "vibes": saved_vibes,
         "char_refs": saved_refs,
-        "source": {
-            "style": {
-                key: copy.deepcopy(style.get(key))
-                for key in (
-                    "id",
-                    "_compare_id",
-                    "title",
-                    "name",
-                    "_compare_name",
-                    "base",
-                    "combo",
-                    "negative",
-                    "params",
-                )
-                if style.get(key) is not None
-            },
-            "character": {
-                key: copy.deepcopy(character.get(key))
-                for key in (
-                    "id",
-                    "_compare_id",
-                    "name",
-                    "_compare_name",
-                    "female",
-                    "clothed",
-                    "negative",
-                    "variant",
-                    "variants",
-                    "reference_ids",
-                    "vibe_ids",
-                    "position",
-                )
-                if character.get(key) is not None
-            },
-            "setting": source_setting,
-            "axes": copy.deepcopy(
-                (job.get("material") or {}).get("selected_axes") or {}
-            ),
-        },
+        "source": _recipe_source(
+            job,
+            style,
+            character,
+            source_setting,
+        ),
         "resolved": {
             "base_prompt": base,
             "negative_prompt": negative,
