@@ -50,8 +50,39 @@ from PIL import Image
 from src.nai_studio.collection import arca as arca_public
 from src.nai_studio.domain.blueprint import (
     canonical_blueprint,
+    canonical_generation_plan,
     fingerprint_blueprint,
     summarize_blueprint,
+)
+from src.nai_studio.domain.experiment import canonical_experiment_rule
+from src.nai_studio.domain.restoration import summarize_restore_queue
+from src.nai_studio.runtime import (
+    JobStore,
+    fingerprint_payload,
+    from_legacy_job_record,
+    new_job,
+    transition_job,
+)
+from src.nai_studio.services.legacy_bridge import (
+    evidence_from_image_record,
+    evaluations_from_picks,
+    knowledge_assets_from_config,
+    restoration_queue_from_collection,
+    sequence_plan_from_setting,
+    style_asset_from_record,
+)
+from src.nai_studio.services.prompt_bridge import (
+    legacy_sequence_text,
+    reroll_legacy_components,
+    resolve_legacy_prompt,
+)
+from src.nai_studio.services.resource_bridge import (
+    export_legacy_resources,
+    legacy_resource_import_plan,
+)
+from src.nai_studio.services.variation_bridge import (
+    character_asset_from_legacy_record,
+    variation_plan_to_legacy_payload_material,
 )
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -1421,6 +1452,30 @@ def vibe_paths(vid):
     return VIBE_DIR / f"{vid}.png", VIBE_DIR / f"{vid}.vibe"
 
 
+def resource_file_index(cfg):
+    """명시적으로 내보낼 때만 현재 Vibe·Reference 재료를 읽는다."""
+    files = {}
+    for item in cfg.get("vibes", []):
+        rid = Path(str(item.get("id") or "")).name
+        if not rid:
+            continue
+        for suffix in (".png", ".vibe"):
+            path = VIBE_DIR / f"{rid}{suffix}"
+            if path.is_file():
+                files[path.name] = (
+                    path.read_text(encoding="ascii")
+                    if suffix == ".vibe" else path.read_bytes()
+                )
+    for item in cfg.get("char_refs", []):
+        rid = Path(str(item.get("id") or "")).name
+        if not rid:
+            continue
+        path = VIBE_DIR / f"{rid}.ref.png"
+        if path.is_file():
+            files[path.name] = path.read_bytes()
+    return files
+
+
 def encode_vibe(token, image_bytes, information_extracted=0.7,
                 model="nai-diffusion-4-5-full"):
     """그림 → 인코딩된 바이브(base64). 2 Anlas 소모. 결과는 캐시해서 재사용한다."""
@@ -2421,6 +2476,20 @@ def _merge_style_evidence(existing, incoming):
             evidence.append(item)
     if evidence:
         merged["evidence"] = evidence
+    evidence_records = list(merged.get("evidence_records") or [])
+    known_records = {
+        str(item.get("id") or "")
+        for item in evidence_records if isinstance(item, dict)
+    }
+    for record in incoming.get("evidence_records") or []:
+        if not isinstance(record, dict):
+            continue
+        record_id = str(record.get("id") or "")
+        if record_id and record_id not in known_records:
+            evidence_records.append(copy.deepcopy(record))
+            known_records.add(record_id)
+    if evidence_records:
+        merged["evidence_records"] = evidence_records
     return merged
 
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
@@ -7098,14 +7167,25 @@ def quality_suffix_text(model):
     return QUALITY_SUFFIX_TEXT.get(str(model or ""), "")
 
 
-def annotate_nai_comment(comment, quality_toggle, uc_preset):
-    """NAI가 생략하는 UI 토글 두 값을 결과 Comment JSON에 명시해 왕복을 보장한다."""
+def annotate_nai_comment(
+    comment,
+    quality_toggle,
+    uc_preset,
+    *,
+    request_id="",
+    payload_hash="",
+):
+    """UI 토글과 재현 계보 식별값을 결과 Comment JSON에 명시한다."""
     try:
         data = json.loads(str(comment or ""))
         if not isinstance(data, dict):
             return comment
         data["qualityToggle"] = bool(quality_toggle)
         data["ucPreset"] = int(uc_preset)
+        if request_id:
+            data["requestId"] = str(request_id)
+        if payload_hash:
+            data["payloadHash"] = str(payload_hash)
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError, json.JSONDecodeError):
         return comment
@@ -7398,12 +7478,39 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
         for key in BLUEPRINT_GENERATION_KEYS
     }
     generation["seed"] = generation.pop("nai_seed", cfg.get("nai_seed", 0))
-    blueprint = canonical_blueprint({
+    generation["resolution"] = {
+        "width": generation.get("width"),
+        "height": generation.get("height"),
+    }
+    generation["settings"] = {
+        key: copy.deepcopy(generation.get(key))
+        for key in BLUEPRINT_GENERATION_KEYS
+        if key not in ("width", "height", "nai_seed")
+    }
+    generation["final"] = {
+        "base_prompt": str(cfg.get("base_prompt") or ""),
+        "negative_prompt": str(cfg.get("negative_prompt") or ""),
+        "character_prompts": [
+            {
+                "prompt": item["resolved_prompt"],
+                "negative": item["negative"],
+                "position": copy.deepcopy(item["position"]),
+            }
+            for item in characters if item.get("enabled")
+        ],
+    }
+    style_settings = {
+        key: copy.deepcopy(cfg.get(key))
+        for key in BLUEPRINT_GENERATION_KEYS
+        if key not in ("nai_seed", "use_coords")
+    }
+    blueprint = canonical_generation_plan({
         "source": copy.deepcopy(source or {"kind": "current-config"}),
         "style": {
             "name": str(cfg.get("style_name") or ""),
             "base": str(cfg.get("base_prompt") or ""),
             "negative": str(cfg.get("negative_prompt") or ""),
+            "generation_settings": style_settings,
             "parts": {
                 "fixed": str(cfg.get("base_fixed") or ""),
                 "variable": str(cfg.get("base_var") or ""),
@@ -7420,7 +7527,9 @@ def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
             "active": active_settings,
             "cast_presets": copy.deepcopy(cfg.get("cast_presets") or []),
         }),
-        "experiment": copy.deepcopy(experiment or {"mode": "single"}),
+        "experiment": canonical_experiment_rule(
+            copy.deepcopy(experiment or {"mode": "single"})
+        ),
         "generation": generation,
         "output": {
             "format": str(cfg.get("save_format") or "webp"),
@@ -7851,6 +7960,8 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
         "Content-Type": "application/json",
         "Accept": "application/x-zip-compressed",
     }
+    request_id = f"nai-request-{uuid.uuid4().hex}"
+    payload_hash = fingerprint_payload(payload)
     resp = requests.post(NAI_API_URL, json=payload, headers=headers, timeout=120)
     if resp.status_code == 429:
         wait = retry_after_seconds(resp.headers.get("Retry-After"), 60)
@@ -7873,10 +7984,14 @@ def call_nai_api(token, base_prompt, female_caption, male_caption, negative, wid
     # 저장할 때 WebP EXIF 로 심어서, 나중에 그림만 보고도 시드·설정을 되찾을 수 있게 한다.
     chunks = png_text_chunks(raw)
     img.nai_seed = seed
+    img.nai_request_id = request_id
+    img.nai_payload_hash = payload_hash
     img.nai_comment = annotate_nai_comment(
         next((chunks[k] for k in chunks if k.lower() == "comment"), ""),
         p.get("quality_toggle", False),
         uc_preset,
+        request_id=request_id,
+        payload_hash=payload_hash,
     )
     return img
 
@@ -8465,6 +8580,8 @@ def list_output(sub="", cfg=None, limit=0, offset=0, only_pick=False, only_fav=F
             "elo": picks.get("elo", {}),
             "elo_matches": picks.get("elo_matches", {}),
             "tags": picks.get("tags", {}),
+            "evaluations": evaluations_from_picks(
+                picks, paths=[item["path"] for item in files]),
             "up": str(Path(sub).parent).replace("\\", "/") if sub and sub != "." else ""}
 
 
@@ -9500,6 +9617,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           <button class="on" data-reftab="vibe">바이브 <span id="bgVibe">0</span></button>
           <button data-reftab="cref">캐릭터 레퍼런스 <span id="bgCref">0</span></button>
         </div>
+        <div class="bar" style="margin:7px 0;">
+          <button id="refBundleExport" type="button">묶음 내보내기</button>
+          <button id="refBundleImport" type="button">Vibe·Reference 묶음 가져오기</button>
+          <input type="file" id="refBundleFile"
+            accept=".naiv4vibe,.naiv4vibebundle,.json,application/json"
+            style="display:none;">
+          <span class="hint">가져온 자원은 기존 생성에 끼어들지 않도록 꺼진 상태로 등록합니다.</span>
+        </div>
         <div data-refpane="vibe">
           <div id="vibeDrop" class="row" style="text-align:center;padding:16px;border-style:dashed;cursor:pointer;">
             <b>＋ 바이브 그림 추가</b>
@@ -9538,7 +9663,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div class="field" style="margin-top:10px;">
           <label>시험해 보기 — 여기 적으면 실제로 어떻게 바뀌는지 보여줍니다 (순번은 안 올라감)</label>
           <input type="text" id="fragTry" placeholder="1girl, <표정>, {smile|serious}">
-          <div class="hint" id="fragTryOut" style="margin-top:5px;font-family:var(--mono);"></div>
+          <div class="bar" style="margin-top:6px;">
+            <button id="fragTryAgain" type="button">전체 다시 뽑기</button>
+            <button id="fragTrySelected" type="button">고른 선택만 다시</button>
+            <span class="hint">아래 선택지를 고르면 나머지는 그대로 고정합니다.</span>
+          </div>
+          <div id="fragTryChoices" class="filterbar" style="margin-top:6px;"></div>
+          <div class="hint" id="fragTryOut" style="margin-top:5px;font-family:var(--mono);
+               white-space:pre-wrap;overflow-wrap:anywhere;"></div>
         </div>
       </div>
     </div>
@@ -11491,6 +11623,35 @@ async function addRefs(files, kind){
 function bindRefs(){
   if(!$('vibeDrop') || $('vibeDrop')._bound) return;
   $('vibeDrop')._bound = true;
+  $('refBundleExport').addEventListener('click', () => {
+    $('refMsg').textContent = 'Vibe·Reference 묶음을 내보내는 중...';
+    window.location.href = '/api/ref_bundle_export';
+    setTimeout(() => { $('refMsg').textContent = '묶음 내보냄 ✓'; }, 800);
+  });
+  $('refBundleImport').addEventListener('click', () => $('refBundleFile').click());
+  $('refBundleFile').addEventListener('change', async () => {
+    const f = $('refBundleFile').files[0];
+    if(!f) return;
+    $('refMsg').textContent = `${f.name} 확인 중...`;
+    try{
+      const r = await (await fetch('/api/ref_bundle_import', {
+        method:'POST',
+        headers:{'X-Filename':encodeURIComponent(f.name)},
+        body:await f.arrayBuffer(),
+      })).json();
+      if(r.ok){
+        STATE.vibes = r.vibes || STATE.vibes || [];
+        STATE.char_refs = r.char_refs || STATE.char_refs || [];
+        if(r.revision != null) STATE._revision = r.revision;
+        rememberSavedKeys(['vibes','char_refs']);
+        $('refMsg').textContent =
+          `꺼진 상태로 바이브 ${r.added_vibes||0}개 · Reference ${r.added_char_refs||0}개 등록`
+          + ((r.skipped||[]).length ? ` · ${r.skipped.length}개 건너뜀` : '');
+        renderRefs();
+      }else $('refMsg').textContent = r.error || '가져오지 못했습니다.';
+    }catch(e){ $('refMsg').textContent = String(e); }
+    $('refBundleFile').value = '';
+  });
   [['vibeDrop','vibeFile','vibe'], ['crefDrop','crefFile','cref']].forEach(([z, fi, kind]) => {
     const zone = $(z), file = $(fi);
     zone.addEventListener('click', () => file.click());
@@ -12058,6 +12219,9 @@ async function loadJobCenter(){
       : `대기 · 최근 ${live.phase || 'idle'}`;
     const collectState = collection.status || 'idle';
     const recent = (ledger.jobs || []).slice(0, 5);
+    const contracts = new Map(
+      (ledger.contracts || []).map(job => [String(job.id || ''), job])
+    );
     host.innerHTML = `
       <div class="row"><div><b>현재 생성 실행권</b><div class="hint">${esc(liveState)}</div>
         <div class="hint">${esc(live.status_text || '')}</div></div>
@@ -12069,9 +12233,16 @@ async function loadJobCenter(){
         <button type="button" data-job-go="library">자료 수집으로</button></div>
       <div class="row" style="grid-column:1/-1;display:block;"><b>최근 실행 기록</b>
         <div class="hint" style="margin-top:5px;">${recent.length ? recent.map(job =>
-          `${esc(job.operation || job.kind)} · ${esc(job.status || '')}`
+          {
+            const contract = contracts.get(String(job.id || '')) || {};
+            const phase = contract.phase && contract.phase !== 'invalid'
+              ? contract.phase : (job.status || '');
+            const request = contract.request_id
+              ? ` · 요청 ${esc(String(contract.request_id).slice(0,18))}` : '';
+            return `${esc(job.operation || job.kind)} · ${esc(phase)}${request}`
           + ` · 성공 ${Number(job.completed||0)} / 실패 ${Number(job.failed||0)}`
-          + `${job.can_resume ? ' · 재개 기록 있음' : ''}`
+          + `${job.can_resume ? ' · 재개 기록 있음' : ''}`;
+          }
         ).join('<br>') : '아직 기록이 없습니다.'}</div></div>`;
     host.querySelectorAll('[data-job-go]').forEach(button => button.addEventListener('click', () => {
       const target = button.dataset.jobGo;
@@ -13090,7 +13261,7 @@ $('scenePresetSave').addEventListener('click', async () => {
 
 /* ── img2img · 인페인트 ─────────────────────────────────────────────
    마스크는 흰색이 '다시 그릴 곳'. NAI 는 64 배수 크기를 원하므로 맞춰서 보낸다. */
-let I2I = {img:null, painting:false, erase:false, undo:[]};
+let I2I = {img:null, painting:false, erase:false, undo:[], variationCharacter:null};
 function i2iLoad(file){
   const fr = new FileReader();
   fr.onload = () => {
@@ -13106,7 +13277,10 @@ function i2iLoad(file){
       I2I.undo = [];
       $('i2iStage').classList.remove('hidden');
       i2iZoom();
-      $('i2iMsg').textContent = `${im.width}×${im.height} → ${w}×${h} 로 맞춰 보냅니다 (NAI 는 64 배수만 받습니다)`;
+      $('i2iMsg').textContent = `${im.width}×${im.height} → ${w}×${h} 로 맞춰 보냅니다`
+        + (I2I.variationCharacter
+          ? ` · '${I2I.variationCharacter.name}' 전체 프롬프트·착의·네거티브로 임시 변형`
+          : ' (NAI 는 64 배수만 받습니다)');
       i2iMode();
       if(window.i2iCostRefresh) window.i2iCostRefresh();
     };
@@ -13147,9 +13321,10 @@ async function resultToReference(url, name, kind, msg){
     return false;
   }
 }
-async function resultToI2I(url, name, msg){
+async function resultToI2I(url, name, msg, variationCharacter=null){
   if(msg) msg.textContent = '결과 그림을 준비하는 중...';
   try{
+    I2I.variationCharacter = variationCharacter;
     const file = await resultFile(url, name);
     expClose();
     setMode('preview');
@@ -13261,7 +13436,10 @@ if($('i2iDrop')){
   $('i2iDrop').addEventListener('click', () => $('i2iFile').click());
   $('i2iDrop2').addEventListener('click', () => $('i2iFile').click());
   $('i2iFile').addEventListener('change', () => {
-    if($('i2iFile').files[0]) i2iLoad($('i2iFile').files[0]);
+    if($('i2iFile').files[0]){
+      I2I.variationCharacter = null;
+      i2iLoad($('i2iFile').files[0]);
+    }
     $('i2iFile').value = '';
   });
   ['dragover','dragenter'].forEach(ev => $('i2iDrop').addEventListener(ev, e => {
@@ -13270,7 +13448,7 @@ if($('i2iDrop')){
     e.preventDefault(); $('i2iDrop').style.borderColor = ''; }));
   $('i2iDrop').addEventListener('drop', e => {
     const f = [...(e.dataTransfer.files || [])].find(x => /image\/(png|webp)/.test(x.type));
-    if(f) i2iLoad(f);
+    if(f){ I2I.variationCharacter = null; i2iLoad(f); }
   });
   /* 원본 그림을 쓰는 작업은 Opus 무료가 아니다 — 실행 버튼 옆에 실제 비용을 띄운다 (CQA-008) */
   window.i2iCostRefresh = async () => {
@@ -13306,7 +13484,8 @@ if($('i2iDrop')){
     const r = await (await fetch('/api/i2i', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({image: $('i2iBase').toDataURL('image/png'), mask,
-        strength: Number($('i2iStrength').value)})})).json();
+        strength: Number($('i2iStrength').value),
+        variation_character_id:(I2I.variationCharacter||{}).id || ''})})).json();
     $('i2iMsg').textContent = r.ok
       ? `${r.mode} 시작 (${r.width}×${r.height}) — 위 미리보기에 나옵니다`
       : (r.error || '실패');
@@ -14753,17 +14932,50 @@ $('fragReset').addEventListener('click', async () => {
   const r = await (await fetch('/api/frag_reset', {method:'POST'})).json();
   $('fragMsg').textContent = r.ok ? '순번을 처음으로 돌렸습니다' : (r.error || '실패');
 });
-let fragTryT = null;
+let fragTryT = null, FRAG_TRY_RESULT = null, FRAG_TRY_SEED = 0;
+function paintFragTry(r){
+  FRAG_TRY_RESULT = r && r.ok ? (r.result || null) : null;
+  $('fragTryOut').textContent = r && r.ok ? '→ ' + r.text : ((r && r.error) || '');
+  const host = $('fragTryChoices');
+  host.innerHTML = '';
+  ((r && r.ui_state && r.ui_state.components) || []).forEach(c => {
+    const label = document.createElement('label');
+    label.className = 'hint';
+    label.style.cssText = 'display:flex;align-items:center;gap:4px;cursor:pointer;';
+    const value = ((c.choice || {}).value ?? '');
+    label.innerHTML = `<input type="checkbox" data-frag-component="${escA(c.id)}">
+      <span>${esc(c.expression || c.fragment || c.kind)} → <b>${esc(value)}</b></span>`;
+    host.appendChild(label);
+  });
+}
+async function runFragTry(selected){
+  const text = $('fragTry').value;
+  if(!text){ paintFragTry({ok:true,text:'',ui_state:{components:[]}}); return; }
+  FRAG_TRY_SEED += 1;
+  const payload = {text, seed:FRAG_TRY_SEED};
+  if(selected && FRAG_TRY_RESULT){
+    payload.previous = FRAG_TRY_RESULT;
+    payload.reroll_ids = [...$('fragTryChoices').querySelectorAll(
+      '[data-frag-component]:checked')].map(x => x.dataset.fragComponent);
+    if(!payload.reroll_ids.length){
+      $('fragTryOut').textContent = '다시 뽑을 선택지를 먼저 고르세요.';
+      return;
+    }
+  }
+  const r = await (await fetch('/api/frag_try', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})).json();
+  paintFragTry(r);
+}
 $('fragTry').addEventListener('input', () => {
   clearTimeout(fragTryT);
-  fragTryT = setTimeout(async () => {
-    const t = $('fragTry').value;
-    if(!t){ $('fragTryOut').textContent = ''; return; }
-    const r = await (await fetch('/api/frag_try', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})})).json();
-    $('fragTryOut').textContent = r.ok ? '→ ' + r.text : (r.error || '');
-  }, 300);
+  FRAG_TRY_RESULT = null;
+  fragTryT = setTimeout(() => runFragTry(false), 300);
 });
+$('fragTryAgain').addEventListener('click', () => {
+  FRAG_TRY_RESULT = null;
+  runFragTry(false);
+});
+$('fragTrySelected').addEventListener('click', () => runFragTry(true));
 
 /* ── 세팅 내보내기 / 가져오기 / 세트 대표 그림 ────────────────────
    세팅은 '세팅/ 폴더의 파일' 이므로 주고받기는 파일 단위로 한다. */
@@ -15514,6 +15726,8 @@ function openLib(it){
   const sourceUrl = it.ref && it.ref.url;
   b.insertAdjacentHTML('beforeend', `<div class="bar"><button class="primary" id="libTake">
     ${it.kind==='캐릭터'?'캐릭터 칸에 추가':'그림체 통째로 적용'}</button>
+    ${it.store==='character' && it.images && it.images[0]
+      ? '<button id="libVary">이 증거 그림으로 캐릭터 변형</button>' : ''}
     ${sourceUrl?`<a href="${escA(sourceUrl)}" target="_blank">원본 게시글 ↗</a>`:''}</div>`);
   $('libTake').addEventListener('click', () => {
     if(it.kind === '캐릭터'){
@@ -15529,6 +15743,16 @@ function openLib(it){
       applyStyle(style);
       $('modalFlash').textContent = '베이스 + 네거티브 + 생성 설정 적용됨 ✓';
     }
+  });
+  if($('libVary')) $('libVary').addEventListener('click', async () => {
+    const ref = it.ref || {};
+    const ok = await resultToI2I(
+      `/img?u=${encodeURIComponent(it.images[0])}`,
+      `${it.name || '캐릭터'} 증거.webp`,
+      $('modalFlash'),
+      {id:ref.id || it.id, name:it.name || ref.name || '캐릭터'});
+    if(ok) $('i2iMsg').textContent =
+      `'${it.name}' 자산의 외형·착의·네거티브·Reference·Vibe를 임시 계획으로 사용합니다.`;
   });
   $('modalFlash').textContent = '';
   $('modalBg').style.display = 'flex';
@@ -17957,6 +18181,8 @@ class PublicCollectionManager:
                 reverse=True,
             )
             data["can_retry_failed"] = bool(data["failed_items"])
+            data["restoration"] = summarize_restore_queue(
+                restoration_queue_from_collection(data))
             return data
 
     def _fresh_job(self, *, status, stage, queue, direct_urls=None,
@@ -18346,6 +18572,35 @@ PUBLIC_COLLECTION = PublicCollectionManager()
 
 
 JOB_LEDGER_FILE = PROFILE_DIR / "작업대기열.json"
+_COMMON_JOB_STORE = None
+_COMMON_JOB_STORE_ROOT = None
+
+
+def common_job_store():
+    """현재 프로필의 공통 실행 장부. 테스트의 임시 장부 경로도 그대로 따른다."""
+    global _COMMON_JOB_STORE, _COMMON_JOB_STORE_ROOT
+    root = (JOB_LEDGER_FILE.parent / "작업기록").resolve()
+    if _COMMON_JOB_STORE is None or _COMMON_JOB_STORE_ROOT != root:
+        _COMMON_JOB_STORE = JobStore(root)
+        _COMMON_JOB_STORE_ROOT = root
+    return _COMMON_JOB_STORE
+
+
+def _runtime_kind(operation, legacy_kind):
+    text = f"{operation} {legacy_kind}".casefold()
+    if "비교" in text or "comparison" in text:
+        return "comparison"
+    if "img2img" in text:
+        return "img2img"
+    if "인페인트" in text or "inpaint" in text:
+        return "inpaint"
+    if "director" in text or "디렉터" in text:
+        return "director"
+    if "vibe" in text or "바이브" in text:
+        return "vibe_encoding"
+    if legacy_kind in ("settings", "generation") or "씬" in text or "세팅" in text:
+        return "setting"
+    return "single"
 
 
 def load_job_ledger():
@@ -18384,10 +18639,17 @@ def recover_job_ledger():
                 job["can_resume"] = job.get("kind") in (
                     "settings", "comparison", "collection", "recovery")
                 changed = True
-        return _save_job_ledger(data) if changed else data
+        data = _save_job_ledger(data) if changed else data
+        try:
+            common_job_store().recover_all()
+        except Exception as error:
+            # 손상 장부를 초기화하거나 덮지 않는다. 관리 화면의 기존 장부는 계속
+            # 열고, 공통 장부 오류는 진단 로그로 남긴다.
+            log.error("공통 작업 장부 복구 실패: %s", error)
+        return data
 
 
-def start_job_record(operation, kind):
+def start_job_record(operation, kind, *, blueprint=None, payload_identity=None):
     with _JSON_IO_LOCK:
         data = recover_job_ledger()
         now = datetime.now().isoformat(timespec="seconds")
@@ -18404,6 +18666,30 @@ def start_job_record(operation, kind):
         }
         data["jobs"].append(record)
         _save_job_ledger(data)
+        blueprint_digest = fingerprint_blueprint(
+            blueprint or {"source": {"kind": str(kind or "preview")}}
+        )
+        payload_digest = fingerprint_payload(
+            payload_identity or {
+                "operation": str(operation or "생성"),
+                "kind": str(kind or "preview"),
+                "blueprint_fingerprint": blueprint_digest,
+            }
+        )
+        runtime_job = new_job(
+            _runtime_kind(operation, kind),
+            blueprint_fingerprint=blueprint_digest,
+            payload_hash=payload_digest,
+            request_id=record["id"],
+            job_id=record["id"],
+            metadata={
+                "legacy_kind": str(kind or "preview"),
+                "operation": str(operation or "생성"),
+            },
+            now=now,
+        )
+        runtime_job = transition_job(runtime_job, "preparing", now=now)
+        common_job_store().save(runtime_job)
         return record["id"]
 
 
@@ -18424,13 +18710,45 @@ def finish_job_record(job_id, *, status, completed=0, failed=0,
                 "can_resume": bool(can_resume),
                 "message": str(message or "")[:500],
             })
+            common_job_store().save(from_legacy_job_record(job))
             break
         _save_job_ledger(data)
 
 
 def job_ledger_summary():
     data = load_job_ledger()
-    return {"ok": True, **data, "jobs": list(reversed(data["jobs"]))}
+    jobs = list(reversed(data["jobs"]))
+    try:
+        durable = common_job_store().list()
+        durable_by_id = {str(item.get("id") or ""): item for item in durable}
+        durable_error = ""
+    except Exception as error:
+        durable = []
+        durable_by_id = {}
+        durable_error = redact_diagnostic_text(error)
+    contracts = []
+    for item in jobs:
+        stored = durable_by_id.get(str(item.get("id") or ""))
+        if stored:
+            contracts.append(stored)
+            continue
+        try:
+            contracts.append(from_legacy_job_record(item))
+        except Exception as error:
+            contracts.append({
+                "schema": "nai-runtime-job/v1",
+                "id": str(item.get("id") or ""),
+                "phase": "invalid",
+                "error": redact_diagnostic_text(error),
+            })
+    return {
+        "ok": True,
+        **data,
+        "jobs": jobs,
+        "contracts": contracts,
+        "durable_jobs": list(reversed(durable)),
+        "durable_error": durable_error,
+    }
 
 
 class LiveState:
@@ -18479,7 +18797,14 @@ class LiveState:
     # 이중 POST 레이스 방지 (라운드04 — Forge 가 실사용에서 겪은 함정과 같은 계열).
     # 예전에는 `if running: 거절` 검사와 스레드 안의 `running=True` 사이에 틈이 있어
     # 빠른 이중 요청이 둘 다 통과했고, 먼저 끝난 쪽 finally 가 남의 running 을 껐다.
-    def try_claim(self, operation="생성", retry_mode="preview"):
+    def try_claim(
+        self,
+        operation="생성",
+        retry_mode="preview",
+        *,
+        blueprint=None,
+        payload_identity=None,
+    ):
         """실행권 원자 선점 — 성공하면 소유 토큰, 이미 실행 중이면 None.
         ⚠ 중지 요청이 와도 실행권은 owner 가 release 할 때까지 잡혀 있다 (CQA-001) —
         중지 직후 재시작해도 옛 작업이 실제로 끝나기 전에는 새 작업이 못 들어온다."""
@@ -18501,7 +18826,12 @@ class LiveState:
             self.finished_at = 0.0
             self.eta_base_completed = 0
             if self.persist_jobs:
-                self.job_id = start_job_record(self.operation, self.retry_mode)
+                self.job_id = start_job_record(
+                    self.operation,
+                    self.retry_mode,
+                    blueprint=blueprint,
+                    payload_identity=payload_identity,
+                )
             return self._owner
 
     def release(self, token):
@@ -18693,7 +19023,24 @@ class ConfigServer:
             return {
                 "ok": True,
                 "blueprint": generation_blueprint(self.cfg),
+                "knowledge_assets": knowledge_assets_from_config(self.cfg),
             }
+
+    def snapshot_sequence(self, name=""):
+        """기존 세팅 파일을 바꾸지 않고 공통 순서 계획으로 보여 준다."""
+        selected = next(
+            (item for item in list_settings()
+             if str(item.get("name") or "") == str(name or "")),
+            None,
+        )
+        if selected is None:
+            return {"ok": False, "error": "세팅을 찾을 수 없습니다."}
+        plan = sequence_plan_from_setting(selected)
+        return {
+            "ok": True,
+            "sequence": plan,
+            "steps": len(plan["steps"]),
+        }
 
     def handle_generate_one(self):
         """① 설정만으로 단독 1장 생성 (세팅 무관 — NAI 기본 생성처럼)"""
@@ -18704,7 +19051,13 @@ class ConfigServer:
             return {"ok": False, "error": "NAI 토큰을 입력해주세요."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-        tok = self.live.try_claim("단독 생성", "preview")
+        tok = self.live.try_claim(
+            "단독 생성",
+            "preview",
+            blueprint=generation_blueprint(
+                cfg, source={"kind": "single-generate"}),
+            payload_identity={"kind": "single", "output": "one-image"},
+        )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -18782,46 +19135,104 @@ class ConfigServer:
             return {"ok": False, "error": f"그림을 못 읽었습니다: {e}"}
         # NAI 는 64 의 배수를 원한다
         w, h = max(64, w // 64 * 64), max(64, h // 64 * 64)
-        tok = self.live.try_claim(mode, "preview")
+        seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
+        job_cfg = cfg
+        variation_id = str(d.get("variation_character_id") or "").strip()
+        variation_name = ""
+        if variation_id:
+            record = next(
+                (item for item in cfg.get("characters", [])
+                 if str(item.get("id") or "") == variation_id),
+                None,
+            )
+            if record is None:
+                return {"ok": False, "error": "변형할 캐릭터 자산을 찾지 못했습니다."}
+            try:
+                asset = character_asset_from_legacy_record(
+                    record,
+                    char_refs=cfg.get("char_refs") or [],
+                    vibes=cfg.get("vibes") or [],
+                )
+                plan = variation_plan_to_legacy_payload_material(asset, {
+                    "mode": "inpaint" if mask_b64 else "img2img",
+                    "source_image": {
+                        "content_hash": hashlib.sha256(raw).hexdigest()},
+                    "mask": ({"content_hash": hashlib.sha256(
+                        base64.b64decode(mask_b64)).hexdigest()}
+                             if mask_b64 else None),
+                    "seed": seed,
+                    "resolution": {"width": w, "height": h},
+                    "temporary_settings": {
+                        "strength": float(d.get("strength", 0.7)),
+                        "noise": float(d.get("noise", 0.0)),
+                    },
+                })
+            except Exception as e:
+                return {"ok": False, "error": f"캐릭터 변형 계획을 만들지 못했습니다: {e}"}
+            job_cfg = copy.deepcopy(cfg)
+            job_cfg["char_slots"] = plan["char_slots"]
+            job_cfg["char_refs"] = plan["char_refs"]
+            job_cfg["vibes"] = plan["vibes"]
+            variation_name = str(record.get("name") or variation_id)
+        tok = self.live.try_claim(
+            mode,
+            "preview",
+            blueprint=generation_blueprint(
+                job_cfg,
+                source={
+                    "kind": "character-variation" if variation_id else "image-edit",
+                    "mode": mode,
+                    "character_id": variation_id,
+                },
+            ),
+            payload_identity={
+                "kind": "inpaint" if mask_b64 else "img2img",
+                "width": w,
+                "height": h,
+                "has_mask": bool(mask_b64),
+                "character_id": variation_id,
+            },
+        )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
         def run():
-            self.live.update(status_text=f"{mode} 생성 중...",
-                             char_name=mode, index=1, total=1)
+            label = f"{variation_name} 변형" if variation_name else mode
+            self.live.update(status_text=f"{label} 생성 중...",
+                             char_name=label, index=1, total=1)
             try:
-                okp, why = pace_gate(cfg, self.live, mode)     # 밴 예방 (CQA-013)
+                okp, why = pace_gate(job_cfg, self.live, mode)     # 밴 예방 (CQA-013)
                 if not okp:
                     self.live.update(
                         status_text=why, phase="stopped", can_retry=True)
                     return
-                slots = [s for s in cfg.get("char_slots", [])
+                slots = [s for s in job_cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-                seed = int(d.get("seed") or 0) or random.randint(0, 2**32 - 1)
-                params = runtime_generation_params(cfg, cfg["token"])
+                params = runtime_generation_params(job_cfg, job_cfg["token"])
                 params["_i2i"] = {"image": img_b64, "mask": mask_b64,
                                   "strength": float(d.get("strength", 0.7)),
                                   "noise": float(d.get("noise", 0.0)), "seed": seed}
                 try:
                     img = call_nai_api(
-                        cfg["token"], cfg.get("base_prompt", "") or "1girl", "", "",
-                        cfg.get("negative_prompt", ""), w, h,
-                        chars=active_people(slots, cfg.get("char_centers"))[0],
-                        scale=cfg.get("cfg_scale", 5.5), cfg_rescale=cfg.get("cfg_rescale", 0.56),
-                        steps=int(cfg.get("steps", 28)), sampler=cfg.get("sampler", "k_euler_ancestral"),
-                        scheduler=cfg.get("scheduler", "karras"), variety=cfg.get("variety", False),
-                        uc_preset=int(cfg.get("uc_preset", 3)), seed=seed,
-                        params=with_centers(params, active_people(slots, cfg.get("char_centers"))[1]))
+                        job_cfg["token"], job_cfg.get("base_prompt", "") or "1girl", "", "",
+                        job_cfg.get("negative_prompt", ""), w, h,
+                        chars=active_people(slots, job_cfg.get("char_centers"))[0],
+                        scale=job_cfg.get("cfg_scale", 5.5), cfg_rescale=job_cfg.get("cfg_rescale", 0.56),
+                        steps=int(job_cfg.get("steps", 28)), sampler=job_cfg.get("sampler", "k_euler_ancestral"),
+                        scheduler=job_cfg.get("scheduler", "karras"), variety=job_cfg.get("variety", False),
+                        uc_preset=int(job_cfg.get("uc_preset", 3)), seed=seed,
+                        params=with_centers(params, active_people(slots, job_cfg.get("char_centers"))[1]))
                 finally:
                     pace_complete()
-                out_dir = out_sub(cfg, mode)
+                out_dir = out_sub(job_cfg, "캐릭터 변형" if variation_id else mode)
                 n = len([x for x in out_dir.iterdir() if x.suffix.lower() in (".webp", ".png")]) + 1
-                save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(cfg), clean=_ocargs(cfg)[0], max_side=_ocargs(cfg)[1],
-                                quality=out_clean(cfg)[2])
+                save_with_meta(img, out_dir / f"{n:04d}.webp", fmt=out_format(job_cfg),
+                               clean=_ocargs(job_cfg)[0], max_side=_ocargs(job_cfg)[1],
+                               quality=out_clean(job_cfg)[2])
                 self.live.set_image(img)
                 st = load_state(); bump_daily(st); save_state(st)
                 self.live.update(
-                    status_text=f"{mode} 완료 ✓ (output/{mode}/{n:04d}.webp · 시드 {seed})",
+                    status_text=f"{label} 완료 ✓ (output/{out_dir.name}/{n:04d}.webp · 시드 {seed})",
                     seed=seed, completed=1, phase="completed")
             except Exception as e:
                 log.error(f"{mode} 실패: {e}")
@@ -18832,7 +19243,10 @@ class ConfigServer:
                 self.live.release(tok)
 
         threading.Thread(target=run, daemon=True).start()
-        return {"ok": True, "mode": mode, "width": w, "height": h}
+        return {
+            "ok": True, "mode": mode, "width": w, "height": h,
+            "variation_character": variation_name,
+        }
 
     def handle_regen(self, body):
         """그림체 복구 — 뽑아 둔 그림의 **메타데이터를 읽어 그 설정 그대로 다시 돌린다**.
@@ -18876,7 +19290,16 @@ class ConfigServer:
         if not jobs:
             return {"ok": False, "error": "메타데이터가 있는 그림이 없습니다. "
                                           "(카톡·디스코드를 거친 그림은 정보가 지워집니다)"}
-        tok = self.live.try_claim("그림체 복구", "library")
+        tok = self.live.try_claim(
+            "그림체 복구",
+            "library",
+            blueprint=generation_blueprint(
+                cfg,
+                source={"kind": "metadata-recovery", "items": len(jobs)},
+            ),
+            payload_identity={
+                "kind": "recovery", "items": len(jobs), "mode": mode},
+        )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -18993,7 +19416,16 @@ class ConfigServer:
             return {"ok": False, "error": "예약 매수를 1 이상으로 걸어 둔 씬이 없습니다."}
         slots = [s for s in cfg.get("char_slots", [])
                  if slot_prompt(s).strip() and s.get("enabled") is not False]
-        tok = self.live.try_claim("씬 모드", "settings")
+        tok = self.live.try_claim(
+            "씬 모드",
+            "settings",
+            blueprint=generation_blueprint(
+                cfg,
+                source={"kind": "scene-run"},
+                setting={"name": "씬 모드", "steps": copy.deepcopy(jobs)},
+            ),
+            payload_identity={"kind": "setting", "jobs": len(jobs)},
+        )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -19228,7 +19660,20 @@ class ConfigServer:
             return {"ok": False, "error":
                     f"실행 직전 장수 확인이 필요합니다. 현재 계획은 {plan['count']:,}장입니다.",
                     "plan": plan}
-        tok = self.live.try_claim("자료 비교 생성", "library")
+        tok = self.live.try_claim(
+            "자료 비교 생성",
+            "library",
+            blueprint=generation_blueprint(
+                self.cfg,
+                source={"kind": "comparison-plan"},
+                experiment=data,
+            ),
+            payload_identity={
+                "kind": "comparison",
+                "count": plan["count"],
+                "mode": (plan.get("options") or {}).get("mode"),
+            },
+        )
         if tok is None:
             return {"ok": False, "error": "이미 생성 중입니다."}
 
@@ -19331,6 +19776,16 @@ class ConfigServer:
                 rec["images"] = [f"local:{key}"]
             except Exception as e:
                 log.warning(f"추출 썸네일 실패: {e}")
+            # 옛 그림체 레코드는 그대로 읽을 수 있게 유지하고, 새 단건 임포트에는
+            # 같은 원본을 증거·지식 자산 계약으로도 함께 보존한다.
+            evidence_record = evidence_from_image_record(rec)
+            knowledge_asset = style_asset_from_record(
+                rec,
+                evidence_refs=[evidence_record["id"]],
+                lifecycle="candidate",
+            )
+            rec["evidence_records"] = [evidence_record]
+            rec["knowledge_asset"] = knowledge_asset
             saved = None
             if save_flag in ("1", "true"):
                 files = ({"수집/이미지캐시": [key]}
@@ -19347,6 +19802,56 @@ class ConfigServer:
             }
         except Exception as e:
             log.warning(f"메타데이터 추출 실패: {traceback.format_exc()}")
+            return {"ok": False, "error": str(e)}
+
+    def handle_resource_import(self, body, filename=""):
+        """Vibe 교환 문서를 기존 저장소에 비활성 자원으로 안전하게 추가."""
+        try:
+            from urllib.parse import unquote
+            if not body:
+                return {"ok": False, "error": "가져올 묶음이 비어 있습니다."}
+            with shared_data_transaction(VIBE_DIR.parent.parent):
+                with self.config_lock:
+                    self.use_latest_config()
+                    plan = legacy_resource_import_plan(
+                        body,
+                        filename=unquote(filename or ""),
+                        existing_config=self.cfg,
+                    )
+                    VIBE_DIR.mkdir(parents=True, exist_ok=True)
+                    for write in plan["writes"]:
+                        name = Path(str(write.get("filename") or "")).name
+                        if not name or name != write.get("filename"):
+                            raise ValueError("안전하지 않은 자원 파일 이름입니다.")
+                        target = VIBE_DIR / name
+                        content = write.get("content")
+                        raw = (content.encode(write.get("encoding") or "utf-8")
+                               if write.get("kind") == "text"
+                               else bytes(content or b""))
+                        if target.exists():
+                            if target.read_bytes() != raw:
+                                raise FileExistsError(
+                                    f"같은 이름의 다른 자원 파일이 있습니다: {name}")
+                            continue
+                        _atomic_write_bytes(target, raw, keep_backup=False)
+                    self.cfg.setdefault("vibes", []).extend(
+                        plan["additions"]["vibes"])
+                    self.cfg.setdefault("char_refs", []).extend(
+                        plan["additions"]["char_refs"])
+                    save_config(self.cfg)
+                    self.config_revision += 1
+            return {
+                "ok": True,
+                "added_vibes": len(plan["additions"]["vibes"]),
+                "added_char_refs": len(plan["additions"]["char_refs"]),
+                "skipped": plan["skipped"],
+                "issues": plan["issues"],
+                "vibes": self.cfg.get("vibes", []),
+                "char_refs": self.cfg.get("char_refs", []),
+                "revision": self.config_revision,
+            }
+        except Exception as e:
+            log.warning(f"Vibe·Reference 묶음 가져오기 실패: {e}")
             return {"ok": False, "error": str(e)}
 
     def handle_ref_add(self, body, kind, filename=""):
@@ -19835,6 +20340,14 @@ class ConfigServer:
                         self._json(server.snapshot_blueprint())
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/setting_sequence"):
+                    from urllib.parse import urlparse, parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    try:
+                        self._json(server.snapshot_sequence(
+                            q.get("name", [""])[0]))
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/jobs"):
                     try:
                         self._json(job_ledger_summary())
@@ -19897,6 +20410,23 @@ class ConfigServer:
                                     "thumbs": setting_thumbs(unquote(q.get("name", [""])[0]), server.cfg)})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/ref_bundle_export"):
+                    try:
+                        blob = export_legacy_resources(
+                            server.cfg,
+                            file_index=resource_file_index(server.cfg),
+                        )
+                    except Exception as e:
+                        self._json({"ok": False, "error": str(e)}); return
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type", "application/json; charset=utf-8")
+                    self.send_header(
+                        "Content-Disposition",
+                        'attachment; filename="nai-resources.naiv4vibebundle"')
+                    self.send_header("Content-Length", str(len(blob)))
+                    self.end_headers()
+                    self.wfile.write(blob)
                 elif self.path.startswith("/api/backup_export"):
                     try:
                         blob = export_user_backup(server.cfg)
@@ -20702,9 +21232,25 @@ class ConfigServer:
                     # 미리보기 — 실제 순번은 건드리지 않는다
                     try:
                         d = json.loads(body or b"{}")
-                        outs, _ = resolve_fragments([d.get("text", "")],
-                                                    counters=dict(load_state().get("frag_seq", {})))
-                        self._json({"ok": True, "text": outs[0]})
+                        seed = d.get("seed", 0)
+                        if d.get("previous") and d.get("reroll_ids"):
+                            result = reroll_legacy_components(
+                                d["previous"], d["reroll_ids"], seed)
+                        else:
+                            result = resolve_legacy_prompt(
+                                d.get("text", ""), list_fragments(), seed)
+                        # 순차 조각은 지금까지의 상태를 복사해 화면에만 투영한다.
+                        # 저장된 순번은 바꾸지 않는다.
+                        outs, _ = resolve_fragments(
+                            [legacy_sequence_text(result)],
+                            counters=dict(load_state().get("frag_seq", {})),
+                            rng=random.Random(str(seed)))
+                        self._json({
+                            "ok": True,
+                            "text": outs[0],
+                            "result": result,
+                            "ui_state": result["ui_state"],
+                        })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/sb_new"):
@@ -20838,6 +21384,9 @@ class ConfigServer:
                         self._json(duplicate_setting_group(d.get("name", ""), sid))
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
+                elif self.path.startswith("/api/ref_bundle_import"):
+                    self._json(server.handle_resource_import(
+                        body, self.headers.get("X-Filename", "")))
                 elif self.path.startswith("/api/ref_add"):
                     from urllib.parse import unquote
                     self._json(server.handle_ref_add(
@@ -21743,7 +22292,16 @@ def main():
     while True:
         server.start_event.wait()  # '생성 시작' 클릭까지 대기
         # 단독 생성 등이 그 틈에 실행권을 가져갔다면 배치를 겹쳐 돌리지 않는다
-        tok = server.live.try_claim("세팅 배치 생성", "settings")
+        tok = server.live.try_claim(
+            "세팅 배치 생성",
+            "settings",
+            blueprint=generation_blueprint(
+                server.cfg,
+                source={"kind": "settings-batch"},
+            ),
+            payload_identity={
+                "kind": "setting", "seed_round": server.cfg.get("seed")},
+        )
         if tok is None:
             server.start_event.clear()
             server.live.update(status_text="다른 생성이 도는 중입니다 — 끝난 뒤 '생성 시작'을 다시 눌러주세요.")

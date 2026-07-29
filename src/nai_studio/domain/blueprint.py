@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 BLUEPRINT_SCHEMA = "nai-generation-blueprint/v1"
@@ -35,6 +35,103 @@ def _list(value: Any) -> list:
     return deepcopy(list(value)) if isinstance(value, (list, tuple)) else []
 
 
+def _text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _present(raw: Mapping[str, Any], key: str, *aliases: str) -> Any:
+    """빈 문자열·빈 목록도 사용자의 명시값이므로 별칭보다 먼저 보존한다."""
+    if key in raw:
+        return raw.get(key)
+    for alias in aliases:
+        if alias in raw:
+            return raw.get(alias)
+    return None
+
+
+def _canonical_character(value: Any) -> dict:
+    """캐릭터 한 명을 실행 경로와 무관한 손실 없는 구조로 정리한다."""
+    raw = _mapping(value)
+    result = deepcopy(raw)
+    result.setdefault("id", _text(raw.get("id")))
+    result.setdefault("name", _text(raw.get("name")))
+    result.setdefault("enabled", raw.get("enabled") is not False)
+    result.setdefault(
+        "appearance",
+        _text(_present(raw, "appearance", "prompt", "female")),
+    )
+    result.setdefault(
+        "clothed",
+        _text(_present(raw, "clothed", "outfit")),
+    )
+    result.setdefault("negative", _text(raw.get("negative")))
+    result["variant"] = _mapping(raw.get("variant"))
+    result["reference_ids"] = _list(_present(raw, "reference_ids", "references"))
+    result["vibe_ids"] = _list(_present(raw, "vibe_ids", "vibes"))
+    result["include"] = _list(_present(raw, "include", "include_tags"))
+    result["exclude"] = _list(_present(raw, "exclude", "exclude_tags"))
+    result["position"] = _mapping(raw.get("position"))
+    result["relations"] = _list(raw.get("relations"))
+    result["provenance"] = _list(raw.get("provenance"))
+    return result
+
+
+def _canonical_style(value: Any) -> dict:
+    raw = _mapping(value)
+    result = deepcopy(raw)
+    result.setdefault("id", _text(raw.get("id")))
+    result.setdefault("name", _text(raw.get("name")))
+    result.setdefault("base", _text(_present(raw, "base", "prompt")))
+    result.setdefault("negative", _text(raw.get("negative")))
+    result["parts"] = _mapping(raw.get("parts"))
+    result["generation_settings"] = _mapping(
+        _present(raw, "generation_settings", "params")
+    )
+    result["evidence"] = _list(raw.get("evidence"))
+    result["provenance"] = _list(raw.get("provenance"))
+    return result
+
+
+def _canonical_setting(value: Any) -> dict:
+    raw = _mapping(value)
+    result = deepcopy(raw)
+    result.setdefault("id", _text(raw.get("id")))
+    result.setdefault("name", _text(raw.get("name")))
+    result["scene_values"] = _mapping(_present(raw, "scene_values", "scene"))
+    result["character_values"] = _mapping(
+        _present(raw, "character_values", "per_character")
+    )
+    result["relations"] = _list(raw.get("relations"))
+    result["steps"] = _list(raw.get("steps"))
+    result["families"] = _list(raw.get("families"))
+    result["options"] = _mapping(raw.get("options"))
+    result["cast"] = [
+        (_canonical_character(item) if isinstance(item, Mapping) else deepcopy(item))
+        for item in _list(raw.get("cast"))
+    ]
+    result["repeat"] = deepcopy(raw.get("repeat"))
+    result["order"] = deepcopy(raw.get("order"))
+    result["reservation"] = _mapping(raw.get("reservation"))
+    result["provenance"] = _list(raw.get("provenance"))
+    return result
+
+
+def _canonical_generation(value: Any) -> dict:
+    raw = _mapping(value)
+    result = deepcopy(raw)
+    resolution = _mapping(raw.get("resolution"))
+    if "width" not in resolution and raw.get("width") is not None:
+        resolution["width"] = deepcopy(raw.get("width"))
+    if "height" not in resolution and raw.get("height") is not None:
+        resolution["height"] = deepcopy(raw.get("height"))
+    result["resolution"] = resolution
+    result["settings"] = _mapping(raw.get("settings"))
+    result["final"] = _mapping(raw.get("final"))
+    result["schedule"] = _mapping(raw.get("schedule"))
+    result["provenance"] = _list(raw.get("provenance"))
+    return result
+
+
 def canonical_blueprint(value: Mapping[str, Any] | None) -> dict:
     """누락된 영역을 빈 구조로 채우되 문자열·배열 원문은 그대로 보존."""
     raw = _mapping(value)
@@ -55,6 +152,148 @@ def canonical_blueprint(value: Mapping[str, Any] | None) -> dict:
         if key not in result:
             result[key] = deepcopy(item)
     return result
+
+
+def canonical_generation_plan(value: Mapping[str, Any] | None) -> dict:
+    """여러 화면의 값을 하나의 실행 전 설계도로 정규화한다.
+
+    기존 필드와 아직 모르는 미래 필드는 그대로 보존한다. 이 함수는 파생 사본만
+    만들며 기존 설정·캐릭터·자료 파일을 바꾸지 않는다.
+    """
+    result = canonical_blueprint(value)
+    result["style"] = _canonical_style(result["style"])
+    result["characters"] = [
+        (_canonical_character(item) if isinstance(item, Mapping) else deepcopy(item))
+        for item in result["characters"]
+    ]
+    result["resources"] = _mapping(result["resources"])
+    result["resources"]["vibes"] = _list(result["resources"].get("vibes"))
+    result["resources"]["character_references"] = _list(
+        _present(result["resources"], "character_references", "references")
+    )
+    result["setting"] = _canonical_setting(result["setting"])
+    result["experiment"] = _mapping(result["experiment"])
+    result["generation"] = _canonical_generation(result["generation"])
+    result["output"] = _mapping(result["output"])
+    result["provenance"] = _list(result.get("provenance"))
+    return result
+
+
+def _pointer(parts: Sequence[str]) -> str:
+    if not parts:
+        return "/"
+    return "/" + "/".join(
+        str(part).replace("~", "~0").replace("/", "~1") for part in parts
+    )
+
+
+def _leaf_values(value: Any, parts: tuple[str, ...] = ()) -> Iterable[tuple]:
+    if isinstance(value, Mapping):
+        if not value:
+            yield parts, {}
+        else:
+            for key, item in value.items():
+                yield from _leaf_values(item, parts + (str(key),))
+        return
+    # 배열은 순서와 캐릭터-좌표 짝이 의미를 가지므로 원자 값으로 취급한다.
+    yield parts, deepcopy(value)
+
+
+def _assign_path(target: dict, parts: Sequence[str], value: Any) -> None:
+    if not parts:
+        if isinstance(value, Mapping):
+            target.clear()
+            target.update(deepcopy(dict(value)))
+        return
+    current = target
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = deepcopy(value)
+
+
+def resolve_blueprint_layers(
+    layers: Sequence[Mapping[str, Any]],
+    *,
+    base: Mapping[str, Any] | None = None,
+) -> dict:
+    """우선순위가 있는 설계도 조각을 합치고 선택 근거와 충돌을 함께 돌려준다.
+
+    레이어 형식은 ``{"source": {...}, "priority": 10, "blueprint": {...}}``다.
+    높은 우선순위가 이기며 같은 우선순위는 뒤 레이어가 이긴다. 값이 다른 모든
+    경쟁은 ``conflicts``에 남으므로 조용한 덮어쓰기가 없다.
+    """
+    candidates: dict[tuple[str, ...], list[dict]] = {}
+    ordered_layers: list[tuple[int, int, dict, dict]] = []
+    if base is not None:
+        ordered_layers.append((-10**9, -1, {"kind": "base"}, _mapping(base)))
+    for order, layer in enumerate(layers or ()):
+        if not isinstance(layer, Mapping):
+            continue
+        try:
+            priority = int(layer.get("priority", 0))
+        except (TypeError, ValueError, OverflowError):
+            priority = 0
+        source = _mapping(layer.get("source"))
+        if not source:
+            source = {"kind": "layer", "id": str(order)}
+        payload = layer.get("blueprint")
+        if payload is None:
+            payload = layer.get("values")
+        ordered_layers.append((priority, order, source, _mapping(payload)))
+
+    for priority, order, source, payload in ordered_layers:
+        for parts, item in _leaf_values(payload):
+            candidates.setdefault(parts, []).append({
+                "priority": priority,
+                "order": order,
+                "source": deepcopy(source),
+                "value": deepcopy(item),
+            })
+
+    resolved: dict = {}
+    provenance: dict[str, dict] = {}
+    conflicts: list[dict] = []
+    for parts in sorted(candidates):
+        choices = candidates[parts]
+        winner = max(choices, key=lambda item: (item["priority"], item["order"]))
+        _assign_path(resolved, parts, winner["value"])
+        pointer = _pointer(parts)
+        provenance[pointer] = {
+            "source": deepcopy(winner["source"]),
+            "priority": winner["priority"],
+        }
+        distinct = {
+            json.dumps(item["value"], ensure_ascii=False, sort_keys=True, default=str)
+            for item in choices
+        }
+        if len(distinct) > 1:
+            conflicts.append({
+                "path": pointer,
+                "winner": {
+                    "source": deepcopy(winner["source"]),
+                    "priority": winner["priority"],
+                    "value": deepcopy(winner["value"]),
+                },
+                "candidates": deepcopy(choices),
+                "rule": (
+                    "higher-priority"
+                    if len({item["priority"] for item in choices}) > 1
+                    else "later-layer"
+                ),
+            })
+
+    plan = canonical_generation_plan(resolved)
+    plan["provenance"] = deepcopy(plan.get("provenance") or [])
+    return {
+        "blueprint": plan,
+        "provenance": provenance,
+        "conflicts": conflicts,
+        "fingerprint": fingerprint_blueprint(plan),
+    }
 
 
 def fingerprint_blueprint(value: Mapping[str, Any] | None) -> str:

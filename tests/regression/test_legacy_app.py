@@ -198,7 +198,7 @@ class RegressionTests(unittest.TestCase):
             'data-exp-result="i2i"',
             "async function resultFile(url, name)",
             "async function resultToReference(url, name, kind, msg)",
-            "async function resultToI2I(url, name, msg)",
+            "async function resultToI2I(",
             "await addRefs([file], kind)",
             "i2iLoad(file)",
         ):
@@ -1604,6 +1604,14 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(jobs[0]["status"], "partial")
             self.assertEqual((jobs[0]["completed"], jobs[0]["failed"]), (3, 1))
             self.assertTrue(jobs[0]["can_resume"])
+            runtime_jobs = APP.common_job_store().list()
+            self.assertEqual(len(runtime_jobs), 1)
+            self.assertEqual(runtime_jobs[0]["kind"], "setting")
+            self.assertEqual(runtime_jobs[0]["phase"], "paused")
+            self.assertEqual(
+                runtime_jobs[0]["progress"]["completed"], 3)
+            self.assertNotIn("prompt", json.dumps(
+                runtime_jobs[0], ensure_ascii=False).casefold())
             jobs[0]["status"] = "running"
             APP.atomic_write_json(
                 APP.JOB_LEDGER_FILE,
@@ -2668,6 +2676,15 @@ class RegressionTests(unittest.TestCase):
         values = json.loads(annotated)
         self.assertTrue(values["qualityToggle"])
         self.assertEqual(values["ucPreset"], 3)
+        traced = json.loads(APP.annotate_nai_comment(
+            original,
+            False,
+            4,
+            request_id="nai-request-test",
+            payload_hash="a" * 64,
+        ))
+        self.assertEqual(traced["requestId"], "nai-request-test")
+        self.assertEqual(traced["payloadHash"], "a" * 64)
 
         image = Image.new("RGB", (2, 2), "white")
         metadata = PngInfo()
@@ -3811,6 +3828,54 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result["style"]["base"], "1girl")
         self.assertTrue(result["style"]["params"]["quality_toggle"])
         self.assertEqual(result["style"]["negative"], "bad anatomy")
+        evidence = result["style"]["evidence_records"][0]
+        asset = result["style"]["knowledge_asset"]
+        self.assertEqual(evidence["kind"], "generation-record")
+        self.assertEqual(evidence["actual_generation"]["base"], "1girl")
+        self.assertEqual(asset["kind"], "style")
+        self.assertEqual(asset["evidence_refs"], [evidence["id"]])
+        self.assertEqual(asset["content"]["base"], "1girl")
+        self.assertEqual(asset["content"]["negative"], "bad anatomy")
+        self.assertTrue(
+            asset["content"]["generation_settings"]["quality_toggle"])
+
+    def test_blueprint_snapshot_exposes_rich_plan_and_token_free_assets(self):
+        cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+        cfg.update({
+            "token": "pst-never-cross-this-contract",
+            "style_name": "검증 그림체",
+            "base_prompt": "base raw",
+            "negative_prompt": "negative raw",
+            "char_slots": [{
+                "id": "slot-a", "name": "A", "prompt": "appearance",
+                "outfit": "outfit", "negative": "character negative",
+                "reference_ids": ["ref-a"], "vibe_ids": ["vibe-a"],
+            }],
+            "char_centers": [{"x": 0.13, "y": 0.87}],
+            "characters": [{
+                "id": "character-a", "name": "A", "female": "appearance",
+                "clothed": "outfit", "negative": "character negative",
+            }],
+        })
+        snapshot = APP.ConfigServer(cfg).snapshot_blueprint()
+        blueprint = snapshot["blueprint"]
+        self.assertEqual(blueprint["schema"], "nai-generation-blueprint/v1")
+        self.assertEqual(
+            blueprint["style"]["generation_settings"]["cfg_scale"],
+            cfg["cfg_scale"],
+        )
+        self.assertEqual(
+            blueprint["generation"]["final"]["character_prompts"][0],
+            {
+                "prompt": "appearance, outfit",
+                "negative": "character negative",
+                "position": {"x": 0.13, "y": 0.87, "enabled": False},
+            },
+        )
+        self.assertEqual(snapshot["knowledge_assets"][0]["kind"], "style")
+        self.assertEqual(snapshot["knowledge_assets"][1]["kind"], "character")
+        self.assertNotIn("pst-never-cross", json.dumps(
+            snapshot, ensure_ascii=False))
 
     def test_metadata_thumbnail_local_name_matches_saved_webp_sha256(self):
         metadata = PngInfo()
@@ -5133,6 +5198,136 @@ class RegressionTests(unittest.TestCase):
                 "data-castsave=", "data-castpresetdel=", "data-castmode=",
                 "data-cresource=", "data-cpos=", "함께 등장 — 한 장에 여러 명",
                 "캐릭터 조합만 저장하며 세팅·장면·생성 설정은 바꾸지 않습니다."):
+            self.assertIn(marker, page)
+
+    def test_vibe_bundle_import_is_disabled_lossless_and_exportable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            vibe_dir = root / "수집" / "바이브"
+            settings_file = root / "설정.json"
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg["model"] = "nai-diffusion-4-5-full"
+            cfg["token"] = "must-not-cross-resource-export"
+            server = APP.ConfigServer(cfg)
+            document = json.dumps({
+                "identifier": "novelai-vibe-transfer",
+                "model": "nai-diffusion-4-5-full",
+                "encoding": "QUJD" * 5000,
+                "informationExtracted": 0.85,
+                "strength": 0.55,
+                "name": "긴 바이브",
+            }, ensure_ascii=False).encode("utf-8")
+            with (
+                patch.object(APP, "VIBE_DIR", vibe_dir),
+                patch.object(APP, "SETTINGS_FILE", settings_file),
+            ):
+                result = server.handle_resource_import(
+                    document, "sample.naiv4vibe")
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["added_vibes"], 1)
+                item = result["vibes"][0]
+                self.assertFalse(item["enabled"])
+                self.assertEqual(item["info_extracted"], 0.85)
+                encoded = (vibe_dir / f"{item['id']}.vibe").read_text(
+                    encoding="ascii")
+                self.assertEqual(encoded, "QUJD" * 5000)
+                exported = APP.export_legacy_resources(
+                    server.cfg,
+                    file_index=APP.resource_file_index(server.cfg),
+                ).decode("utf-8")
+                self.assertNotIn("must-not-cross-resource-export", exported)
+                self.assertIn("QUJD" * 5000, exported)
+
+        page = APP.render_page()
+        for marker in (
+                'id="refBundleExport"', 'id="refBundleImport"',
+                "/api/ref_bundle_export", "/api/ref_bundle_import"):
+            self.assertIn(marker, page)
+
+    def test_character_evidence_can_run_as_temporary_img2img_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = copy.deepcopy(APP.DEFAULT_CONFIG)
+            cfg.update({
+                "token": "pst-fixture",
+                "out_dir": str(Path(td) / "output"),
+                "characters": [{
+                    "id": "hero", "name": "주인공",
+                    "female": "1girl, red hair",
+                    "clothed": "blue dress",
+                    "negative": "bad hands",
+                    "reference_ids": ["ref-hero"],
+                    "vibe_ids": ["vibe-hero"],
+                }],
+                "char_refs": [{
+                    "id": "ref-hero", "name": "주인공 참조",
+                    "enabled": False, "strength": 1.1, "fidelity": 0.8,
+                }],
+                "vibes": [{
+                    "id": "vibe-hero", "name": "주인공 분위기",
+                    "enabled": False, "strength": 0.7,
+                    "info_extracted": 0.9,
+                }],
+            })
+            source = io.BytesIO()
+            Image.new("RGB", (128, 128), "white").save(source, "PNG")
+            body = json.dumps({
+                "image": "data:image/png;base64,"
+                         + APP.base64.b64encode(source.getvalue()).decode(),
+                "strength": 0.7,
+                "variation_character_id": "hero",
+                "seed": 77,
+            }).encode()
+            server = APP.ConfigServer(cfg)
+            captured = {}
+
+            def runtime_params(value, _token):
+                captured["job_cfg"] = copy.deepcopy(value)
+                return {}
+
+            def generate(_token, _base, _female, _male, _negative,
+                         width, height, **kwargs):
+                captured["chars"] = copy.deepcopy(kwargs["chars"])
+                image = Image.new("RGB", (width, height), "white")
+                image.nai_seed = kwargs["seed"]
+                return image
+
+            with (
+                patch.object(APP, "runtime_generation_params",
+                             side_effect=runtime_params),
+                patch.object(APP, "pace_gate", return_value=(True, "")),
+                patch.object(APP, "pace_complete", return_value=None),
+                patch.object(APP, "call_nai_api", side_effect=generate),
+                patch.object(APP, "save_with_meta", return_value=None),
+                patch.object(APP, "load_state",
+                             return_value={"daily": {}, "total_generated": 0}),
+                patch.object(APP, "save_state", return_value=None),
+            ):
+                started = server.handle_i2i(body)
+                self.assertTrue(started["ok"], started)
+                self.assertEqual(started["variation_character"], "주인공")
+                deadline = time.time() + 3
+                while server.live.running and time.time() < deadline:
+                    time.sleep(0.01)
+
+            self.assertFalse(server.live.running)
+            temporary = captured["job_cfg"]
+            self.assertEqual(temporary["char_slots"][0]["prompt"],
+                             "1girl, red hair")
+            self.assertEqual(temporary["char_slots"][0]["outfit"],
+                             "blue dress")
+            self.assertEqual(temporary["char_slots"][0]["negative"],
+                             "bad hands")
+            self.assertEqual(temporary["char_refs"][0]["id"], "ref-hero")
+            self.assertEqual(temporary["vibes"][0]["id"], "vibe-hero")
+            self.assertEqual(captured["chars"][0]["prompt"],
+                             "1girl, red hair, blue dress")
+            self.assertEqual(server.cfg["char_slots"],
+                             cfg["char_slots"])
+
+        page = APP.render_page()
+        for marker in (
+                'id="libVary"', "variation_character_id",
+                "이 증거 그림으로 캐릭터 변형"):
             self.assertIn(marker, page)
 
 
