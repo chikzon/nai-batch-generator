@@ -45,9 +45,7 @@ from PIL import Image
 from src.nai_studio.collection import arca as arca_public
 from src.nai_studio.domain.blueprint import (
     canonical_blueprint,
-    canonical_generation_plan,
     fingerprint_blueprint,
-    summarize_blueprint,
 )
 from src.nai_studio.domain.project_inheritance import (
     blueprint_common,
@@ -57,7 +55,6 @@ from src.nai_studio.domain.project_inheritance import (
     project_by_id,
     resolve_inheritance,
 )
-from src.nai_studio.domain.experiment import canonical_experiment_rule
 from src.nai_studio.domain.image_metadata import (
     GENERATION_KEYS,
     PARAM_KEYS,
@@ -203,6 +200,10 @@ from src.nai_studio.services.character_runtime import (
     character_run_from_group,
     slot_bundle_identity,
     slot_prompt,
+)
+from src.nai_studio.services.generation_blueprint import (
+    BLUEPRINT_GENERATION_KEYS,
+    generation_blueprint,
 )
 from src.nai_studio.services.prompt_bridge import (
     legacy_sequence_text,
@@ -7923,138 +7924,6 @@ def _variety_sigma_value(model, width, height, variety, p):
     """이전 단일 파일 호출부를 위한 호환 어댑터."""
     return variety_sigma_value(
         model, width, height, variety, p, warn=log.warning)
-
-
-BLUEPRINT_GENERATION_KEYS = (
-    "model", "width", "height", "nai_seed", "steps", "cfg_scale",
-    "cfg_rescale", "sampler", "scheduler", "uc_preset", "quality_toggle",
-    "variety", "smea", "smea_dyn", "dynamic_thresholding",
-    "uncond_scale", "controlnet_strength", "prefer_brownian",
-    "deliberate_euler_ancestral_bug", "use_coords", "position_mode",
-)
-
-
-def generation_blueprint(cfg, *, source=None, setting=None, experiment=None):
-    """현재 여러 저장 구조를 한 번의 실행 가능한 생성 설계도로 해석한다.
-
-    파생 모델만 만들며 설정·캐릭터·세팅 파일에는 아무것도 쓰지 않는다. 화면, 비교,
-    챗봇 연결 계약이 같은 값을 읽게 하는 경계다.
-    """
-    cfg = cfg or {}
-    slots = cfg.get("char_slots") or []
-    centers = cfg.get("char_centers") or []
-    characters = []
-    for index, slot in enumerate(slots):
-        if not isinstance(slot, dict):
-            continue
-        effective = selected_variation_values(slot)
-        selected = effective["selected_variant"]
-        center = (centers[index] if index < len(centers)
-                  and isinstance(centers[index], dict) else {"x": 0.5, "y": 0.5})
-        characters.append({
-            "id": str(slot.get("id") or ""),
-            "name": str(slot.get("name") or ""),
-            "enabled": slot.get("enabled") is not False,
-            "appearance": effective["prompt"],
-            "clothed": effective["outfit"],
-            "negative": effective["negative"],
-            "resolved_prompt": slot_prompt(slot),
-            "position": {
-                "x": center.get("x", 0.5),
-                "y": center.get("y", 0.5),
-                "mode": normalize_position_mode(
-                    cfg.get("position_mode"), cfg.get("use_coords")),
-                "enabled": position_mode_uses_coords(
-                    cfg.get("position_mode"), cfg.get("use_coords")),
-            },
-            "variant": copy.deepcopy(slot.get("variant") or {}),
-            "variants": copy.deepcopy(slot.get("variants") or []),
-            "selected_variant_id": effective["selected_variant_id"],
-            "reference_ids": copy.deepcopy((
-                selected.get("reference_ids")
-                if "reference_ids" in selected else slot.get("reference_ids")
-            ) or []),
-            "vibe_ids": copy.deepcopy((
-                selected.get("vibe_ids")
-                if "vibe_ids" in selected else slot.get("vibe_ids")
-            ) or []),
-        })
-
-    active_settings = {}
-    for name, state in (cfg.get("setting_state") or {}).items():
-        if isinstance(state, dict) and state.get("use"):
-            active_settings[str(name)] = copy.deepcopy(state)
-
-    generation = {
-        key: copy.deepcopy(cfg.get(key))
-        for key in BLUEPRINT_GENERATION_KEYS
-    }
-    generation["seed"] = generation.pop("nai_seed", cfg.get("nai_seed", 0))
-    generation["resolution"] = {
-        "width": generation.get("width"),
-        "height": generation.get("height"),
-    }
-    generation["settings"] = {
-        key: copy.deepcopy(generation.get(key))
-        for key in BLUEPRINT_GENERATION_KEYS
-        if key not in ("width", "height", "nai_seed")
-    }
-    generation["final"] = {
-        "base_prompt": str(cfg.get("base_prompt") or ""),
-        "negative_prompt": str(cfg.get("negative_prompt") or ""),
-        "character_prompts": [
-            {
-                "prompt": item["resolved_prompt"],
-                "negative": item["negative"],
-                "position": copy.deepcopy(item["position"]),
-            }
-            for item in characters if item.get("enabled")
-        ],
-    }
-    style_settings = {
-        key: copy.deepcopy(cfg.get(key))
-        for key in BLUEPRINT_GENERATION_KEYS
-        if key not in ("nai_seed", "use_coords", "position_mode")
-    }
-    blueprint = canonical_generation_plan({
-        "source": copy.deepcopy(source or {"kind": "current-config"}),
-        "style": {
-            "name": str(cfg.get("style_name") or ""),
-            "base": str(cfg.get("base_prompt") or ""),
-            "negative": str(cfg.get("negative_prompt") or ""),
-            "generation_settings": style_settings,
-            "parts": {
-                "fixed": str(cfg.get("base_fixed") or ""),
-                "variable": str(cfg.get("base_var") or ""),
-                "detail": str(cfg.get("base_detail") or ""),
-            },
-        },
-        "characters": characters,
-        "resources": {
-            "vibes": copy.deepcopy(cfg.get("vibes") or []),
-            "character_references": copy.deepcopy(cfg.get("char_refs") or []),
-        },
-        "setting": copy.deepcopy(setting or {
-            "name": next(iter(active_settings), ""),
-            "active": active_settings,
-            "cast_presets": copy.deepcopy(cfg.get("cast_presets") or []),
-        }),
-        "experiment": canonical_experiment_rule(
-            copy.deepcopy(experiment or {"mode": "single"})
-        ),
-        "generation": generation,
-        "output": {
-            "format": str(cfg.get("save_format") or "webp"),
-            "quality": cfg.get("save_quality", 92),
-            "clean_metadata": bool(cfg.get("save_clean")),
-            "max_side": cfg.get("save_max_side", 0),
-            "directory": str(cfg.get("out_dir") or ""),
-            "by_date": bool(cfg.get("out_by_date")),
-        },
-    })
-    blueprint["fingerprint"] = fingerprint_blueprint(blueprint)
-    blueprint["summary"] = summarize_blueprint(blueprint)
-    return blueprint
 
 
 def inherited_blueprint_resolution(cfg, *, source=None, setting=None,
