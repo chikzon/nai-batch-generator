@@ -186,6 +186,7 @@ from src.nai_studio.services import (
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
     output_lifecycle as _output_lifecycle,
+    user_backup_store as _user_backup_store,
 )
 from src.nai_studio.services.experiment_execution_bridge import (
     legacy_execution_material,
@@ -3464,6 +3465,30 @@ BACKUP_SCHEMA = "nais-user-backup/v1"
 BACKUP_SECRET_KEYS = {"token", "booru_keys", "out_dir"}
 
 
+def _user_backup_paths():
+    return _user_backup_store.UserBackupPaths(
+        base_dir=BASE_DIR,
+        profile_dir=PROFILE_DIR,
+        schema=BACKUP_SCHEMA,
+        journal_schema="nais-restore-journal/v1",
+        journal_dir_name="복원기록",
+    )
+
+
+def _user_backup_operations():
+    """현재 복원·원자 저장 경계를 호출 때 주입해 기존 patch와 롤백 순서를 보존한다."""
+    return _user_backup_store.UserBackupOperations(
+        transaction=shared_data_transaction,
+        atomic_write_bytes=_atomic_write_bytes,
+        atomic_write_json=atomic_write_json,
+        load_settings=load_settings_recover,
+        rollback=rollback_user_backup,
+        after_restore=forget_collection_caches,
+        now=datetime.now,
+        random_bytes=os.urandom,
+    )
+
+
 def _backup_clean_settings(raw):
     data = dict(raw or {}) if isinstance(raw, dict) else {}
     for key in BACKUP_SECRET_KEYS:
@@ -3551,37 +3576,6 @@ def _backup_safe_logical(value):
     return "/".join(parts)
 
 
-def _read_user_backup(blob):
-    if not blob.startswith(b"PK"):
-        raise ValueError("NAI 사용자 백업 ZIP이 아닙니다.")
-    archive_sha = hashlib.sha256(blob).hexdigest()
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        infos = [x for x in z.infolist() if not x.is_dir()]
-        if len(infos) > 50000 or sum(x.file_size for x in infos) > 1024 ** 3:
-            raise ValueError("백업의 파일 수나 압축 해제 크기가 비정상적입니다.")
-        try:
-            manifest = json.loads(z.read("manifest.json"))
-        except Exception as e:
-            raise ValueError(f"manifest.json을 읽지 못했습니다: {e}") from e
-        if manifest.get("schema") != BACKUP_SCHEMA:
-            raise ValueError("지원하지 않는 백업 형식입니다.")
-        payloads, seen = {}, set()
-        for entry in manifest.get("files") or []:
-            logical = _backup_safe_logical(entry.get("path"))
-            if not logical or logical in seen:
-                raise ValueError("백업 manifest에 위험하거나 중복된 경로가 있습니다.")
-            seen.add(logical)
-            try:
-                raw = z.read("data/" + logical)
-            except KeyError as e:
-                raise ValueError(f"백업 내용이 빠졌습니다: {logical}") from e
-            if (len(raw) != int(entry.get("size", -1))
-                    or hashlib.sha256(raw).hexdigest() != entry.get("sha256")):
-                raise ValueError(f"백업 내용 검사가 실패했습니다: {logical}")
-            payloads[logical] = raw
-    return manifest, payloads, archive_sha
-
-
 def _backup_destination(logical):
     logical = _backup_safe_logical(logical)
     if not logical:
@@ -3619,181 +3613,12 @@ def _backup_merge_secrets(logical, raw, target):
     return json.dumps(incoming, ensure_ascii=False, indent=1).encode("utf-8")
 
 
-_BACKUP_MISSING = object()
-
-
-def _backup_list_key(current, incoming):
-    """목록을 통째로 덮지 않고 자산별로 비교할 수 있는 안정 열쇠를 찾는다."""
-    lists = [value for value in (current, incoming) if isinstance(value, list)]
-    rows = [item for value in lists for item in value]
-    if not rows or not all(isinstance(item, dict) for item in rows):
-        return ""
-    for key in ("id", "이름", "name", "title", "seed"):
-        values_by_list = [
-            [str(item.get(key, "")).strip() for item in value]
-            for value in lists
-        ]
-        if all(
-            all(values) and len(values) == len(set(values))
-            for values in values_by_list
-        ):
-            return key
-    return ""
-
-
-def _backup_pointer(tokens):
-    parts = []
-    for token in tokens:
-        if token[0] == "key":
-            parts.append(str(token[1]).replace("~", "~0").replace("/", "~1"))
-        else:
-            parts.append(
-                f"@{token[1]}={str(token[2]).replace('~', '~0').replace('/', '~1')}")
-    return "/" + "/".join(parts) if parts else "/"
-
-
-def _backup_collect_changes(current, incoming, tokens=()):
-    if current is not _BACKUP_MISSING and incoming is not _BACKUP_MISSING:
-        if current == incoming:
-            return []
-        if isinstance(current, dict) and isinstance(incoming, dict):
-            changes = []
-            for key in sorted(set(current) | set(incoming), key=str):
-                changes.extend(_backup_collect_changes(
-                    current.get(key, _BACKUP_MISSING),
-                    incoming.get(key, _BACKUP_MISSING),
-                    tokens + (("key", key),),
-                ))
-            return changes
-        if isinstance(current, list) and isinstance(incoming, list):
-            key = _backup_list_key(current, incoming)
-            if key:
-                before = {str(item[key]): item for item in current}
-                after = {str(item[key]): item for item in incoming}
-                changes = []
-                for value in sorted(set(before) | set(after)):
-                    changes.extend(_backup_collect_changes(
-                        before.get(value, _BACKUP_MISSING),
-                        after.get(value, _BACKUP_MISSING),
-                        tokens + (("item", key, value),),
-                    ))
-                return changes
-    return [{
-        "tokens": tokens,
-        "current_exists": current is not _BACKUP_MISSING,
-        "incoming_exists": incoming is not _BACKUP_MISSING,
-        "current": None if current is _BACKUP_MISSING else copy.deepcopy(current),
-        "incoming": None if incoming is _BACKUP_MISSING else copy.deepcopy(incoming),
-    }]
-
-
-def _backup_apply_change(value, change, depth=0):
-    """선택한 JSON 조각 하나만 현재값 사본에 적용한다."""
-    tokens = change["tokens"]
-    exists = change["incoming_exists"]
-    incoming = copy.deepcopy(change["incoming"])
-    if depth >= len(tokens):
-        return incoming if exists else _BACKUP_MISSING
-    token = tokens[depth]
-    if token[0] == "key":
-        obj = copy.deepcopy(value) if isinstance(value, dict) else {}
-        key = token[1]
-        child = obj.get(key, _BACKUP_MISSING)
-        replaced = _backup_apply_change(child, change, depth + 1)
-        if replaced is _BACKUP_MISSING:
-            obj.pop(key, None)
-        else:
-            obj[key] = replaced
-        return obj
-    rows = copy.deepcopy(value) if isinstance(value, list) else []
-    field, wanted = token[1], str(token[2])
-    index = next((
-        i for i, item in enumerate(rows)
-        if isinstance(item, dict) and str(item.get(field, "")) == wanted
-    ), None)
-    child = rows[index] if index is not None else _BACKUP_MISSING
-    replaced = _backup_apply_change(child, change, depth + 1)
-    if replaced is _BACKUP_MISSING:
-        if index is not None:
-            rows.pop(index)
-    elif index is None:
-        rows.append(replaced)
-    else:
-        rows[index] = replaced
-    return rows
-
-
 def _backup_diff_plan(blob):
-    manifest, payloads, archive_sha = _read_user_backup(blob)
-    declared = {
-        str(item.get("path") or ""): item
-        for item in (manifest.get("files") or [])
-    }
-    plans, counts, total = [], {"새 파일": 0, "바뀔 파일": 0, "같은 파일": 0}, 0
-    for logical, raw in sorted(payloads.items()):
-        target = _backup_destination(logical)
-        wanted = _backup_merge_secrets(logical, raw, target)
-        current_raw = target.read_bytes() if target.is_file() else None
-        total += len(wanted)
-        if current_raw == wanted:
-            counts["같은 파일"] += 1
-            continue
-        status = "새 파일" if current_raw is None else "바뀔 파일"
-        counts[status] += 1
-        incoming_value = current_value = _BACKUP_MISSING
-        json_mode = False
-        try:
-            incoming_value = json.loads(wanted.decode("utf-8"))
-            current_value = (
-                json.loads(current_raw.decode("utf-8"))
-                if current_raw is not None else _BACKUP_MISSING)
-            json_mode = True
-        except (UnicodeError, json.JSONDecodeError, AttributeError):
-            pass
-        changes = (
-            _backup_collect_changes(current_value, incoming_value)
-            if json_mode and current_raw is not None else [{
-                "tokens": (),
-                "current_exists": current_raw is not None,
-                "incoming_exists": True,
-                "current": ({
-                    "bytes": len(current_raw),
-                    "sha256": hashlib.sha256(current_raw).hexdigest(),
-                } if current_raw is not None else None),
-                "incoming": {
-                    "bytes": len(wanted),
-                    "sha256": hashlib.sha256(wanted).hexdigest(),
-                },
-            }]
-        )
-        current_sha = hashlib.sha256(current_raw or b"").hexdigest()
-        incoming_sha = hashlib.sha256(wanted).hexdigest()
-        base_sha = str((declared.get(logical) or {}).get("base_sha256") or "")
-        for change in changes:
-            pointer = _backup_pointer(change["tokens"])
-            change_id = hashlib.sha256(
-                f"{archive_sha}\0{logical}\0{pointer}\0{current_sha}\0{incoming_sha}"
-                .encode("utf-8")
-            ).hexdigest()
-            plans.append({
-                **change,
-                "id": change_id,
-                "logical": logical,
-                "pointer": pointer,
-                "file_status": status,
-                "json": json_mode,
-                "current_sha256": current_sha,
-                "incoming_sha256": incoming_sha,
-                "base_sha256": base_sha,
-                "target": target,
-                "wanted_raw": wanted,
-                "current_raw": current_raw,
-            })
-    fingerprint = hashlib.sha256(
-        "\n".join(item["id"] for item in plans).encode("ascii")
-    ).hexdigest()
-    return manifest, payloads, archive_sha, plans, counts, total, fingerprint
-
+    return _user_backup_store.backup_diff_plan(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        blob,
+    )
 
 def _backup_change_public(change):
     if change["current_exists"] and change["incoming_exists"]:
@@ -3825,80 +3650,15 @@ def preview_user_backup(blob):
             "changes": [_backup_change_public(change) for change in plans]}
 
 
-@serialized_data_write(lambda: BASE_DIR)
 def restore_user_backup(blob, expected_sha="", selected=None, expected_diff=""):
-    (manifest, payloads, archive_sha, plans, _counts,
-     _total, diff_fingerprint) = _backup_diff_plan(blob)
-    if expected_sha and expected_sha != archive_sha:
-        return {"ok": False, "error": "미리보기한 백업과 복원할 백업이 다릅니다."}
-    if expected_diff and expected_diff != diff_fingerprint:
-        return {"ok": False, "conflict": True,
-                "error": "검사 뒤 현재 자료가 바뀌었습니다. 백업을 다시 검사해 주세요."}
-    selected_ids = None if selected is None else set(map(str, selected))
-    by_id = {item["id"]: item for item in plans}
-    if selected_ids is not None:
-        unknown = selected_ids - set(by_id)
-        if unknown:
-            return {"ok": False, "conflict": True,
-                    "error": "검사 뒤 충돌 항목이 바뀌었습니다. 백업을 다시 검사해 주세요."}
-        if not selected_ids:
-            return {"ok": True, "batch": "", "changed": 0,
-                    "files": len(payloads), "selected": 0}
-    chosen = plans if selected_ids is None else [
-        by_id[item_id] for item_id in selected_ids]
-    grouped = {}
-    for change in chosen:
-        grouped.setdefault(change["logical"], []).append(change)
-
-    batch = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
-    journal = PROFILE_DIR / "복원기록" / batch
-    operations = []
-    for logical, changes in sorted(grouped.items()):
-        target = _backup_destination(logical)
-        old = target.read_bytes() if target.is_file() else None
-        if len(changes) == 1 and not changes[0]["tokens"]:
-            wanted = changes[0]["wanted_raw"]
-        else:
-            try:
-                value = json.loads(old.decode("utf-8")) if old is not None else {}
-            except (UnicodeError, json.JSONDecodeError) as e:
-                return {"ok": False, "error": f"{logical} 현재 JSON을 읽지 못했습니다: {e}"}
-            for change in sorted(changes, key=lambda item: item["pointer"]):
-                value = _backup_apply_change(value, change)
-            if value is _BACKUP_MISSING:
-                continue
-            wanted = json.dumps(value, ensure_ascii=False, indent=1).encode("utf-8")
-        if old == wanted:
-            continue
-        op = {"path": logical, "new": old is None,
-              "applied_sha256": hashlib.sha256(wanted).hexdigest()}
-        if old is not None:
-            saved = (_backup_clean_settings(json.loads(old))
-                     if logical == "profile/설정.json" else old)
-            _atomic_write_bytes(journal / "before" / logical, saved, keep_backup=False)
-        operations.append((op, target, wanted))
-    record = {"schema": "nais-restore-journal/v1", "id": batch,
-              "backup_sha256": archive_sha, "status": "ready",
-              "operations": [x[0] for x in operations], "completed": []}
-    atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
-    try:
-        record["status"] = "applying"
-        atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
-        for op, target, wanted in operations:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_bytes(target, wanted)
-            record["completed"].append(op["path"])
-            atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
-    except Exception:
-        rollback_user_backup(batch)
-        raise
-    record.update(status="complete",
-                  completed_at=datetime.now().isoformat(timespec="seconds"))
-    atomic_write_json(journal / "journal.json", record, indent=1, keep_backup=False)
-    forget_collection_caches()
-    return {"ok": True, "batch": batch, "changed": len(operations),
-            "files": len(payloads), "selected": len(chosen)}
-
+    return _user_backup_store.restore_user_backup(
+        _user_backup_paths(),
+        _user_backup_operations(),
+        blob,
+        expected_sha,
+        selected,
+        expected_diff,
+    )
 
 @serialized_data_write(lambda: BASE_DIR)
 def rollback_user_backup(batch_id):
