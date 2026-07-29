@@ -19,6 +19,36 @@
 `src/nai_studio/domain/model_presets.py`가 소유한다. 레거시 작업실은 호환 이름을
 import해 UI·저장·payload 경로를 그대로 유지한다.
 
+## 현재 분리된 NAI 작업실 경계
+
+| 책임 | 소유 모듈 |
+|---|---|
+| 모델·Quality·UC 변환 | `domain/model_presets.py` |
+| Anlas 비용·Opus 무료 조건 | `domain/costs.py` |
+| PNG·WebP·Stealth 메타데이터 복원 | `domain/image_metadata.py` |
+| NAI T5 토큰 계산 | `domain/tokenization.py` |
+| 좌표·Reference·img2img를 포함한 NAI payload 조립 | `domain/nai_payload.py` |
+| 사용자 자료 잠금·원자 저장·손상 복구 | `runtime/data_files.py` |
+| 실행권·중지·진행률·미리보기 상태 | `runtime/live_state.py` |
+| 정적 HTML·JavaScript 화면 | `web/page_template.py` |
+
+`legacy_app.py`는 위 이름을 import하거나 얇은 호환 어댑터로 노출한다. 저장 schema,
+사용자 자료 위치, HTTP endpoint와 `start.py` 진입점은 바꾸지 않았다.
+
+## 아직 분리되지 않은 책임
+
+점진 분리는 **완료되지 않았다**. 다음 큰 경계가 `legacy_app.py`에 남아 있다.
+
+- `ConfigServer`: API endpoint 조정과 HTTP handler
+- `PublicCollectionManager`: 공개자료 발견·재개·임포트
+- 자료실 검색·그림체·작가 평가·태그 자동완성
+- 세팅·자료팩·전체 백업·휴지통
+- 비교 계획·결과 승격·재실행
+- 단일·세팅·비교 생성 오케스트레이션
+
+이들은 사용자 데이터와 실행 순서가 얽혀 있으므로 schema 변경 없이 한 경계씩 옮기고,
+기존 호출 경로에는 호환 어댑터를 남긴다.
+
 ### 연결 계약
 
 - 두 앱이 공유하는 안정된 ID
