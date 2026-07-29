@@ -167,6 +167,35 @@ class RestorationInputsContractTests(unittest.TestCase):
         )
         self.assert_safe_contract(retried)
 
+    def test_public_collection_includes_history_and_scrubs_key_variants_and_posix_paths(self):
+        state = {
+            "status": "idle",
+            "queue": ["https://example.invalid/current"],
+            "articles": {
+                "https://example.invalid/history": {
+                    "metadata_images": 1,
+                    "metadata_raw": {
+                        "access_token": "opaque-secret",
+                        "naiToken": "also-secret",
+                        "note": "cached at /home/private/file.png",
+                    },
+                },
+            },
+            "failures": {
+                "https://example.invalid/failed-history": {
+                    "error": "read /tmp/private/cache.webp",
+                    "attempts": 1,
+                },
+            },
+        }
+        queue = public_collection_queue(state)
+        self.assertEqual(len(queue["items"]), 3)
+        text = json.dumps(queue, ensure_ascii=False)
+        self.assertNotIn("opaque-secret", text)
+        self.assertNotIn("also-secret", text)
+        self.assertNotIn("/home/private", text)
+        self.assertNotIn("/tmp/private", text)
+
     def test_pack_import_keeps_manifest_lineage_and_report_without_archive(self):
         result = {
             "ok": True,

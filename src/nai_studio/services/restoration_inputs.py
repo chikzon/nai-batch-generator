@@ -26,18 +26,6 @@ from src.nai_studio.domain.restoration import (
 
 RESTORATION_INPUT_SCHEMA = "nai-restoration-input/v1"
 
-_SECRET_KEYS = frozenset({
-    "authorization",
-    "api-key",
-    "api_key",
-    "apikey",
-    "api_token",
-    "cookie",
-    "password",
-    "secret",
-    "set-cookie",
-    "token",
-})
 _BINARY_KEYS = frozenset({
     "binary",
     "blob",
@@ -66,6 +54,10 @@ _TOKEN_PATTERN = re.compile(
 _WINDOWS_PATH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/][^\r\n\t\"'<>|]+|"
     r"\\\\[^\\/\s]+[\\/][^\r\n\t\"'<>|]+)"
+)
+_POSIX_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9:])/(?:home|Users|var|tmp|opt|root|mnt|srv|private)"
+    r"(?:/[^\s\r\n\t\"'<>|]+)+"
 )
 
 
@@ -142,13 +134,26 @@ def _safe_string(value: str) -> str:
     text = _TOKEN_PATTERN.sub("[secret]", value)
     if _is_absolute_path(text):
         return "[absolute-path]"
-    return _WINDOWS_PATH_PATTERN.sub("[absolute-path]", text)
+    text = _WINDOWS_PATH_PATTERN.sub("[absolute-path]", text)
+    return _POSIX_PATH_PATTERN.sub("[absolute-path]", text)
+
+
+def _is_secret_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+    return (
+        normalized in {
+            "authorization", "apikey", "apitoken", "accesstoken",
+            "naitoken", "persistenttoken", "cookie", "password",
+            "secret", "setcookie", "refreshtoken",
+        }
+        or normalized.endswith("token")
+    )
 
 
 def _safe_json(value: Any, *, key: str = "") -> Any:
     """JSON 호환 사본을 만들며 비밀값·바이너리·절대경로만 제거한다."""
     folded = str(key or "").casefold()
-    if folded in _SECRET_KEYS or folded in _BINARY_KEYS:
+    if _is_secret_key(key) or folded in _BINARY_KEYS:
         return None
     if isinstance(value, (bytes, bytearray, memoryview)):
         return None
@@ -156,7 +161,7 @@ def _safe_json(value: Any, *, key: str = "") -> Any:
         result = {}
         for raw_key, raw_item in value.items():
             item_key = str(raw_key)
-            if item_key.casefold() in _SECRET_KEYS | _BINARY_KEYS:
+            if _is_secret_key(item_key) or item_key.casefold() in _BINARY_KEYS:
                 continue
             safe = _safe_json(raw_item, key=item_key)
             if safe is not None:
@@ -501,7 +506,11 @@ def public_collection_queue(value: Mapping[str, Any]) -> dict:
         },
     )
     items = []
-    urls = list(state.get("queue") or [])
+    urls = list(dict.fromkeys([
+        *list(state.get("queue") or []),
+        *[str(url) for url in articles],
+        *[str(url) for url in failures],
+    ]))
     for index, raw_url in enumerate(urls):
         url = str(raw_url or "")
         article = _record(articles.get(url))
