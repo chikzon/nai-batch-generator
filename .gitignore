@@ -63,3 +63,7 @@ Thumbs.db
 /build/
 dist/
 *.spec
+
+# 내부 감사 기록 — 저장소 밖 보관본이 원본
+ai-review/
+docs/evidence/
