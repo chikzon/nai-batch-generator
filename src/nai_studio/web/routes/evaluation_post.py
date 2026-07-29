@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
+from src.nai_studio.services.evaluation_workflow import (
+    delete_outputs_workflow,
+    save_mosaic_workflow,
+    save_picks_workflow,
+    strip_metadata_workflow,
+)
+
 
 @dataclass(frozen=True)
 class EvaluationPostOperations:
@@ -78,90 +85,6 @@ def _evaluation(
         request._json(operations.apply_evaluation(_json_body(body)))
 
 
-def _picks_save(
-    request: Any, operations: EvaluationPostOperations, body: bytes
-) -> None:
-    data = _json_body(body)
-    with operations.picks_lock:
-        current = operations.load_picks()
-        for key in (
-            "picked", "fav", "folders", "ranks", "ratings", "elo",
-            "elo_matches", "tags", "memos", "review_states",
-        ):
-            if key in data:
-                current[key] = data[key]
-        saved = operations.save_picks(current)
-    request._json({"ok": True, "picks": saved})
-
-
-def _remove_paths_from_picks(picks: dict, gone: set[str]) -> None:
-    for key in ("picked", "fav"):
-        picks[key] = [item for item in picks.get(key, []) if item not in gone]
-    for key in (
-        "ranks", "ratings", "elo", "elo_matches", "tags", "memos",
-        "review_states",
-    ):
-        picks[key] = {
-            item: value
-            for item, value in picks.get(key, {}).items()
-            if item not in gone
-        }
-    picks["folders"] = {
-        name: [item for item in paths if item not in gone]
-        for name, paths in picks.get("folders", {}).items()
-    }
-
-
-def _picks_delete(
-    request: Any,
-    application: Any,
-    operations: EvaluationPostOperations,
-    body: bytes,
-) -> None:
-    data = _json_body(body)
-    keep = set(data.get("keep") or [])
-    targets = [
-        str(item) for item in (data.get("targets") or []) if str(item) not in keep
-    ]
-    result = operations.trash_outputs(application.cfg, targets, keep)
-    if result["deleted"]:
-        gone = set(result.get("paths") or [])
-        with operations.picks_lock:
-            picks = operations.load_picks()
-            _remove_paths_from_picks(picks, gone)
-            operations.save_picks(picks)
-    request._json({"ok": True, **result})
-
-
-def _mosaic_save(
-    request: Any,
-    application: Any,
-    operations: EvaluationPostOperations,
-    body: bytes,
-) -> None:
-    directory = operations.output_subdir(application.cfg, "모자이크")
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{len(list(directory.glob('*.png'))) + 1:04d}.png"
-    operations.atomic_write(path, body, keep_backup=False)
-    request._json({"ok": True, "file": path.name, "bytes": len(body)})
-
-
-def _strip_metadata(
-    request: Any,
-    application: Any,
-    operations: EvaluationPostOperations,
-    body: bytes,
-) -> None:
-    request._json(operations.strip_and_save(
-        body,
-        unquote(request.headers.get("X-Filename", "image.png")),
-        max_side=int(request.headers.get("X-MaxSide", "0") or 0),
-        quality=int(request.headers.get("X-Quality", "95") or 95),
-        force_webp=request.headers.get("X-ForceWebp") == "1",
-        cfg=application.cfg,
-    ))
-
-
 def handle_evaluation_post(
     request: Any,
     application: Any,
@@ -176,18 +99,32 @@ def handle_evaluation_post(
         elif request.path.startswith("/api/evaluation_action"):
             _evaluation(request, operations, body)
         elif request.path.startswith("/api/picks_save"):
-            _picks_save(request, operations, body)
+            request._json(save_picks_workflow(operations, _json_body(body)))
         elif request.path.startswith("/api/picks_del"):
-            _picks_delete(request, application, operations, body)
+            request._json(delete_outputs_workflow(
+                application, operations, _json_body(body)
+            ))
         elif request.path.startswith("/api/picks_restore"):
             result = operations.restore_trash(
                 application.cfg, _json_body(body).get("batch_id")
             )
             request._json({"ok": True, **result})
         elif request.path.startswith("/api/mosaic_save"):
-            _mosaic_save(request, application, operations, body)
+            request._json(save_mosaic_workflow(
+                application, operations, body
+            ))
         elif request.path.startswith("/api/strip_meta"):
-            _strip_metadata(request, application, operations, body)
+            request._json(strip_metadata_workflow(
+                application,
+                operations,
+                body,
+                filename=unquote(
+                    request.headers.get("X-Filename", "image.png")
+                ),
+                max_side=int(request.headers.get("X-MaxSide", "0") or 0),
+                quality=int(request.headers.get("X-Quality", "95") or 95),
+                force_webp=request.headers.get("X-ForceWebp") == "1",
+            ))
         else:
             return False
     except Exception as exc:
