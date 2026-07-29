@@ -11886,7 +11886,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   <!-- ══ 가운데: 모드 영역 ══ -->
   <div class="center" id="center">
     <header class="workspace-context" id="workspaceContext">
-      <div class="workspace-step" id="workspaceStep">01 · GENERATE</div>
+      <div class="workspace-step" id="workspaceStep">01 · 생성</div>
       <div class="workspace-context-copy">
         <h1 id="workspaceTitle">생성</h1>
         <p id="workspaceDesc">프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.</p>
@@ -12129,7 +12129,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="view" id="vSettings" style="display:none;">
       <div id="studioSettingsNav" class="studio-subnav hidden" aria-label="세팅 작업 선택">
         <div class="studio-subnav-copy">
-          <span class="eyebrow">Setting workspace</span>
+          <span class="eyebrow">세팅 작업실</span>
           <strong>씬을 고르고 구조를 편집한 뒤, 빠른 변주나 비교 실험으로 이어갑니다</strong>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="세팅 작업">
@@ -12410,7 +12410,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="view" id="vLibrary" style="display:none;">
       <div id="studioLibraryNav" class="studio-subnav hidden" aria-label="자료 작업 선택">
         <div class="studio-subnav-copy">
-          <span class="eyebrow">Library workspace</span>
+          <span class="eyebrow">자료 작업실</span>
           <strong>가져온 뒤 자료실에서 정리하고, 결과를 선별·복구합니다</strong>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="자료 작업">
@@ -12691,7 +12691,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="view" id="vSystem" style="display:none;">
       <div id="studioManageNav" class="studio-subnav hidden" aria-label="관리 작업 선택">
         <div class="studio-subnav-copy">
-          <span class="eyebrow">Manage workspace</span>
+          <span class="eyebrow">관리 작업실</span>
           <strong>설정과 안전장치, 진행 작업, 출력 도구를 나눠 봅니다</strong>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="관리 작업">
@@ -15087,11 +15087,11 @@ function arrangeStudioWorkspace(){
   arrangeResultTools(studio);
 }
 const MODE_CONTEXT = {
-  preview: ['01 · GENERATE', '생성', '프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.'],
-  settings: ['02 · SETTING', '세팅', '씬, 캐스트, 단계와 비교 실험을 한 생성 계획으로 설계합니다.'],
-  library: ['03 · LIBRARY', '자료', '공개 자료와 내 자료를 수집하고, 큰 묶음 그대로 찾고 정리합니다.'],
-  builder: ['04 · BUILD', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
-  system: ['05 · MANAGE', '관리', '작업 큐, 출력, 백업·복구와 앱 환경을 관리합니다.'],
+  preview: ['01 · 생성', '생성', '프롬프트, 캐릭터, 생성 설정을 확인하고 결과를 만듭니다.'],
+  settings: ['02 · 세팅', '세팅', '씬, 캐스트, 단계와 비교 실험을 한 생성 계획으로 설계합니다.'],
+  library: ['03 · 자료', '자료', '공개 자료와 내 자료를 수집하고, 큰 묶음 그대로 찾고 정리합니다.'],
+  builder: ['04 · 빌더', '빌더', '근거가 있는 그림체·캐릭터·작가 조합을 만들고 바로 사용합니다.'],
+  system: ['05 · 관리', '관리', '작업 큐, 출력, 백업·복구와 앱 환경을 관리합니다.'],
 };
 function setMode(m){
   document.body.dataset.mode = m;
@@ -21178,16 +21178,16 @@ $('modalSave').addEventListener('click', async () => {
 /* '' = 슬레이트(:root 기본). 밝은 것 먼저, 어두운 것 뒤로 묶어 뒀다 */
 /* [값, 이름, 배경, 카드, 강조] — 칩에 그 테마 색을 실제로 보여 준다 */
 const THEMES = [
-  ['','슬레이트','#e9ecef','#ffffff','#2563eb'],
-  ['paper','종이','#f3f1ec','#ffffff','#4a6cf7'],
-  ['sepia','고서','#efe6d4','#faf4e6','#9a6a2f'],
-  ['sakura','벚꽃','#fdf2f6','#ffffff','#e0508f'],
-  ['midnight','미드나잇','#0e1014','#161920','#7c8cff'],
-  ['ocean','오션','#0b1a24','#11242f','#3ec9e0'],
-  ['forest','포레스트','#101a12','#16231a','#5fd47a'],
-  ['terminal','터미널','#07100a','#0b160f','#39ff87'],
-  ['mono','모노크롬','#141414','#1c1c1c','#d8d8d8'],
-  ['wine','와인','#170f14','#20161c','#e05780'],
+  ['','슬레이트','#f3efe5','#fffdf8','#0f6b62'],
+  ['paper','종이','#f3efe5','#fffdf8','#0f6b62'],
+  ['sepia','고서','#e9e0ce','#fcf6e9','#6f5b2d'],
+  ['sakura','벚꽃','#f3e9e8','#fffaf8','#8a4d5a'],
+  ['midnight','미드나잇','#141311','#1c1b18','#62cbbe'],
+  ['ocean','오션','#141311','#1c1b18','#62cbbe'],
+  ['forest','포레스트','#141311','#1c1b18','#62cbbe'],
+  ['terminal','터미널','#141311','#1c1b18','#62cbbe'],
+  ['mono','모노크롬','#141311','#1c1b18','#62cbbe'],
+  ['wine','와인','#141311','#1c1b18','#62cbbe'],
 ];
 const LAYOUTS = [['studio','작업실'],['classic','기존 호환']];
 const ACCENTS = [['','기본'],['blue','파랑'],['violet','보라'],['pink','분홍'],['green','초록'],['amber','앰버'],['cyan','시안'],['red','빨강']];
