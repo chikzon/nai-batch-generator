@@ -229,6 +229,10 @@ from src.nai_studio.web.http_server import (
     start_http_server,
 )
 from src.nai_studio.web.page_template import PAGE_TEMPLATE
+from src.nai_studio.web.routes.catalog import (
+    CatalogGetOperations,
+    handle_catalog_get,
+)
 from src.nai_studio.web.routes.recovery import (
     RecoveryGetOperations,
     handle_recovery_get,
@@ -12669,6 +12673,16 @@ class ConfigServer:
 
     def start(self, open_browser=True):
         server = self
+        catalog_get = CatalogGetOperations(
+            booru=lambda *args: search_booru(*args),
+            style_duplicates=lambda: find_style_dupes(),
+            library=lambda *args, **kwargs: search_library(*args, **kwargs),
+            combos=lambda *args, **kwargs: search_combos(*args, **kwargs),
+            recipes=lambda *args: search_recipes(*args),
+            prewarm=lambda *args, **kwargs: prewarm_images(*args, **kwargs),
+            autocomplete=lambda *args: autocomplete_tags(*args),
+            tags=lambda *args: search_tags(*args),
+        )
         recovery_get = RecoveryGetOperations(
             metadata_audit=lambda offset, limit: metadata_audit_status(
                 found_offset=offset, found_limit=limit
@@ -12693,6 +12707,8 @@ class ConfigServer:
                 if handle_runtime_get(self, server):
                     return
                 if handle_recovery_get(self, server, recovery_get):
+                    return
+                if handle_catalog_get(self, server, catalog_get):
                     return
                 if self.path.startswith("/api/config"):
                     self._json(server.snapshot_config())
@@ -12813,23 +12829,6 @@ class ConfigServer:
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
-                elif self.path.startswith("/api/booru"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    res = search_booru(q.get("site", ["danbooru"])[0],
-                                       unquote(q.get("q", [""])[0]),
-                                       int(q.get("page", ["1"])[0]),
-                                       int(q.get("limit", ["40"])[0]))
-                    # 부루 썸네일은 브라우저가 직접 받는다 (Cloudflare 때문에
-                    # 서버에서 미리 받아 두면 전부 403 이 되어 헛일이다).
-                    self._json(res)
-                elif self.path.startswith("/api/style_dupes"):
-                    # 출처가 다른 자료를 합치면 같은 조합이 여러 번 들어온다 (id 가 달라
-                    # 자동 병합이 못 잡는다). 묶어서 보여 주고 고르게 한다.
-                    try:
-                        self._json(find_style_dupes())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/compare_catalog"):
                     try:
                         self._json(comparison_catalog(server.cfg, server.spec))
@@ -12843,49 +12842,6 @@ class ConfigServer:
                 elif self.path.startswith("/api/compare_progress"):
                     try:
                         self._json(comparison_progress_summary(server.cfg))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/library"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json(search_library(
-                            server.cfg, server.spec,
-                            q=q.get("q", [""])[0],
-                            kind=q.get("kind", [""])[0],
-                            source=q.get("source", [""])[0],
-                            review=q.get("review", [""])[0],
-                            label=q.get("label", [""])[0],
-                            limit=int(q.get("limit", ["100"])[0]),
-                            offset=int(q.get("offset", ["0"])[0]),
-                        ))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/combos"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        res = search_combos(
-                            q.get("q", [""])[0], int(q.get("limit", ["40"])[0]),
-                            int(q.get("offset", ["0"])[0]),
-                            tab=q.get("tab", [""])[0], source=q.get("source", [""])[0],
-                            sort=q.get("sort", [""])[0], seeded=q.get("seeded", [""])[0],
-                            rating=q.get("rating", [""])[0])
-                        # 카드의 <img loading="lazy">가 보이는 것만 요청한다.
-                        # 여기서 결과 50~200장을 모두 선다운로드하면 브라우저 요청과
-                        # 겹쳐 네트워크·디스크·WebP 디코딩이 몰리고 모달이 멈춘다.
-                        self._json({"ok": True, **res})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/recipes"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        res = search_recipes(
-                            q.get("q", [""])[0], q.get("axis", [""])[0],
-                            int(q.get("limit", ["60"])[0]), int(q.get("offset", ["0"])[0]))
-                        prewarm_images(res.get("items"), n=60)
-                        self._json({"ok": True, **res})
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/diag"):
@@ -12927,27 +12883,6 @@ class ConfigServer:
                             "ok": False,
                             "error": redact_diagnostic_text(e),
                         })
-                elif self.path.startswith("/api/ac"):
-                    from urllib.parse import urlparse, parse_qs, unquote
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json({"ok": True, "items": autocomplete_tags(
-                            server.spec, unquote(q.get("q", [""])[0]),
-                            int(q.get("limit", ["12"])[0]))})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/tags"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        res = search_tags(server.spec,
-                                          (q.get("kind", ["char"])[0]),
-                                          (q.get("slot", [""])[0]),
-                                          (q.get("q", [""])[0]),
-                                          int(q.get("limit", ["60"])[0]))
-                        self._json({"ok": True, "tags": res})
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/scenes"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
