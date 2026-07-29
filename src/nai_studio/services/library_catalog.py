@@ -403,27 +403,8 @@ def organize_library_items(
         }
 
 
-def search_library(
-    paths: LibraryCatalogPaths,
-    operations: LibraryCatalogOperations,
-    config: dict | None,
-    spec: dict | None,
-    query: str = "",
-    kind: str = "",
-    source: str = "",
-    limit: int = 100,
-    offset: int = 0,
-    review: str = "",
-    label: str = "",
-) -> dict[str, Any]:
-    """모든 자료 저장소를 카드 규격으로 투영해 서버측 검색·페이징한다."""
-    try:
-        limit = max(1, min(200, int(limit)))
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        limit, offset = 100, 0
-    rows: list[dict[str, Any]] = []
-
+def _character_rows(config: dict | None) -> list[dict[str, Any]]:
+    rows = []
     for character in (config or {}).get("characters", []):
         if not isinstance(character, dict):
             continue
@@ -513,7 +494,14 @@ def search_library(
                 if key in character
             },
         })
+    return rows
 
+
+def _preset_rows(
+    operations: LibraryCatalogOperations,
+    spec: dict | None,
+) -> list[dict[str, Any]]:
+    rows = []
     for index, style in enumerate(
         operations.list_styles(spec or {})
     ):
@@ -534,7 +522,13 @@ def search_library(
             "images": [],
             "ref": copy.deepcopy(style),
         })
+    return rows
 
+
+def _collected_style_rows(
+    operations: LibraryCatalogOperations,
+) -> list[dict[str, Any]]:
+    rows = []
     card_fields = (
         "id",
         "title",
@@ -598,7 +592,13 @@ def search_library(
             "images": list(style.get("images") or [])[:1],
             "ref": compact,
         })
+    return rows
 
+
+def _recipe_rows(
+    operations: LibraryCatalogOperations,
+) -> list[dict[str, Any]]:
+    rows = []
     for index, recipe in enumerate(operations.load_recipes()):
         if not isinstance(recipe, dict):
             continue
@@ -648,7 +648,13 @@ def search_library(
             "images": list(recipe.get("images") or [])[:1],
             "ref": compact,
         })
+    return rows
 
+
+def _setting_rows(
+    operations: LibraryCatalogOperations,
+) -> list[dict[str, Any]]:
+    rows = []
     for setting in operations.list_settings():
         data = (
             setting.get("data")
@@ -696,7 +702,14 @@ def search_library(
                 "file": str(setting.get("file") or ""),
             },
         })
+    return rows
 
+
+def _generation_rows(
+    operations: LibraryCatalogOperations,
+    config: dict | None,
+) -> list[dict[str, Any]]:
+    rows = []
     for run in operations.comparison_runs(
         config,
         limit=200,
@@ -732,7 +745,14 @@ def search_library(
             },
             "ref": copy.deepcopy(run),
         })
+    return rows
 
+
+def _apply_library_review(
+    rows: list[dict[str, Any]],
+    paths: LibraryCatalogPaths,
+    operations: LibraryCatalogOperations,
+) -> tuple[dict, dict[str, int], dict[str, int]]:
     review_data = load_library_review(paths, operations)
     review_items = review_data.get("items") or {}
     review_counts = {
@@ -759,7 +779,12 @@ def search_library(
         review_counts[status] += 1
         for value in labels:
             all_labels[value] = all_labels.get(value, 0) + 1
+    return review_data, review_counts, all_labels
 
+
+def _library_facets(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, int], dict[str, int]]:
     all_sources: dict[str, int] = {}
     all_kinds: dict[str, int] = {}
     for row in rows:
@@ -769,7 +794,11 @@ def search_library(
         all_kinds[row["kind"]] = (
             all_kinds.get(row["kind"], 0) + 1
         )
-    terms = [
+    return all_sources, all_kinds
+
+
+def _library_terms(query: str) -> list[str]:
+    return [
         part
         for part in re.split(
             r"\s+",
@@ -780,39 +809,84 @@ def search_library(
         )
         if part
     ]
-    matched = []
-    for row in rows:
-        if kind and kind not in {"all", row["kind"]}:
-            continue
-        if source and source not in {"all", row["source"]}:
-            continue
-        if (
-            review
-            and review not in {"all", row["review_status"]}
-        ):
-            continue
-        if label and label not in row["labels"]:
-            continue
-        if terms:
-            haystack = unicodedata.normalize(
-                "NFKC",
-                " ".join([
-                    row.get("name", ""),
-                    row.get("prompt", ""),
-                    row.get("negative", ""),
-                    row.get("outfit", ""),
-                    row.get("source", ""),
-                    " ".join(row.get("labels") or []),
-                    row.get("review_status", ""),
-                    json.dumps(
-                        row.get("meta") or {},
-                        ensure_ascii=False,
-                    ),
-                ]),
-            ).casefold()
-            if not all(term in haystack for term in terms):
-                continue
-        matched.append(row)
+
+
+def _library_row_matches(
+    row: dict[str, Any],
+    terms: list[str],
+    kind: str,
+    source: str,
+    review: str,
+    label: str,
+) -> bool:
+    if kind and kind not in {"all", row["kind"]}:
+        return False
+    if source and source not in {"all", row["source"]}:
+        return False
+    if review and review not in {"all", row["review_status"]}:
+        return False
+    if label and label not in row["labels"]:
+        return False
+    if not terms:
+        return True
+    haystack = unicodedata.normalize(
+        "NFKC",
+        " ".join([
+            row.get("name", ""),
+            row.get("prompt", ""),
+            row.get("negative", ""),
+            row.get("outfit", ""),
+            row.get("source", ""),
+            " ".join(row.get("labels") or []),
+            row.get("review_status", ""),
+            json.dumps(
+                row.get("meta") or {},
+                ensure_ascii=False,
+            ),
+        ]),
+    ).casefold()
+    return all(term in haystack for term in terms)
+
+
+def search_library(
+    paths: LibraryCatalogPaths,
+    operations: LibraryCatalogOperations,
+    config: dict | None,
+    spec: dict | None,
+    query: str = "",
+    kind: str = "",
+    source: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    review: str = "",
+    label: str = "",
+) -> dict[str, Any]:
+    """각 저장소 투영을 합친 뒤 검토 상태·검색·페이징을 한 번 적용한다."""
+    try:
+        limit = max(1, min(200, int(limit)))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        limit, offset = 100, 0
+    rows = [
+        *_character_rows(config),
+        *_preset_rows(operations, spec),
+        *_collected_style_rows(operations),
+        *_recipe_rows(operations),
+        *_setting_rows(operations),
+        *_generation_rows(operations, config),
+    ]
+    review_data, review_counts, all_labels = _apply_library_review(
+        rows, paths, operations
+    )
+    all_sources, all_kinds = _library_facets(rows)
+    query_terms = _library_terms(query)
+    matched = [
+        row
+        for row in rows
+        if _library_row_matches(
+            row, query_terms, kind, source, review, label
+        )
+    ]
     page = matched[offset:offset + limit]
     return {
         "ok": True,
