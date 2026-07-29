@@ -198,6 +198,154 @@ def trash_output_files(
     }
 
 
+def _trash_restore_manifest(
+    operations: OutputLifecycleOperations,
+    batch: Path,
+) -> tuple[Path, dict, list[dict]]:
+    manifest_path = batch / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError("복원할 휴지통 묶음을 찾을 수 없습니다.")
+    manifest = operations.load_json(manifest_path)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
+        raise ValueError("휴지통 장부 형식이 올바르지 않습니다.")
+    return (
+        manifest_path,
+        manifest,
+        [item for item in manifest["items"] if isinstance(item, dict)],
+    )
+
+
+def _unused_restore_target(
+    root: Path,
+    trash_root: Path,
+    original: str,
+) -> Path | None:
+    target = (root / original).resolve()
+    if not path_is_inside(target, root) or path_is_inside(target, trash_root):
+        return None
+    stem, suffix, serial = target.stem, target.suffix, 2
+    while target.exists():
+        target = target.with_name(f"{stem}_{serial}{suffix}")
+        serial += 1
+    return target
+
+
+def _plan_trash_restore(
+    operations: OutputLifecycleOperations,
+    root: Path,
+    trash_root: Path,
+    batch: Path,
+    manifest_path: Path,
+    manifest: dict,
+    items: list[dict],
+) -> dict[str, str]:
+    plan = manifest.get("restore_plan")
+    plan = dict(plan) if isinstance(plan, dict) else {}
+    changed = False
+    for item in items:
+        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
+        source = (root / str(item.get("trashed") or "")).resolve()
+        if not original or not path_is_inside(source, batch):
+            continue
+        relative = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
+        planned = (root / relative).resolve() if relative else None
+        if planned is not None and (
+            not path_is_inside(planned, root)
+            or path_is_inside(planned, trash_root)
+        ):
+            planned = None
+        if planned is None and source.is_file():
+            planned = _unused_restore_target(root, trash_root, original)
+            if planned is not None:
+                plan[original] = planned.relative_to(root).as_posix()
+                changed = True
+    if changed or manifest.get("restore_plan") != plan:
+        manifest["restore_plan"] = plan
+        manifest["restore_status"] = "moving"
+        operations.atomic_write_json(manifest_path, manifest, indent=2)
+    return plan
+
+
+def _move_trash_items(
+    operations: OutputLifecycleOperations,
+    root: Path,
+    trash_root: Path,
+    batch: Path,
+    manifest_path: Path,
+    manifest: dict,
+    items: list[dict],
+    plan: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    restored: list[str] = []
+    restored_map: dict[str, str] = {}
+    for item in items:
+        original = str(item.get("original") or "").replace("\\", "/").lstrip("/")
+        planned_relative = str(plan.get(original) or "").replace("\\", "/").lstrip("/")
+        if not original or not planned_relative:
+            continue
+        source = (root / str(item.get("trashed") or "")).resolve()
+        target = (root / planned_relative).resolve()
+        if (
+            not path_is_inside(source, batch)
+            or not path_is_inside(target, root)
+            or path_is_inside(target, trash_root)
+        ):
+            continue
+        if source.is_file() and target.exists():
+            target = _unused_restore_target(root, trash_root, original)
+            if target is None:
+                continue
+            planned_relative = target.relative_to(root).as_posix()
+            plan[original] = planned_relative
+            manifest["restore_plan"] = plan
+            operations.atomic_write_json(manifest_path, manifest, indent=2)
+        if source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            operations.move_file(str(source), str(target))
+        elif not target.is_file():
+            continue
+        restored.append(planned_relative)
+        restored_map[original] = planned_relative
+    return restored, restored_map
+
+
+def _restore_trash_labels(
+    operations: OutputLifecycleOperations,
+    labels: dict,
+    restored_map: dict[str, str],
+) -> None:
+    if not restored_map or not isinstance(labels, dict):
+        return
+    keyed = ("ranks", "ratings", "elo", "elo_matches", "tags")
+    with operations.picks_lock:
+        picks = operations.load_picks()
+        for original, restored_relative in restored_map.items():
+            record = labels.get(original) or {}
+            record = record if isinstance(record, dict) else {}
+            picks["picked"][:] = [
+                value for value in picks["picked"] if value != original
+            ]
+            picks["fav"][:] = [
+                value for value in picks["fav"] if value != original
+            ]
+            for values in picks["folders"].values():
+                values[:] = [value for value in values if value != original]
+            for key in keyed:
+                picks[key].pop(original, None)
+            if record.get("picked") and restored_relative not in picks["picked"]:
+                picks["picked"].append(restored_relative)
+            if record.get("fav") and restored_relative not in picks["fav"]:
+                picks["fav"].append(restored_relative)
+            for name in record.get("folders") or []:
+                values = picks["folders"].setdefault(str(name)[:40], [])
+                if restored_relative not in values:
+                    values.append(restored_relative)
+            for key in keyed:
+                if key in record:
+                    picks[key][restored_relative] = record[key]
+        operations.save_picks(picks)
+
+
 def restore_trash_batch(
     paths: OutputLifecyclePaths,
     operations: OutputLifecycleOperations,
@@ -210,182 +358,16 @@ def restore_trash_batch(
     batch = (trash_root / str(batch_id or "")).resolve()
     if not path_is_inside(batch, trash_root):
         raise ValueError("잘못된 휴지통 묶음입니다.")
-    manifest_path = batch / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            "복원할 휴지통 묶음을 찾을 수 없습니다."
-        )
-    manifest = operations.load_json(manifest_path)
-    if (
-        not isinstance(manifest, dict)
-        or not isinstance(manifest.get("items"), list)
-    ):
-        raise ValueError("휴지통 장부 형식이 올바르지 않습니다.")
-    items = [
-        item for item in manifest["items"] if isinstance(item, dict)
-    ]
-    plan = manifest.get("restore_plan")
-    if not isinstance(plan, dict):
-        plan = {}
-    plan_changed = False
-
-    def unused_target(original: str) -> Path | None:
-        target = (root / original).resolve()
-        if (
-            not path_is_inside(target, root)
-            or path_is_inside(target, trash_root)
-        ):
-            return None
-        if not target.exists():
-            return target
-        stem, suffix, serial = target.stem, target.suffix, 2
-        while target.exists():
-            target = target.with_name(f"{stem}_{serial}{suffix}")
-            serial += 1
-        return target
-
-    for item in items:
-        original = (
-            str(item.get("original") or "")
-            .replace("\\", "/")
-            .lstrip("/")
-        )
-        source = (
-            root / str(item.get("trashed") or "")
-        ).resolve()
-        if not original or not path_is_inside(source, batch):
-            continue
-        planned_relative = (
-            str(plan.get(original) or "")
-            .replace("\\", "/")
-            .lstrip("/")
-        )
-        planned = (
-            (root / planned_relative).resolve()
-            if planned_relative
-            else None
-        )
-        if planned is not None and (
-            not path_is_inside(planned, root)
-            or path_is_inside(planned, trash_root)
-        ):
-            planned = None
-        if planned is None and source.is_file():
-            planned = unused_target(original)
-            if planned is not None:
-                plan[original] = planned.relative_to(root).as_posix()
-                plan_changed = True
-    if plan_changed or manifest.get("restore_plan") != plan:
-        manifest["restore_plan"] = plan
-        manifest["restore_status"] = "moving"
-        operations.atomic_write_json(
-            manifest_path,
-            manifest,
-            indent=2,
-        )
-
-    restored: list[str] = []
-    restored_map: dict[str, str] = {}
-    for item in items:
-        original = (
-            str(item.get("original") or "")
-            .replace("\\", "/")
-            .lstrip("/")
-        )
-        planned_relative = (
-            str(plan.get(original) or "")
-            .replace("\\", "/")
-            .lstrip("/")
-        )
-        if not original or not planned_relative:
-            continue
-        source = (
-            root / str(item.get("trashed") or "")
-        ).resolve()
-        target = (root / planned_relative).resolve()
-        if (
-            not path_is_inside(source, batch)
-            or not path_is_inside(target, root)
-            or path_is_inside(target, trash_root)
-        ):
-            continue
-        if source.is_file() and target.exists():
-            target = unused_target(original)
-            if target is None:
-                continue
-            planned_relative = target.relative_to(root).as_posix()
-            plan[original] = planned_relative
-            manifest["restore_plan"] = plan
-            operations.atomic_write_json(
-                manifest_path,
-                manifest,
-                indent=2,
-            )
-        if source.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            operations.move_file(str(source), str(target))
-        elif not target.is_file():
-            continue
-        restored.append(planned_relative)
-        restored_map[original] = planned_relative
-
-    labels = manifest.get("labels") or {}
-    if restored_map and isinstance(labels, dict):
-        with operations.picks_lock:
-            picks = operations.load_picks()
-            for original, restored_relative in restored_map.items():
-                record = labels.get(original) or {}
-                if not isinstance(record, dict):
-                    record = {}
-                picks["picked"] = [
-                    value
-                    for value in picks["picked"]
-                    if value != original
-                ]
-                picks["fav"] = [
-                    value
-                    for value in picks["fav"]
-                    if value != original
-                ]
-                for values in picks["folders"].values():
-                    values[:] = [
-                        value for value in values if value != original
-                    ]
-                for key in (
-                    "ranks",
-                    "ratings",
-                    "elo",
-                    "elo_matches",
-                    "tags",
-                ):
-                    picks[key].pop(original, None)
-                if (
-                    record.get("picked")
-                    and restored_relative not in picks["picked"]
-                ):
-                    picks["picked"].append(restored_relative)
-                if (
-                    record.get("fav")
-                    and restored_relative not in picks["fav"]
-                ):
-                    picks["fav"].append(restored_relative)
-                for name in record.get("folders") or []:
-                    values = picks["folders"].setdefault(
-                        str(name)[:40],
-                        [],
-                    )
-                    if restored_relative not in values:
-                        values.append(restored_relative)
-                for key in (
-                    "ranks",
-                    "ratings",
-                    "elo",
-                    "elo_matches",
-                    "tags",
-                ):
-                    if key in record:
-                        picks[key][restored_relative] = record[key]
-            operations.save_picks(picks)
+    manifest_path, manifest, items = _trash_restore_manifest(operations, batch)
+    plan = _plan_trash_restore(
+        operations, root, trash_root, batch, manifest_path, manifest, items
+    )
+    restored, restored_map = _move_trash_items(
+        operations, root, trash_root, batch, manifest_path, manifest, items, plan
+    )
+    _restore_trash_labels(
+        operations, manifest.get("labels") or {}, restored_map
+    )
     manifest["restored_at"] = operations.now().isoformat(
         timespec="seconds"
     )
