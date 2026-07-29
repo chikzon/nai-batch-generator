@@ -7,6 +7,14 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from src.nai_studio.services.user_backup_workflow import (
+    data_index_response,
+    preview_backup_workflow,
+    restoration_batch_response,
+    restore_backup_workflow,
+    rollback_backup_workflow,
+)
+
 
 @dataclass(frozen=True)
 class RecoveryPostOperations:
@@ -39,83 +47,6 @@ def _error(request: Any, exc: Exception) -> None:
     request._json({"ok": False, "error": str(exc)})
 
 
-def _refresh_restored_state(
-    application: Any, operations: RecoveryPostOperations
-) -> None:
-    fresh = operations.load_settings()
-    merged = dict(operations.default_config())
-    merged.update(fresh if isinstance(fresh, dict) else {})
-    operations.migrate_selections(merged)
-    operations.migrate_slots(merged)
-    application.cfg.clear()
-    application.cfg.update(merged)
-    application.spec = operations.load_spec()
-    options = operations.options()
-    options.clear()
-    options.update(operations.load_options())
-    application.config_revision += 1
-
-
-def _backup_preview(
-    request: Any,
-    application: Any,
-    operations: RecoveryPostOperations,
-    body: bytes,
-) -> None:
-    result = operations.preview_backup(body)
-    if result.get("ok"):
-        application.backup_preview_blob = bytes(body)
-        application.backup_preview_sha256 = str(result.get("sha256") or "")
-    request._json(result)
-
-
-def _backup_restore(
-    request: Any,
-    application: Any,
-    operations: RecoveryPostOperations,
-    body: bytes,
-) -> None:
-    if "application/json" in request.headers.get("Content-Type", ""):
-        data = _json_body(body)
-        expected_sha = str(data.get("sha256") or "")
-        if (
-            not application.backup_preview_blob
-            or expected_sha != application.backup_preview_sha256
-        ):
-            request._json({
-                "ok": False,
-                "error": "검사한 백업 원문이 메모리에 없습니다. 다시 검사해 주세요.",
-            })
-            return
-        result = operations.restore_backup(
-            application.backup_preview_blob,
-            expected_sha,
-            selected=data.get("selected") or [],
-            expected_diff=str(data.get("diff_fingerprint") or ""),
-        )
-    else:
-        result = operations.restore_backup(
-            body, request.headers.get("X-Backup-SHA256", "")
-        )
-    if result.get("ok"):
-        application.backup_preview_blob = None
-        application.backup_preview_sha256 = ""
-        _refresh_restored_state(application, operations)
-    request._json(result)
-
-
-def _backup_rollback(
-    request: Any,
-    application: Any,
-    operations: RecoveryPostOperations,
-    body: bytes,
-) -> None:
-    result = operations.rollback_backup(_json_body(body).get("id"))
-    if result.get("ok"):
-        _refresh_restored_state(application, operations)
-    request._json(result)
-
-
 def _simple_recovery(
     request: Any,
     operations: RecoveryPostOperations,
@@ -140,34 +71,6 @@ def _simple_recovery(
     return False
 
 
-def _data_index(
-    request: Any, operations: RecoveryPostOperations
-) -> None:
-    index = operations.rebuild_data_index()
-    request._json({
-        "ok": True,
-        "files": index["files"],
-        "bytes": index["bytes"],
-        "fingerprint": index["fingerprint"],
-    })
-
-
-def _restoration_batch(
-    request: Any, operations: RecoveryPostOperations, body: bytes
-) -> None:
-    data = _json_body(body)
-    queue = operations.image_batch_queue(
-        data.get("items") or [],
-        cursor=data.get("cursor"),
-        status=data.get("status") or "completed",
-    )
-    request._json({
-        "ok": True,
-        "restoration": operations.summarize_queue(queue),
-        "restoration_queue": queue,
-    })
-
-
 def handle_recovery_post(
     request: Any,
     application: Any,
@@ -176,17 +79,35 @@ def handle_recovery_post(
 ) -> bool:
     try:
         if request.path.startswith("/api/backup_preview"):
-            _backup_preview(request, application, operations, body)
+            result = preview_backup_workflow(application, operations, body)
         elif request.path.startswith("/api/backup_restore"):
-            _backup_restore(request, application, operations, body)
+            selected = (
+                "application/json"
+                in request.headers.get("Content-Type", "")
+            )
+            value = _json_body(body) if selected else body
+            result = restore_backup_workflow(
+                application,
+                operations,
+                value,
+                selected_request=selected,
+                backup_sha256=request.headers.get("X-Backup-SHA256", ""),
+            )
         elif request.path.startswith("/api/backup_rollback"):
-            _backup_rollback(request, application, operations, body)
+            result = rollback_backup_workflow(
+                application, operations, _json_body(body).get("id")
+            )
         elif request.path.startswith("/api/data_index_rebuild"):
-            _data_index(request, operations)
+            result = data_index_response(operations)
         elif request.path.startswith("/api/restoration_batch"):
-            _restoration_batch(request, operations, body)
+            result = restoration_batch_response(
+                operations, _json_body(body)
+            )
         elif not _simple_recovery(request, operations, body):
             return False
+        else:
+            return True
+        request._json(result)
     except Exception as exc:
         _error(request, exc)
     return True
