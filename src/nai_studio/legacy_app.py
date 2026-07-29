@@ -178,6 +178,7 @@ from src.nai_studio.services.experiment_bridge import (
     expand_legacy_experiment_cells,
 )
 from src.nai_studio.services import (
+    catalog_search as _catalog_search,
     comparison_planning as _comparison_planning,
     datapack_store as _datapack_store,
     output_lifecycle as _output_lifecycle,
@@ -1042,392 +1043,115 @@ EMOTIONS = ["neutral", "happy", "sad", "angry", "scared", "surprised", "tired",
 #  iframe 이 막힌다. 대신 각 사이트의 JSON API 를 서버가 불러 우리 그리드에 그린다.
 #  (원본 사이트로 새 창 열기도 함께 제공)
 # ══════════════════════════════════════════════════════════════════════
-BOORUS = {
-    "danbooru": {"name": "단부루", "url": "https://danbooru.donmai.us/posts.json",
-                 "page": "https://danbooru.donmai.us/posts"},
-    # 겔부루는 2024 년부터 API 키(&api_key=&user_id=)가 없으면 401,
-    # e621 은 한국에서 451(지역 차단)이다. 목록에는 남기되 미리 알려 준다.
-    "gelbooru": {"name": "겔부루", "note": " (API 키 필요)", "auth": "gel",
-                 "url": "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1",
-                 "page": "https://gelbooru.com/index.php?page=post&s=list"},
-    "e621": {"name": "e621", "note": " (지역 차단)", "auth": "basic",
-             "url": "https://e621.net/posts.json",
-             "page": "https://e621.net/posts"},
-}
-BOORUS["danbooru"]["auth"] = "basic"
+BOORUS = _catalog_search.BOORUS
+DANBOORU_MIRRORS = _catalog_search.DANBOORU_MIRRORS
+DANBOORU_SFW_MIRROR = _catalog_search.DANBOORU_SFW_MIRROR
+BOORU_AUTH_HELP = _catalog_search.BOORU_AUTH_HELP
+NAI_RENAMED_TAGS = _catalog_search.NAI_RENAMED_TAGS
 
-# 단부루 미러 도메인 — 같은 데이터베이스를 다른 호스트 이름으로 서비스한다.
-# 본 도메인이 연결을 끊을 때(반복 호출·ISP·지역) 미러는 대개 응답한다.
-#   실측: danbooru 가 ConnectionError 인 상태에서 hijiribe·sonohara 는 HTTP 200.
-# ⚠ safebooru 는 전연령만 걸러 보여 주므로 결과가 달라진다 — 마지막에 두고 알려 준다.
-# ⚠ 태그 2개 제한은 미러에서도 똑같다(422 TagLimitError). 미러는 차단만 우회한다.
-DANBOORU_MIRRORS = ["danbooru.donmai.us", "hijiribe.donmai.us", "sonohara.donmai.us"]
-DANBOORU_SFW_MIRROR = "safebooru.donmai.us"
-
-# 부루 계정은 사이트마다 방식이 다르다
-#   단부루 · e621 → HTTP Basic (아이디 + API 키). e621 은 User-Agent 도 요구한다.
-#   겔부루      → 쿼리 파라미터 (&user_id=&api_key=)
-# 넣지 않아도 단부루는 비로그인으로 검색되고, 겔부루만 반드시 필요하다.
-BOORU_AUTH_HELP = {
-    "danbooru": "danbooru.donmai.us → My Account → API Key. "
-                "골드 이상이면 태그 제한이 2개에서 6개로 풀린다.",
-    "gelbooru": "gelbooru.com → My Account → Options 맨 아래 API Access Credentials "
-                "(user_id 와 api_key 가 함께 나온다).",
-    "e621": "e621.net → Account → Manage API Access. 지역 차단이면 키가 있어도 451 이다.",
-}
-
-
-# search_booru 는 모듈 함수라 서버의 cfg 를 못 본다. 저장할 때 여기 심어 둔다.
+# 검색 간격과 판정 캐시는 프로세스에서 공유하되, 저장·통신 의존성은 호출 때 연결한다.
 _BOORU_KEYS = {}
+_BOORU_LAST = [0.0]
+_BOORU_LOCK = threading.Lock()
+_TAGV_CACHE = {}
+
+
+def _catalog_search_paths():
+    return _catalog_search.CatalogSearchPaths(settings_file=SETTINGS_FILE)
+
+
+def _catalog_search_state():
+    return _catalog_search.CatalogSearchState(
+        booru_keys=_BOORU_KEYS,
+        booru_last=_BOORU_LAST,
+        booru_lock=_BOORU_LOCK,
+        tag_cache=_TAGV_CACHE,
+    )
+
+
+def _catalog_search_operations():
+    """현재 HTTP·시간·로그 객체를 주입해 기존 APP monkeypatch 계약을 보존한다."""
+    return _catalog_search.CatalogSearchOperations(
+        request_get=requests.get,
+        request_errors=(requests.exceptions.RequestException,),
+        clock=time.time,
+        sleep=time.sleep,
+        log_info=log.info,
+        log_warning=log.warning,
+        user_agent=BOORU_UA,
+    )
 
 
 def booru_creds(site):
-    """설정에 저장된 부루 계정 (없으면 빈 값). 검색은 1초에 한 번이라 파일을 읽어도 된다."""
-    keys = _BOORU_KEYS.get(site)
-    if keys is None:
-        try:
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
-                keys = (json.load(f).get("booru_keys") or {}).get(site) or {}
-        except (OSError, ValueError):
-            keys = {}
-    return str(keys.get("user") or "").strip(), str(keys.get("key") or "").strip()
-
-
-_BOORU_LAST = [0.0]
-_BOORU_LOCK = threading.Lock()
+    return _catalog_search.booru_creds(
+        _catalog_search_paths(),
+        _catalog_search_state(),
+        site,
+    )
 
 
 def _booru_throttle(gap=1.0):
-    """검색 요청 간 최소 간격. 몰아치면 Cloudflare 가 IP 를 잠시 막는다."""
-    with _BOORU_LOCK:
-        wait = gap - (time.time() - _BOORU_LAST[0])
-        if wait > 0:
-            time.sleep(wait)
-        _BOORU_LAST[0] = time.time()
+    return _catalog_search.booru_throttle(
+        _catalog_search_state(),
+        _catalog_search_operations(),
+        gap,
+    )
 
 
 def search_booru(site="danbooru", tags="", page=1, limit=40):
-    """태그로 검색해 [{id,tags,thumb,full,url,rating,score}] 반환."""
-    cfg = BOORUS.get(site) or BOORUS["danbooru"]
-    # 태그는 **공백으로 구분**한다. 공백을 _ 로 바꾸면 태그 하나로 뭉쳐 0건이 된다.
-    # 태그 안의 공백은 사용자가 _ 로 적어 넣는다 (단부루 표기 그대로).
-    # 우리 그림체 데이터는 `artist:wanke` 형태인데 단부루 검색은 태그 이름만 받는다.
-    # 그대로 붙여넣어도 찾아지도록 접두사를 떼어 준다.
-    parts = [re.sub(r"^artists?:", "", t, flags=re.I).replace(" ", "_")
-             for t in (tags or "").split() if t]
-    # 단부루는 비로그인 검색이 태그 2개까지다 (초과하면 422 TagLimitError).
-    note = ""
-    if site == "danbooru" and len(parts) > 2:
-        # 비로그인 2개 · 로그인(골드 이상) 6개. 키를 넣어 두면 6개까지 보내 본다.
-        cap = 6 if all(booru_creds("danbooru")) else 2
-        if len(parts) > cap:
-            note = (f"단부루는 태그 {cap}개까지만 검색됩니다 — 앞 {cap}개만 씁니다: "
-                    f"{' '.join(parts[:cap])}"
-                    + ("" if cap > 2 else " (관리 → API 에 단부루 계정을 넣으면 6개까지)"))
-            parts = parts[:cap]
-    tags = " ".join(parts)[:200]
-    headers = {"User-Agent": BOORU_UA}
-    params = ({"tags": tags, "limit": limit, "pid": max(0, page - 1)} if site == "gelbooru"
-              else {"tags": tags, "limit": limit, "page": page})
-    # 저장된 계정이 있으면 붙인다 (겔부루는 이게 없으면 아예 JSON 을 주지 않는다)
-    auth = None
-    cuser, ckey = booru_creds(site)
-    if cuser and ckey:
-        if cfg.get("auth") == "gel":
-            params["user_id"], params["api_key"] = cuser, ckey
-        else:
-            auth = (cuser, ckey)
-    elif site == "gelbooru":
-        return {"ok": False,
-                "error": "겔부루는 API 키가 있어야 검색됩니다. "
-                         "관리 → API 의 '부루 계정' 에 user_id 와 api_key 를 넣어 주세요."}
-    try:
-        # 단부루는 본 도메인이 막히면 미러를 차례로 시도한다.
-        urls = [cfg["url"]]
-        if site == "danbooru":
-            urls = [cfg["url"].replace(DANBOORU_MIRRORS[0], h) for h in DANBOORU_MIRRORS]
-        r, used, last_err = None, urls[0], None
-        for ui, u in enumerate(urls):
-            for attempt in range(2 if len(urls) > 1 else 3):
-                _booru_throttle()
-                try:
-                    r = requests.get(u, timeout=25, headers=headers,
-                                     params=params, auth=auth)
-                    used = u
-                    break
-                except requests.exceptions.RequestException as e:
-                    # 연달아 검색하면 Cloudflare 가 연결을 끊는다(ConnectionReset).
-                    # 잠깐 쉬고 다시 시도하면 대개 풀리고, 그래도 안 되면 미러로 넘어간다.
-                    last_err, r = e, None
-                    time.sleep(1.0 * (attempt + 1))
-            if r is not None:
-                if ui > 0:
-                    host = used.split("/")[2]
-                    note = (note + " · " if note else "") + f"본 도메인이 막혀 미러({host})로 검색했습니다"
-                    log.info(f"단부루 미러 사용: {host}")
-                break
-        if r is None:
-            log.warning(f"{site} 검색 연결 실패: {last_err}")
-            extra = (" 미러(hijiribe·sonohara)도 응답하지 않았습니다."
-                     if site == "danbooru" else "")
-            return {"ok": False,
-                    "error": f"{cfg['name']} 이 연결을 끊었습니다 — 검색을 너무 "
-                             f"자주 보내면 잠시 막습니다. 1~2분 뒤 다시 해 보세요.{extra}"}
-        if r.status_code == 429:
-            return {"ok": False,
-                    "error": f"{cfg['name']} 요청 제한(429) — 잠시 뒤 다시 해 보세요."}
-        if r.status_code == 451:
-            return {"ok": False, "error": f"{cfg['name']} 은 이 지역에서 막혀 있습니다 (451)."}
-        if r.status_code in (401, 403):
-            return {"ok": False,
-                    "error": f"{cfg['name']} 인증 실패({r.status_code}) — 관리 → API 의 "
-                             f"'부루 계정' 을 확인해 주세요. {BOORU_AUTH_HELP.get(site, '')}"}
-        if r.status_code == 422 and "TagLimit" in r.text:
-            return {"ok": False,
-                    "error": f"{cfg['name']} 태그 개수 제한(422) — 계정 등급이 낮으면 "
-                             f"태그 2개까지만 됩니다. 태그를 줄여 보세요."}
-        if r.status_code != 200:
-            return {"ok": False, "error": f"{cfg['name']} HTTP {r.status_code}: {r.text[:100]}"}
-        try:
-            data = r.json()
-        except ValueError:
-            return {"ok": False,
-                    "error": f"{cfg['name']} 이 JSON 을 주지 않았습니다 "
-                             f"(API 키가 필요할 수 있음). 단부루로 검색해 보세요."}
-        posts = data.get("post", []) if isinstance(data, dict) and "post" in data else data
-        if isinstance(posts, dict):
-            posts = posts.get("posts", [])
-    except Exception as e:
-        return {"ok": False, "error": f"{cfg['name']} 검색 실패: {e}"}
-
-    # 미러로 검색했으면 게시물 링크도 그 미러로 준다 (본 도메인이 막혀 있으면 클릭도 안 열린다)
-    page_base = cfg["page"]
-    if site == "danbooru":
-        used_host = used.split("/")[2]
-        if used_host != DANBOORU_MIRRORS[0]:
-            page_base = page_base.replace(DANBOORU_MIRRORS[0], used_host)
-
-    out = []
-    for p in posts or []:
-        if site == "e621":
-            f = (p.get("file") or {}); pv = (p.get("preview") or {})
-            tg = " ".join(sum(((p.get("tags") or {}).get(k) or []) for k in
-                              ("artist", "character", "copyright", "general", "species")), )
-            thumb, full = pv.get("url"), f.get("url")
-        elif site == "gelbooru":
-            tg = p.get("tags") or ""
-            thumb, full = p.get("preview_url"), p.get("file_url")
-        else:
-            tg = p.get("tag_string") or ""
-            thumb = p.get("preview_file_url") or p.get("large_file_url")
-            full = p.get("file_url") or p.get("large_file_url")
-        if not thumb:
-            continue
-        out.append({"id": p.get("id"), "tags": tg,
-                    "artist": (p.get("tag_string_artist") or "").strip(),
-                    "character": (p.get("tag_string_character") or "").strip(),
-                    "copyright": (p.get("tag_string_copyright") or "").strip(),
-                    "thumb": thumb, "full": full,
-                    "rating": p.get("rating", ""), "score": p.get("score", 0),
-                    "url": f"{page_base}/{p.get('id')}" if site != "gelbooru"
-                           else f"{page_base}&id={p.get('id')}"})
-    return {"ok": True, "site": site, "name": cfg["name"], "count": len(out),
-            "items": out, "page": page, "note": note,
-            "search_url": (f"{page_base}?tags={tags.replace(' ', '+')}"
-                           if site != "gelbooru" else f"{page_base}&tags={tags}")}
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  태그 검증 — 프롬프트의 태그가 단부루에 실제로 있는지
-# ══════════════════════════════════════════════════════════════════════
-# posts.json 은 비로그인 태그 2개 제한이 있지만 **tags.json 은 제한이 없다**.
-# 태그 이름과 게시물 수만 묻는 것이라 프롬프트를 통째로 검사할 수 있다.
-#   (착안: nais_blue 가 tags.json 으로 태그를 검증한다 — 코드는 가져오지 않았다)
-# 없는 태그는 그림에 아무 영향이 없으면서 토큰만 잡아먹으므로 찾아낼 값어치가 있다.
-_TAGV_CACHE = {}
-
-# NovelAI 공식 개명표. 단부루에서는 왼쪽이 여전히 정식 태그이므로 CSV 자체는 고치지 않는다.
-# https://docs.novelai.net/en/image/tags/#renamed-tags
-NAI_RENAMED_TAGS = {
-    "v": "peace sign",
-    "double_v": "double peace",
-    "|_|": "bar eyes",
-    r"\||/": r"open \m/",
-    ":|": "neutral face",
-    ";|": "neutral face",
-    "<|>_<|>": "neco-arc eyes",
-    "eyepatch_bikini": "square bikini",
-    "tachi-e": "character image",
-}
+    return _catalog_search.search_booru(
+        _catalog_search_paths(),
+        _catalog_search_state(),
+        _catalog_search_operations(),
+        site,
+        tags,
+        page,
+        limit,
+        credentials=booru_creds,
+        throttle=_booru_throttle,
+    )
 
 
 def _nai_tag_key(raw):
-    """NAI 개명표 대조용 키. `<|> <|>`를 우리 `<조각>` 문법으로 오인하지 않는다."""
-    t = str(raw or "").strip().lower()
-    for _ in range(4):
-        m = re.fullmatch(r"[+-]?\d+(?:\.\d+)?\s*::(.*?)::", t)
-        if not m:
-            break
-        t = m.group(1).strip()
-    t = t.translate(str.maketrans("", "", "{}[]")).strip()
-    t = re.sub(r"^artists?:", "", t)
-    return re.sub(r"_+", "_", re.sub(r"\s+", "_", t)).strip("_")
+    return _catalog_search.nai_tag_key(raw)
 
 
 def nai_renamed_tag(raw):
-    """단부루 이름이 NAI에서 개명됐으면 NAI 권장 이름을 돌려준다."""
-    return NAI_RENAMED_TAGS.get(_nai_tag_key(raw))
+    return _catalog_search.nai_renamed_tag(raw)
 
 
 def _tagv_norm(raw):
-    """`1.3::artist:foo::` · `{a}` · `<조각>` 같은 표기를 단부루 태그 이름으로."""
-    t = (raw or "").strip()
-    if not t or t.startswith("#"):
-        return ""
-    renamed_key = _nai_tag_key(t)
-    if renamed_key in NAI_RENAMED_TAGS:
-        return renamed_key
-    if t.startswith("<") and t.endswith(">"):      # 우리 조각 문법은 검사 대상이 아니다
-        return ""
-    for _ in range(4):                              # 1.3::a:: 를 벗겨 낸다 (겹칠 수 있다)
-        m = re.fullmatch(r"[+-]?\d+(?:\.\d+)?\s*::(.*?)::", t.strip())
-        if not m:
-            break
-        t = m.group(1)
-    # ⚠ `{}` `[]` 는 NAI 의 강조 표기라 떼지만 **`()` 는 떼면 안 된다** —
-    #   `2b (nier:automata)` · `1920s (style)` 처럼 괄호가 단부루 태그 이름의 일부다.
-    #   떼면 캐릭터·저작물 태그 수백 개가 통째로 '없는 태그' 로 잘못 나온다.
-    t = t.translate(str.maketrans("", "", "{}[]")).strip().lower()
-    # NAI 는 `artist:wanke` 로 쓰지만 단부루 태그 이름은 `wanke` 다.
-    # 떼지 않으면 멀쩡한 작가 태그가 전부 '없음' 으로 나온다.
-    t = re.sub(r"^artists?:", "", t)
-    return re.sub(r"_+", "_", re.sub(r"\s+", "_", t)).strip("_")
-
-
-def _tags_json(params):
-    """tags.json 을 미러 우회까지 붙여 호출."""
-    return _tags_json_at("tags.json", params)
+    return _catalog_search.tagv_norm(raw)
 
 
 def _tags_json_at(endpoint, params):
-    """단부루의 목록 API 를 미러 우회까지 붙여 호출 (tags.json · tag_aliases.json)."""
-    last = None
-    for host in DANBOORU_MIRRORS:
-        _booru_throttle(0.4)
-        try:
-            r = requests.get(f"https://{host}/{endpoint}", params=params, timeout=20,
-                             headers={"User-Agent": BOORU_UA, "Accept": "application/json"})
-            if r.status_code == 200:
-                d = r.json()
-                return d if isinstance(d, list) else []
-            last = f"HTTP {r.status_code}"
-        except (requests.exceptions.RequestException, ValueError) as e:
-            last = type(e).__name__
-    raise RuntimeError(last or "실패")
+    return _catalog_search.tags_json_at(
+        _catalog_search_state(),
+        _catalog_search_operations(),
+        endpoint,
+        params,
+        throttle=_booru_throttle,
+    )
+
+
+def _tags_json(params):
+    return _catalog_search.tags_json(
+        _catalog_search_state(),
+        _catalog_search_operations(),
+        params,
+        fetch_at=_tags_json_at,
+    )
 
 
 def verify_tags(text, low=100):
-    """프롬프트를 훑어 태그별로 있음/드묾/없음 을 돌려준다.
-
-    없는 태그(GHOST)에는 비슷한 이름 후보를 함께 준다 — 오타를 고치기 쉽게."""
-    seen, order = {}, []
-    # 세미콜론도 예전에는 구분자로 받았지만 `;|` 자체가 NAI 공식 개명 태그다.
-    # 그 한 태그는 임시 표식으로 보존한 뒤 나머지 세미콜론만 구분자로 바꾼다.
-    semi_tag = "\x00NAI_SEMICOLON_BAR\x00"
-    prepared = (text or "").replace(";|", semi_tag)
-    parts = prepared.replace(chr(10), ",").replace(";", ",").replace(semi_tag, ";|").split(",")
-    for chunk in parts:
-        n = _tagv_norm(chunk)
-        if not n or n in seen:
-            continue
-        seen[n] = chunk.strip()
-        order.append(n)
-    out, err = [], None
-    # 이름 여러 개를 한 번에 물어본다 (요청 수를 줄인다)
-    todo = [n for n in order if n not in NAI_RENAMED_TAGS and n not in _TAGV_CACHE]
-    for i in range(0, len(todo), 40):
-        batch = todo[i:i + 40]
-        try:
-            got = _tags_json({"search[name_space]": " ".join(batch), "limit": 200})
-            # 게시물 수만 보면 안 된다. `bangs`·`arms`·`athletic` 처럼 **폐지된 태그**는
-            # 실존하는데 post_count 가 0 이다 (is_deprecated: true). 없는 것과 구분해야
-            # 멀쩡한 태그를 '없음' 이라고 잘못 말하지 않는다.
-            found = {str(x.get("name")): (int(x.get("post_count") or 0),
-                                          bool(x.get("is_deprecated"))) for x in got}
-            for n in batch:
-                _TAGV_CACHE[n] = found.get(n)      # 목록에 없으면 None = 정말 없음
-        except RuntimeError as e:
-            err = str(e)
-            break
-    # 게시물 0 장인 것은 세 가지가 섞여 있다 — 별칭 · 폐지 · 정말 없음.
-    #   ⚠ 별칭된 태그도 tags.json 에 **행이 남아 있고 is_deprecated 는 false** 다
-    #     (crouching 0장 false → squatting 으로 옮겨 감). 행이 없는 것만 찾으면 놓친다.
-    #   그래서 '0 장인 모든 것' 을 별칭 조회에 넣는다.
-    missing = [n for n in order if n not in NAI_RENAMED_TAGS
-               if _TAGV_CACHE.get(n, (1, False)) is None or _TAGV_CACHE.get(n, (1, False))[0] == 0]
-    aliases = {}
-    for i in range(0, len(missing), 30):
-        batch = missing[i:i + 30]
-        try:
-            for x in _tags_json_at("tag_aliases.json",
-                                   {"search[antecedent_name_space]": " ".join(batch),
-                                    "limit": 200}):
-                # ⚠ status 가 "active" 인 것만 보면 안 된다. `arm around waist` 처럼
-                #   별칭이 나중에 지워진(deleted) 경우에도 **가리키던 이름이 지금 쓰이는 태그**다
-                #   (arm_around_another's_waist). 거르면 정답을 알면서 '없음' 이라 말하게 된다.
-                #   active 를 더 신뢰하므로 active 가 있으면 그것으로 덮어쓴다.
-                ant, con = str(x.get("antecedent_name")), str(x.get("consequent_name"))
-                cur = aliases.get(ant)
-                if cur is None or (x.get("status") == "active" and cur[1] != "active"):
-                    aliases[ant] = (con, str(x.get("status") or ""))
-        except RuntimeError:
-            break
-
-    for n in order:
-        if n in NAI_RENAMED_TAGS:
-            out.append({"raw": seen[n], "tag": n, "count": None,
-                        "status": "nai_renamed",
-                        "alias_to": NAI_RENAMED_TAGS[n]})
-            continue
-        if n not in _TAGV_CACHE:               # 요청 자체가 실패한 것
-            out.append({"raw": seen[n], "tag": n, "count": None, "status": "unknown"})
-            continue
-        rec = _TAGV_CACHE[n]
-        cnt, dep = (0, False) if rec is None else rec
-        if cnt >= low:
-            st = "ok"
-        elif cnt > 0:
-            st = "low"
-        elif n in aliases:                     # 이름이 바뀐 것 — 새 이름을 알려 준다
-            con, ast_ = aliases[n]
-            out.append({"raw": seen[n], "tag": n, "count": 0, "status": "alias",
-                        "alias_to": con, "alias_status": ast_})
-            continue
-        elif dep:                              # 폐지 — 어휘엔 있고 NAI 는 대개 알아듣는다
-            st = "old"
-        else:
-            st = "ghost"                       # 정말 없음
-        item = {"raw": seen[n], "tag": n, "count": cnt, "status": st}
-        if dep:
-            item["deprecated"] = True
-        if st == "ghost":
-            try:
-                sug = _tags_json({"search[name_matches]": f"*{n}*",
-                                  "search[order]": "count", "limit": 5})
-                # 자기 자신과 0 장짜리는 후보로 쓸모가 없다 (`best_quality` → `best_quality`)
-                item["suggest"] = [{"name": str(x.get("name")),
-                                    "count": int(x.get("post_count") or 0)}
-                                   for x in sug
-                                   if x.get("name") and str(x.get("name")) != n
-                                   and int(x.get("post_count") or 0) > 0]
-            except RuntimeError:
-                item["suggest"] = []
-        out.append(item)
-    return {"ok": True, "items": out, "error": err,
-            "summary": {k: sum(1 for x in out if x["status"] == k)
-                        for k in ("ok", "low", "old", "alias", "nai_renamed",
-                                  "ghost", "unknown")}}
-
+    return _catalog_search.verify_tags(
+        _catalog_search_state(),
+        _catalog_search_operations(),
+        text,
+        low,
+        fetch_tags=_tags_json,
+        fetch_at=_tags_json_at,
+    )
 
 def _b64_png(img_bytes_or_image):
     """디렉터 툴은 PNG base64 를 받는다."""
