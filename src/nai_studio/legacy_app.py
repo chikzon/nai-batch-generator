@@ -158,6 +158,7 @@ from src.nai_studio.runtime.data_files import (
 )
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
+from src.nai_studio.runtime import program_entry as _program_entry
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
     knowledge_assets_from_config,
@@ -5470,9 +5471,9 @@ class LiveState(RuntimeLiveState):
 class ConfigServer:
     """설정 편집(실시간 자동저장) + 생성 시작 신호 + 실시간 미리보기를 모두 담당."""
 
-    def __init__(self, cfg, persist_jobs=False):
+    def __init__(self, cfg, persist_jobs=False, spec=None):
         self.cfg = cfg
-        self.spec = load_spec()
+        self.spec = load_spec() if spec is None else spec
         self.live = LiveState(persist_jobs=persist_jobs)
         self.start_event = threading.Event()
         self.httpd = None
@@ -6522,91 +6523,55 @@ def _run_comparison(server, cfg, plan, styles, chars):
         chars,
     )
 
+
+def _program_entry_operations():
+    """기존 main의 초기화·서버·batch 경계를 호출 시점에 연결한다."""
+    return _program_entry.ProgramEntryOperations(
+        prepare_profile=lambda profile: profile,
+        initialize_logging=lambda _context: globals()["log"],
+        acquire_single_instance=lambda _context: True,
+        release_single_instance=lambda _instance: None,
+        migrate_program_data=lambda _context: globals()["_DATA_MIGRATION"],
+        load_config=lambda _context: globals()["load_or_init_config"](),
+        load_options=lambda _context: globals()["OPTIONS"],
+        load_spec=lambda _context: globals()["load_spec"](),
+        recover_jobs=lambda _context: globals()["recover_job_ledger"](),
+        create_server=lambda config, _options, spec, _context: globals()[
+            "ConfigServer"
+        ](
+            config,
+            persist_jobs=True,
+            spec=spec,
+        ),
+        start_server=lambda server, open_browser: server.start(
+            open_browser=open_browser
+        ),
+        cleanup_server=lambda _server: None,
+        close_logging=lambda _logger: None,
+        warm_index=lambda server: globals()["_ac_index"](server.spec),
+        start_daemon=lambda target: globals()["threading"].Thread(
+            target=target,
+            daemon=True,
+        ).start(),
+        run_generation=lambda server, config: globals()["_run_generation"](
+            server,
+            config,
+        ),
+        inherited_blueprint=globals()["inherited_blueprint"],
+        fatal_stop_errors=(globals()["FatalStopError"],),
+        log_info=globals()["log"].info,
+        log_critical=globals()["log"].critical,
+        format_traceback=globals()["traceback"].format_exc,
+        read_input=lambda prompt: input(prompt),
+        write_line=lambda line: print(line),
+    )
+
+
 def main():
-    cfg = load_or_init_config()
-
-    recover_job_ledger()
-    server = ConfigServer(cfg, persist_jobs=True)
-    url = server.start(open_browser="--no-browser" not in sys.argv[1:])
-    if not url:
-        input("엔터를 누르면 종료...")
-        return
-
-    # 태그 사전(22만개) 로드 + 자동완성 색인을 미리 만들어 둔다.
-    # 안 하면 **첫 타이핑에서 10초쯤 멈춘 것처럼** 보인다.
-    def _warm():
-        try:
-            _ac_index(server.spec)
-        except Exception as e:
-            log.info(f"자동완성 예열 건너뜀: {e}")
-    threading.Thread(target=_warm, daemon=True).start()
-
-    print()
-    print("브라우저에서 설정을 마치고 '생성 시작'을 눌러주세요.")
-    print(f"창이 자동으로 열리지 않으면 이 주소를 직접 열어주세요: {url}")
-    print("생성이 끝난 뒤에도 설정을 바꿔서 '생성 시작'을 다시 누르면 이어서 새로 만듭니다.")
-    print()
-
-    while True:
-        server.start_event.wait()  # '생성 시작' 클릭까지 대기
-        with server.config_lock:
-            run_cfg = copy.deepcopy(
-                server.pending_batch_config
-                if isinstance(server.pending_batch_config, dict)
-                else server.cfg
-            )
-            server.pending_batch_config = None
-        # 단독 생성 등이 그 틈에 실행권을 가져갔다면 배치를 겹쳐 돌리지 않는다
-        tok = server.live.try_claim(
-            "세팅 배치 생성",
-            "settings",
-            blueprint=inherited_blueprint(
-                run_cfg,
-                source={"kind": "settings-batch"},
-            ),
-            payload_identity={
-                "kind": "setting", "seed_round": run_cfg.get("seed")},
-        )
-        if tok is None:
-            server.start_event.clear()
-            server.live.update(status_text="다른 생성이 도는 중입니다 — 끝난 뒤 '생성 시작'을 다시 눌러주세요.")
-            continue
-        try:
-            _run_generation(server, run_cfg)
-            if server.live.stop_req:
-                server.live.update(
-                    status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.",
-                    phase="stopped", can_retry=True)
-            elif server.live.failed:
-                server.live.update(
-                    status_text=(
-                        f"일부 완료 — 성공 {server.live.completed} · "
-                        f"실패 {server.live.failed} (다시 실행하면 실패분 재시도)"
-                    ),
-                    phase="partial", can_retry=True)
-            else:
-                log.info("═══ 이번 실행 완료 — 설정을 바꾸고 '생성 시작'을 다시 누르면 계속할 수 있습니다 ═══")
-                server.live.update(
-                    status_text="완료! 다시 '생성 시작'을 누르면 계속할 수 있습니다.",
-                    phase="completed")
-        except FatalStopError as e:
-            server.live.update(
-                status_text=f"즉시 중단: {e}", failed=max(1, server.live.failed),
-                last_error=str(e), phase="failed", can_retry=True)
-            break
-        except Exception as e:
-            log.critical(f"예기치 못한 오류로 중단되었습니다: {e}")
-            log.critical(traceback.format_exc())
-            server.live.update(
-                status_text=f"오류로 중단됨: {e}",
-                failed=max(1, server.live.failed), last_error=str(e),
-                phase="failed", can_retry=True)
-            break
-        finally:
-            server.live.release(tok)
-            server.start_event.clear()
-
-    print("프로그램을 종료합니다.")
+    return _program_entry.run_program(
+        globals()["sys"].argv[1:],
+        _program_entry_operations(),
+    )
 
 
 def _run_generation(server, cfg_snapshot=None):
