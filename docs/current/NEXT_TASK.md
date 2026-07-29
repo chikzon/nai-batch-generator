@@ -2,40 +2,32 @@
 
 ## 목적
 
-`ConfigServer.do_GET`의 읽기 전용 runtime 라우트를
-`src/nai_studio/web/routes/runtime.py`로 옮긴다.
+`ConfigServer.do_GET`의 자료 복구·보존 조회 라우트를
+`src/nai_studio/web/routes/recovery.py`로 옮긴다.
 
 ## 구현 범위
 
-- `/api/blueprint`
-- `/api/setting_sequence`
-- `/api/jobs`
-- 기존 `ConfigServer`의 snapshot 메서드 재사용
-- 기존 `startswith` 순서·HTTP 200 JSON 오류 형식 유지
+- metadata audit·folder inventory·trash
+- pack log·public collection·data storage
+- image origins·local image integrity
+- 기존 서비스와 `ConfigServer` 상태를 재구현하지 않고 동적 adapter로 연결
+- `/api/public_collection_restoration`을 `/api/public_collection`보다 먼저 유지
 
 ## 완료 조건
 
-- 세 라우트 구현이 `legacy_app.py`에 중복되지 않음
-- blueprint·sequence·jobs 응답과 오류 변환 유지
-- 기존 실제 HTTP transport 시험 통과
-- 새 route 모듈 함수 50줄 이하
-
-## 직접 관련된 기존 테스트
-
-- blueprint snapshot·project inheritance 테스트
-- setting sequence 저장·검증 테스트
-- job snapshot·command 테스트
-- `ConfigServer.start` HTTP 테스트
+- 대상 GET 구현이 `legacy_app.py`에 중복되지 않음
+- 기존 JSON·오류·prefix 우선순위 유지
+- 공개자료 복원·자료 저장·무결성 조회 테스트 통과
+- route 함수 50줄 이하
 
 ## 금지 범위
 
 - POST 라우트 이동
-- 다른 GET 기능군 이동
-- endpoint·status·schema 변경
-- route dict·exact path 일괄 변경
+- export·raw image 응답 이동
+- endpoint·schema 변경
 - 전체 회귀·빌드·Release·push
 - 저장소 밖의 `성향 표`와 `로그 편집기`
 
 ## 다음 경계
 
-runtime GET 검증 뒤 나머지 읽기 전용 GET을 generation·catalog·recovery 순으로 옮긴다.
+recovery GET 검증 뒤 catalog와 generation GET을 각각 이동한다.

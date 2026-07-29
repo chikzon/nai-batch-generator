@@ -979,6 +979,14 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(
                     response.headers.get_content_type(), "text/css"
                 )
+            for endpoint in (
+                "api/blueprint",
+                "api/setting_sequence?name=",
+                "api/jobs",
+            ):
+                with urllib.request.urlopen(url + endpoint, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIsInstance(json.load(response), dict)
         finally:
             if server.httpd:
                 server.httpd.shutdown()

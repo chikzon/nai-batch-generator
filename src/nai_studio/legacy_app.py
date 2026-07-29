@@ -229,6 +229,7 @@ from src.nai_studio.web.http_server import (
     start_http_server,
 )
 from src.nai_studio.web.page_template import PAGE_TEMPLATE
+from src.nai_studio.web.routes.runtime import handle_runtime_get
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -12670,25 +12671,9 @@ class ConfigServer:
             def do_GET(self):
                 if self._serve_static(UI_DIR):
                     return
-                if self.path.startswith("/api/blueprint"):
-                    try:
-                        self._json(server.snapshot_blueprint())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/setting_sequence"):
-                    from urllib.parse import urlparse, parse_qs
-                    q = parse_qs(urlparse(self.path).query)
-                    try:
-                        self._json(server.snapshot_sequence(
-                            q.get("name", [""])[0]))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/jobs"):
-                    try:
-                        self._json(server.snapshot_jobs())
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/metadata_audit_status"):
+                if handle_runtime_get(self, server):
+                    return
+                if self.path.startswith("/api/metadata_audit_status"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
                     try:
