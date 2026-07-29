@@ -156,6 +156,7 @@ from src.nai_studio.runtime.data_files import (
     shared_data_transaction,
 )
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
+from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
     knowledge_assets_from_config,
@@ -186,6 +187,10 @@ from src.nai_studio.services import (
     comparison_promotion as _comparison_promotion,
     comparison_runtime as _comparison_runtime,
     datapack_store as _datapack_store,
+    generation_commit as _generation_commit,
+    generation_execution as _generation_execution,
+    generation_retry as _generation_retry,
+    generation_step as _generation_step,
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
     metadata_candidate_store as _metadata_candidate_store,
@@ -3848,9 +3853,64 @@ def comparison_recipe_context(cfg, plan, styles, chars):
     return _comparison_planning.comparison_recipe_context(
         _comparison_operations(), cfg, plan, styles, chars)
 
-class FatalStopError(Exception):
-    """계정 정지/인증 오류 등 프로그램 자체를 완전히 끝내야 하는 경우."""
-    pass
+def _generation_execution_operations():
+    """세팅 생성의 계산·재시도·저장 의존성을 호출 시점에 연결한다."""
+    step = _generation_step.GenerationStepOperations(
+        character_resource_config=globals()["character_resource_config"],
+        setting_reference_config=globals()["setting_reference_config"],
+        build_scene=globals()["build_scene"],
+        seed_for=globals()["seed_for"],
+        join_tags=globals()["_join_tags"],
+        setting_scene_people=globals()["setting_scene_people"],
+        with_position_mode=globals()["with_position_mode"],
+        with_centers=globals()["with_centers"],
+    )
+    retry = _generation_retry.GenerationRetryOperations(
+        pace_gate=globals()["pace_gate"],
+        pace_complete=globals()["pace_complete"],
+        call_nai_api=globals()["call_nai_api"],
+        warning=globals()["log"].warning,
+        error=globals()["log"].error,
+        critical=globals()["log"].critical,
+    )
+    commit = _generation_commit.GenerationCommitOperations(
+        save_image=globals()["save_with_meta"],
+        output_format=globals()["out_format"],
+        output_clean_args=globals()["_ocargs"],
+        output_clean=globals()["out_clean"],
+        task_fingerprint=globals()["generation_task_fingerprint"],
+        record_job_result=globals()["record_job_result"],
+        output_root=globals()["out_root"],
+        make_progress_record=globals()["make_progress_record"],
+        progress_item_key=globals()["progress_item_key"],
+        bump_daily=globals()["bump_daily"],
+        daily_count=globals()["daily_count"],
+        save_state=globals()["save_state"],
+        warning=globals()["log"].warning,
+    )
+    return _generation_execution.GenerationExecutionOperations(
+        step=step,
+        retry=retry,
+        commit=commit,
+        load_state=globals()["load_state"],
+        save_state=globals()["save_state"],
+        fixed_seed=globals()["fixed_seed"],
+        daily_count=globals()["daily_count"],
+        daily_cap=DAILY_CAP,
+        load_asset_config=globals()["load_asset_config"],
+        context_fingerprint=globals()["generation_context_fingerprint"],
+        compute_pending=globals()["compute_pending"],
+        progress_record_valid=globals()["progress_record_valid"],
+        progress_record_path=globals()["progress_record_path"],
+        pace=globals()["pace"],
+        output_sub=globals()["out_sub"],
+        runtime_params=globals()["runtime_generation_params"],
+        random_seed=lambda: globals()["random"].randint(0, 2**32 - 1),
+        random_uniform=globals()["random"].uniform,
+        info=globals()["log"].info,
+        warning=globals()["log"].warning,
+        error=globals()["log"].error,
+    )
 
 
 # ═══════════════ 설정 로드/저장 ═══════════════
@@ -8133,334 +8193,11 @@ def main():
 
 
 def _run_generation(server, cfg_snapshot=None):
-    cfg = copy.deepcopy(
-        cfg_snapshot if isinstance(cfg_snapshot, dict) else server.cfg)
-    seed_idx = int(cfg.get("seed", 1) or 1)
-    seed_key = f"{seed_idx:02d}"
-
-    state = load_state()
-    if seed_key not in state["seeds"]:
-        state["seeds"][seed_key] = random.randint(0, 2**32 - 1)
-        save_state(state)
-    base_seed = state["seeds"][seed_key]           # 이 회차의 기준 시드
-    # 조각 순차(<*이름>) 순번은 배치 내내, 그리고 다음 실행까지 이어진다.
-    # cfg 에 실어 두면 call_nai_api 가 장마다 하나씩 올려 준다.
-    state.setdefault("frag_seq", {})
-    cfg["_frag_counters"] = state["frag_seq"]
-    server.live.update(seed_key=seed_key)
-    if fixed_seed(cfg):
-        log.info(f"═══ 회차 {seed_key} — NAI 시드 고정 {fixed_seed(cfg)} "
-                 f"(모든 장이 같은 시드) ═══")
-    else:
-        log.info(f"═══ 회차 {seed_key} (기준 시드 {base_seed}) — 장마다 '기준+씬번호' 시드. "
-                 f"같은 회차를 다시 돌리면 같은 결과 ═══")
-    log.info(f"오늘 생성량: {daily_count(state)}/{DAILY_CAP}")
-
-    characters_now = cfg.get("characters", [])
-    enabled_now = [c for c in characters_now if c.get("enabled", True)]
-    sel_summary = " · ".join(
-        f"{name} {len(st.get('selected', []))}세트"
-        for name, st in (cfg.get("setting_state") or {}).items()
-        if st.get("use") is not False and st.get("selected"))
-    log.info(f"캐릭터 {len(enabled_now)}명 켜짐 (전체 {len(characters_now)}명) · 선택: {sel_summary or '없음'}")
-    if not enabled_now:
-        log.warning("⚠ 켜진 캐릭터가 없습니다. 브라우저에서 캐릭터를 추가하거나 켜주세요.")
-
-    # 이 회차에서 **이미 끝낸 장**을 상태 파일에서 되살린다 (CQA-010).
-    #   예전에는 progress 를 쓰기만 하고 읽지 않아, 중지 후 '생성 시작'을 다시 누르면
-    #   끝난 장을 처음부터 다시 만들고 같은 파일을 덮어썼다 (Anlas·시간 재소모).
-    #   회차(seed) 를 바꾸면 progress 키가 달라져 자연히 새로 시작한다.
-    acfg = load_asset_config(cfg)
-    context_fingerprint = generation_context_fingerprint(cfg, acfg)
-    records = {}
-    legacy_records = 0
-    for cid, items in (state.get("progress", {}).get(seed_key) or {}).items():
-        for item in items if isinstance(items, list) else []:
-            if not isinstance(item, dict):
-                legacy_records += 1
-                continue
-            try:
-                key = (str(cid), int(item["scene"]), int(item.get("copy", 1)))
-            except (KeyError, TypeError, ValueError):
-                continue
-            records[key] = item
-
-    done_this_run = {}
-    verified_records = []
-    invalid_records = 0
-    lineage_failures = 0
-    candidates = compute_pending(cfg, acfg, {}, set())
-    for char, cid, num, copy_num in candidates:
-        record = records.get((cid, num, copy_num))
-        if record is None:
-            continue
-        fingerprint = generation_task_fingerprint(
-            context_fingerprint, char, cid, num, copy_num)
-        if progress_record_valid(record, cfg, fingerprint):
-            done_this_run.setdefault(cid, set()).add((num, copy_num))
-            verified_records.append(
-                (str(cid), int(num), int(copy_num), record, fingerprint))
-        else:
-            invalid_records += 1
-    n_done = sum(len(v) for v in done_this_run.values())
-    if n_done:
-        log.info(f"회차 {seed_key}의 파일·설정이 일치하는 완료 {n_done}장을 건너뜁니다.")
-        for cid, num, copy_num, record, fingerprint in verified_records:
-            try:
-                record_job_result(
-                    server.live.job_id,
-                    progress_record_path(record, cfg),
-                    artifact=str(record.get("path") or ""),
-                    result_id=(
-                        "result-setting-"
-                        + hashlib.sha256(
-                            f"{seed_key}\0{cid}\0{num}\0{copy_num}\0"
-                            f"{fingerprint}".encode("utf-8")
-                        ).hexdigest()[:24]
-                    ),
-                )
-            except Exception as error:
-                log.warning("검증된 세팅 결과의 Job 계보 연결 실패: %s", error)
-                lineage_failures += 1
-    if legacy_records or invalid_records:
-        log.warning("재개 기록 중 파일 또는 설정 근거가 없는 %d건은 다시 생성합니다.",
-                    legacy_records + invalid_records)
-    skip_set = set()   # 이번 실행에서 계속 실패해 건너뛴 작업 (재실행하면 다시 시도)
-    completed = n_done
-    server.live.update(
-        completed=completed,
-        eta_base_completed=completed,
-        total=max(len(candidates), completed),
+    return _generation_execution.run_generation(
+        _generation_execution_operations(),
+        server,
+        cfg_snapshot,
     )
-
-    while True:
-        if server.live.stop_req:   # /api/stop — 장 경계에서 멈춘다 (실행권은 finally 가 푼다)
-            log.info("■ 중지되었습니다 — '생성 시작'을 다시 누르면 이어서 합니다.")
-            server.live.update(
-                status_text="중지됨 — '생성 시작'을 누르면 이어서 합니다.",
-                phase="stopped", can_retry=True)
-            save_state(state)
-            return
-        acfg = load_asset_config(cfg)
-        context_fingerprint = generation_context_fingerprint(cfg, acfg)
-        pending = compute_pending(cfg, acfg, done_this_run, skip_set)
-
-        if not pending:
-            break
-
-        if daily_count(state) >= pace(cfg)["daily_cap"]:
-            log.warning(f"일일 {pace(cfg)['daily_cap']}장 한도 도달. 내일 다시 실행하면 이어서 합니다.")
-            server.live.update(
-                status_text="일일 한도 도달 — 내일 다시 실행하면 이어집니다.",
-                phase="stopped", can_retry=True)
-            save_state(state)
-            return
-
-        # 쉬는 자리는 **패스 경계**다 — 장 사이에서만 쉬고, 생성 도중엔 안 끊는다
-        pc = pace(cfg)
-        if pc["cool_every"] and completed > 0 and completed % pc["cool_every"] == 0:
-            log.info(f"⏸ {pc['cool_every']}장 완료 — {pc['cool_seconds']}초 쿨다운")
-            server.live.update(status_text=f"쿨다운 {pc['cool_seconds']}초...")
-            save_state(state)
-            # 취소를 존중하는 대기 — 중지되면 다음 장을 시작하지 않고 바로 끝낸다
-            if server.live.wait_cancelable(pc["cool_seconds"]):
-                continue
-        elif pc["soft_every"] and completed > 0 and completed % pc["soft_every"] == 0:
-            pause = pc["soft_seconds"] + random.uniform(-5, 10)
-            pause = max(1.0, pause)
-            log.info(f"⏸ 소프트 휴식 {pause:.0f}초")
-            server.live.update(status_text=f"소프트 휴식 {pause:.0f}초...")
-            save_state(state)
-            if server.live.wait_cancelable(pause):
-                continue
-
-        negative = acfg["base"].get("nsfw_negative_prompt", acfg["base"]["negative_prompt"])
-        scale = acfg["base"].get("cfg_scale", cfg.get("cfg_scale", 5.5))
-        cfg_rescale = acfg["base"].get("cfg_rescale", cfg.get("cfg_rescale", 0.56))
-        sampler = acfg["base"].get("sampler", cfg.get("sampler", "k_euler_ancestral"))
-        scheduler = acfg["base"].get("scheduler", cfg.get("scheduler", "karras"))
-        uc_preset = int(cfg.get("uc_preset", acfg["base"].get("uc_preset", 3)))
-        variety = cfg.get("variety", False)
-        steps = int(cfg.get("steps", acfg["base"].get("steps", 28)))
-        token = cfg["token"]
-        char, cid, num, copy_num = pending[0]
-        total_now = completed + len(skip_set) + len(pending)
-
-        try:
-            out_dir = out_sub(cfg, "nsfw_seed") / f"seed_{seed_key}" / cid
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            scene = acfg["scenes"][str(num)]
-            # 씬에서 Reference를 따로 고른 경우에만 전역 활성 목록을 그 선택으로
-            # 좁힌다. Vibe는 그대로 유지하고 캐릭터 Reference만 씬 범위를 따른다.
-            cast_cfg = character_resource_config(cfg, char)
-            reference_cfg, _, _ = setting_reference_config(cast_cfg, scene)
-            params = runtime_generation_params(reference_cfg, token)
-            char_label = char.get("name") or cid
-            suffix = "" if copy_num == 1 else f"_{copy_num}벌"
-            fname = (f"{num:03d}_{scene['name'].replace(' ', '_').replace('/', '_')}"
-                     f"{suffix}.webp")
-            base_p, female, male, char_neg, male_neg, w, h = build_scene(acfg, char, cfg, num)
-        except Exception as e:
-            log.error(f"[{completed+1}/{total_now}] 프롬프트/폴더 준비 중 오류로 이 컷 건너뜀: {e}")
-            log.error(traceback.format_exc())
-            skip_set.add((cid, num, copy_num))
-            server.live.update(
-                status_text=f"오류(건너뜀): {e}", failed=len(skip_set),
-                last_error=str(e), can_retry=True)
-            if server.live.wait_cancelable(1):
-                return
-            continue
-
-        # 이 장의 시드 — 씬 번호로 갈라지고, 같은 씬을 여러 벌 뽑으면 벌마다 또 갈라진다
-        # (안 그러면 2벌·3벌이 1벌과 똑같은 그림이 된다)
-        seed = seed_for(cfg, base_seed, num + (copy_num - 1) * 100003)
-        log.info(f"[{completed+1}/{total_now}] ({char_label}) {fname} "
-                 f"시드 {seed} (오늘 {daily_count(state)+1}/{DAILY_CAP})")
-        server.live.update(index=completed + 1, total=total_now, filename=fname,
-                            char_name=char_label, status_text="생성 중...", seed=seed)
-
-        ok = False
-        for attempt in range(3):
-            if server.live.stop_req:      # 보내기 직전에도 확인 (CQA-019)
-                break
-            okp, why = pace_gate(cfg, server.live, "배치")
-            if not okp:
-                server.live.update(status_text=why)
-                break
-            try:
-                # 씬 전용 네거티브가 있으면 기본 네거티브 뒤에 붙인다
-                #   (씬 모드와 같은 규칙 — 세팅 씬도 이제 이 칸을 가진다)
-                scene_neg = (acfg["scenes"][str(num)].get("negative") or "").strip()
-                neg_now = _join_tags(negative, scene_neg) if scene_neg else negative
-                # 주인공 + 상대역 + 추가 인물의 프롬프트와 위치를 같은 순서로
-                # 만든다. 씬 전용 위치가 있으면 전역 위치보다 우선한다.
-                people, centers, use_positions = setting_scene_people(
-                    scene, female, male, char_neg, male_neg, char, cfg)
-                scene_params = with_position_mode(
-                    params, char.get("position_mode"), use_positions)
-                if use_positions:
-                    scene_params = with_centers(scene_params, centers)
-                try:
-                    img = call_nai_api(token, base_p, neg_now, w, h,
-                                       chars=people,
-                                       scale=scale, cfg_rescale=cfg_rescale,
-                                       steps=steps, sampler=sampler, scheduler=scheduler, uc_preset=uc_preset,
-                                       seed=seed, variety=variety, params=scene_params)
-                finally:
-                    pace_complete()
-                frozen = server.live.frozen_blueprint()
-                img.nai_blueprint_fingerprint = str(
-                    (frozen or {}).get("fingerprint") or "")
-                saved_path = save_with_meta(
-                    img, out_dir / fname, fmt=out_format(cfg), clean=_ocargs(cfg)[0],
-                    max_side=_ocargs(cfg)[1], quality=out_clean(cfg)[2])
-                fingerprint = generation_task_fingerprint(
-                    context_fingerprint, char, cid, num, copy_num)
-                try:
-                    record_job_result(
-                        server.live.job_id,
-                        saved_path,
-                        artifact=saved_path.resolve().relative_to(
-                            out_root(cfg).resolve()).as_posix(),
-                        result_id=(
-                            "result-setting-"
-                            + hashlib.sha256(
-                                f"{seed_key}\0{cid}\0{num}\0{copy_num}\0"
-                                f"{fingerprint}".encode("utf-8")
-                            ).hexdigest()[:24]
-                        ),
-                    )
-                except Exception as error:
-                    lineage_failures += 1
-                    log.warning(
-                        "세팅 결과는 저장했지만 Job 계보 연결에 실패: %s",
-                        error,
-                    )
-                server.live.set_image(img)
-                ok = True
-                break
-            except RateLimitError as e:
-                wait = e.retry_after
-                log.warning(f"  429 — 서버 지시대로 {wait:g}초 대기 후 재시도")
-                if attempt >= 2:
-                    break
-                server.live.note_retry(e)
-                server.live.update(status_text=f"429 — {wait:g}초 대기 중...")
-                if server.live.wait_cancelable(wait):
-                    break                      # 중지 — 재시도하지 않는다
-            except (AccountBannedError, AuthError) as e:
-                log.critical(f"  {e}")
-                server.live.update(
-                    status_text=f"중단됨: {e}", failed=max(1, len(skip_set)),
-                    last_error=str(e), phase="failed", can_retry=True)
-                save_state(state)
-                raise FatalStopError(str(e))
-            except APIError as e:
-                log.error(f"  시도 {attempt+1} 실패: {e}")
-                if not e.retryable:
-                    server.live.update(
-                        status_text=f"재시도하지 않는 요청 오류: {e}",
-                        last_error=str(e))
-                    break
-                if attempt >= 2:
-                    break
-                wait = min(5 * (2 ** attempt), 30)
-                server.live.note_retry(e)
-                server.live.update(
-                    status_text=f"서버 오류 — {wait}초 뒤 재시도 ({attempt+1}/3)")
-                if server.live.wait_cancelable(wait):
-                    break
-            except Exception as e:
-                log.error(f"  시도 {attempt+1} 실패: {e}")
-                if attempt < 2:
-                    server.live.note_retry(e)
-                    server.live.update(
-                        status_text=f"재시도 중... ({attempt+1}/3)",
-                        last_error=str(e))
-                if attempt < 2 and server.live.wait_cancelable(30):
-                    break                      # 중지 — 재시도하지 않는다
-
-        if ok:
-            done_this_run.setdefault(cid, set()).add((num, copy_num))
-            record = make_progress_record(
-                cfg, num, copy_num, saved_path, fingerprint)
-            rec = state["progress"].setdefault(seed_key, {}).setdefault(cid, [])
-            rec[:] = [
-                item for item in rec
-                if progress_item_key(item) != (num, copy_num)
-            ]
-            rec.append(record)
-            bump_daily(state)
-            completed += 1
-            server.live.update(
-                daily=daily_count(state), completed=completed,
-                failed=len(skip_set))
-            # 매 장 저장한다 — 중지·강제 종료 후 재개가 정확해야 하고 파일은 몇 KB 다
-            try:
-                save_state(state)
-            except Exception as error:
-                lineage_failures += 1
-                log.warning(
-                    "세팅 결과는 저장했지만 재개 장부 저장에 실패: %s",
-                    error,
-                )
-        else:
-            skip_set.add((cid, num, copy_num))
-            server.live.update(
-                status_text=f"실패 — 건너뜀: {fname}",
-                failed=len(skip_set), can_retry=True)
-
-    if lineage_failures:
-        server.live.update(
-            failed=max(server.live.failed, lineage_failures),
-            status_text=(
-                "이미지는 저장했지만 작업 계보·재개 장부 일부를 확인해야 합니다."
-            ),
-            phase="partial",
-            can_retry=True,
-        )
-
 
 if __name__ == "__main__":
     main()

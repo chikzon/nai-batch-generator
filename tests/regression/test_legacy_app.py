@@ -4811,12 +4811,32 @@ class RegressionTests(unittest.TestCase):
                 server.httpd.server_close()
 
     def test_every_generation_path_builds_call_local_reference_params(self):
-        source = (
+        legacy = (
             ROOT / "src" / "nai_studio" / "legacy_app.py"
         ).read_text(encoding="utf-8")
-        self.assertEqual(source.count("runtime_generation_params("), 8)
-        self.assertNotIn('raw.get("source_model")', source)
-        self.assertNotIn("ensure_refs(", source)
+        services = {
+            name: (
+                ROOT / "src" / "nai_studio" / "services" / name
+            ).read_text(encoding="utf-8")
+            for name in (
+                "generation_execution.py",
+                "comparison_runtime.py",
+                "comparison_execution.py",
+            )
+        }
+        self.assertEqual(legacy.count("runtime_generation_params("), 5)
+        self.assertIn(
+            "operations.runtime_params(",
+            services["generation_execution.py"],
+        )
+        for name in ("comparison_runtime.py", "comparison_execution.py"):
+            self.assertIn(
+                "operations.runtime_generation_params(",
+                services[name],
+            )
+        combined = legacy + "\n".join(services.values())
+        self.assertNotIn('raw.get("source_model")', combined)
+        self.assertNotIn("ensure_refs(", combined)
 
     def test_page_installs_visible_runtime_error_handlers_before_app_code(self):
         page = rendered_ui_source()
@@ -6416,11 +6436,25 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(clock[0], before)
 
     def test_every_nai_generation_path_marks_completion(self):
-        source = (
+        legacy = (
             ROOT / "src" / "nai_studio" / "legacy_app.py"
         ).read_text(encoding="utf-8")
-        self.assertEqual(source.count("call_nai_api("), 8)  # definition + seven callers
-        self.assertEqual(source.count("pace_complete()"), 8)  # definition + seven callers
+        services = [
+            (
+                ROOT / "src" / "nai_studio" / "services" / name
+            ).read_text(encoding="utf-8")
+            for name in (
+                "generation_retry.py",
+                "comparison_runtime.py",
+                "comparison_execution.py",
+            )
+        ]
+        self.assertEqual(legacy.count("call_nai_api("), 5)
+        self.assertEqual(legacy.count("pace_complete()"), 5)
+        for source in services:
+            self.assertIn("operations.call_nai_api(", source)
+            self.assertIn("operations.pace_complete()", source)
+        source = legacy + "\n".join(services)
         self.assertNotIn(
             'time.sleep(random.uniform(pc["delay_min"], pc["delay_max"]))',
             source,
