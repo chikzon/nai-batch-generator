@@ -983,10 +983,15 @@ class RegressionTests(unittest.TestCase):
                 "api/blueprint",
                 "api/setting_sequence?name=",
                 "api/jobs",
+                "api/config",
+                "status.json",
             ):
                 with urllib.request.urlopen(url + endpoint, timeout=3) as response:
                     self.assertEqual(response.status, 200)
                     self.assertIsInstance(json.load(response), dict)
+            with self.assertRaises(urllib.error.HTTPError) as latest:
+                urllib.request.urlopen(url + "latest.webp", timeout=3)
+            self.assertEqual(latest.exception.code, 404)
         finally:
             if server.httpd:
                 server.httpd.shutdown()

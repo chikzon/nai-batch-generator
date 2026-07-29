@@ -29,6 +29,9 @@ def handle_runtime_get(request: Any, application: Any) -> bool:
     if request.path.startswith("/api/jobs"):
         _respond(request, application.snapshot_jobs)
         return True
+    if request.path.startswith("/api/config"):
+        request._json(application.snapshot_config())
+        return True
     return False
 
 

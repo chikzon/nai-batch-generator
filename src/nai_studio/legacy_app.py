@@ -233,6 +233,10 @@ from src.nai_studio.web.routes.catalog import (
     CatalogGetOperations,
     handle_catalog_get,
 )
+from src.nai_studio.web.routes.generation import (
+    GenerationGetOperations,
+    handle_generation_get,
+)
 from src.nai_studio.web.routes.recovery import (
     RecoveryGetOperations,
     handle_recovery_get,
@@ -12683,6 +12687,11 @@ class ConfigServer:
             autocomplete=lambda *args: autocomplete_tags(*args),
             tags=lambda *args: search_tags(*args),
         )
+        generation_get = GenerationGetOperations(
+            comparison_catalog=lambda cfg, spec: comparison_catalog(cfg, spec),
+            comparison_runs=lambda cfg: comparison_runs(cfg),
+            comparison_progress=lambda cfg: comparison_progress_summary(cfg),
+        )
         recovery_get = RecoveryGetOperations(
             metadata_audit=lambda offset, limit: metadata_audit_status(
                 found_offset=offset, found_limit=limit
@@ -12710,9 +12719,9 @@ class ConfigServer:
                     return
                 if handle_catalog_get(self, server, catalog_get):
                     return
-                if self.path.startswith("/api/config"):
-                    self._json(server.snapshot_config())
-                elif self.path.startswith("/refimg"):
+                if handle_generation_get(self, server, generation_get):
+                    return
+                if self.path.startswith("/refimg"):
                     from urllib.parse import urlparse, parse_qs
                     q = parse_qs(urlparse(self.path).query)
                     rid = Path(q.get("id", [""])[0]).name        # 경로 탈출 차단
@@ -12829,21 +12838,6 @@ class ConfigServer:
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
-                elif self.path.startswith("/api/compare_catalog"):
-                    try:
-                        self._json(comparison_catalog(server.cfg, server.spec))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/compare_runs"):
-                    try:
-                        self._json(comparison_runs(server.cfg))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/api/compare_progress"):
-                    try:
-                        self._json(comparison_progress_summary(server.cfg))
-                    except Exception as e:
-                        self._json({"ok": False, "error": str(e)})
                 elif self.path.startswith("/api/diag"):
                     # 진단 — raw 로그는 절대 내보내지 않고 redacted 구조화 이벤트만 돌려준다.
                     from urllib.parse import urlparse, parse_qs
@@ -12952,18 +12946,6 @@ class ConfigServer:
                         })
                     except Exception as e:
                         self._json({"ok": False, "error": str(e)})
-                elif self.path.startswith("/status.json"):
-                    self._json(server.live.snapshot())
-                elif self.path.startswith("/latest.webp"):
-                    data = server.live.image()
-                    if data is None:
-                        self.send_response(404); self.end_headers(); return
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/webp")
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
                 elif self.path == "/" or self.path.startswith("/?"):
                     body = render_page().encode("utf-8")
                     self.send_response(200)

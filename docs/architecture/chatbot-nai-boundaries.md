@@ -35,6 +35,7 @@ import해 UI·저장·payload 경로를 그대로 유지한다.
 | 설계도·순서·작업 상태 GET 라우트 | `web/routes/runtime.py` |
 | 자료 복구·보존 상태 GET 라우트 | `web/routes/recovery.py` |
 | 자료실·빌더 검색 GET 라우트 | `web/routes/catalog.py` |
+| 비교·실시간 생성 상태 GET 라우트 | `web/routes/generation.py` |
 | 공개자료 검색·재개·임포트 조정 | `services/public_collection.py` |
 | 공개 게시글 URL·HTML·이미지 통신 | `collection/arca.py` |
 
