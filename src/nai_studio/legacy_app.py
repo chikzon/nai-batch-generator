@@ -188,6 +188,7 @@ from src.nai_studio.services import (
     metadata_candidate_store as _metadata_candidate_store,
     output_lifecycle as _output_lifecycle,
     public_style_import as _public_style_import,
+    setting_runtime as _setting_runtime,
     style_store as _style_store,
     user_backup_store as _user_backup_store,
 )
@@ -3669,30 +3670,22 @@ def comparison_characters(cfg):
     return _comparison_planning.comparison_characters(cfg)
 
 
-def setting_cast_members(cfg, state):
-    """세팅 실행용 캐스트를 저장 방식과 무관하게 한 구조로 돌려준다.
+def _setting_runtime_operations():
+    """현재 세팅·캐릭터·이름 경계를 호출 때 주입해 APP patch를 보존한다."""
+    return _setting_runtime.SettingRuntimeOperations(
+        comparison_characters=globals()["comparison_characters"],
+        derive_catalog=globals()["derive_setting_catalog"],
+        safe_name=globals()["_safe_name"],
+        setting_state=globals()["setting_state"],
+    )
 
-    `all_characters`는 캐릭터 자료를 설정 안에 수백 번 복사하지 않고 실행할 때
-    참조한다. 사용자가 직접 적은 cast는 그대로 남아 있어 이 계획을 꺼도 복구된다.
-    """
-    if (state or {}).get("cast_source") == "all_characters":
-        return [{
-            "id": item.get("id", ""),
-            "name": item.get("name", ""),
-            "prompt": item.get("female", ""),
-            "outfit": item.get("clothed", ""),
-            "negative": item.get("negative", ""),
-            "variant": copy.deepcopy(item.get("variant") or {}),
-            "variants": copy.deepcopy(item.get("variants") or []),
-            "selected_variant_id": item.get("selected_variant_id", ""),
-            "reference_ids": copy.deepcopy(item.get("reference_ids") or []),
-            "vibe_ids": copy.deepcopy(item.get("vibe_ids") or []),
-            "enabled": True,
-        } for item in comparison_characters(cfg)]
-    return [
-        item for item in ((state or {}).get("cast") or [])
-        if isinstance(item, dict)
-    ]
+
+def setting_cast_members(cfg, state):
+    return _setting_runtime.setting_cast_members(
+        _setting_runtime_operations(),
+        cfg,
+        state,
+    )
 
 
 
@@ -7629,90 +7622,13 @@ def progress_record_valid(record, cfg, expected_fingerprint):
         return False
 
 def compute_pending(cfg, acfg, done_this_run, skip_set):
-    """세팅별 선택(setting_state)을 기준으로 작업 목록 계산. 사용 꺼진 세팅은 제외."""
-    allowed = set()
-    for name, ctx in acfg.get("_settings", {}).items():
-        state = setting_state(cfg, name)
-        if state.get("use") is False:
-            continue
-        selected = set(state.get("selected", []))
-        if not selected:
-            continue
-        scenes_of = {k: sc for k, sc in acfg["scenes"].items() if sc.get("_setting") == name}
-        # 단계 선택 — "전 체위의 사정 컷만" 처럼 세트를 가로로 자른다.
-        # 비어 있으면 전 단계. 저장값은 1부터 센 사람 기준 번호다.
-        stages = {int(x) for x in (state.get("stages") or []) if str(x).isdigit()}
-        for g in derive_setting_catalog(scenes_of):
-            if g["id"] not in selected:
-                continue
-            if stages:
-                allowed.update(sn for i, sn in enumerate(g["ids"], 1) if i in stages)
-            else:
-                allowed.update(g["ids"])
-
-    scene_nums = sorted(n for n in (int(x) for x in acfg.get("scenes", {}) if str(x).isdigit())
-                        if n in allowed)
-
-    # 주인공: 씬이 속한 세팅의 전용 캐스트 → 없으면 ① 설정의 캐릭터 슬롯 (설정을 강제하지 않음)
-    # 켠 인물만 (칸은 6명 넘게 둬도 된다)
-    slots = [s for s in cfg.get("char_slots", [])
-             if slot_prompt(s).strip() and s.get("enabled") is not False]
-    # 씬 번호 → 예약 매수 (세트별로 '몇 벌' 뽑을지. 기본 1벌)
-    reserve = {}
-    for name in acfg.get("_settings", {}):
-        rep = (setting_state(cfg, name).get("reserve") or {})
-        if not rep:
-            continue
-        scenes_of = {k: sc for k, sc in acfg["scenes"].items() if sc.get("_setting") == name}
-        for g in derive_setting_catalog(scenes_of):
-            n = int(rep.get(str(g["id"]), rep.get(g["id"], 1)) or 1)
-            if n > 1:
-                for sn in g["ids"]:
-                    reserve[sn] = n
-
-    pending = []
-    for num in scene_nums:
-        sc = acfg["scenes"][str(num)]
-        sname = sc.get("_setting", "")
-        scene_setting_state = setting_state(cfg, sname)
-        cast = [c for c in setting_cast_members(cfg, scene_setting_state)
-                if slot_prompt(c).strip()]
-        # 두 목록의 뜻이 다르다 (UI 문구 그대로):
-        #   세팅 전용 캐스트 = "각자 따로 전체 씬 생성" → 인원수만큼 벌이 늘어난다
-        #   ① 설정의 캐릭터 칸 = "한 그림에 함께 들어갈 인물" → 늘어나지 않는다.
-        #     첫 칸이 주인공, 둘째 칸이 상대역이 된다 (단독 생성과 같은 규칙).
-        if cast:
-            cast_mode = scene_setting_state.get("cast_mode")
-            if cast_mode == "together":
-                identity = "\0".join(slot_bundle_identity(c) for c in cast)
-                runs = [(cast, f"{sname}\0together\0{identity}")]
-            else:
-                # 표시 이름이 같아도 각 캐스트는 별개 작업이다. index와 내용 fingerprint를 identity로 쓴다.
-                runs = [([c], f"{sname}\0sequence\0{i}\0{slot_bundle_identity(c)}")
-                        for i, c in enumerate(cast)]
-        else:
-            runs = [(slots, None)] if slots else []
-        for i, (group, identity) in enumerate(runs):
-            char = character_run_from_group(
-                group, i, scene_setting_state.get("position_mode"))
-            cid = _safe_name(char["name"]).lower() or f"char{i+1}"
-            if identity is not None:
-                digest = zlib.crc32(identity.encode("utf-8")) & 0xffffffff
-                cid = f"{cid[:30]}-{digest:08x}"
-            done_set = done_this_run.get(cid, set())
-            for copy in range(1, max(1, int(reserve.get(num, 1))) + 1):
-                if (num, copy) in done_set or (cid, num, copy) in skip_set:
-                    continue
-                pending.append((char, cid, num, copy))
-    # 캐스트가 여럿이면 **한 사람의 씬을 다 돌고 다음 사람으로** 넘어간다.
-    # 위 루프는 씬을 겉돌기 때문에 사람이 번갈아 섞인다 — 폴더가 뒤죽박죽이 되고
-    # 중간에 멈췄을 때 누구까지 끝났는지 알 수 없다.
-    if cfg.get("per_char_order", True):
-        order = {}
-        for item in pending:
-            order.setdefault(item[1], len(order))
-        pending.sort(key=lambda it: (order[it[1]], it[2], it[3]))
-    return pending
+    return _setting_runtime.compute_pending(
+        _setting_runtime_operations(),
+        cfg,
+        acfg,
+        done_this_run,
+        skip_set,
+    )
 
 
 def _comparison_progress_load():
