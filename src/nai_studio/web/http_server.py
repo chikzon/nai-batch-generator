@@ -36,6 +36,10 @@ STATIC_ASSETS = {
         "studio-admin.js",
         "text/javascript; charset=utf-8",
     ),
+    "/ui/studio-bootstrap.js": (
+        "studio-bootstrap.js",
+        "text/javascript; charset=utf-8",
+    ),
     "/ui/studio.js": ("studio.js", "text/javascript; charset=utf-8"),
 }
 

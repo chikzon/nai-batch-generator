@@ -1445,6 +1445,7 @@ window.NAI_STUDIO_BOOTSTRAP = {resolutions: __RESJSON__};
 <script src="/ui/studio-library.js"></script>
 <script src="/ui/studio-builder.js"></script>
 <script src="/ui/studio-admin.js"></script>
+<script src="/ui/studio-bootstrap.js"></script>
 <script src="/ui/studio.js"></script>
 </body></html>
 """

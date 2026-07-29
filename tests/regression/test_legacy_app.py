@@ -64,6 +64,7 @@ UI_SOURCE = (
     + (STATIC_UI_DIR / "studio-library.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio-builder.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio-admin.js").read_text(encoding="utf-8")
+    + (STATIC_UI_DIR / "studio-bootstrap.js").read_text(encoding="utf-8")
     + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
 )
 
@@ -79,6 +80,7 @@ def rendered_ui_source():
         + (STATIC_UI_DIR / "studio-library.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio-builder.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio-admin.js").read_text(encoding="utf-8")
+        + (STATIC_UI_DIR / "studio-bootstrap.js").read_text(encoding="utf-8")
         + (STATIC_UI_DIR / "studio.js").read_text(encoding="utf-8")
     )
 
@@ -135,6 +137,7 @@ class RegressionTests(unittest.TestCase):
             "studio-library.js",
             "studio-builder.js",
             "studio-admin.js",
+            "studio-bootstrap.js",
             "studio.js",
         ):
             parser.scripts.append(
@@ -1022,6 +1025,7 @@ class RegressionTests(unittest.TestCase):
                 ("ui/studio-library.js", "text/javascript"),
                 ("ui/studio-builder.js", "text/javascript"),
                 ("ui/studio-admin.js", "text/javascript"),
+                ("ui/studio-bootstrap.js", "text/javascript"),
                 ("ui/studio.js", "text/javascript"),
             ):
                 with urllib.request.urlopen(url + asset, timeout=3) as response:
@@ -1315,6 +1319,7 @@ class RegressionTests(unittest.TestCase):
                 "src/nai_studio/web/static/studio-library.js",
                 "src/nai_studio/web/static/studio-builder.js",
                 "src/nai_studio/web/static/studio-admin.js",
+                "src/nai_studio/web/static/studio-bootstrap.js",
                 "src/nai_studio/web/static/studio.js",
             },
         )

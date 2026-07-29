@@ -84,6 +84,7 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
         self.assertIn('src="/ui/studio-library.js"', template)
         self.assertIn('src="/ui/studio-builder.js"', template)
         self.assertIn('src="/ui/studio-admin.js"', template)
+        self.assertIn('src="/ui/studio-bootstrap.js"', template)
         self.assertIn('src="/ui/studio.js"', template)
         self.assertLess(
             template.index('src="/ui/studio-core.js"'),
@@ -107,6 +108,10 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
         )
         self.assertLess(
             template.index('src="/ui/studio-admin.js"'),
+            template.index('src="/ui/studio-bootstrap.js"'),
+        )
+        self.assertLess(
+            template.index('src="/ui/studio-bootstrap.js"'),
             template.index('src="/ui/studio.js"'),
         )
 
