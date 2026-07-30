@@ -285,6 +285,62 @@ $('tokenShow').addEventListener('click', () => {
   $('tokenShow').textContent = show ? '숨기기' : '보기';
   $('tokenShow').setAttribute('aria-pressed', show ? 'true' : 'false');
 });
+/* 제품 갱신 — 공식 GitHub Release만 확인, SHA 일치 시만 완료, 무인 설치 없음 */
+let UPDATE_POLL = null;
+function bindUpdateCard(){
+  const card = $('updateCard');
+  if(!card || card._bound) return;
+  card._bound = true;
+  const msg = $('updateMsg');
+  const paint = st => {
+    if(!st) return;
+    if(!st.ok && !st.downloading){
+      msg.textContent = (st.error || '확인 실패')
+        + (st.current ? ` · 현재 버전 ${st.current} 유지` : '');
+      return;
+    }
+    let text = st.update_available
+      ? `새 버전 ${st.latest} (현재 ${st.current}) · 설치본 `
+        + `${((st.download_size||0)/1048576).toFixed(1)}MB`
+        + (st.notes ? ` · ${String(st.notes).split('\n')[0].slice(0,80)}` : '')
+      : `현재 ${st.current} — 최신입니다.`;
+    if(st.update_available) $('updateDownload').classList.remove('hidden');
+    if(st.downloading) text += ' · 내려받는 중…';
+    if(st.download_result && !st.download_result.ok)
+      text += ` · ${st.download_result.error || '내려받기 실패'}`;
+    if(st.downloaded && !st.downloading){
+      $('updateInstall').classList.remove('hidden');
+      text += ` · 준비됨: ${st.downloaded.version}`;
+    }
+    msg.textContent = text;
+  };
+  const refresh = async () => {
+    try{
+      const st = await (await fetch('/api/update_status', {method:'POST'})).json();
+      paint(st);
+      return st;
+    }catch(e){ msg.textContent = `확인 실패: ${e}`; }
+  };
+  $('updateCheck').addEventListener('click', refresh);
+  $('updateDownload').addEventListener('click', async () => {
+    const r = await (await fetch('/api/update_download', {method:'POST'})).json();
+    if(!r.ok){ msg.textContent = r.error || '내려받기 실패'; return; }
+    if(r.reused){ refresh(); return; }
+    msg.textContent = '내려받는 중…';
+    clearInterval(UPDATE_POLL);
+    UPDATE_POLL = setInterval(async () => {
+      const st = await refresh();
+      if(st && !st.downloading){ clearInterval(UPDATE_POLL); UPDATE_POLL = null; }
+    }, 2000);
+  });
+  $('updateInstall').addEventListener('click', async () => {
+    const r = await (await fetch('/api/update_install', {method:'POST'})).json();
+    msg.textContent = r.ok
+      ? '설치 프로그램을 열었습니다. 화면의 안내에 따라 진행하세요.'
+      : (r.error || '실행 실패');
+  });
+}
+
 /* 부루 계정 — 다른 파라미터 저장 훅과 섞으면 서로 덮어쓰므로 따로 둔다 */
 [['bkDanUser','danbooru','user'],['bkDanKey','danbooru','key'],['bkGelUser','gelbooru','user'],['bkGelKey','gelbooru','key'],['bkE6User','e621','user'],['bkE6Key','e621','key']].forEach(([id, site, f]) => {
   const el = $(id); if(!el) return;

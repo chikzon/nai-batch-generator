@@ -21,10 +21,35 @@ from src.nai_studio.services import collection_relay as _collection_relay
 from src.nai_studio.services import evidence_merge as _evidence_merge
 from src.nai_studio.services import merge_plan as _merge_plan
 from src.nai_studio.services import style_store as _style_store
+from src.nai_studio.services import update_check as _update_check
 from src.nai_studio.services.character_storage import safe_name as _safe_name
 
 _ARCHIVE_MANAGER: Any = None
 _RELAY_PAIRING = _collection_relay.RelayPairing()
+_UPDATE_MANAGER: Any = None
+
+
+def _resolve_public_host(host: str) -> list[str]:
+    return sorted({item[4][0] for item in socket.getaddrinfo(host, 443)})
+
+
+def _archive_operations_factory(app: dict, should_stop):
+    """archive·갱신 다운로드가 공유하는 스트림·저장 경계."""
+    return _archive_download.ArchiveDownloadOperations(
+        open_stream=lambda url, headers: app["requests"].get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=(10, 60),
+            allow_redirects=False,
+        ),
+        resolve_host=_resolve_public_host,
+        atomic_write_json=app["atomic_write_json"],
+        load_json=app["load_json_recover"],
+        should_stop=should_stop,
+        info=app["log"].info,
+        warning=app["log"].warning,
+    )
 
 
 def user_backup_baseline_fields(profile_dir: Path) -> dict[str, Callable]:
@@ -95,35 +120,63 @@ def extra_route_bindings(app: dict) -> dict:
         """프로세스에 하나뿐인 archive 다운로드 작업. app 전역은 호출 때 읽는다."""
         global _ARCHIVE_MANAGER
         if _ARCHIVE_MANAGER is None:
-            def resolve_host(host):
-                return sorted({
-                    item[4][0] for item in socket.getaddrinfo(host, 443)
-                })
+            _ARCHIVE_MANAGER = _archive_download.ArchiveDownloadManager(
+                destination_root=lambda: (
+                    Path(app["BASE_DIR"]) / "수집" / "받기"),
+                operations_factory=(
+                    lambda should_stop:
+                        _archive_operations_factory(app, should_stop)),
+                safe_name=_safe_name,
+            )
+        return _ARCHIVE_MANAGER
 
-            def operations_factory(should_stop):
-                return _archive_download.ArchiveDownloadOperations(
-                    open_stream=lambda url, headers: app["requests"].get(
-                        url,
-                        headers=headers,
-                        stream=True,
-                        timeout=(10, 60),
-                        allow_redirects=False,
-                    ),
-                    resolve_host=resolve_host,
-                    atomic_write_json=app["atomic_write_json"],
-                    load_json=app["load_json_recover"],
-                    should_stop=should_stop,
+    def update_manager():
+        """공식 GitHub Release만 보는 갱신 검사. 다운로드는 archive 경계 재사용."""
+        global _UPDATE_MANAGER
+        if _UPDATE_MANAGER is None:
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "NAI-batch-generator-update-check",
+            }
+
+            def http_get_json(url):
+                response = app["requests"].get(
+                    url, headers=headers, timeout=(10, 30))
+                response.raise_for_status()
+                return response.json()
+
+            def http_get_text(url):
+                response = app["requests"].get(
+                    url,
+                    headers={"User-Agent": headers["User-Agent"]},
+                    timeout=(10, 60),
+                )
+                response.raise_for_status()
+                return response.text
+
+            def download(url, destination, *, expected_sha256):
+                return _archive_download.download_archive(
+                    _archive_operations_factory(app, lambda: False),
+                    url,
+                    destination,
+                    expected_sha256=expected_sha256,
+                )
+
+            def operations_factory():
+                return _update_check.UpdateCheckOperations(
+                    http_get_json=http_get_json,
+                    http_get_text=http_get_text,
+                    download=download,
+                    destination_root=lambda: (
+                        Path(app["BASE_DIR"]) / "갱신"),
+                    open_installer=lambda path: app["os"].startfile(
+                        str(path)),
                     info=app["log"].info,
                     warning=app["log"].warning,
                 )
 
-            _ARCHIVE_MANAGER = _archive_download.ArchiveDownloadManager(
-                destination_root=lambda: (
-                    Path(app["BASE_DIR"]) / "수집" / "받기"),
-                operations_factory=operations_factory,
-                safe_name=_safe_name,
-            )
-        return _ARCHIVE_MANAGER
+            _UPDATE_MANAGER = _update_check.UpdateManager(operations_factory)
+        return _UPDATE_MANAGER
 
     return {
         "evidence_compare": evidence_compare,
@@ -139,6 +192,9 @@ def extra_route_bindings(app: dict) -> dict:
                 origin=origin,
                 pairing_code=code,
             )),
+        "update_status": lambda: update_manager().status(),
+        "update_download": lambda: update_manager().download(),
+        "update_install": lambda: update_manager().install(),
     }
 
 

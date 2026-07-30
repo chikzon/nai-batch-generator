@@ -485,6 +485,7 @@ function activateMode(mode){
     renderScenes();
   }else if(mode === 'system'){
     bindUserBackup(); bindTrashCenter(); bindLocalImageIntegrity();
+    bindUpdateCard();
   }
 }
 function setMode(m){

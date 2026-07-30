@@ -1,19 +1,27 @@
 # 현재 작업
 
-## 다음 작업 (단계 5)
+## 다음 작업 (단계 5 잔여)
 
-1. 업데이트 검사 `/api/update_status` · `/api/update_download` ·
-   `/api/update_install` — 공식 GitHub Release만 확인, 새 버전·현재 버전·
-   변경 요약·다운로드 크기 먼저 표시, `SHA256SUMS.txt`와 asset hash 일치 시만
-   다운로드 완료 처리, 사용자 승인 시 installer UI 실행(무서명 자동·무인 설치
-   금지), 실패·불일치·오프라인이면 현재 버전 유지. 다운로드는 기존
-   `archive_download`(Range 재개·HTTPS·크기 상한) 재사용.
-2. 내부 감사 기록을 저장소 밖 보관본에 원본 경로대로 복사(파일 수·SHA-256
+1. 내부 감사 기록을 저장소 밖 보관본에 원본 경로대로 복사(파일 수·SHA-256
    확인) 후 Git 추적에서만 정리 → README·스크린샷·기능 제한·Release 설명을
    실제 최종 화면과 일치.
-3. 최종 한 번: 전체 계약·구조·회귀 + JS 구문 + localhost + Python 없는 포터블
+2. 최종 한 번: 전체 계약·구조·회귀 + JS 구문 + localhost + Python 없는 포터블
    기동 + 설치·제거 + 배포물 토큰/개인 자료 0건 → 재빌드(이후 커밋 금지) →
    Claude push 인계서 재생성.
+
+## 완료 — 업데이트 검사 (이 커밋)
+
+- `services/update_check.py` — `UpdateManager`: 공식 GitHub Release만 확인
+  (60초 캐시), status가 새/현재 버전·변경 요약·다운로드 크기를 먼저 표시,
+  download는 `SHA256SUMS.txt` 항목과 일치할 때만 완료(강제는 기존
+  `archive_download`의 expected_sha256 폐기 규칙), 이미 검증된 파일은 재사용,
+  install은 재해시 일치 시에만 installer UI 실행 — 무인 설치 플래그 없음.
+  실패·오프라인은 `ok:false + current` 로 현재 버전 유지.
+- `/api/update_status·download·install` (runtime_post) + 관리 탭 갱신 카드
+  (environment 그룹) + `bindUpdateCard`. 바인딩은 studio_wiring(legacy 0줄).
+- `CURRENT_VERSION == tools.build.app.APP_VERSION` 계약 시험으로 고정.
+- 새 계약 시험 10개 · 페이지 id 중복·레이아웃 회귀 2/2 · 경계 5/5 ·
+  template 91,828/100,000자.
 
 ## 완료 — UI 성능·반응 목표 측정 (단계 4 마감, 이 커밋)
 

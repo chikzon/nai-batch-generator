@@ -25,6 +25,9 @@ class RuntimePostOperations:
     finalize_tokens: Any
     token_count: Any
     tokens_exact: Any
+    update_status: Any
+    update_download: Any
+    update_install: Any
 
 
 def _json_body(body: bytes) -> dict:
@@ -47,6 +50,12 @@ def handle_runtime_post(
             result = anlas_response(application, operations, _json_body(body))
         elif request.path.startswith("/api/tokens"):
             result = token_response(application, operations, _json_body(body))
+        elif request.path.startswith("/api/update_status"):
+            result = operations.update_status()
+        elif request.path.startswith("/api/update_download"):
+            result = operations.update_download()
+        elif request.path.startswith("/api/update_install"):
+            result = operations.update_install()
         else:
             return False
         request._json(result)

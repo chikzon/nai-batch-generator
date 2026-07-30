@@ -1278,6 +1278,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         요청이 겹쳐 제한에 걸릴 위험이 커집니다. 프로필은 계정이 <b>다를 때</b> 쓰는 기능입니다.</p>
       </div>
 
+      <div class="card" id="updateCard" data-manage-panel="environment">
+        <h2><span class="n">갱신</span>새 버전 확인</h2>
+        <p class="hint">공식 GitHub Release만 확인합니다. 설치본은
+        <b>SHA256SUMS.txt와 내용이 일치할 때만</b> 내려받기 완료로 처리하고,
+        설치는 설치 프로그램 화면을 직접 보고 진행합니다(자동·무인 설치 없음).
+        확인 실패·오프라인이면 현재 버전이 그대로 유지됩니다.</p>
+        <div class="bar" style="flex-wrap:wrap;">
+          <button type="button" id="updateCheck" class="primary">새 버전 확인</button>
+          <button type="button" id="updateDownload" class="hidden">⬇ 설치본 내려받기</button>
+          <button type="button" id="updateInstall" class="hidden">설치 프로그램 열기</button>
+        </div>
+        <div id="updateMsg" class="hint" style="margin-top:8px;"></div>
+      </div>
       <div class="card" id="jobCenterCard" data-manage-panel="jobs">
         <h2><span class="n">작업</span>진행·재개 센터
           <button type="button" id="jobCenterRefresh" style="margin-left:auto;">↻ 새로고침</button></h2>
