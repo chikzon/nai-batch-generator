@@ -1,48 +1,42 @@
 # 현재 작업
 
-## 다음 작업 (단계 5 잔여)
+## 상태 — 잔여 계획(코덱스 계획서) 구현 마감
 
-1. 내부 감사 기록을 저장소 밖 보관본에 원본 경로대로 복사(파일 수·SHA-256
-   확인) 후 Git 추적에서만 정리 → README·스크린샷·기능 제한·Release 설명을
-   실제 최종 화면과 일치.
-2. 최종 한 번: 전체 계약·구조·회귀 + JS 구문 + localhost + Python 없는 포터블
-   기동 + 설치·제거 + 배포물 토큰/개인 자료 0건 → 재빌드(이후 커밋 금지) →
-   Claude push 인계서 재생성.
+단계 1(데이터 안전·병합) · 2(증거 정제, 첫 조각) · 3(수집: Range 재개·relay) ·
+4(NAI 실검증·UI 성능·검토 흐름 UI) · 5(업데이트 검사·README 정합)을 구현했고,
+이 커밋 뒤 전체 무과금 검증과 v1.2.0 재빌드, Claude push 인계서 재생성만 남는다.
+**이 커밋이 마지막 코드 커밋이다 — 빌드 뒤에는 커밋하지 않는다.**
 
-## 완료 — 업데이트 검사 (이 커밋)
+## 구현 커밋 (bd9b578 이후)
 
-- `services/update_check.py` — `UpdateManager`: 공식 GitHub Release만 확인
-  (60초 캐시), status가 새/현재 버전·변경 요약·다운로드 크기를 먼저 표시,
-  download는 `SHA256SUMS.txt` 항목과 일치할 때만 완료(강제는 기존
-  `archive_download`의 expected_sha256 폐기 규칙), 이미 검증된 파일은 재사용,
-  install은 재해시 일치 시에만 installer UI 실행 — 무인 설치 플래그 없음.
-  실패·오프라인은 `ok:false + current` 로 현재 버전 유지.
-- `/api/update_status·download·install` (runtime_post) + 관리 탭 갱신 카드
-  (environment 그룹) + `bindUpdateCard`. 바인딩은 studio_wiring(legacy 0줄).
-- `CURRENT_VERSION == tools.build.app.APP_VERSION` 계약 시험으로 고정.
-- 새 계약 시험 10개 · 페이지 id 중복·레이아웃 회귀 2/2 · 경계 5/5 ·
-  template 91,828/100,000자.
+9470efd 파일 트랜잭션 · 3c36d5c 자료팩 staging · 56ee240 백업 복원 기동 복구 ·
+3f63f15 3-way 기준값 · 5e9eb93 병합 표면 · 27b9bd3/2311ab4 인계 ·
+b504280 증거 병합 · dd9ad41 Range 재개 · fb92208 다운로드 제어 ·
+eb09086 browser relay · 00fe779 자료 탭 검토 흐름 UI · bd4b1c2 바이너리 업로드
+디스패치 결함 수정 + NAI 실검증(13 Anlas) · 3a241bc UI 성능 실측 ·
+bd2eea1 업데이트 검사 · 66c9322 README·v1.2.0
 
-## 완료 — UI 성능·반응 목표 측정 (단계 4 마감, 이 커밋)
+## 미완 항목 (완료라고 쓰지 않는 것)
 
-빈 사용자 데이터 · `--data-dir` 임시 폴더 · 포트 8788 인스턴스(사용자 8787
-불간섭, 측정 후 종료·폴더 삭제). 실브라우저 실측:
+- **스크린샷 재촬영**: 자료·관리 탭에 카드가 추가됐으나 화면 표시가 없는
+  환경이라 캡처 불가(2회 시도). README에 차이를 명시했다. 다음에 브라우저
+  패널이 표시되는 세션에서 `current-library.png`·`current-management.png`
+  재촬영 후 README 문구 원복.
+- **UI 성능 실자료 측정**: 빈 데이터 실측만 있음(작가 조합 목록 렌더는 하한값).
+- **단계 2 잔여**: 캐릭터 자산 중복 검토(merge_evaluations·merge_resources
+  연계), 자료팩 쪽 3-way 기준값.
+- **relay 브라우저 쪽 스크립트**: pairing UI는 자료 탭에 있으나 arca.live에서
+  쓸 bookmarklet/userscript 문안은 안내 텍스트 수준.
+- 스마트폰 앱·PC 연동은 계획대로 이번 범위에서 제외.
 
-| 목표 | 실측 | 판정 |
-|---|---|---|
-| 초기 화면 준비 ≤ 1초 | load 762ms · DOMContentLoaded 372ms | ✓ |
-| 탭 전환 ≤ 200ms | 첫 진입 최대 18.8ms(세팅) · 이후 ≤1ms | ✓ |
-| 작가 조합 첫 열기 ≤ 200ms | 4.9ms | ✓* |
-| 390×844 가로 넘침 0 | 5개 탭 전부 scrollW==390 | ✓ |
-| 반복 진입 DOM 증가 0 | 10사이클×5탭: 1,649 → 1,649 (+0) | ✓ |
-| 1280×800 · 1600×1000 넘침 | 0 · 0 | ✓ |
-| 키보드 Alt+1~5 | Alt+3→자료, Alt+1→생성 전환 확인 | ✓ |
-| 콘솔 오류 | 0건 | ✓ |
+## 마감 절차 (이 커밋 뒤, 순서 고정)
 
-\* 한계: 빈 데이터라 작가 조합 목록이 비어 있어 하한값이다. 실자료(수백 건)
-에서는 `loadCombos`가 지연·중단 가능 구조라 목록 렌더가 지배 — 실자료 측정은
-사용자 환경(8787)에서만 가능해 생략했다.
+1. 새 계약 시험 전체 + `python 검증.py` (계약 10 · 경계 5 · 회귀 171)
+2. `python 빌드.py --설치본` → 포터블 ZIP·자료팩·설치본·SHA256SUMS (v1.2.0)
+3. 산출물 스모크(빈 데이터 기동 HTTP 200 · 토큰/개인 자료 0건)
+4. `docs/current/CLAUDE_PUSH_HANDOFF.md`(미추적) 재생성 — push 범위·검증
+   수치·산출물 해시·절차. push·태그·Release는 하지 않는다.
 
 ## 금지 범위
 
-- 사용자 8787 인스턴스·개인 자료 접근, push·태그·Release
+- 빌드 뒤 커밋, 기존 태그·Release 수정, push, 사용자 자료 접근
