@@ -35,6 +35,7 @@ from src.nai_studio.web.routes.generation import (
 from src.nai_studio.web.routes.generation_post import (
     handle_generation_post,
 )
+from src.nai_studio.web.routes.merge_post import handle_merge_post
 from src.nai_studio.web.routes.recovery import handle_recovery_get
 from src.nai_studio.web.routes.recovery_post import (
     handle_recovery_post,
@@ -100,7 +101,14 @@ def _dispatch_post(
 ) -> bool:
     """Run POST route groups in the legacy first-match order."""
     return (
-        handle_recovery_post(
+        handle_merge_post(
+            request,
+            application,
+            operation_sets["recovery_post"],
+            operation_sets["collection_post"],
+            body,
+        )
+        or handle_recovery_post(
             request,
             application,
             operation_sets["recovery_post"],

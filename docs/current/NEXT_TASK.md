@@ -2,52 +2,42 @@
 
 ## 목적
 
-3-way 병합의 기준값 계약을 만든다. 새 백업부터 JSON 항목의 공통 기준값을
-백업 ZIP에 함께 보존하고(`baseline/<logical>` + manifest `base_sha256`),
-복원 미리보기가 항목마다 `기준/현재/들어오는 값`과 판정
-(take-incoming · keep-current · both-changed · no-base)을 제공한다.
-구형 백업은 자동 변환 없이 현재 2-way(no-base)를 유지한다.
-이미지 등 바이너리는 내용 해시로만 비교하고 baseline에 바이트를 중복 저장하지
-않는다.
+백업·자료팩 충돌 검토를 하나의 공통 merge plan 표면으로 통합하는
+`/api/merge_preview` · `/api/merge_apply` · `/api/merge_undo` endpoint를 만든다.
+기존 preview·apply·undo 엔진(백업 workflow · 자료팩 workflow)에 위임하고,
+행 모양만 통일한다({id, source, kind, label, decision, base/current/incoming,
+recoverable}). 백업 쪽은 3-way 판정(3f63f15)이 그대로 실리고 자료팩 쪽은
+아직 no-base(2-way)다.
 
-잔여 계획 단계 1 넷째 조각. `/api/merge_*` endpoint와 UI는 다음 작업.
+잔여 계획 단계 1 다섯째 조각. 기존 `/api/backup_*`·`/api/pack_*`는 그대로 둔다.
 
 ## 단계
 
-1. `services/merge_plan.py` — 기준값 장부
-   (`프로필/.nai-studio/merge-baseline.json`) load/record, 포인터 해석,
-   `three_way_decision`.
-2. `user_backup_store`:
-   - export — 장부에 기준값이 있는 파일은 manifest에 `base_sha256`(+크기)를
-     적고 JSON 값은 `baseline/<logical>`로 동봉 (스키마 추가 키만 — 구버전은
-     무시하고 읽음).
-   - `backup_diff_plan` — 동봉 기준값을 검증해 change마다 `base`·`decision`
-     부여 (반환 튜플 모양 유지, plan 행에만 추가).
-   - 복원 적용 후 `record_baseline`으로 적용된 파일의 기준값 갱신.
-   - `UserBackupOperations`에 `baseline_lookup`·`record_baseline` 선택 필드.
-3. 새 compat 모듈 `compat/studio_wiring.py` — legacy_surface 줄 예산(8줄)을
-   지키기 위해 baseline 배선 필드를 여기서 조립. legacy에는 import 1줄 +
-   전개 1줄만.
-4. 새 계약 시험: 구형 백업 no-base 유지 · 적용→기준값 기록 → 재내보내기 동봉 ·
-   3-way 판정 4종 · 바이너리 해시 전용 · 구버전 판독 호환.
+1. `services/merge_workflow.py` — 행 투영·응답 조립(순수).
+2. `web/routes/merge_post.py` — `handle_merge_post(request, application,
+   recovery_ops, collection_ops, body)`. 새 Operations dataclass 없이 기존
+   두 세트를 재사용 → 새 바인딩·legacy 변경 0줄.
+3. `server_runtime._dispatch_post` 맨 앞에 merge 그룹 추가
+   (`/api/merge_` 접두는 기존과 충돌 없음).
+4. UI: 기존 백업 검사 목록(studio-admin `backupDiffPaint`)에 3-way 판정
+   배지 표시 (선택 기본값은 바꾸지 않는다 — 통합 검토 화면은 단계 4에서).
+5. 새 계약 시험: 두 소스 preview 행 통일 · apply→undo 핸들 왕복 ·
+   잘못된 source 거부 · 비관할 경로 통과.
 
 ## 완료 조건
 
-- 기존 백업 미리보기·복원·롤백 회귀 통과. 응답은 추가 키만 늘어난다.
-- legacy_surface ≤ 5,500줄.
-- 기준값 장부·ZIP에 토큰이 들어가지 않는다 (설정은 이미 secrets 제거 후 내보냄).
+- 기존 backup·pack 회귀 통과 (기존 endpoint 무변경).
+- do_GET/do_POST ≤40줄·legacy_surface ≤5,500줄 경계 유지 (legacy 변경 0).
+- merge_apply는 preview와 같은 원문·같은 diff 지문일 때만 적용(기존 가드 재사용).
 
 ## 진행 상태
 
-- [x] `services/merge_plan.py` — 장부·포인터 해석·`three_way_decision`·
-      `decision_for_hashes`(바이너리 해시 전용)
-- [x] export 동봉(`baseline/<logical>` + `base_sha256`/`base_size`) ·
-      `backup_diff_plan` 판정 · 복원 후 `record_baseline`(설정은 토큰 제거)
-- [x] `compat/studio_wiring.py` 신설 — legacy_surface에는 import 1줄 +
-      전개 1줄 (5,494줄, 여유 6줄)
-- [x] 새 계약 시험 6개 · 백업 복구 계약 5/5 · 백업 회귀 4/4 · 경계 5/5
+- [x] `services/merge_workflow.py` (순수 투영) · `web/routes/merge_post.py`
+- [x] `_dispatch_post` 맨 앞 merge 그룹 — 새 바인딩 0 · legacy 변경 0줄
+- [x] 백업 검사 목록에 3-way 판정 배지 + 기준값 접기 (기본 선택값 불변)
+- [x] 새 계약 시험 6개 · JS 구문 · 경계 5/5 · 관련 회귀 4/4
 
 ## 금지 범위
 
-- `/api/merge_*` endpoint·UI(다음 작업), 자료팩 쪽 3-way(그다음), 구형 백업
-  자동 변환, push·태그·Release
+- 자료팩 3-way(다음), 통합 검토 화면 재배치(단계 4), 기존 endpoint 제거·변경,
+  push·태그·Release

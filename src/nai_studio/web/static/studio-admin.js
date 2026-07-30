@@ -28,14 +28,26 @@ function backupDiffPaint(reset=false){
     const card = document.createElement('label');
     card.className = 'row';
     card.style.cssText = 'display:block;margin:0;cursor:pointer;';
+    const DECISION_KO = {
+      'take-incoming': '들어오는 값만 바뀜',
+      'keep-current': '내 쪽만 바뀜',
+      'both-changed': '양쪽 다 바뀜 — 직접 선택',
+      'no-base': '공통 기준 없음(2-way)',
+    };
     card.innerHTML = `<div class="bar">
       <input type="checkbox" data-backup-change="${escA(change.id)}" style="width:auto;flex:none;"
         ${change.selected?'checked':''}>
-      <b>${esc(change.logical)}</b><span class="tag">${esc(change.action)}</span></div>
+      <b>${esc(change.logical)}</b><span class="tag">${esc(change.action)}</span>`
+      + (change.decision && change.decision !== 'no-base'
+        ? `<span class="tag">${esc(DECISION_KO[change.decision] || change.decision)}</span>`
+        : '') + `</div>
       <div class="hint">${esc(change.pointer)} · ${esc(change.file_status)}`
       + (change.base_available
         ? ` · 공통 기준 ${esc(String(change.base_sha256).slice(0,12))}`
-        : ' · 공통 기준 미제공') + `</div>
+        : ' · 공통 기준 미제공') + `</div>`
+      + (change.base_found && change.decision !== 'no-base'
+        ? `<details><summary>기준값</summary>${backupValue(change.base, true)}</details>`
+        : '') + `
       <details><summary>현재값</summary>${backupValue(change.current, change.current_exists)}</details>
       <details><summary>들어오는 값</summary>${backupValue(change.incoming, change.incoming_exists)}</details>`;
     card.querySelector('input').addEventListener('change', event => {
