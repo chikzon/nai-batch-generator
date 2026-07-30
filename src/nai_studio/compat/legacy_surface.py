@@ -165,6 +165,7 @@ from src.nai_studio.runtime.data_files import (
 )
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
+from src.nai_studio.runtime import file_transaction as _file_transaction
 from src.nai_studio.runtime import program_entry as _program_entry
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
@@ -3576,13 +3577,42 @@ def _config_initialization_operations():
     )
 
 
+def _file_transaction_paths():
+    return _file_transaction.FileTransactionPaths(root=BASE_DIR)
+
+
+def _file_transaction_operations():
+    return _file_transaction.FileTransactionOperations(
+        transaction=globals()["shared_data_transaction"],
+        atomic_write_bytes=globals()["_atomic_write_bytes"],
+        atomic_write_json=globals()["atomic_write_json"],
+        load_json=globals()["load_json_recover"],
+        replace=globals()["os"].replace,
+        info=log.info,
+        warning=log.warning,
+    )
+
+
+def recover_pending_file_transactions():
+    """기동 시 미완 파일 트랜잭션을 이어서 완료하거나 전체 되돌린다."""
+    try:
+        return _file_transaction.recover_file_transactions(
+            _file_transaction_paths(), _file_transaction_operations())
+    except Exception as exc:  # 복구 실패가 기동을 막으면 안 된다 — journal은 남는다.
+        log.warning(f"파일 트랜잭션 복구를 건너뜁니다: {exc}")
+        return []
+
+
 def load_or_init_config():
     global STARTUP_RECOVERY_NOTICE
+    transaction_notices = recover_pending_file_transactions()
     cfg, STARTUP_RECOVERY_NOTICE = _management_state.load_or_init_config(
         SETTINGS_FILE,
         DEFAULT_CONFIG,
         _config_initialization_operations(),
     )
+    if STARTUP_RECOVERY_NOTICE is None and transaction_notices:
+        STARTUP_RECOVERY_NOTICE = transaction_notices[0]
     return cfg
 
 

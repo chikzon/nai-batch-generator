@@ -2,61 +2,53 @@
 
 ## 목적
 
-현재 `main`의 구조·README·스크린샷·배포 산출물을 같은 HEAD에 맞추고 Claude가 기록을
-섞지 않고 안전하게 push할 수 있는 인계서를 만든다.
+여러 파일을 바꾸는 자료 작업(자료팩·백업·병합)이 공유할 재시작 안전 파일 트랜잭션
+경계를 만든다. staging에 준비 → 검증 → 파일별 교체로 반영하고, journal에
+단계·대상 경로·전후 SHA-256·백업·완료 여부를 남겨 중단 시 다음 기동에서
+이어서 완료하거나 전체 되돌린다.
+
+잔여 계획(코덱스 계획서) 단계 1의 첫 조각이다. 자료팩·백업 경로를 이 경계로
+옮기는 것과 merge plan·3-way 비교는 다음 작업이다.
 
 ## 단계
 
-1. 공개 레거시 진입점과 호환 표면을 분리하고 기존 import·patch 계약을 확인한다.
-2. 현재 개발본을 빈 사용자 데이터에서 실행해 동일한 크기로 화면을 촬영한다.
-3. README와 구조 문서를 현재 코드에 맞추고 참조하지 않는 구형 화면은 외부 보관한다.
-4. 전체 무과금 회귀와 localhost·JavaScript를 마지막 소스 상태에서 한 번 확인한다.
-5. 같은 HEAD로 실행본·자료팩·설치본을 빌드하고 해시를 기록한다.
-6. 그 뒤 코드를 바꾸지 않고 Claude push 인계서를 생성한다.
+1. `runtime/file_transaction.py` — begin/stage/commit/rollback/undo/recover.
+   다중 파일을 완전 원자로 과장하지 않고, 실패 후 원상 복구 가능한 transaction으로.
+2. journal은 `<데이터 루트>/.nai-studio/transactions/<id>/` 아래 journal.json ·
+   staging/ · backup/. 대상 경로는 루트 기준 상대경로만 기록하고 토큰·쿠키를 남기지
+   않는다.
+3. 기동 복구: `load_or_init_config` 진입 시 미완 journal을 검사해
+   staged 내용이 전부 검증되면 이어서 완료, 아니면 백업으로 전체 rollback.
+   결과는 기존 STARTUP_RECOVERY_NOTICE 배너로 알린다.
+4. 새 계약 시험 `tests/contracts/test_file_transaction_contract.py` —
+   정상 commit · 파일별 실패 지점 주입 · 재기동 이어서 완료 · staged 손상 시
+   rollback · commit 후 한 판 undo · 사용자 수정 파일 보호(충돌 기록).
 
 ## 진행 상태
 
-- [x] 기능 본문을 생성·세팅·자료·빌더·관리 서비스와 route로 분류
-- [x] 150줄 이상 제품 함수 0개
-- [x] 자료팩 import·undo coordinator 분해
-- [x] `ApplicationContext` 기반과 첫 실제 경로 의존성 연결
-- [x] `legacy_app.py`를 40줄 미만 호환 진입점으로 축소
-- [x] README를 현재 제품 목적·기능·자료 분리에 맞게 개편
-- [x] 빈 데이터의 현재 개발 화면 촬영과 구형 화면 외부 보관
-- [x] 최종 전체 회귀·localhost·JavaScript 검증
-- [x] 현재 HEAD 최종 빌드·산출물 스모크·해시
-- [x] Claude push 인계서 확정
-
-## 완료 조건
-
-- 분류되지 않은 함수·라우트·UI 진입점이 없다.
-- `legacy_app.py`는 진입점만 남고 새 기능 로직이 없다.
-- 저장 schema, 사용자 파일 경로, endpoint, 응답 형식, 생성 payload 결과가 유지된다.
-- 범주별 관련 시험과 마지막 전체 회귀가 통과한다.
-- 미완료 경계가 있으면 파일·함수·이유를 명시하고 전체 완료라고 쓰지 않는다.
-
-## 남은 구조 부채
-
-- `compat/legacy_surface.py`의 다수 Operations 조립이 아직 기존 전역 이름에 의존한다.
-- `ApplicationContext` 실제 전환은 출력 경로 경계부터 시작한 상태다.
-- 직접 파일 로딩 호환을 위한 제한적 실행 어댑터가 남아 있다.
-
-이 항목들은 숨기지 않되 이번 공개본 정리를 방해하는 기능 결함으로 과장하지 않는다.
+- [x] runtime/file_transaction.py (403줄)
+- [x] legacy_surface 배선 + 기동 복구 연결 (`load_or_init_config` 진입 시 복구,
+      기존 STARTUP_RECOVERY_NOTICE 배너 재사용, 설정 검역 알림이 우선)
+- [x] 계약 시험 11개 (`tests/contracts/test_file_transaction_contract.py`)
+- [x] 관련 시험 통과 — 새 계약 11/11 · 설정 검역 회귀 3/3 · 모듈 경계 5/5
 
 ## 완료 기록
 
-- 챗봇↔NAI 계약 10/10 · 모듈 경계 5/5 · 무과금 회귀 171/171
-- 현재 개발 화면 7장, 모두 빈 사용자 데이터의 1600×1000 PNG
-- 포터블 폴더·포터블 ZIP 기동과 핵심 HTTP 4경로 확인
-- 설치본의 임시 설치·기동·제거 확인
-- 실행본·설치본·기본자료팩과 SHA-256 목록 생성
-- 실제 Persistent API Token 형태 문자열과 개인 자료의 Git 추적 0건
-- push·태그·Release는 하지 않았고 별도 Claude 인계서에 정확한 HEAD와 절차를 기록
+- `legacy_surface.py` 5,485줄 — 경계 5,500 대비 **여유 15줄뿐**.
+  다음 작업부터 새 배선·엔드포인트 연결은 별도 compat 모듈로 뺀다.
+- 되돌리기 중단 방향 보존을 위해 journal에 `rolling-back` 상태를 추가했다
+  (재기동 시 반영 재개와 되돌리기 재개를 구분).
+
+## 완료 조건
+
+- 중단 지점을 어디에 주입해도 재기동 후 자료가 "전부 반영" 또는 "전부 원상" 중
+  하나로 수렴한다 (수렴 불가 항목은 conflict로 기록하고 원본을 보존).
+- 기존 저장 schema·endpoint·응답 형식 변경 없음. `legacy_surface.py`는 배선만
+  늘고 경계 시험(≤5,500줄)을 넘지 않는다.
+- journal·백업에 NAI 토큰이 기록되지 않는다.
 
 ## 금지 범위
 
-- 기능 삭제·축소와 사용자 데이터 자동 변환
-- 저장 schema와 공개 HTTP 계약 변경
-- 관련 없는 새 기능·새 의존성·전면 재작성
-- 저장소 밖의 `성향 표`와 `로그 편집기`
-- Release·태그·push
+- 기존 자료팩·백업 경로의 동작 변경(다음 작업에서 연결)
+- 사용자 자료 자동 변환·삭제, schema 파괴
+- push·태그·Release
