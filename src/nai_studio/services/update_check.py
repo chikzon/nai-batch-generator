@@ -23,7 +23,7 @@ RELEASE_API = (
     "/releases/latest"
 )
 # 빌드의 tools.build.app.APP_VERSION과 계약 시험으로 묶여 있다.
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.2.0"
 SUMS_ASSET_NAME = "SHA256SUMS.txt"
 _SETUP_SUFFIX = "-setup.exe"
 

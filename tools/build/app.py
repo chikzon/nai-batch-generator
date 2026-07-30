@@ -43,7 +43,7 @@ except Exception:
 
 HERE = Path(__file__).resolve().parents[2]
 APP_NAME = "NAI배치생성기"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 PUBLISHER = "ninesdead"
 
 # exe 옆에 놓을 **프로그램 자산**. 후보·태그·세팅 등 내용물은 넣지 않는다.
