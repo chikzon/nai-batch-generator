@@ -32,6 +32,19 @@ URL·ETag·Last-Modified·받은 크기·예상 크기·SHA-256이 일치할 때
 - 정상 Range · Range 미지원 서버 · ETag 변경 · 중단 재개 · 잘못된 Origin ·
   대용량 제한. 기존 공개자료 수집 회귀(pause·resume·변경 판정) 유지.
 
+## 진행 상태
+
+- [x] `services/archive_download.py` — `.part` + sidecar
+      (`nais-archive-download/v1`), 이어받기 조건(URL·ETag/Last-Modified·
+      크기·부분 SHA-256 전부 일치), checkpoint 초과분 truncate 회수,
+      Range 미지원(200)·검증 실패 206은 처음부터, redirect 각 단계
+      HTTPS·공인 주소 재검증, 크기 상한, 중지 시 재개 가능 상태 저장,
+      완료 시 기대 SHA-256 검증 후 원자 교체
+- [x] 새 계약 시험 10개 (정상·중단 재개·ETag 변경·Range 미지원·변조 .part·
+      크기 상한·해시 불일치 폐기·주소 차단·redirect 차단·중지)
+- 네트워크 예외는 호출자에게 전파 — 다음 조각의
+  `/api/archive_download_control`이 잡아 resumable로 보고한다.
+
 ## 금지 범위
 
 - 쿠키·비밀번호 저장, HTTP 평문 허용, 기존 수집 흐름 재작성,
