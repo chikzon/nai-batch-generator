@@ -3594,13 +3594,20 @@ def _file_transaction_operations():
 
 
 def recover_pending_file_transactions():
-    """기동 시 미완 파일 트랜잭션을 이어서 완료하거나 전체 되돌린다."""
-    try:
-        return _file_transaction.recover_file_transactions(
-            _file_transaction_paths(), _file_transaction_operations())
-    except Exception as exc:  # 복구 실패가 기동을 막으면 안 된다 — journal은 남는다.
-        log.warning(f"파일 트랜잭션 복구를 건너뜁니다: {exc}")
-        return []
+    """기동 시 미완 파일 트랜잭션·백업 복원을 수렴시킨다."""
+    notices = []
+    recoveries = (
+        ("파일 트랜잭션", lambda: _file_transaction.recover_file_transactions(
+            _file_transaction_paths(), _file_transaction_operations())),
+        ("백업 복원", lambda: _user_backup_store.recover_unfinished_restores(
+            _user_backup_paths(), _user_backup_operations())),
+    )
+    for label, run in recoveries:
+        try:
+            notices.extend(run())
+        except Exception as exc:  # 복구 실패가 기동을 막으면 안 된다 — journal은 남는다.
+            log.warning(f"{label} 복구를 건너뜁니다: {exc}")
+    return notices
 
 
 def load_or_init_config():

@@ -826,6 +826,62 @@ def _matches_applied(target: Path, operation: Mapping[str, Any]) -> bool:
     )
 
 
+def recover_unfinished_restores(
+    paths: UserBackupPaths,
+    operations: UserBackupOperations,
+) -> list[dict]:
+    """기동 시 ready·applying으로 남은 복원 journal을 전체 되돌려 수렴시킨다.
+
+    복원 journal은 전후 SHA-256과 before/ 백업만 갖고 적용할 새 내용은 없어
+    이어서 완료할 수 없다 — 되돌리기가 유일한 수렴 방향이다. 복원 뒤 사용자가
+    바꾼 파일은 기존 규칙대로 보존하고 건너뛴다.
+    """
+    root = paths.profile_dir / paths.journal_dir_name
+    if not root.is_dir():
+        return []
+    notices: list[dict] = []
+    with operations.transaction(paths.base_dir):
+        for journal_file in sorted(root.glob("*/journal.json")):
+            try:
+                record = operations.load_settings(journal_file)
+            except Exception as exc:
+                operations.warning(
+                    "복원 journal을 읽지 못했습니다: %s (%s)",
+                    journal_file,
+                    exc,
+                )
+                continue
+            if record.get("status") not in ("ready", "applying"):
+                continue
+            journal = journal_file.parent
+            restored, skipped = _rollback_operations(
+                paths, operations, journal, record)
+            record.update(
+                status="rolled_back",
+                rolled_back_at=operations.now().isoformat(timespec="seconds"),
+                startup_recovery=True,
+            )
+            operations.atomic_write_json(journal_file, record, indent=1)
+            notices.append({
+                "schema": "nais-startup-recovery/v1",
+                "kind": "backup-restore",
+                "action": "rolled-back",
+                "id": journal.name,
+                "label": "백업 복원",
+                "files": list(record.get("completed") or []),
+                "folder": str(journal),
+                "conflicts": [],
+                "skipped": skipped,
+            })
+            operations.warning(
+                "중단된 백업 복원을 되돌렸습니다: %s (복구 %d · 보존 %d)",
+                journal.name,
+                restored,
+                skipped,
+            )
+    return notices
+
+
 __all__ = [
     "UserBackupOperations",
     "UserBackupPaths",
@@ -838,6 +894,7 @@ __all__ = [
     "export_user_backup",
     "merge_secrets",
     "preview_user_backup",
+    "recover_unfinished_restores",
     "restore_user_backup",
     "rollback_user_backup",
     "safe_logical",
