@@ -453,6 +453,19 @@ class PublicCollectionManager:
         image_url: str,
     ) -> str | None:
         data, content_type = arca.fetch_image(session, image_url)
+        return self._ingest_image_bytes(article, data, content_type, image_url)
+
+    def _ingest_image_bytes(
+        self,
+        article: Mapping[str, Any],
+        data: bytes,
+        content_type: str,
+        origin_url: str,
+    ) -> str | None:
+        """받은 바이트를 기존 수집 계약(증거·그림체·이미지캐시)으로 들여온다.
+
+        네트워크 수집(_import_image)과 브라우저 relay가 같은 경로를 쓴다.
+        """
         record = self._style_record_from_image(data, content_type, article)
         with self.lock:
             self.state["scanned_images"] += 1
@@ -461,7 +474,8 @@ class PublicCollectionManager:
                 self.state["skipped"] += 1
                 self._save_locked()
             return None
-        local_ref, created = self._local_import_image(data, content_type, image_url)
+        local_ref, created = self._local_import_image(
+            data, content_type, origin_url)
         record["images"] = [local_ref]
         record["content_sha256"] = hashlib.sha256(data).hexdigest()
         evidence_record = evidence_from_image_record(record)
@@ -488,6 +502,63 @@ class PublicCollectionManager:
                 self.state[action] += 1
             self._save_locked()
         return evidence_record["id"]
+
+    def relay_article(
+        self,
+        source_url: str,
+        html_text: str,
+        images: list[tuple[bytes, str]],
+    ) -> dict:
+        """브라우저가 전달한 게시물 하나를 기존 수집 계약 그대로 들여온다.
+
+        네트워크를 쓰지 않는다 — HTML과 이미지 바이트는 사용자가 브라우저에서
+        고른 것이다. 진행·중복 판정·증거 기록은 수집과 같은 상태 파일을 쓴다.
+        """
+        url = arca.normalize_article_url(source_url)
+        article = arca.extract_article(html_text, url)
+        article["board_tab"] = "NAI"
+        digest = self._article_digest(article)
+        with self.lock:
+            previous = copy.deepcopy(
+                (self.state.get("articles") or {}).get(url) or {}
+            )
+        classification = "changed" if previous else "new"
+        if (
+            previous.get("content_sha256") == digest
+            and int(previous.get("metadata_images") or 0)
+        ):
+            metadata_images = int(previous.get("metadata_images") or 0)
+            self._remember_article(article, digest, "unchanged", metadata_images)
+            return {
+                "ok": True,
+                "classification": "unchanged",
+                "metadata_images": metadata_images,
+                "url": url,
+            }
+        evidence_refs, image_errors = [], []
+        for image_index, (data, content_type) in enumerate(images, 1):
+            try:
+                evidence_ref = self._ingest_image_bytes(
+                    article, data, content_type, url)
+                if evidence_ref:
+                    evidence_refs.append(evidence_ref)
+            except Exception as exc:
+                image_errors.append(
+                    f"이미지 {image_index}/{len(images)}: {exc}")
+        self._remember_article(
+            article,
+            digest,
+            classification,
+            len(evidence_refs),
+            evidence_refs=evidence_refs,
+        )
+        return {
+            "ok": not image_errors,
+            "classification": classification,
+            "metadata_images": len(evidence_refs),
+            "url": url,
+            "errors": image_errors,
+        }
 
     def _article_version(
         self, session: Any, url: str

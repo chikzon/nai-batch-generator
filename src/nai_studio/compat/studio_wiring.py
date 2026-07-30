@@ -17,12 +17,14 @@ from src.nai_studio.runtime.data_files import (
     load_json_recover,
 )
 from src.nai_studio.services import archive_download as _archive_download
+from src.nai_studio.services import collection_relay as _collection_relay
 from src.nai_studio.services import evidence_merge as _evidence_merge
 from src.nai_studio.services import merge_plan as _merge_plan
 from src.nai_studio.services import style_store as _style_store
 from src.nai_studio.services.character_storage import safe_name as _safe_name
 
 _ARCHIVE_MANAGER: Any = None
+_RELAY_PAIRING = _collection_relay.RelayPairing()
 
 
 def user_backup_baseline_fields(profile_dir: Path) -> dict[str, Callable]:
@@ -128,6 +130,15 @@ def extra_route_bindings(app: dict) -> dict:
         "evidence_merge": evidence_merge,
         "archive_download_control": (
             lambda data: archive_manager().control(data)),
+        "public_pairing": _RELAY_PAIRING.issue,
+        "public_relay": lambda origin, code, data: (
+            _collection_relay.handle_relay_payload(
+                app["PUBLIC_COLLECTION"],
+                _RELAY_PAIRING,
+                data,
+                origin=origin,
+                pairing_code=code,
+            )),
     }
 
 

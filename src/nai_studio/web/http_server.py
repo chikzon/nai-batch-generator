@@ -44,11 +44,23 @@ STATIC_ASSETS = {
 }
 
 
+# arca.live browser relay만 받는 교차 출처 예외. 최소·명시적으로 유지한다 —
+# 이 경로는 라우트에서 pairing code를 다시 검증한다.
+RELAY_POST_PATHS = ("/api/public_collection_relay",)
+RELAY_ALLOWED_ORIGIN = "https://arca.live"
+
+
 class ConfigRequestHandler(BaseHTTPRequestHandler):
     """기능 라우트가 공유하는 localhost 보안·응답 계약."""
 
     def log_message(self, *args: Any) -> None:
         pass
+
+    def _relay_request(self) -> bool:
+        return (
+            self.path.startswith(RELAY_POST_PATHS)
+            and self.headers.get("Origin") == RELAY_ALLOWED_ORIGIN
+        )
 
     def _json(self, obj: Any, status: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -57,9 +69,35 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        if self._relay_request():
+            # 브라우저의 relay 스크립트가 응답을 읽을 수 있어야 한다.
+            self.send_header(
+                "Access-Control-Allow-Origin", RELAY_ALLOWED_ORIGIN)
+            self.send_header("Vary", "Origin")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler 규약
+        """relay 경로의 CORS·Private Network Access preflight만 허용한다."""
+        if not self._relay_request():
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        self.send_header(
+            "Access-Control-Allow-Origin", RELAY_ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers", "Content-Type, X-Pairing-Code")
+        requested = (
+            self.headers.get("Access-Control-Request-Private-Network") or ""
+        ).lower()
+        if requested == "true":
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+        self.end_headers()
 
     def _trusted_post(self) -> bool:
         """다른 웹사이트가 localhost API를 대신 호출하지 못하게 한다."""
@@ -68,6 +106,9 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             host = urlparse("http://" + (self.headers.get("Host") or ""))
             if host.hostname not in allowed or host.port != self.server.server_port:
                 return False
+            if self.path.startswith(RELAY_POST_PATHS):
+                # 유일한 교차 출처 예외 — pairing code 검증은 라우트의 몫이다.
+                return self.headers.get("Origin") == RELAY_ALLOWED_ORIGIN
             origin = self.headers.get("Origin")
             if origin:
                 source = urlparse(origin)

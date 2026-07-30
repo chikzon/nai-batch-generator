@@ -35,6 +35,8 @@ class CollectionPostOperations:
     reference_add: Any
     reference_save: Any
     archive_download_control: Any
+    public_pairing: Any
+    public_relay: Any
 
 
 def _json_body(body: bytes) -> dict:
@@ -53,6 +55,14 @@ def _public_collection(
 ) -> bool:
     data = _json_body(body)
     routes = (
+        # ⚠ pairing·relay가 start/retry/control보다 먼저 와야 하는 것은
+        # 아니지만, 접두가 서로 겹치지 않는지 늘 확인할 것.
+        ("/api/public_collection_pairing", lambda: operations.public_pairing()),
+        ("/api/public_collection_relay", lambda: operations.public_relay(
+            request.headers.get("Origin", ""),
+            request.headers.get("X-Pairing-Code", ""),
+            data,
+        )),
         ("/api/public_collection_start", lambda: operations.public_start(data)),
         ("/api/public_collection_retry", lambda: operations.public_retry(data)),
         ("/api/public_collection_control", lambda: operations.public_control(

@@ -393,6 +393,8 @@ class ArchiveDownloadRouteContractTests(unittest.TestCase):
             reference_save=None,
             archive_download_control=lambda data: (
                 log.append(data), {"ok": True, "echo": data})[1],
+            public_pairing=None,
+            public_relay=None,
         )
         request = FakeRequest()
         handled = handle_collection_post(
