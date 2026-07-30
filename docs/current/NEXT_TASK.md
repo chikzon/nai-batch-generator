@@ -2,42 +2,29 @@
 
 ## 목적
 
-백업·자료팩 충돌 검토를 하나의 공통 merge plan 표면으로 통합하는
-`/api/merge_preview` · `/api/merge_apply` · `/api/merge_undo` endpoint를 만든다.
-기존 preview·apply·undo 엔진(백업 workflow · 자료팩 workflow)에 위임하고,
-행 모양만 통일한다({id, source, kind, label, decision, base/current/incoming,
-recoverable}). 백업 쪽은 3-way 판정(3f63f15)이 그대로 실리고 자료팩 쪽은
-아직 no-base(2-way)다.
+잔여 계획 단계 2 첫 조각 — 증거·지식 정제 작업면의 공통 병합 서비스.
+기존 `merge_style_evidence`(style_store) · `merge_evaluations`(domain/evaluation) ·
+`merge_resources`(domain/resources)를 한 병합 서비스에서 쓰도록 묶고,
+자료실의 중복 후보(find_style_dupes 결과)를 나란히 비교하는 데 필요한
+자료(원본 이미지·출처·메타데이터·생성 설정·평가)를 한 응답으로 투영한다.
 
-잔여 계획 단계 1 다섯째 조각. 기존 `/api/backup_*`·`/api/pack_*`는 그대로 둔다.
+## 원칙 (계획서 단계 2)
 
-## 단계
+- 사용자가 대표 자산을 선택하거나 증거만 합친다. 원본 자산 자동 삭제 금지.
+- weighted prompt는 원문 그대로 유지, 공통·좌측 전용·우측 전용 구간만 비교
+  표시. 자동 의미 병합·prompt 재작성 금지. 최종 원문은 사용자가 확정.
+- 기존 caret 가중치 버튼·무손실 저장 유지.
+- parser tree·hover-wheel·범용 DSL은 구현하지 않는다 (결함 근거 없음).
 
-1. `services/merge_workflow.py` — 행 투영·응답 조립(순수).
-2. `web/routes/merge_post.py` — `handle_merge_post(request, application,
-   recovery_ops, collection_ops, body)`. 새 Operations dataclass 없이 기존
-   두 세트를 재사용 → 새 바인딩·legacy 변경 0줄.
-3. `server_runtime._dispatch_post` 맨 앞에 merge 그룹 추가
-   (`/api/merge_` 접두는 기존과 충돌 없음).
-4. UI: 기존 백업 검사 목록(studio-admin `backupDiffPaint`)에 3-way 판정
-   배지 표시 (선택 기본값은 바꾸지 않는다 — 통합 검토 화면은 단계 4에서).
-5. 새 계약 시험: 두 소스 preview 행 통일 · apply→undo 핸들 왕복 ·
-   잘못된 source 거부 · 비관할 경로 통과.
+## 참고 (단계 1 완료 상태 — 커밋 9470efd·3c36d5c·56ee240·3f63f15·5e9eb93)
 
-## 완료 조건
-
-- 기존 backup·pack 회귀 통과 (기존 endpoint 무변경).
-- do_GET/do_POST ≤40줄·legacy_surface ≤5,500줄 경계 유지 (legacy 변경 0).
-- merge_apply는 preview와 같은 원문·같은 diff 지문일 때만 적용(기존 가드 재사용).
-
-## 진행 상태
-
-- [x] `services/merge_workflow.py` (순수 투영) · `web/routes/merge_post.py`
-- [x] `_dispatch_post` 맨 앞 merge 그룹 — 새 바인딩 0 · legacy 변경 0줄
-- [x] 백업 검사 목록에 3-way 판정 배지 + 기준값 접기 (기본 선택값 불변)
-- [x] 새 계약 시험 6개 · JS 구문 · 경계 5/5 · 관련 회귀 4/4
+- 파일 트랜잭션 journal 경계 + 자료팩 staging + 백업 복원 기동 복구
+- 3-way 기준값 (백업 왕복) + `/api/merge_preview·apply·undo` 공통 표면
+- 남긴 것: 자료팩 쪽 3-way(기준값 장부 연계), 통합 검토 화면 배치(단계 4),
+  가져온백업/트랜잭션 backup 이중 보관 정리(후보)
+- ⚠ legacy_surface 5,494/5,500줄 — 새 배선은 전부 `compat/studio_wiring.py`에
 
 ## 금지 범위
 
-- 자료팩 3-way(다음), 통합 검토 화면 재배치(단계 4), 기존 endpoint 제거·변경,
+- 원본 자산 자동 삭제·의미 병합, prompt 재작성, 기존 저장 schema 변경,
   push·태그·Release
