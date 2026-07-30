@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -347,8 +348,153 @@ def download_archive(
     }
 
 
+class ArchiveDownloadManager:
+    """archive를 한 번에 하나씩 받는 백그라운드 작업.
+
+    진행 상태의 진실은 sidecar다 — 조회는 sidecar를 읽고, 재시작 후에도
+    같은 URL이면 이어받는다. 쿠키·토큰은 저장하지 않는다.
+    """
+
+    def __init__(
+        self,
+        destination_root: Callable[[], Path],
+        operations_factory: Callable[
+            [Callable[[], bool]], ArchiveDownloadOperations],
+        *,
+        download: Callable[..., dict] = download_archive,
+        safe_name: Callable[[str], str] | None = None,
+    ) -> None:
+        self._destination_root = destination_root
+        self._operations_factory = operations_factory
+        self._download = download
+        self._safe_name = safe_name or (lambda value: value)
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._state: dict = {
+            "running": False,
+            "url": "",
+            "destination": "",
+            "result": None,
+        }
+
+    def _destination_for(self, url: str, filename: str) -> Path:
+        name = self._safe_name(
+            str(filename or "").strip()
+            or Path(urlsplit(str(url)).path).name
+            or "archive.zip"
+        )
+        root = Path(self._destination_root())
+        target = (root / name).resolve()
+        if root.resolve() != target.parent:
+            raise ArchiveDownloadError("받을 파일 이름이 올바르지 않습니다.")
+        return target
+
+    def start(
+        self,
+        url: Any,
+        filename: str = "",
+        expected_sha256: str = "",
+        max_bytes: Any = None,
+    ) -> dict:
+        with self._lock:
+            if self._state["running"]:
+                return {
+                    "ok": False,
+                    "error": "이미 받는 중입니다. 멈추거나 끝난 뒤 시작하세요.",
+                }
+            operations = self._operations_factory(self._stop.is_set)
+            try:
+                validate_archive_url(str(url or ""), operations.resolve_host)
+                destination = self._destination_for(str(url), filename)
+            except ArchiveDownloadError as exc:
+                return {"ok": False, "error": str(exc)}
+            self._stop.clear()
+            self._state.update(
+                running=True,
+                url=str(url),
+                destination=str(destination),
+                result=None,
+            )
+            extra = {}
+            if max_bytes is not None:
+                extra["max_bytes"] = int(max_bytes)
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(str(url), destination, str(expected_sha256 or ""), extra),
+                daemon=True,
+            )
+            self._thread.start()
+            return {"ok": True, "destination": str(destination)}
+
+    def _run(
+        self,
+        url: str,
+        destination: Path,
+        expected_sha256: str,
+        extra: dict,
+    ) -> None:
+        operations = self._operations_factory(self._stop.is_set)
+        try:
+            result = self._download(
+                operations,
+                url,
+                destination,
+                expected_sha256=expected_sha256,
+                **extra,
+            )
+        except ArchiveDownloadError as exc:
+            result = {"ok": False, "resumable": False, "error": str(exc)}
+        except Exception as exc:
+            # 네트워크 단절 — checkpoint까지는 sidecar에 있으니 이어받는다.
+            result = {
+                "ok": False,
+                "resumable": True,
+                "error": f"연결이 끊겼습니다: {exc}",
+            }
+        with self._lock:
+            self._state.update(running=False, result=result)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            state = dict(self._state)
+        destination = state.get("destination") or ""
+        if destination:
+            sidecar = Path(destination).with_name(
+                Path(destination).name + ".download.json")
+            if sidecar.is_file():
+                try:
+                    operations = self._operations_factory(lambda: False)
+                    saved = operations.load_json(sidecar)
+                    state["received"] = int(saved.get("received") or 0)
+                    state["expected_size"] = int(
+                        saved.get("expected_size") or 0)
+                except Exception:
+                    pass
+        state["ok"] = True
+        return state
+
+    def control(self, data: Any) -> dict:
+        data = data if isinstance(data, dict) else {}
+        action = str(data.get("action") or "status").strip().lower()
+        if action == "start":
+            return self.start(
+                data.get("url"),
+                filename=str(data.get("filename") or ""),
+                expected_sha256=str(data.get("sha256") or ""),
+                max_bytes=data.get("max_bytes"),
+            )
+        if action == "stop":
+            self._stop.set()
+            return {"ok": True, "stopping": True}
+        if action == "status":
+            return self.snapshot()
+        return {"ok": False, "error": f"모르는 동작입니다: {action}"}
+
+
 __all__ = [
     "ArchiveDownloadError",
+    "ArchiveDownloadManager",
     "ArchiveDownloadOperations",
     "DOWNLOAD_STATE_SCHEMA",
     "download_archive",

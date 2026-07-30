@@ -34,6 +34,7 @@ class CollectionPostOperations:
     resource_import: Any
     reference_add: Any
     reference_save: Any
+    archive_download_control: Any
 
 
 def _json_body(body: bytes) -> dict:
@@ -127,6 +128,9 @@ def handle_collection_post(
             request._json(operations.import_settings(
                 body, unquote(request.headers.get("X-Filename", ""))
             ))
+        elif request.path.startswith("/api/archive_download_control"):
+            request._json(
+                operations.archive_download_control(_json_body(body)))
         elif _public_collection(request, operations, body):
             pass
         elif _reference_import(request, operations, body):

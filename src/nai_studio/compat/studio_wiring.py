@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,9 +16,13 @@ from src.nai_studio.runtime.data_files import (
     atomic_write_json,
     load_json_recover,
 )
+from src.nai_studio.services import archive_download as _archive_download
 from src.nai_studio.services import evidence_merge as _evidence_merge
 from src.nai_studio.services import merge_plan as _merge_plan
 from src.nai_studio.services import style_store as _style_store
+from src.nai_studio.services.character_storage import safe_name as _safe_name
+
+_ARCHIVE_MANAGER: Any = None
 
 
 def user_backup_baseline_fields(profile_dir: Path) -> dict[str, Callable]:
@@ -84,9 +89,45 @@ def extra_route_bindings(app: dict) -> dict:
                     result.pop("batch"))
         return result
 
+    def archive_manager():
+        """프로세스에 하나뿐인 archive 다운로드 작업. app 전역은 호출 때 읽는다."""
+        global _ARCHIVE_MANAGER
+        if _ARCHIVE_MANAGER is None:
+            def resolve_host(host):
+                return sorted({
+                    item[4][0] for item in socket.getaddrinfo(host, 443)
+                })
+
+            def operations_factory(should_stop):
+                return _archive_download.ArchiveDownloadOperations(
+                    open_stream=lambda url, headers: app["requests"].get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=(10, 60),
+                        allow_redirects=False,
+                    ),
+                    resolve_host=resolve_host,
+                    atomic_write_json=app["atomic_write_json"],
+                    load_json=app["load_json_recover"],
+                    should_stop=should_stop,
+                    info=app["log"].info,
+                    warning=app["log"].warning,
+                )
+
+            _ARCHIVE_MANAGER = _archive_download.ArchiveDownloadManager(
+                destination_root=lambda: (
+                    Path(app["BASE_DIR"]) / "수집" / "받기"),
+                operations_factory=operations_factory,
+                safe_name=_safe_name,
+            )
+        return _ARCHIVE_MANAGER
+
     return {
         "evidence_compare": evidence_compare,
         "evidence_merge": evidence_merge,
+        "archive_download_control": (
+            lambda data: archive_manager().control(data)),
     }
 
 

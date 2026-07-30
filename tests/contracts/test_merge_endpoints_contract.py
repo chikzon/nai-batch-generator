@@ -138,6 +138,7 @@ def collection_ops(import_log: list) -> CollectionPostOperations:
         resource_import=None,
         reference_add=None,
         reference_save=None,
+        archive_download_control=None,
     )
 
 

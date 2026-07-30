@@ -1,6 +1,26 @@
 # 현재 작업
 
-## 목적
+## 다음 작업 (단계 3 셋째 조각)
+
+arca.live 전용 browser relay — 로그인 자료를 쿠키·비밀번호 저장 없이
+브라우저가 직접 localhost로 전달한다.
+- `/api/public_collection_pairing`: 매 실행 1회용 pairing code 발급
+- `/api/public_collection_relay`: code + 허용 Origin(arca.live) + 크기 제한 +
+  CORS/Private Network Access 검증 후, 사용자가 고른 게시물의 HTML·이미지
+  바이트만 수신 → 기존 공개자료 복원 큐·증거 계약으로 투입 (별도 저장 체계
+  금지, 기존 `_import_article` 경로 재사용)
+- ⚠ http_server의 POST 신뢰 검사(_trusted_post)는 localhost Origin만 허용
+  한다 — relay는 브라우저(외부 Origin)에서 오므로 이 두 경로만 pairing code
+  검증으로 예외를 열어야 한다. 예외는 최소·명시적으로.
+
+## 완료 조각 2 — /api/archive_download_control (이 커밋)
+
+- `ArchiveDownloadManager` — 한 번에 하나, 시작 전 URL 검증, 중지 시
+  resumable, 상태 조회는 sidecar가 진실, 파일명 탈출 거부
+- collection_post 라우트 + studio_wiring 바인딩 (legacy 0줄)
+- 시험: 매니저 4개 + 라우트 1개. UI는 단계 4 검토 흐름에서.
+
+## 원래 목적 (첫 조각 — 완료 dd9ad41)
 
 잔여 계획 단계 3 첫 조각 — 대형 archive 다운로드의 HTTP Range 재개.
 `.part` 파일과 sidecar 상태(JSON)로 중단 지점을 기록하고,

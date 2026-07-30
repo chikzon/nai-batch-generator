@@ -264,5 +264,144 @@ class ArchiveDownloadContractTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class ArchiveDownloadManagerContractTests(unittest.TestCase):
+    def setUp(self):
+        import threading
+
+        from src.nai_studio.services.archive_download import (
+            ArchiveDownloadManager,
+        )
+
+        self.temp = tempfile.TemporaryDirectory(prefix="nais-dlm-")
+        self.root = Path(self.temp.name) / "수집" / "받기"
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls: list = []
+
+        def fake_download(operations, url, destination, **kwargs):
+            self.calls.append((url, str(destination), kwargs))
+            self.started.set()
+            self.release.wait(timeout=5)
+            if operations.should_stop():
+                return {"ok": False, "resumable": True, "error": "중지"}
+            return {"ok": True, "path": str(destination), "bytes": 3}
+
+        def operations_factory(should_stop):
+            return ArchiveDownloadOperations(
+                open_stream=lambda url, headers: None,
+                resolve_host=lambda host: ["93.184.216.34"],
+                atomic_write_json=atomic_write_json,
+                load_json=load_json_recover,
+                should_stop=should_stop,
+            )
+
+        self.manager = ArchiveDownloadManager(
+            destination_root=lambda: self.root,
+            operations_factory=operations_factory,
+            download=fake_download,
+        )
+
+    def tearDown(self):
+        self.release.set()
+        self.temp.cleanup()
+
+    def wait_done(self):
+        for _ in range(100):
+            if not self.manager.snapshot()["running"]:
+                return
+            import time
+            time.sleep(0.02)
+        self.fail("작업이 끝나지 않았습니다")
+
+    def test_start_stop_status_round_trip(self):
+        result = self.manager.control({"action": "start", "url": URL})
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(self.started.wait(timeout=5))
+        status = self.manager.control({"action": "status"})
+        self.assertTrue(status["running"])
+        # 진행 중 중복 시작 거부
+        again = self.manager.control({"action": "start", "url": URL})
+        self.assertFalse(again["ok"])
+        stop = self.manager.control({"action": "stop"})
+        self.assertTrue(stop["ok"])
+        self.release.set()
+        self.wait_done()
+        status = self.manager.control({"action": "status"})
+        self.assertFalse(status["running"])
+        self.assertTrue(status["result"]["resumable"])
+        # 끝난 뒤 재시작 가능
+        self.release.clear()
+        self.started.clear()
+        result = self.manager.control({"action": "start", "url": URL})
+        self.assertTrue(result["ok"])
+        self.release.set()
+        self.wait_done()
+
+    def test_bad_url_is_rejected_before_thread_starts(self):
+        result = self.manager.control(
+            {"action": "start", "url": "http://files.example.com/a.zip"})
+        self.assertFalse(result["ok"])
+        self.assertFalse(self.manager.snapshot()["running"])
+
+    def test_filename_escape_is_rejected(self):
+        result = self.manager.control({
+            "action": "start",
+            "url": URL,
+            "filename": "..\\밖.zip",
+        })
+        self.assertFalse(result["ok"])
+
+    def test_unknown_action_is_rejected(self):
+        result = self.manager.control({"action": "fly"})
+        self.assertFalse(result["ok"])
+
+
+class ArchiveDownloadRouteContractTests(unittest.TestCase):
+    def test_collection_post_routes_control_body(self):
+        from src.nai_studio.web.routes.collection_post import (
+            CollectionPostOperations,
+            handle_collection_post,
+        )
+
+        class FakeRequest:
+            path = "/api/archive_download_control"
+            headers: dict = {}
+
+            def __init__(self):
+                self.sent = None
+
+            def _json(self, payload):
+                self.sent = payload
+
+        log: list = []
+        operations = CollectionPostOperations(
+            preview_pack=None,
+            import_pack=None,
+            pack_queue=None,
+            summarize_queue=None,
+            forget_caches=None,
+            load_spec=None,
+            options=None,
+            load_options=None,
+            public_start=None,
+            public_retry=None,
+            public_control=None,
+            undo_pack=None,
+            import_settings=None,
+            resource_import=None,
+            reference_add=None,
+            reference_save=None,
+            archive_download_control=lambda data: (
+                log.append(data), {"ok": True, "echo": data})[1],
+        )
+        request = FakeRequest()
+        handled = handle_collection_post(
+            request, None, operations,
+            b'{"action": "status"}')
+        self.assertTrue(handled)
+        self.assertTrue(request.sent["ok"])
+        self.assertEqual(log, [{"action": "status"}])
+
+
 if __name__ == "__main__":
     unittest.main()
