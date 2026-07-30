@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import io
 import json
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image
+
+from src.nai_studio.runtime import file_transaction as file_txn
 
 
 _BACKUP_MISSING = object()
@@ -70,6 +73,8 @@ class DatapackOperations:
     pack_queue: Callable[..., Any]
     summarize_queue: Callable[[Any], Any]
     warning: Callable[[str], Any]
+    # 파일별 교체 지점. 실패 주입 시험을 위해 갈아끼울 수 있다.
+    replace: Callable[[Any, Any], None] = os.replace
 
 
 def datapack_lists(paths: DatapackPaths) -> dict[str, tuple[Path, str]]:
@@ -1302,6 +1307,81 @@ def _finalize_datapack_import(
     return result
 
 
+def _transaction_boundary(
+    paths: DatapackPaths,
+    operations: DatapackOperations,
+) -> tuple[file_txn.FileTransactionPaths, file_txn.FileTransactionOperations]:
+    """설치가 쓸 파일 트랜잭션 경계를 주입된 공통 경계로 조립한다."""
+    txn_paths = file_txn.FileTransactionPaths(root=paths.base_dir)
+    txn_ops = file_txn.FileTransactionOperations(
+        transaction=operations.transaction,
+        atomic_write_bytes=operations.atomic_write_bytes,
+        atomic_write_json=operations.atomic_write_json,
+        load_json=operations.load_json,
+        replace=operations.replace,
+        info=lambda *_: None,
+        warning=operations.warning,
+    )
+    return txn_paths, txn_ops
+
+
+def _stage_rel(paths: DatapackPaths, path: Any) -> str | None:
+    """staging 대상 판정. base_dir 밖·가져온백업·journal은 즉시 쓴다."""
+    try:
+        relative = Path(path).resolve().relative_to(
+            Path(paths.base_dir).resolve())
+    except (OSError, ValueError):
+        return None
+    posix = relative.as_posix()
+    if posix.startswith("수집/가져온백업/") or posix.startswith(".nai-studio/"):
+        return None
+    return posix
+
+
+def _staged_operations(
+    paths: DatapackPaths,
+    operations: DatapackOperations,
+    txn_paths: file_txn.FileTransactionPaths,
+    txn_ops: file_txn.FileTransactionOperations,
+    journal: dict,
+    staged: dict[str, bytes],
+) -> DatapackOperations:
+    """설치 중 대상 파일 쓰기를 staging으로 돌린 operations 사본.
+
+    방금 stage한 파일의 재읽기는 staged 내용을 돌려준다.
+    ponytail: 디스크에 없는 파일을 한 ZIP에서 같은 이름으로 두 번 넣는
+    기형 자료팩은 뒤의 내용이 이긴다 — 정상 자료팩에는 없는 모양이다.
+    """
+
+    def write_bytes(path, payload, keep_backup=True, **kwargs):
+        relative = _stage_rel(paths, path)
+        if relative is None:
+            operations.atomic_write_bytes(
+                path, payload, keep_backup=keep_backup, **kwargs)
+            return
+        file_txn.stage_file_bytes(
+            txn_paths, txn_ops, journal, relative, bytes(payload))
+        staged[relative] = bytes(payload)
+
+    def write_json(path, data, indent=2, keep_backup=True, **kwargs):
+        raw = json.dumps(
+            data, ensure_ascii=False, indent=indent).encode("utf-8")
+        write_bytes(path, raw, keep_backup=keep_backup)
+
+    def load_json(path):
+        relative = _stage_rel(paths, path)
+        if relative is not None and relative in staged:
+            return json.loads(staged[relative].decode("utf-8"))
+        return operations.load_json(path)
+
+    return dataclasses.replace(
+        operations,
+        atomic_write_bytes=write_bytes,
+        atomic_write_json=write_json,
+        load_json=load_json,
+    )
+
+
 def _import_datapack_bytes(
     paths: DatapackPaths,
     operations: DatapackOperations,
@@ -1332,12 +1412,23 @@ def _import_datapack_bytes(
         selected_lists,
         selected_whole,
     )
+    # 설치 전체를 staging에 준비하고 journal과 함께 파일별 교체로 반영한다.
+    # 여기서 중단되면 기동 복구가 이어서 완료하거나 전체 되돌린다.
+    txn_paths, txn_ops = _transaction_boundary(paths, operations)
+    journal = file_txn.begin_file_transaction(
+        txn_paths, txn_ops, f"자료팩 적용: {state.batch['file']}")
+    staged: dict[str, bytes] = {}
+    state.operations = _staged_operations(
+        paths, operations, txn_paths, txn_ops, journal, staged)
     if data[:2] == b"PK":
         _import_datapack_archive(state, data, schema)
     else:
         error = _import_single_datapack(state, data, filename)
         if error:
             return error
+    state.batch["transaction"] = journal["id"]
+    file_txn.commit_file_transaction(txn_paths, txn_ops, journal)
+    state.operations = operations
     return _finalize_datapack_import(state, filename)
 
 
