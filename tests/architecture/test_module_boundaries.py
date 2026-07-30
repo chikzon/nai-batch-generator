@@ -77,7 +77,7 @@ class LegacyGrowthBoundaryTests(unittest.TestCase):
         compatibility = compatibility_path.read_text(encoding="utf-8")
         # 레거시 축소 진행 중 — wiring 이동이 끝난 만큼 상한을 내려
         # 역증가를 차단한다. 새 기능은 이 표면에 추가하지 않는다.
-        self.assertLessEqual(len(compatibility.splitlines()), 5_300)
+        self.assertLessEqual(len(compatibility.splitlines()), 5_100)
 
         transport = (
             ROOT / "src" / "nai_studio" / "web" / "server_runtime.py"
