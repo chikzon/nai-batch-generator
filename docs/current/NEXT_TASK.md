@@ -15,10 +15,11 @@
       user_backup). legacy_surface 5,495 → **5,386줄** (−109)
       검증: 자료팩·백업·로컬이미지·색인·메타 회귀 16/16 · exports 계약 7 ·
       관련 계약 16 · 경계 5
-- [ ] 조각 2 — 자료실·수집·빌더 계열 (style_store · style_catalog ·
-      artist_rating · artist_workspace · library_catalog · tag_catalog ·
-      builder_handlers · catalog_search · remote_image_cache ·
-      fragment_import · public_style_import)
+- [x] 조각 2 — 자료실·수집·빌더 계열 23함수 → wiring/library.py
+      (style_store · style_catalog · artist_rating · artist_workspace ·
+      library_catalog · tag_catalog · builder_handlers · catalog_search ·
+      remote_image_cache · fragment_import · public_style_import)
+      5,386 → **5,253줄** (−133). 회귀 18/18 · 계약 28 · 경계 5
 - [ ] 조각 3 — 생성 계열 (reference · auxiliary · generation_step/retry/
       commit/execution · handler bindings 3벌 · image_tool · collection ·
       pacing) → `wiring/generation.py`

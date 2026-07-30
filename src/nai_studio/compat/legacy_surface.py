@@ -946,29 +946,15 @@ _TAGV_CACHE = {}
 
 
 def _catalog_search_paths():
-    return _catalog_search.CatalogSearchPaths(settings_file=SETTINGS_FILE)
+    return _wiring_library.catalog_search_paths(globals())
 
 
 def _catalog_search_state():
-    return _catalog_search.CatalogSearchState(
-        booru_keys=_BOORU_KEYS,
-        booru_last=_BOORU_LAST,
-        booru_lock=_BOORU_LOCK,
-        tag_cache=_TAGV_CACHE,
-    )
+    return _wiring_library.catalog_search_state(globals())
 
 
 def _catalog_search_operations():
-    """현재 HTTP·시간·로그 객체를 주입해 기존 APP monkeypatch 계약을 보존한다."""
-    return _catalog_search.CatalogSearchOperations(
-        request_get=requests.get,
-        request_errors=(requests.exceptions.RequestException,),
-        clock=time.time,
-        sleep=time.sleep,
-        log_info=log.info,
-        log_warning=log.warning,
-        user_agent=BOORU_UA,
-    )
+    return _wiring_library.catalog_search_operations(globals())
 
 
 def booru_creds(site):
@@ -1170,27 +1156,11 @@ def _img_origin_path():
 
 
 def _remote_image_cache_paths():
-    """patch 가능한 레거시 경로·상한·MIME 계약을 서비스에 늦게 연결한다."""
-    return _remote_image_cache.RemoteImageCachePaths(
-        image_cache=IMG_CACHE,
-        remote_cache=REMOTE_CACHE,
-        origin_file=_img_origin_path(),
-        cap_mb=REMOTE_CAP_MB,
-        mime=MIME,
-    )
+    return _wiring_library.remote_image_cache_paths(globals())
 
 
 def _remote_image_cache_operations():
-    """현재 HTTP·원자 저장·복구·로그 의존성을 서비스에 주입한다."""
-    return _remote_image_cache.RemoteImageCacheOperations(
-        http_get=requests.get,
-        load_json=load_json_recover,
-        atomic_write_bytes=_atomic_write_bytes,
-        atomic_write_json=atomic_write_json,
-        warning=log.warning,
-        info=log.info,
-        origin_lock=_ORIGIN_LOCK,
-    )
+    return _wiring_library.remote_image_cache_operations(globals())
 
 
 def load_image_origins():
@@ -1270,26 +1240,11 @@ def _style_value(record, *names):
 
 
 def _style_store_paths():
-    return _style_store.StyleStorePaths(
-        style_file=STYLE_FILE,
-        transaction_root=STYLE_FILE.parent.parent,
-        trash_file=_trashed_style_path(),
-    )
+    return _wiring_library.style_store_paths(globals())
 
 
 def _style_store_operations():
-    """현재 저장·모델·Undo 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
-    return _style_store.StyleStoreOperations(
-        transaction=shared_data_transaction,
-        lock=_STYLE_TX_LOCK,
-        load_rows=load_combos,
-        atomic_write_json=atomic_write_json,
-        normalize_model=model_id_from_metadata,
-        forget_caches=forget_collection_caches,
-        record_import_batch=record_import_batch,
-        load_json=load_json_recover,
-        deletion_stamp=lambda: time.strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    return _wiring_library.style_store_operations(globals())
 
 
 def canonical_style_settings(record):
@@ -1333,12 +1288,7 @@ def _merge_style_evidence(existing, incoming):
 # 작가 태그는 낱개가 아니라 묶음이 기본이다. `1.7::artist:a::` `.9::artist:b::`
 # `0.6::artist:a, artist:b::`(한 가중치가 여럿에 걸림) 모두 순서·가중치를 지켜 읽는다.
 def _artist_workspace_operations():
-    """현재 난수·태그 결합 함수를 주입해 seed와 APP patch 계약을 보존한다."""
-    return _artist_workspace.ArtistWorkspaceOperations(
-        seeded_random=random.Random,
-        system_random=random.SystemRandom,
-        join_tags=_join_tags,
-    )
+    return _wiring_library.artist_workspace_operations(globals())
 
 
 def parse_artist_combo(text):
@@ -1365,19 +1315,11 @@ def artist_workspace_request(data):
 
 
 def _style_catalog_paths():
-    return _library_catalog.StyleCatalogPaths(
-        style_file=STYLE_FILE,
-        combo_file=COMBO_FILE,
-    )
+    return _wiring_library.style_catalog_paths(globals())
 
 
 def _style_catalog_operations():
-    return _library_catalog.StyleCatalogOperations(
-        load_json=load_json_recover,
-        info=log.info,
-        warning=log.warning,
-        lock=_COMBOS_LOCK,
-    )
+    return _wiring_library.style_catalog_operations(globals())
 
 
 def load_combos():
@@ -1495,29 +1437,15 @@ def artist_key(name):
 
 
 def _artist_rating_paths():
-    return _artist_rating_store.ArtistRatingPaths(
-        ratings_file=RATINGS_FILE,
-    )
+    return _wiring_library.artist_rating_paths(globals())
 
 
 def _artist_rating_state():
-    return _artist_rating_store.ArtistRatingState(
-        cache=_RATINGS,
-        lock=_RATINGS_LOCK,
-    )
+    return _wiring_library.artist_rating_state(globals())
 
 
 def _artist_rating_operations():
-    """현재 저장 경계와 patch 가능한 조회·저장 함수를 서비스에 늦게 연결한다."""
-    return _artist_rating_store.ArtistRatingOperations(
-        transaction=shared_data_transaction,
-        load_json=load_json_recover,
-        atomic_write_json=atomic_write_json,
-        parse_artist_combo=parse_artist_combo,
-        warning=log.warning,
-        current_loader=lambda: globals()["load_ratings"](),
-        current_saver=lambda data: globals()["save_ratings"](data),
-    )
+    return _wiring_library.artist_rating_operations(globals())
 
 
 def load_ratings():
@@ -1572,36 +1500,15 @@ LIBRARY_REVIEW_STATUSES = {"pending", "reviewed", "hold"}
 
 
 def _library_catalog_paths():
-    return _library_catalog.LibraryCatalogPaths(
-        review_file=LIBRARY_REVIEW_FILE,
-        review_schema="nais-library-review/v1",
-        review_statuses=frozenset(LIBRARY_REVIEW_STATUSES),
-    )
+    return _wiring_library.library_catalog_paths(globals())
 
 
 def _library_catalog_state():
-    return _library_catalog.LibraryCatalogState(
-        combo_cache=_COMBOS,
-        style_sorts=STYLE_SORTS,
-    )
+    return _wiring_library.library_catalog_state(globals())
 
 
 def _library_catalog_operations():
-    """현재 자료 공급자와 저장 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
-    return _library_catalog.LibraryCatalogOperations(
-        load_combos=load_combos,
-        load_ratings=load_ratings,
-        style_rating=style_rating,
-        list_settings=list_settings,
-        list_styles=list_styles,
-        load_recipes=load_recipes,
-        comparison_runs=comparison_runs,
-        load_json=load_json_recover,
-        atomic_write_json=atomic_write_json,
-        now=datetime.now,
-        review_lock=_LIBRARY_REVIEW_LOCK,
-        warning=log.warning,
-    )
+    return _wiring_library.library_catalog_operations(globals())
 
 
 def search_combos(q="", limit=40, offset=0, tab="", source="", sort="", seeded="",
@@ -1685,26 +1592,15 @@ def _slot_of_tag(tag, cat, char_rules, style_rules):
 
 
 def _tag_catalog_paths():
-    return _tag_catalog.TagCatalogPaths(
-        tag_dir=TAG_DIR,
-        cache_file=AC_CACHE_FILE,
-    )
+    return _wiring_library.tag_catalog_paths(globals())
 
 
 def _tag_catalog_state():
-    return _tag_catalog.TagCatalogState(
-        cache=_TAG_CACHE,
-        lock=_TAG_LOCK,
-        cache_version=AC_CACHE_VER,
-    )
+    return _wiring_library.tag_catalog_state(globals())
 
 
 def _tag_catalog_operations():
-    return _tag_catalog.TagCatalogOperations(
-        renamed_tag=nai_renamed_tag,
-        info=log.info,
-        warning=log.warning,
-    )
+    return _wiring_library.tag_catalog_operations(globals())
 
 
 def load_tag_dict(spec):
@@ -1805,28 +1701,11 @@ def search_tags(spec, kind, slot, q, limit=60):
 
 
 def _builder_handler_paths():
-    return _builder_handlers.BuilderHandlerPaths(
-        builder_file=BUILDER_FILE,
-        transaction_root=CHAR_DIR.parent,
-    )
+    return _wiring_library.builder_handler_paths(globals())
 
 
 def _builder_handler_operations():
-    """빌더 저장이 쓰는 기존 저장·잠금·파일 동기화 경계를 늦게 연결한다."""
-    return _builder_handlers.BuilderHandlerOperations(
-        load_json=globals()["load_json_recover"],
-        transaction=globals()["shared_data_transaction"],
-        compose_ordered=globals()["_compose_ordered"],
-        save_style_file=globals()["save_style_file"],
-        list_styles=globals()["list_styles"],
-        random_character_id=lambda: "".join(random.choices(
-            string.ascii_lowercase + string.digits,
-            k=8,
-        )),
-        sync_chars_to_files=globals()["sync_chars_to_files"],
-        save_config=globals()["save_config"],
-        warning=globals()["log"].warning,
-    )
+    return _wiring_library.builder_handler_operations(globals())
 
 
 def load_builder():
@@ -4099,12 +3978,7 @@ def save_fragment(name, lines):
 
 
 def _fragment_import_operations():
-    return _fragment_workflow.FragmentImportOperations(
-        fragment_dir=lambda: FRAG_DIR,
-        safe_name=_safe_name,
-        atomic_write_text=atomic_write_text,
-        list_fragments=list_fragments,
-    )
+    return _wiring_library.fragment_import_operations(globals())
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -4330,14 +4204,7 @@ def _local_import_image(data, content_type, source_url=""):
 
 
 def _public_style_import_operations():
-    """현재 메타·모델·UC·품질·작가 파서를 호출 때 주입해 APP patch를 보존한다."""
-    return _public_style_import.PublicStyleImportOperations(
-        extract_metadata=extract_nai_metadata,
-        model_id=model_id_from_metadata,
-        split_uc_preset=split_uc_preset,
-        restore_quality_prompt=restore_quality_prompt,
-        parse_artist_combo=parse_artist_combo,
-    )
+    return _wiring_library.public_style_import_operations(globals())
 
 
 def _style_record_from_public_image(data, content_type, article):

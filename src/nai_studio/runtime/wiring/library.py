@@ -9,12 +9,26 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from src.nai_studio.services import artist_rating_store as _artist_rating_store
+from src.nai_studio.services import artist_workspace as _artist_workspace
+from src.nai_studio.services import builder_handlers as _builder_handlers
+from src.nai_studio.services import catalog_search as _catalog_search
 from src.nai_studio.services import data_inventory as _data_inventory
 from src.nai_studio.services import datapack_store as _datapack_store
+from src.nai_studio.services import fragment_workflow as _fragment_workflow
+from src.nai_studio.services import library_catalog as _library_catalog
 from src.nai_studio.services import local_image_store as _local_image_store
 from src.nai_studio.services import (
     metadata_candidate_store as _metadata_candidate_store,
 )
+from src.nai_studio.services import (
+    public_style_import as _public_style_import,
+)
+from src.nai_studio.services import (
+    remote_image_cache as _remote_image_cache,
+)
+from src.nai_studio.services import style_store as _style_store
+from src.nai_studio.services import tag_catalog as _tag_catalog
 from src.nai_studio.services import user_backup_store as _user_backup_store
 
 
@@ -169,15 +183,262 @@ def user_backup_operations(app: Mapping[str, Any]):
     )
 
 
+def catalog_search_paths(app: Mapping[str, Any]):
+    return _catalog_search.CatalogSearchPaths(
+        settings_file=app["SETTINGS_FILE"])
+
+
+def catalog_search_state(app: Mapping[str, Any]):
+    return _catalog_search.CatalogSearchState(
+        booru_keys=app["_BOORU_KEYS"],
+        booru_last=app["_BOORU_LAST"],
+        booru_lock=app["_BOORU_LOCK"],
+        tag_cache=app["_TAGV_CACHE"],
+    )
+
+
+def catalog_search_operations(app: Mapping[str, Any]):
+    """현재 HTTP·시간·로그 객체를 주입해 기존 APP monkeypatch 계약을 보존한다."""
+    return _catalog_search.CatalogSearchOperations(
+        request_get=app["requests"].get,
+        request_errors=(app["requests"].exceptions.RequestException,),
+        clock=app["time"].time,
+        sleep=app["time"].sleep,
+        log_info=app["log"].info,
+        log_warning=app["log"].warning,
+        user_agent=app["BOORU_UA"],
+    )
+
+
+def remote_image_cache_paths(app: Mapping[str, Any]):
+    return _remote_image_cache.RemoteImageCachePaths(
+        image_cache=app["IMG_CACHE"],
+        remote_cache=app["REMOTE_CACHE"],
+        origin_file=app["_img_origin_path"](),
+        cap_mb=app["REMOTE_CAP_MB"],
+        mime=app["MIME"],
+    )
+
+
+def remote_image_cache_operations(app: Mapping[str, Any]):
+    return _remote_image_cache.RemoteImageCacheOperations(
+        http_get=app["requests"].get,
+        load_json=app["load_json_recover"],
+        atomic_write_bytes=app["_atomic_write_bytes"],
+        atomic_write_json=app["atomic_write_json"],
+        warning=app["log"].warning,
+        info=app["log"].info,
+        origin_lock=app["_ORIGIN_LOCK"],
+    )
+
+
+def style_store_paths(app: Mapping[str, Any]):
+    return _style_store.StyleStorePaths(
+        style_file=app["STYLE_FILE"],
+        transaction_root=app["STYLE_FILE"].parent.parent,
+        trash_file=app["_trashed_style_path"](),
+    )
+
+
+def style_store_operations(app: Mapping[str, Any]):
+    """현재 저장·모델·Undo 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
+    return _style_store.StyleStoreOperations(
+        transaction=app["shared_data_transaction"],
+        lock=app["_STYLE_TX_LOCK"],
+        load_rows=app["load_combos"],
+        atomic_write_json=app["atomic_write_json"],
+        normalize_model=app["model_id_from_metadata"],
+        forget_caches=app["forget_collection_caches"],
+        record_import_batch=app["record_import_batch"],
+        load_json=app["load_json_recover"],
+        deletion_stamp=lambda: app["time"].strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def artist_workspace_operations(app: Mapping[str, Any]):
+    """현재 난수·태그 결합 함수를 주입해 seed와 APP patch 계약을 보존한다."""
+    return _artist_workspace.ArtistWorkspaceOperations(
+        seeded_random=app["random"].Random,
+        system_random=app["random"].SystemRandom,
+        join_tags=app["_join_tags"],
+    )
+
+
+def style_catalog_paths(app: Mapping[str, Any]):
+    return _library_catalog.StyleCatalogPaths(
+        style_file=app["STYLE_FILE"],
+        combo_file=app["COMBO_FILE"],
+    )
+
+
+def style_catalog_operations(app: Mapping[str, Any]):
+    return _library_catalog.StyleCatalogOperations(
+        load_json=app["load_json_recover"],
+        info=app["log"].info,
+        warning=app["log"].warning,
+        lock=app["_COMBOS_LOCK"],
+    )
+
+
+def artist_rating_paths(app: Mapping[str, Any]):
+    return _artist_rating_store.ArtistRatingPaths(
+        ratings_file=app["RATINGS_FILE"],
+    )
+
+
+def artist_rating_state(app: Mapping[str, Any]):
+    return _artist_rating_store.ArtistRatingState(
+        cache=app["_RATINGS"],
+        lock=app["_RATINGS_LOCK"],
+    )
+
+
+def artist_rating_operations(app: Mapping[str, Any]):
+    """현재 저장 경계와 patch 가능한 조회·저장 함수를 서비스에 늦게 연결한다."""
+    return _artist_rating_store.ArtistRatingOperations(
+        transaction=app["shared_data_transaction"],
+        load_json=app["load_json_recover"],
+        atomic_write_json=app["atomic_write_json"],
+        parse_artist_combo=app["parse_artist_combo"],
+        warning=app["log"].warning,
+        current_loader=lambda: app["load_ratings"](),
+        current_saver=lambda data: app["save_ratings"](data),
+    )
+
+
+def library_catalog_paths(app: Mapping[str, Any]):
+    return _library_catalog.LibraryCatalogPaths(
+        review_file=app["LIBRARY_REVIEW_FILE"],
+        review_schema="nais-library-review/v1",
+        review_statuses=frozenset(app["LIBRARY_REVIEW_STATUSES"]),
+    )
+
+
+def library_catalog_state(app: Mapping[str, Any]):
+    return _library_catalog.LibraryCatalogState(
+        combo_cache=app["_COMBOS"],
+        style_sorts=app["STYLE_SORTS"],
+    )
+
+
+def library_catalog_operations(app: Mapping[str, Any]):
+    """현재 자료 공급자와 저장 경계를 호출 때 주입해 기존 patch 계약을 보존한다."""
+    return _library_catalog.LibraryCatalogOperations(
+        load_combos=app["load_combos"],
+        load_ratings=app["load_ratings"],
+        style_rating=app["style_rating"],
+        list_settings=app["list_settings"],
+        list_styles=app["list_styles"],
+        load_recipes=app["load_recipes"],
+        comparison_runs=app["comparison_runs"],
+        load_json=app["load_json_recover"],
+        atomic_write_json=app["atomic_write_json"],
+        now=app["datetime"].now,
+        review_lock=app["_LIBRARY_REVIEW_LOCK"],
+        warning=app["log"].warning,
+    )
+
+
+def tag_catalog_paths(app: Mapping[str, Any]):
+    return _tag_catalog.TagCatalogPaths(
+        tag_dir=app["TAG_DIR"],
+        cache_file=app["AC_CACHE_FILE"],
+    )
+
+
+def tag_catalog_state(app: Mapping[str, Any]):
+    return _tag_catalog.TagCatalogState(
+        cache=app["_TAG_CACHE"],
+        lock=app["_TAG_LOCK"],
+        cache_version=app["AC_CACHE_VER"],
+    )
+
+
+def tag_catalog_operations(app: Mapping[str, Any]):
+    return _tag_catalog.TagCatalogOperations(
+        renamed_tag=app["nai_renamed_tag"],
+        info=app["log"].info,
+        warning=app["log"].warning,
+    )
+
+
+def builder_handler_paths(app: Mapping[str, Any]):
+    return _builder_handlers.BuilderHandlerPaths(
+        builder_file=app["BUILDER_FILE"],
+        transaction_root=app["CHAR_DIR"].parent,
+    )
+
+
+def builder_handler_operations(app: Mapping[str, Any]):
+    """빌더 저장이 쓰는 기존 저장·잠금·파일 동기화 경계를 늦게 연결한다."""
+    return _builder_handlers.BuilderHandlerOperations(
+        load_json=app["load_json_recover"],
+        transaction=app["shared_data_transaction"],
+        compose_ordered=app["_compose_ordered"],
+        save_style_file=app["save_style_file"],
+        list_styles=app["list_styles"],
+        random_character_id=lambda: "".join(app["random"].choices(
+            app["string"].ascii_lowercase + app["string"].digits,
+            k=8,
+        )),
+        sync_chars_to_files=app["sync_chars_to_files"],
+        save_config=app["save_config"],
+        warning=app["log"].warning,
+    )
+
+
+def fragment_import_operations(app: Mapping[str, Any]):
+    return _fragment_workflow.FragmentImportOperations(
+        fragment_dir=lambda: app["FRAG_DIR"],
+        safe_name=app["_safe_name"],
+        atomic_write_text=app["atomic_write_text"],
+        list_fragments=app["list_fragments"],
+    )
+
+
+def public_style_import_operations(app: Mapping[str, Any]):
+    """현재 메타·모델·UC·품질·작가 파서를 호출 때 주입해 APP patch를 보존한다."""
+    return _public_style_import.PublicStyleImportOperations(
+        extract_metadata=app["extract_nai_metadata"],
+        model_id=app["model_id_from_metadata"],
+        split_uc_preset=app["split_uc_preset"],
+        restore_quality_prompt=app["restore_quality_prompt"],
+        parse_artist_combo=app["parse_artist_combo"],
+    )
+
+
 __all__ = [
+    "artist_rating_operations",
+    "artist_rating_paths",
+    "artist_rating_state",
+    "artist_workspace_operations",
+    "builder_handler_operations",
+    "builder_handler_paths",
+    "catalog_search_operations",
+    "catalog_search_paths",
+    "catalog_search_state",
     "data_inventory_operations",
     "data_inventory_paths",
     "datapack_operations",
     "datapack_paths",
+    "fragment_import_operations",
+    "library_catalog_operations",
+    "library_catalog_paths",
+    "library_catalog_state",
     "local_image_operations",
     "local_image_paths",
     "metadata_candidate_operations",
     "metadata_candidate_paths",
+    "public_style_import_operations",
+    "remote_image_cache_operations",
+    "remote_image_cache_paths",
+    "style_catalog_operations",
+    "style_catalog_paths",
+    "style_store_operations",
+    "style_store_paths",
+    "tag_catalog_operations",
+    "tag_catalog_paths",
+    "tag_catalog_state",
     "user_backup_operations",
     "user_backup_paths",
 ]
