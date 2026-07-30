@@ -1087,6 +1087,8 @@ if($('publicCollectStart')){
 // 로그인해야 보이는 글은 브라우저가 직접 넘긴다 — 앱은 쿠키를 갖지 않는다.
 // 아래 코드는 arca.live 페이지에서 실행되며 본문 HTML과 이미지 바이트만
 // 이 앱(localhost)으로 POST 한다. 서버가 연결 번호와 출처를 다시 검사한다.
+// ⚠ 이미지 CDN이 CORS를 안 줄 수 있다 — 이미지는 장별로 건너뛰고 HTML은
+//   반드시 보낸다 (한 덩어리 try로 묶으면 이미지 하나에 전체가 죽는다 — 실측).
 function relayScriptText(code){
   const origin = location.origin;
   return "javascript:(async()=>{try{"
@@ -1096,19 +1098,23 @@ function relayScriptText(code){
     + "const box=document.querySelector('.article-content')||document.body;"
     + "const urls=[...box.querySelectorAll('img')].map(i=>i.dataset.originalurl||i.src)"
     + ".filter(Boolean).slice(0,40);"
-    + "const images=[];for(const u of urls){const r=await fetch(u.startsWith('//')?'https:'+u:u,"
-    + "{credentials:'include'});const b=await r.blob();"
-    + "if(b.size>64*1024*1024)continue;"
+    + "const images=[];let skipped=0;"
+    + "for(const u of urls){try{"
+    + "const r=await fetch(u.startsWith('//')?'https:'+u:u,{credentials:'include'});"
+    + "if(!r.ok)throw new Error(r.status);"
+    + "const b=await r.blob();"
+    + "if(b.size>64*1024*1024){skipped++;continue;}"
     + "const d=await new Promise(k=>{const f=new FileReader();"
     + "f.onload=()=>k(String(f.result).split(',')[1]);f.readAsDataURL(b);});"
-    + "images.push({type:b.type,data:d});}"
+    + "images.push({type:b.type,data:d});}catch(_){skipped++;}}"
     + "const res=await fetch('" + origin + "/api/public_collection_relay',"
     + "{method:'POST',headers:{'Content-Type':'application/json',"
     + "'X-Pairing-Code':'" + code + "'},"
     + "body:JSON.stringify({url:location.href,html,images})});"
     + "const j=await res.json();"
-    + "alert(j.ok?('보냈습니다: 이미지 '+(j.metadata_images||0)+'장 · '+(j.classification||''))"
-    + ":('실패: '+(j.error||(j.errors||[]).join(', '))));"
+    + "const skipNote=skipped?' · 원본 못 받은 이미지 '+skipped+'장':'';"
+    + "alert(j.ok?('보냈습니다: 이미지 '+(j.metadata_images||0)+'장 · '+(j.classification||'')+skipNote)"
+    + ":('실패: '+(j.error||(j.errors||[]).join(', '))+skipNote));"
     + "}catch(e){alert('실패: '+e);}})()";
 }
 if($('relayPairingIssue')){
@@ -1123,8 +1129,8 @@ if($('relayPairingIssue')){
       $('relayPairingScript').classList.remove('hidden');
       $('relayPairingCopy').classList.remove('hidden');
       $('relayPairingMsg').textContent =
-        '전달 코드를 복사해 ' + (r.origin || 'arca.live') + ' 글 주소창에 붙여 실행하세요. '
-        + '이전에 발급한 번호는 이제 쓸 수 없습니다.';
+        '전달 코드를 복사해 북마크 주소로 저장한 뒤 ' + (r.origin || 'arca.live')
+        + ' 글에서 그 북마크를 누르세요. 이전에 발급한 번호는 이제 쓸 수 없습니다.';
     }catch(e){ $('relayPairingMsg').textContent = '발급 실패: ' + e; }
   });
   $('relayPairingCopy').addEventListener('click', async () => {

@@ -1,4 +1,26 @@
-# 현재 작업 — 레거시 이동 후보 8함수 서비스 이동 (미완 목록 ⑤) — 완료
+# 현재 작업 — ③ arca bookmarklet 실검증·문안 (미완 목록 마지막) — 완료
+
+## 이번 커밋 (③)
+
+가짜 arca.live Origin(playwright route)으로 bookmarklet 전문을 실행해
+CORS·pairing 왕복을 실측 검증. 두 가지를 실측으로 잡아 고쳤다:
+
+1. **이미지 한 장이 전체를 죽이던 결함** — CDN이 CORS를 안 주는 이미지에서
+   fetch가 던지면 한 덩어리 try가 전부 삼켜 HTML조차 안 갔다. 이미지별
+   try/catch로 바꿔 건너뛴 장수를 알림에 표시("원본 못 받은 이미지 N장").
+2. **최신 Chromium의 Local Network Access 권한** — 공개 사이트→127.0.0.1
+   fetch는 브라우저 권한 프롬프트를 요구한다(거부·headless면 preflight도
+   없이 "Failed to fetch"). 서버 PNA preflight만으로는 부족 — 사용자가
+   "허용"을 눌러야 하며, 그 안내를 문안에 넣었다. 검증은
+   grant_permissions(["local-network-access"])로 프롬프트 허용을 재현.
+
+문안 정비: 주소창 붙여넣기는 브라우저가 `javascript:`를 지움 → 북마크
+저장 방식을 기본 안내로. 실측 왕복: 정상 코드 "보냈습니다 · new" /
+틀린 코드 "pairing code가 없거나 틀립니다" / 비채널 경로 가드 동작.
+검증: node --check · page_template 93,197자(상한 내) · relay 계약 ·
+검증.py(회귀 171) 통과.
+
+## 직전 완료 — 레거시 이동 후보 8함수 (⑤, a2e0ae4)
 
 ## 이번 커밋
 
