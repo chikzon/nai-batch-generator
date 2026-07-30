@@ -168,6 +168,7 @@ from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.runtime import file_transaction as _file_transaction
 from src.nai_studio.runtime.wiring import generation as _wiring_generation
 from src.nai_studio.runtime.wiring import management as _wiring_management
+from src.nai_studio.runtime.wiring import routes as _wiring_routes
 from src.nai_studio.runtime.wiring import settings as _wiring_settings
 from src.nai_studio.runtime.wiring import library as _wiring_library
 from src.nai_studio.compat import studio_wiring as _studio_wiring
@@ -2804,213 +2805,31 @@ def _late_bound(name):
 
 
 def _route_catalog_bindings():
-    return {
-        "booru": _late_bound("search_booru"),
-        "style_duplicates": _late_bound("find_style_dupes"),
-        "library": _late_bound("search_library"),
-        "combos": _late_bound("search_combos"),
-        "recipes": _late_bound("search_recipes"),
-        "prewarm": _late_bound("prewarm_images"),
-        "autocomplete": _late_bound("autocomplete_tags"),
-        "tags": _late_bound("search_tags"),
-        "scenes": lambda cfg, ids, setting: globals()["scene_catalog"](
-            cfg,
-            ids,
-            setting,
-            setting_path=globals()["setting_path"],
-            load_json=globals()["load_json_recover"],
-            load_asset_config=globals()["load_asset_config"],
-            content_revision=globals()["setting_content_revision"],
-            normalize_refs=globals()["normalize_scene_reference_ids"],
-            normalize_centers=globals()["normalize_scene_centers"],
-        ),
-        "comparison_catalog": _late_bound("comparison_catalog"),
-        "comparison_runs": _late_bound("comparison_runs"),
-        "comparison_progress": _late_bound("comparison_progress_summary"),
-    }
+    return _wiring_routes.catalog_bindings(globals())
 
 
 def _route_asset_bindings():
-    return {
-        "vibe_dir": lambda: globals()["VIBE_DIR"],
-        "mime": lambda: globals()["MIME"],
-        "output_preview": _late_bound("output_file_for_preview"),
-        "output_list": _late_bound("list_output"),
-        "setting_thumbs": _late_bound("setting_thumbs"),
-        "resource_export": lambda cfg: globals()[
-            "export_legacy_resources"
-        ](
-            cfg,
-            file_index=globals()["resource_file_index"](cfg),
-        ),
-        "backup_export": _late_bound("export_user_backup"),
-        "fragments_export": _late_bound("export_fragments_zip"),
-        "settings_export": _late_bound("export_settings_zip"),
-        "cached_image": _late_bound("fetch_cached_image"),
-        "diagnostics": lambda limit, errors_only: globals()[
-            "diagnostic_snapshot"
-        ](
-            globals()["LOG_FILE"],
-            limit=limit,
-            errors_only=errors_only,
-        ),
-        "render_page": _late_bound("render_page"),
-    }
+    return _wiring_routes.asset_bindings(globals())
 
 
 def _route_recovery_bindings():
-    return {
-        "metadata_audit": lambda offset, limit: globals()[
-            "metadata_audit_status"
-        ](
-            found_offset=offset,
-            found_limit=limit,
-        ),
-        "folder_inventory": _late_bound("folder_inventory_page"),
-        "trash": _late_bound("list_trash_batches"),
-        "pack_log": lambda: {
-            "ok": True,
-            "log": globals()["pack_log_brief"](),
-        },
-        "public_restoration": lambda: globals()[
-            "PUBLIC_COLLECTION"
-        ].restoration_snapshot(),
-        "public_collection": lambda: globals()[
-            "PUBLIC_COLLECTION"
-        ].snapshot(),
-        "data_storage": _late_bound("data_storage_status"),
-        "image_origins": _late_bound("image_origin_stats"),
-        "local_integrity": _late_bound("local_image_integrity"),
-        "preview_backup": _late_bound("preview_user_backup"),
-        "restore_backup": _late_bound("restore_user_backup"),
-        "rollback_backup": _late_bound("rollback_user_backup"),
-        "load_settings": lambda: globals()["load_settings_recover"](
-            globals()["SETTINGS_FILE"]
-        ),
-        "default_config": lambda: globals()["DEFAULT_CONFIG"],
-        "migrate_selections": _late_bound("migrate_legacy_selections"),
-        "migrate_slots": _late_bound("migrate_char_slots"),
-        "load_spec": _late_bound("load_spec"),
-        "options": lambda: globals()["OPTIONS"],
-        "load_options": _late_bound("load_options"),
-        "normalize_local_images": _late_bound(
-            "normalize_local_image_refs"
-        ),
-        "rollback_local_images": _late_bound(
-            "rollback_local_image_normalize"
-        ),
-        "rebuild_data_index": _late_bound("rebuild_data_index"),
-        "metadata_control": _late_bound("metadata_audit_control"),
-        "metadata_candidate": _late_bound("metadata_audit_candidate"),
-        "metadata_save": _late_bound("metadata_audit_save_candidate"),
-        "image_batch_queue": _late_bound("image_batch_queue"),
-        "summarize_queue": _late_bound("summarize_restore_queue"),
-    }
+    return _wiring_routes.recovery_bindings(globals())
 
 
 def _route_collection_bindings():
-    return {
-        "preview_pack": _late_bound("preview_datapack_bytes"),
-        "import_pack": _late_bound("import_datapack_bytes"),
-        "pack_queue": _late_bound("pack_import_queue"),
-        "summarize_queue": _late_bound("summarize_restore_queue"),
-        "forget_caches": _late_bound("forget_collection_caches"),
-        "public_start": lambda payload: globals()[
-            "PUBLIC_COLLECTION"
-        ].start(payload),
-        "public_retry": lambda payload: globals()[
-            "PUBLIC_COLLECTION"
-        ].retry_failed(payload),
-        "public_control": lambda action: globals()[
-            "PUBLIC_COLLECTION"
-        ].control(action),
-        "undo_pack": _late_bound("undo_datapack"),
-        "import_settings": _late_bound("import_settings_bytes"),
-        "verify_tags": _late_bound("verify_tags"),
-        "organize_library": _late_bound("organize_library_items"),
-        "delete_styles": _late_bound("delete_styles"),
-        "restore_styles": _late_bound("restore_styles"),
-    }
+    return _wiring_routes.collection_bindings(globals())
 
 
 def _route_evaluation_fragment_bindings():
-    return {
-        "artist_workspace": _late_bound("artist_workspace_request"),
-        "load_ratings": _late_bound("load_ratings"),
-        "rate_artist": _late_bound("rate_artist"),
-        "apply_evaluation": _late_bound("apply_evaluation_action"),
-        "picks_lock": globals()["_JSON_IO_LOCK"],
-        "load_picks": _late_bound("load_picks"),
-        "save_picks": _late_bound("save_picks"),
-        "trash_outputs": _late_bound("trash_output_files"),
-        "restore_trash": _late_bound("restore_trash_batch"),
-        "output_subdir": _late_bound("out_sub"),
-        "atomic_write": _late_bound("_atomic_write_bytes"),
-        "strip_and_save": _late_bound("strip_and_save"),
-        "fragment_dir": lambda: globals()["FRAG_DIR"],
-        "save_fragment": _late_bound("save_fragment"),
-        "list_fragments": _late_bound("list_fragments"),
-        "recoverable_remove": _late_bound("recoverable_remove"),
-        "load_state": _late_bound("load_state"),
-        "save_state": _late_bound("save_state"),
-        "import_fragments": _late_bound("import_fragments_bytes"),
-        "reroll_components": _late_bound("reroll_legacy_components"),
-        "resolve_prompt": _late_bound("resolve_legacy_prompt"),
-        "sequence_text": _late_bound("legacy_sequence_text"),
-        "resolve_fragments": _late_bound("resolve_fragments"),
-        "random_factory": globals()["random"].Random,
-    }
+    return _wiring_routes.evaluation_fragment_bindings(globals())
 
 
 def _route_settings_runtime_bindings():
-    return {
-        "duplicate_scene_undo": _late_bound(
-            "undo_duplicate_setting_scene"
-        ),
-        "duplicate_scene": _late_bound("duplicate_setting_scene"),
-        "load_asset_config": _late_bound("load_asset_config"),
-        "setting_state": _late_bound("setting_state"),
-        "cast_members": _late_bound("setting_cast_members"),
-        "slot_prompt": _late_bound("slot_prompt"),
-        "character_run": _late_bound("character_run_from_group"),
-        "build_scene": _late_bound("build_scene"),
-        "reference_config": _late_bound("setting_reference_config"),
-        "scene_people": _late_bound("setting_scene_people"),
-        "seed_for": _late_bound("seed_for"),
-        "normalize_prompt": _late_bound("normalize_prompt"),
-        "join_tags": _late_bound("_join_tags"),
-        "token_count": _late_bound("nai_tokens"),
-        "save_scenes": _late_bound("save_scenes"),
-        "new_setting": _late_bound("new_setting"),
-        "add_set": _late_bound("setting_add_set"),
-        "save_meta": _late_bound("setting_meta_save"),
-        "renumber": _late_bound("setting_renumber"),
-        "delete_setting": _late_bound("setting_delete"),
-        "duplicate_group": _late_bound("duplicate_setting_group"),
-        "log_warning": globals()["log"].warning,
-        "activate_comparison": _late_bound("activate_comparison_run"),
-        "comparison_recipe": _late_bound("comparison_recipe_for_output"),
-        "fetch_balance": _late_bound("fetch_anlas_balance"),
-        "vibe_paths": _late_bound("vibe_paths"),
-        "compute_pending": _late_bound("compute_pending"),
-        "estimate_anlas": _late_bound("anlas_estimate"),
-        "finalize_tokens": _late_bound("finalized_token_texts"),
-        "tokens_exact": _late_bound("tokens_exact"),
-    }
+    return _wiring_routes.settings_runtime_bindings(globals())
 
 
 def _route_bindings():
-    """라우트 Operations 의존성을 기능 범주별로 합친다."""
-    groups = (
-        _route_catalog_bindings(),
-        _route_asset_bindings(),
-        _route_recovery_bindings(),
-        _route_collection_bindings(),
-        _route_evaluation_fragment_bindings(),
-        _route_settings_runtime_bindings(),
-        _studio_wiring.extra_route_bindings(globals()),
-    )
-    return {key: value for group in groups for key, value in group.items()}
+    return _wiring_routes.route_bindings(globals())
 
 
 # ═══════════════ 설정 로드/저장 ═══════════════
@@ -3056,19 +2875,7 @@ def _prefill_partner_defaults(cfg):
 
 
 def _config_initialization_operations():
-    """설정 복구와 캐릭터 동기화의 기존 patch 경계를 늦게 연결한다."""
-    return _management_state.ConfigInitializationOperations(
-        load_settings=globals()["load_settings_recover"],
-        quarantine_corrupt=globals()["quarantine_corrupt_settings"],
-        migrate_legacy=globals()["_migrate_legacy"],
-        ensure_settings_migration=globals()["ensure_settings_migration"],
-        migrate_selections=globals()["migrate_legacy_selections"],
-        migrate_char_slots=globals()["migrate_char_slots"],
-        import_char_files=globals()["import_char_files"],
-        sync_chars_to_files=globals()["sync_chars_to_files"],
-        save_config=globals()["save_config"],
-        log_critical=globals()["log"].critical,
-    )
+    return _wiring_management.config_initialization_operations(globals())
 
 
 def _file_transaction_paths():
@@ -3504,32 +3311,11 @@ _DIR_COUNT_CACHE = {}   # 경로 → (재귀 이미지 수, 기록 시각)
 
 
 def _output_lifecycle_paths():
-    """레거시 상수와 서비스의 파일·휴지통 계약을 한곳에서 연결한다."""
-    return _output_lifecycle.OutputLifecyclePaths(
-        trash_dir_name=TRASH_DIR_NAME,
-        image_extensions=IMG_EXT,
-        trash_schema="nais-output-trash/v2",
-        directory_count_ttl=30.0,
-    )
+    return _wiring_management.output_lifecycle_paths(globals())
 
 
 def _output_lifecycle_operations():
-    """호출 시점의 저장·시간 의존성을 주입해 기존 monkeypatch 계약을 보존한다."""
-    return _output_lifecycle.OutputLifecycleOperations(
-        output_root=out_root,
-        atomic_write_json=atomic_write_json,
-        load_json=load_json_recover,
-        load_picks=load_picks,
-        save_picks=save_picks,
-        picks_lock=_JSON_IO_LOCK,
-        project_evaluations=project_legacy_evaluations,
-        move_file=shutil.move,
-        now=datetime.now,
-        uuid4=uuid.uuid4,
-        clock=time.time,
-        directory_count_cache=_DIR_COUNT_CACHE,
-        warning=log.warning,
-    )
+    return _wiring_management.output_lifecycle_operations(globals())
 
 
 def _path_is_inside(path, root):
@@ -3935,23 +3721,11 @@ _COMMON_JOB_STORE_ROOT = None
 
 
 def _job_ledger_paths():
-    return _management_state.JobLedgerPaths(
-        ledger_file=JOB_LEDGER_FILE,
-    )
+    return _wiring_management.job_ledger_paths(globals())
 
 
 def _job_ledger_operations():
-    """현재 프로필 저장소와 patch 가능한 장부 의존성을 늦게 연결한다."""
-    return _management_state.JobLedgerOperations(
-        lock=_JSON_IO_LOCK,
-        load_json=globals()["load_json_recover"],
-        atomic_write_json=globals()["atomic_write_json"],
-        common_job_store=lambda: globals()["common_job_store"](),
-        now=lambda: datetime.now().isoformat(timespec="seconds"),
-        uuid_hex=lambda: uuid.uuid4().hex,
-        redact=globals()["redact_diagnostic_text"],
-        log_error=globals()["log"].error,
-    )
+    return _wiring_management.job_ledger_operations(globals())
 
 
 def common_job_store():
@@ -4059,19 +3833,7 @@ def job_ledger_summary():
 
 
 def _config_projection_operations():
-    """ConfigServer의 읽기 전용 설정·Job 투영 의존성을 늦게 연결한다."""
-    return _management_state.ConfigProjectionOperations(
-        load_settings=globals()["load_settings_recover"],
-        migrate_selections=globals()["migrate_legacy_selections"],
-        migrate_char_slots=globals()["migrate_char_slots"],
-        job_summary=lambda: globals()["job_ledger_summary"](),
-        runtime_kind=globals()["_runtime_kind"],
-        inherited_blueprint=globals()["inherited_blueprint"],
-        project_live_state=globals()["project_live_state"],
-        comparison_progress=lambda: globals()["_comparison_progress_load"](),
-        project_comparison_progress=globals()["project_comparison_progress"],
-        redact=globals()["redact_diagnostic_text"],
-    )
+    return _wiring_management.config_projection_operations(globals())
 
 
 class LiveState(RuntimeLiveState):
@@ -4514,98 +4276,11 @@ def comparison_progress_summary(cfg):
 
 
 def _comparison_runtime_operations():
-    """비교 manifest·재실행 의존성을 호출 시점의 APP 경계에 연결한다."""
-    return _comparison_runtime.ComparisonRuntimeOperations(
-        output_root=globals()["out_root"],
-        comparison_signature=globals()["comparison_signature"],
-        load_progress=globals()["_comparison_progress_load"],
-        load_json=globals()["load_json_recover"],
-        path_is_inside=globals()["_path_is_inside"],
-        output_file_for_preview=globals()["output_file_for_preview"],
-        output_subdir=globals()["out_sub"],
-        now=lambda: globals()["datetime"].now(),
-        random_bytes=globals()["os"].urandom,
-        now_text=lambda: globals()["time"].strftime("%Y-%m-%d %H:%M:%S"),
-        random_seed=globals()["random"].randint,
-        comparison_recipe_context=globals()["comparison_recipe_context"],
-        save_progress=globals()["_comparison_progress_save"],
-        info=globals()["log"].info,
-        warning=globals()["log"].warning,
-        selected_comparison_record=globals()["_selected_comparison_record"],
-        regenerate_execution_material=globals()[
-            "regenerate_legacy_execution_material"
-        ],
-        selected_config=globals()["_comparison_selected_cfg"],
-        load_asset_config=globals()["load_asset_config"],
-        compute_pending=globals()["compute_pending"],
-        selected_job_values=globals()["comparison_selected_job_values"],
-        generation_blueprint=globals()["generation_blueprint"],
-        pace_gate=globals()["pace_gate"],
-        runtime_generation_params=globals()["runtime_generation_params"],
-        call_nai_api=globals()["call_nai_api"],
-        with_centers=globals()["with_centers"],
-        pace_complete=globals()["pace_complete"],
-        output_format=globals()["out_format"],
-        available_output_path=globals()["available_output_path"],
-        output_clean_args=globals()["out_clean"],
-        save_with_meta=globals()["save_with_meta"],
-        record_job_result=globals()["record_job_result"],
-        uuid4=globals()["uuid"].uuid4,
-        comparison_job_recipe_snapshot=globals()[
-            "comparison_job_recipe_snapshot"
-        ],
-        load_state=globals()["load_state"],
-        bump_daily=globals()["bump_daily"],
-        save_state=globals()["save_state"],
-    )
+    return _wiring_management.comparison_runtime_operations(globals())
 
 
 def _comparison_execution_operations():
-    """비교 큐·NAI·결과 저장 의존성을 호출 시점의 APP 경계에 연결한다."""
-    return _comparison_execution.ComparisonExecutionOperations(
-        progress_start=globals()["_comparison_progress_start"],
-        save_progress=globals()["_comparison_progress_save"],
-        link_job_ancestor=globals()["link_job_ancestor"],
-        record_job_result=globals()["record_job_result"],
-        output_file_for_preview=globals()["output_file_for_preview"],
-        redact_diagnostic_text=globals()["redact_diagnostic_text"],
-        warning=globals()["log"].warning,
-        info=globals()["log"].info,
-        error=globals()["log"].error,
-        iter_character_setting_jobs=globals()[
-            "iter_character_setting_jobs"
-        ],
-        iter_selected_jobs=globals()["iter_selected_comparison_jobs"],
-        iter_comparison_jobs=globals()["iter_comparison_jobs"],
-        comparison_job_values=globals()["comparison_job_values"],
-        comparison_job_recipe_snapshot=globals()[
-            "comparison_job_recipe_snapshot"
-        ],
-        generation_blueprint=globals()["generation_blueprint"],
-        safe_name=globals()["_safe_name"],
-        available_output_path=globals()["available_output_path"],
-        output_format=globals()["out_format"],
-        output_root=globals()["out_root"],
-        output_clean_args=globals()["out_clean"],
-        pace=globals()["pace"],
-        pace_gate=globals()["pace_gate"],
-        pace_complete=globals()["pace_complete"],
-        runtime_generation_params=globals()["runtime_generation_params"],
-        call_nai_api=globals()["call_nai_api"],
-        with_centers=globals()["with_centers"],
-        save_with_meta=globals()["save_with_meta"],
-        load_state=globals()["load_state"],
-        daily_count=globals()["daily_count"],
-        bump_daily=globals()["bump_daily"],
-        save_state=globals()["save_state"],
-        now_text=lambda: globals()["time"].strftime("%Y-%m-%d %H:%M:%S"),
-        rate_limit_error=globals()["RateLimitError"],
-        account_errors=(
-            globals()["AccountBannedError"],
-            globals()["AuthError"],
-        ),
-        api_error=globals()["APIError"],
-    )
+    return _wiring_management.comparison_execution_operations(globals())
 
 
 def comparison_runs(cfg, limit=50):
@@ -4690,49 +4365,12 @@ def _comparison_result_context(cfg, rel):
 
 
 def _comparison_promotion_paths():
-    """현재 프로필의 승격 저장 경로를 호출 시점에 조립한다."""
-    return _comparison_promotion.ComparisonPromotionPaths(
-        base_dir=BASE_DIR,
-        style_dir=STYLE_DIR,
-        character_dir=CHAR_DIR,
-        settings_file=SETTINGS_FILE,
-    )
+    return _wiring_management.comparison_promotion_paths(globals())
 
 
 def _comparison_promotion_operations(include_recipe_adapter=False):
-    """현재 비교·평가·저장 경계를 늦게 주입해 APP patch를 보존한다."""
-    return _comparison_promotion.ComparisonPromotionOperations(
-        transaction=shared_data_transaction,
-        comparison_result_context=globals()["_comparison_result_context"],
-        default_config=globals()["DEFAULT_CONFIG"],
-        comparison_style_config=globals()["comparison_style_config"],
-        recipe_setting_keys=COMPARE_RECIPE_SETTING_KEYS,
-        slot_prompt=globals()["slot_prompt"],
-        comparison_result_evaluation=globals()[
-            "_comparison_result_evaluation"
-        ],
-        build_result_promotion=globals()["build_result_promotion"],
-        style_bundle_signature=globals()["style_bundle_signature"],
-        character_bundle_signature=globals()[
-            "character_bundle_signature"
-        ],
-        list_styles=globals()["list_styles"],
-        load_spec=globals()["load_spec"],
-        load_combos=globals()["load_combos"],
-        unique_library_name=globals()["_unique_library_name"],
-        save_style_file=globals()["save_style_file"],
-        safe_name=globals()["_safe_name"],
-        record_import_batch=globals()["record_import_batch"],
-        sync_characters_to_files=globals()["sync_chars_to_files"],
-        save_config=globals()["save_config"],
-        random_character_id=lambda: "".join(random.choices(
-            string.ascii_lowercase + string.digits, k=8)),
-        recipe_for_output=(
-            globals()["comparison_recipe_for_output"]
-            if include_recipe_adapter
-            else None
-        ),
-    )
+    return _wiring_management.comparison_promotion_operations(
+        globals(), include_recipe_adapter)
 
 
 def comparison_recipe_for_output(cfg, rel):
@@ -4892,46 +4530,7 @@ def _run_comparison(server, cfg, plan, styles, chars):
 
 
 def _program_entry_operations():
-    """기존 main의 초기화·서버·batch 경계를 호출 시점에 연결한다."""
-    return _program_entry.ProgramEntryOperations(
-        prepare_profile=lambda profile: profile,
-        initialize_logging=lambda _context: globals()["log"],
-        acquire_single_instance=lambda _context: True,
-        release_single_instance=lambda _instance: None,
-        migrate_program_data=lambda _context: globals()["_DATA_MIGRATION"],
-        load_config=lambda _context: globals()["load_or_init_config"](),
-        load_options=lambda _context: globals()["OPTIONS"],
-        load_spec=lambda _context: globals()["load_spec"](),
-        recover_jobs=lambda _context: globals()["recover_job_ledger"](),
-        create_server=lambda config, _options, spec, _context: globals()[
-            "ConfigServer"
-        ](
-            config,
-            persist_jobs=True,
-            spec=spec,
-        ),
-        start_server=lambda server, open_browser: server.start(
-            open_browser=open_browser
-        ),
-        cleanup_server=lambda _server: None,
-        close_logging=lambda _logger: None,
-        warm_index=lambda server: globals()["_ac_index"](server.spec),
-        start_daemon=lambda target: globals()["threading"].Thread(
-            target=target,
-            daemon=True,
-        ).start(),
-        run_generation=lambda server, config: globals()["_run_generation"](
-            server,
-            config,
-        ),
-        inherited_blueprint=globals()["inherited_blueprint"],
-        fatal_stop_errors=(globals()["FatalStopError"],),
-        log_info=globals()["log"].info,
-        log_critical=globals()["log"].critical,
-        format_traceback=globals()["traceback"].format_exc,
-        read_input=lambda prompt: input(prompt),
-        write_line=lambda line: print(line),
-    )
+    return _wiring_management.program_entry_operations(globals())
 
 
 def main():

@@ -27,9 +27,11 @@
 - [x] 조각 4a — 세팅·캐릭터 저장 7함수 → `wiring/settings.py`,
       비교 계획·핸들러 2함수 → `wiring/management.py`
       5,071 → **4,952줄** (−119). 회귀 12/12 · exports 7 · 경계 5
-- [ ] 조각 4b — 관리 잔여(config init/projection · character? · output ·
-      job ledger · comparison runtime/execution/promotion · program_entry)
-      → `wiring/management.py`, 라우트 바인딩 6벌 → `wiring/routes.py`
+- [x] 조각 4b — 관리 잔여 12함수 → `wiring/management.py`
+      (config init/projection · output lifecycle · job ledger · comparison
+      runtime/execution/promotion · program_entry) + 라우트 바인딩 7벌 →
+      `wiring/routes.py`. 4,952 → **4,551줄** (−401)
+      검증: 서버·Job·검역·비교 재개·휴지통·승격 회귀 19/19 · exports 7 · 경계 5
 - [ ] 조각마다 경계 상한 하향(별도 커밋) — 역증가 차단
 
 ## 검증 원칙 (계획서)
