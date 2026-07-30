@@ -1,46 +1,37 @@
-# 현재 작업 — 레거시 축소 단계 3: 범주별 wiring 분리
+# 현재 작업 — 레거시 축소 단계 4: 서버·실행 수명 이동
 
-`compat/legacy_surface.py`의 `_*_operations()`/`_*_paths()` 조립을
-`runtime/wiring/`으로 옮긴다. wiring 함수는 `app`(레거시 globals())을 받아
-호출 시점에 이름을 찾는다 — 기존 `patch.object(APP, …)` monkeypatch 계약과
-내부 호출자(레거시 셔틀 함수)가 전부 그대로 산다. 기능 알고리즘은 넣지 않는다.
+## 완료된 단계
 
-단계 2(경로·상태 → ApplicationContext)는 wiring이 app 대신 context를 받는
-형태로 뒤에 수렴시킨다(가정 명시 — 계약·회귀 무손상 순서 우선).
+- 단계 1 (d778d0e): LEGACY_EXPORTS 247 + endpoint 119·경로·payload 기준선
+- 단계 3 (62ec50d~ed18539): wiring 분리 **완료** — 68개 조립 함수 이동
+  - `wiring/library.py` 33 (자료팩·백업·자료실·수집·빌더)
+  - `wiring/generation.py` 13 (NAI 호출·진행·재시도·저장·이미지 도구)
+  - `wiring/settings.py` 7 (세팅 저장·씬·프로젝트·캐릭터 파일)
+  - `wiring/management.py` 15 (Job·비교·출력·기동)
+  - `wiring/routes.py` 8 (late_bound + 바인딩 6벌 + 합류)
+  - legacy_surface **5,495 → 4,551줄 (−944)** · 경계 상한 4,600
+  - 시험 seam 변경 0 (app=globals() 호출 시점 조회로 monkeypatch 무손상)
+- 단계 2는 계획대로 wiring이 context를 받는 형태로 뒤에 수렴 (가정 명시됨)
 
-## 진행 (조각별 커밋)
+## 이 단계에서 할 것 (계획서 단계 4)
 
-- [x] 조각 1 — 자료 계열 5쌍 → `runtime/wiring/library.py`
-      (datapack · local_image · data_inventory · metadata_candidate ·
-      user_backup). legacy_surface 5,495 → **5,386줄** (−109)
-      검증: 자료팩·백업·로컬이미지·색인·메타 회귀 16/16 · exports 계약 7 ·
-      관련 계약 16 · 경계 5
-- [x] 조각 2 — 자료실·수집·빌더 계열 23함수 → wiring/library.py
-      (style_store · style_catalog · artist_rating · artist_workspace ·
-      library_catalog · tag_catalog · builder_handlers · catalog_search ·
-      remote_image_cache · fragment_import · public_style_import)
-      5,386 → **5,253줄** (−133). 회귀 18/18 · 계약 28 · 경계 5
-- [x] 조각 3 — 생성 계열 13함수 → `wiring/generation.py`
-      (reference · auxiliary · pacing · step/retry/commit/execution ·
-      handler bindings 3벌 · handler · image_tool · collection)
-      5,253 → **5,071줄** (−182). 생성 경로 회귀 16/16 · exports 7 · 경계 5
-- [x] 조각 4a — 세팅·캐릭터 저장 7함수 → `wiring/settings.py`,
-      비교 계획·핸들러 2함수 → `wiring/management.py`
-      5,071 → **4,952줄** (−119). 회귀 12/12 · exports 7 · 경계 5
-- [x] 조각 4b — 관리 잔여 12함수 → `wiring/management.py`
-      (config init/projection · output lifecycle · job ledger · comparison
-      runtime/execution/promotion · program_entry) + 라우트 바인딩 7벌 →
-      `wiring/routes.py`. 4,952 → **4,551줄** (−401)
-      검증: 서버·Job·검역·비교 재개·휴지통·승격 회귀 19/19 · exports 7 · 경계 5
-- [ ] 조각마다 경계 상한 하향(별도 커밋) — 역증가 차단
+1. `ConfigServer` 클래스 본체 → `web/application_server.py`
+   - 메서드가 참조하는 레거시 이름들은 생성 시 주입되는 namespace(레거시
+     globals())를 통해 해석 — monkeypatch·`_SERVER_MEMBERS` 바인딩 유지
+   - legacy_surface에는 `ConfigServer = …` alias만
+2. `LiveState`·`PublicCollectionManager` alias 유지 확인 (이미 어댑터 클래스)
+3. route 문자열·HTTP 응답 조립이 web/routes 밖으로 안 나왔는지
+   ROUTE_BASELINE 계약으로 재확인
+4. 검증: 서버 기동 회귀(two_servers·cross-site) · Job·스냅샷 회귀 ·
+   exports 계약 · 경계 (do_GET/do_POST ≤40 유지)
 
-## 검증 원칙 (계획서)
+## 그 다음 (단계 5)
 
-- 각 조각: 직접 관련 회귀 + legacy_exports 계약 + payload 기준선
-- 시험 seam 변경 없음 — wiring은 app 조회라 patch 의미 동일
-- 전체 회귀·빌드는 마지막에만
+- legacy_surface = 명시적 export map + 최소 adapter만. 남은 각 구획의
+  호환 이유를 legacy_exports.py kind에 반영, 상한 대폭 하향
+- 마지막에만 전체 계약·구조·회귀 + JS + localhost + 포터블·설치본 재검증
 
 ## 금지 범위
 
-- 기능 알고리즘을 wiring에 넣기, 같은 Operations 재정의, schema 변경,
+- 기능 삭제·schema 변경·UI 개편 혼합, endpoint 문자열 web 밖 유출,
   성향 표·로그 편집기·사용자 데이터, push·태그·Release
