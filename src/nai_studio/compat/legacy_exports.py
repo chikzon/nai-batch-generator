@@ -1,12 +1,38 @@
 # -*- coding: utf-8 -*-
-"""레거시 호환 표면의 명시적 export 계약 (레거시 축소 단계 1).
+"""레거시 호환 표면의 명시적 export 계약 (레거시 축소 단계 1→5).
 
 이 목록은 회귀·계약 시험과 CLI가 실제로 쓰는 이름 전수를 고정한다.
-- kind: alias(다른 모듈 재수출) · adapter(legacy 정의 — 이동 대상) ·
-  경로 · 상수·상태 · 모듈 참조 · legacy-class(이동 대상 클래스)
-- owner: 현재 소유 모듈. 이동이 끝나면 owner가 실제 모듈로 바뀌고
-  kind가 alias로 수렴한다. 미사용이 되어도 한 릴리스 동안 지우지 않는다.
+- kind: alias(다른 모듈 재수출) · adapter(legacy 정의) · 경로 · 상수·상태 ·
+  모듈 참조 · legacy-class(호환 서브클래스)
+- owner: 배정 당시 소유 모듈. 미사용이 되어도 한 릴리스 동안 지우지 않는다.
 이 파일과 test_legacy_exports_contract.py가 표면 드리프트를 차단한다.
+
+## 축소 완료 후 legacy_surface 잔여 구획 색인 (2026-07-30, 4,208줄 실측)
+
+각 구획이 남아 있는 호환 이유:
+
+- 재수출 import 81건(340줄): 과거 단일 파일 시절 이름을 같은 자리에서
+  제공한다 — 회귀 299개 monkeypatch 지점과 alias 44개의 근거.
+- 경로·부트스트랩·상수 132할당(280줄): PROGRAM_DIR·BASE_DIR·프로필·
+  DEFAULT_CONFIG·OPTIONS·pace 기본값 등. 사용자 자료 위치의 진실이며
+  시험이 patch.object(APP, "BASE_DIR", …)로 직접 바꾼다.
+- 셔틀 함수 170개(≤4줄): 서비스·wiring 호출을 legacy 이름으로 노출한다.
+  이것이 계획서의 "필요한 최소 adapter"다 — 줄 압축 금지 원칙에 따라
+  한 이름당 한 함수를 유지한다.
+- 실질 adapter ~200개(호출 인자 조립·예외 문구 유지):
+  call_nai_api(조각 해석 주입)·save_config(`_` 키 필터)·out_root 등.
+- 클래스 3개(30줄): ConfigServer(namespace 고정 서브클래스)·LiveState·
+  PublicCollectionManager 어댑터 — 계획서가 alias 유지를 명시.
+- Operations/Paths 조립: **0건** (runtime/wiring/ 5모듈 + web/
+  application_server로 전부 이동).
+
+### 아직 legacy에 남은 이동 후보 (완료 아님 — 다음 축소 라운드)
+
+setting_reference_config(33줄)·character_resource_config(27줄)·
+save_scenes(29줄)·activate_comparison_run(32줄)·_comparison_result_context
+(37줄)·_nai_json_metadata(31줄)·ensure_schema_split(33줄)·setting_thumbs
+(29줄) 등 20줄 초과 함수 — 기능 계산이 섞여 있어 서비스로 옮길 가치가
+있으나 이번 라운드 범위 밖. 경계 상한 4,250이 역증가를 막는다.
 """
 from __future__ import annotations
 
