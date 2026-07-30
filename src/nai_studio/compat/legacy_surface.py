@@ -409,22 +409,10 @@ _LEGACY_USER_DIRS = (
 
 
 def migrate_legacy_program_data(program_dir, data_dir):
-    paths = _program_data_migration.ProgramDataMigrationPaths(
-        program_dir=Path(program_dir),
-        data_dir=Path(data_dir),
-        user_files=globals()["_LEGACY_USER_FILES"],
-        user_dirs=globals()["_LEGACY_USER_DIRS"],
-    )
-    operations = _program_data_migration.ProgramDataMigrationOperations(
-        copy_file=globals()["shutil"].copy2,
-        replace_file=globals()["os"].replace,
-        process_id=globals()["os"].getpid,
-        thread_id=globals()["threading"].get_ident,
-        now=lambda: globals()["datetime"].now(),
-    )
     return _program_data_migration.migrate_legacy_program_data(
-        paths,
-        operations,
+        _wiring_management.program_data_migration_paths(
+            globals(), Path(program_dir), Path(data_dir)),
+        _wiring_management.program_data_migration_operations(globals()),
     )
 
 
@@ -817,18 +805,11 @@ def resource_file_index(cfg):
 
 
 def _resource_import_paths():
-    return _resource_bridge.LegacyResourceImportPaths(
-        vibe_dir=VIBE_DIR,
-        transaction_root=VIBE_DIR.parent.parent,
-    )
+    return _wiring_library.resource_import_paths(globals())
 
 
 def _resource_import_operations():
-    return _resource_bridge.LegacyResourceImportOperations(
-        transaction=shared_data_transaction,
-        atomic_write_bytes=_atomic_write_bytes,
-        save_config=save_config,
-    )
+    return _wiring_library.resource_import_operations(globals())
 
 
 def _reference_operations():
@@ -2879,19 +2860,11 @@ def _config_initialization_operations():
 
 
 def _file_transaction_paths():
-    return _file_transaction.FileTransactionPaths(root=BASE_DIR)
+    return _wiring_library.file_transaction_paths(globals())
 
 
 def _file_transaction_operations():
-    return _file_transaction.FileTransactionOperations(
-        transaction=globals()["shared_data_transaction"],
-        atomic_write_bytes=globals()["_atomic_write_bytes"],
-        atomic_write_json=globals()["atomic_write_json"],
-        load_json=globals()["load_json_recover"],
-        replace=globals()["os"].replace,
-        info=log.info,
-        warning=log.warning,
-    )
+    return _wiring_library.file_transaction_operations(globals())
 
 
 def recover_pending_file_transactions():

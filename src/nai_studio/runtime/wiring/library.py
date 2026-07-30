@@ -27,7 +27,9 @@ from src.nai_studio.services import (
 from src.nai_studio.services import (
     remote_image_cache as _remote_image_cache,
 )
+from src.nai_studio.services import resource_bridge as _resource_bridge
 from src.nai_studio.services import style_store as _style_store
+from src.nai_studio.runtime import file_transaction as _file_transaction
 from src.nai_studio.services import tag_catalog as _tag_catalog
 from src.nai_studio.services import user_backup_store as _user_backup_store
 
@@ -180,6 +182,37 @@ def user_backup_operations(app: Mapping[str, Any]):
         recoverable_remove=app["recoverable_remove"],
         **app["_studio_wiring"].user_backup_baseline_fields(
             app["PROFILE_DIR"]),
+    )
+
+
+def resource_import_paths(app: Mapping[str, Any]):
+    return _resource_bridge.LegacyResourceImportPaths(
+        vibe_dir=app["VIBE_DIR"],
+        transaction_root=app["VIBE_DIR"].parent.parent,
+    )
+
+
+def resource_import_operations(app: Mapping[str, Any]):
+    return _resource_bridge.LegacyResourceImportOperations(
+        transaction=app["shared_data_transaction"],
+        atomic_write_bytes=app["_atomic_write_bytes"],
+        save_config=app["save_config"],
+    )
+
+
+def file_transaction_paths(app: Mapping[str, Any]):
+    return _file_transaction.FileTransactionPaths(root=app["BASE_DIR"])
+
+
+def file_transaction_operations(app: Mapping[str, Any]):
+    return _file_transaction.FileTransactionOperations(
+        transaction=app["shared_data_transaction"],
+        atomic_write_bytes=app["_atomic_write_bytes"],
+        atomic_write_json=app["atomic_write_json"],
+        load_json=app["load_json_recover"],
+        replace=app["os"].replace,
+        info=app["log"].info,
+        warning=app["log"].warning,
     )
 
 

@@ -17,6 +17,9 @@ from src.nai_studio.services import (
 from src.nai_studio.services import comparison_runtime as _comparison_runtime
 from src.nai_studio.services import management_state as _management_state
 from src.nai_studio.services import output_lifecycle as _output_lifecycle
+from src.nai_studio.services import (
+    program_data_migration as _program_data_migration,
+)
 from src.nai_studio.runtime import program_entry as _program_entry
 
 
@@ -273,6 +276,25 @@ def comparison_promotion_operations(
             if include_recipe_adapter
             else None
         ),
+    )
+
+
+def program_data_migration_paths(app: Mapping[str, Any], program_dir, data_dir):
+    return _program_data_migration.ProgramDataMigrationPaths(
+        program_dir=program_dir,
+        data_dir=data_dir,
+        user_files=app["_LEGACY_USER_FILES"],
+        user_dirs=app["_LEGACY_USER_DIRS"],
+    )
+
+
+def program_data_migration_operations(app: Mapping[str, Any]):
+    return _program_data_migration.ProgramDataMigrationOperations(
+        copy_file=app["shutil"].copy2,
+        replace_file=app["os"].replace,
+        process_id=app["os"].getpid,
+        thread_id=app["threading"].get_ident,
+        now=lambda: app["datetime"].now(),
     )
 
 
