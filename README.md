@@ -12,12 +12,11 @@ NovelAI 이미지 생성부터 자료 정리, 그림체·캐릭터 제작, 장�
 
 | 구분 | 용도 | 상태 |
 | --- | --- | --- |
-| [`v1.1.0` Release](https://github.com/chikzon/nai-batch-generator/releases/tag/v1.1.0) | 일반 사용자용 안정판 | 설치본·포터블·기본자료팩·SHA-256 목록 공개 |
-| `main` | 다음 안정판을 준비하는 개발 소스 | `v1.1.0` 이후 변경을 포함하며 Release 실행본과 동작이 다를 수 있음 |
+| [`v1.2.0` Release](https://github.com/chikzon/nai-batch-generator/releases/tag/v1.2.0) | 일반 사용자용 안정판 | 설치본·포터블·기본자료팩·SHA-256 목록 공개 |
+| `main` | 다음 안정판을 준비하는 개발 소스 | `v1.2.0` 이후 변경을 포함하며 Release 실행본과 동작이 다를 수 있음 |
 
-다운로드 파일명은 **`v1.1.0` 안정판 기준**이고, 아래 화면은 **현재 `main` 개발본**을
-빈 사용자 데이터 폴더에서 실행해 촬영했습니다. `main`의 최신 화면이 보인다고 해서
-새 Release가 게시됐다는 뜻은 아닙니다.
+다운로드 파일명은 **`v1.2.0` 안정판 기준**이고, 아래 화면은 이 안정판과 같은
+개발본을 빈 사용자 데이터 폴더에서 실행해 촬영했습니다.
 
 ## 다운로드와 첫 실행
 
@@ -26,9 +25,9 @@ NovelAI 이미지 생성부터 자료 정리, 그림체·캐릭터 제작, 장�
 
 | 파일 | 내용 |
 | --- | --- |
-| `NAI-batch-generator-1.1.0-setup.exe` | Windows x64 설치·제거가 가능한 권장 설치본 |
-| `NAI-batch-generator-1.1.0-portable-win-x64.zip` | 설치 없이 압축을 풀어 실행하는 포터블판 |
-| `NAI-batch-generator-1.1.0-datapack.zip` | 빌더 후보·규격·옵션·태그 검색 자료 |
+| `NAI-batch-generator-1.2.0-setup.exe` | Windows x64 설치·제거가 가능한 권장 설치본 |
+| `NAI-batch-generator-1.2.0-portable-win-x64.zip` | 설치 없이 압축을 풀어 실행하는 포터블판 |
+| `NAI-batch-generator-1.2.0-datapack.zip` | 빌더 후보·규격·옵션·태그 검색 자료 |
 | `SHA256SUMS.txt` | 위 세 파일의 SHA-256 확인 목록 |
 
 1. 설치본을 실행하거나 포터블 ZIP을 풉니다.
