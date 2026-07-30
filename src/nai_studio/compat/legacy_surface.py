@@ -166,6 +166,7 @@ from src.nai_studio.runtime.data_files import (
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.runtime import file_transaction as _file_transaction
+from src.nai_studio.compat import studio_wiring as _studio_wiring
 from src.nai_studio.runtime import program_entry as _program_entry
 from src.nai_studio.services.legacy_bridge import (
     evidence_from_image_record,
@@ -2548,6 +2549,7 @@ def _user_backup_operations():
         random_bytes=os.urandom,
         warning=log.warning,
         recoverable_remove=recoverable_remove,
+        **_studio_wiring.user_backup_baseline_fields(PROFILE_DIR),
     )
 
 

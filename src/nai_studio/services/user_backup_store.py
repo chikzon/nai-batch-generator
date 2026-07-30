@@ -14,6 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from src.nai_studio.services.merge_plan import (
+    baseline_export_payload as _baseline_export_payload,
+    decision_for_hashes as _decision_for_hashes,
+    resolve_pointer as _resolve_pointer,
+    three_way_decision as _three_way_decision,
+)
+
 
 _MISSING = object()
 _SECRET_KEYS = frozenset({"token", "booru_keys", "out_dir"})
@@ -54,6 +61,9 @@ class UserBackupOperations:
     random_bytes: Callable[[int], bytes]
     warning: Callable[..., Any]
     recoverable_remove: Callable[..., Any]
+    # 3-way 기준값 (없으면 기존 2-way 그대로) — compat/studio_wiring이 조립한다.
+    baseline_lookup: Callable[[str], dict | None] | None = None
+    record_baseline: Callable[[dict], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -299,18 +309,33 @@ def export_user_backup(
 ) -> bytes:
     """사용자 원본과 비밀값 제외 내역을 기존 ZIP schema로 내보낸다."""
     payloads = backup_sources(paths, operations, config)
+    # 새 백업부터 3-way 기준값을 함께 싣는다. 장부가 없으면 이전과 같은 모양이다.
+    baselines: dict[str, bytes] = {}
+    entries = []
+    for logical, raw in sorted(payloads.items()):
+        entry = {
+            "path": logical,
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        known = (
+            operations.baseline_lookup(logical)
+            if operations.baseline_lookup
+            else None
+        )
+        if known:
+            base_raw, base_sha = _baseline_export_payload(known)
+            if base_sha:
+                entry["base_sha256"] = base_sha
+            if base_raw is not None:
+                baselines[logical] = base_raw
+                entry["base_size"] = len(base_raw)
+        entries.append(entry)
     manifest = {
         "schema": paths.schema,
         "created_at": operations.now().isoformat(timespec="seconds"),
         "profile": paths.profile_name or "기본",
-        "files": [
-            {
-                "path": logical,
-                "size": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            }
-            for logical, raw in sorted(payloads.items())
-        ],
+        "files": entries,
         "excluded": [
             "API 토큰",
             "생성 결과(output)",
@@ -337,6 +362,8 @@ def export_user_backup(
         )
         for logical, raw in sorted(payloads.items()):
             archive.writestr("data/" + logical, raw)
+        for logical, raw in sorted(baselines.items()):
+            archive.writestr("baseline/" + logical, raw)
     return output.getvalue()
 
 
@@ -444,6 +471,35 @@ def _apply_change(value: Any, change: dict, depth: int = 0) -> Any:
     return rows
 
 
+def _read_baselines(blob: bytes, manifest: dict) -> dict[str, Any]:
+    """동봉된 3-way 기준값을 검증해 logical → JSON 값으로 돌려준다.
+
+    손상되거나 빠진 기준값은 없는 것으로 본다 — 그 항목만 no-base(2-way)가 된다.
+    """
+    wanted = {
+        str(entry.get("path")): str(entry.get("base_sha256"))
+        for entry in (manifest.get("files") or [])
+        if entry.get("base_sha256") and entry.get("base_size") is not None
+    }
+    if not wanted:
+        return {}
+    values: dict[str, Any] = {}
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        names = set(archive.namelist())
+        for logical, sha in wanted.items():
+            name = "baseline/" + logical
+            if name not in names:
+                continue
+            raw = archive.read(name)
+            if hashlib.sha256(raw).hexdigest() != sha:
+                continue
+            try:
+                values[logical] = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError):
+                continue
+    return values
+
+
 def backup_diff_plan(
     paths: UserBackupPaths,
     operations: UserBackupOperations,
@@ -454,6 +510,7 @@ def backup_diff_plan(
         str(item.get("path") or ""): item
         for item in (manifest.get("files") or [])
     }
+    baselines = _read_baselines(blob, manifest)
     plans = []
     counts = {"새 파일": 0, "바뀔 파일": 0, "같은 파일": 0}
     total = 0
@@ -498,9 +555,38 @@ def backup_diff_plan(
         )
         current_sha = hashlib.sha256(current_raw or b"").hexdigest()
         incoming_sha = hashlib.sha256(wanted).hexdigest()
-        base_sha = str((declared.get(logical) or {}).get("base_sha256") or "")
+        declared_entry = declared.get(logical) or {}
+        base_sha = str(declared_entry.get("base_sha256") or "")
+        # base_size가 없는 base_sha256은 바이너리 원본 해시다 (파일 단위 비교용).
+        binary_base = bool(base_sha) and declared_entry.get("base_size") is None
+        base_value = baselines.get(logical, _MISSING)
         for change in changes:
             pointer = _pointer(change["tokens"])
+            if json_mode and base_value is not _MISSING:
+                if change["tokens"] or (
+                    json_mode and current_raw is not None
+                ):
+                    found, base_item = _resolve_pointer(
+                        base_value, change["tokens"])
+                    decision = _three_way_decision(
+                        found, base_item,
+                        change["current_exists"], change["current"],
+                        change["incoming_exists"], change["incoming"])
+                else:
+                    found, base_item = True, base_value
+                    decision = _three_way_decision(
+                        True, base_value,
+                        current_raw is not None,
+                        current_value if current_raw is not None else None,
+                        True, incoming_value)
+                base_public, base_found = (
+                    (base_item, True) if found else (None, False))
+            elif not json_mode and binary_base:
+                decision = _decision_for_hashes(
+                    base_sha, current_sha, incoming_sha)
+                base_public, base_found = None, True
+            else:
+                decision, base_public, base_found = "no-base", None, False
             change_id = hashlib.sha256(
                 f"{archive_sha}\0{logical}\0{pointer}\0"
                 f"{current_sha}\0{incoming_sha}".encode("utf-8")
@@ -515,6 +601,9 @@ def backup_diff_plan(
                 "current_sha256": current_sha,
                 "incoming_sha256": incoming_sha,
                 "base_sha256": base_sha,
+                "base": copy.deepcopy(base_public),
+                "base_found": base_found,
+                "decision": decision,
                 "target": target,
                 "wanted_raw": wanted,
                 "current_raw": current_raw,
@@ -552,6 +641,9 @@ def backup_change_public(change: Mapping[str, Any]) -> dict:
     } | {
         "action": action,
         "base_available": bool(change.get("base_sha256")),
+        "base": copy.deepcopy(change.get("base")),
+        "base_found": bool(change.get("base_found")),
+        "decision": change.get("decision", "no-base"),
     }
 
 
@@ -736,6 +828,22 @@ def _restore_user_backup(
     operations.atomic_write_json(
         journal_file, record, indent=1, keep_backup=False
     )
+    if operations.record_baseline and pending:
+        # 적용된 상태가 다음 3-way의 기준값이 된다. 설정은 토큰을 지우고 기록한다.
+        applied: dict[str, bytes] = {}
+        for item, _target, wanted in pending:
+            logical = item["path"]
+            if logical == "profile/설정.json":
+                try:
+                    wanted = _clean_settings(
+                        json.loads(wanted.decode("utf-8")))
+                except (UnicodeError, json.JSONDecodeError):
+                    continue
+            applied[logical] = wanted
+        try:
+            operations.record_baseline(applied)
+        except Exception as exc:
+            operations.warning("병합 기준값 기록을 건너뜁니다: %s", exc)
     operations.after_restore()
     return {
         "ok": True,
