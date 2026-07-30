@@ -322,7 +322,11 @@ def program_entry_operations(app: Mapping[str, Any]):
         ),
         cleanup_server=lambda _server: None,
         close_logging=lambda _logger: None,
-        warm_index=lambda server: app["_ac_index"](server.spec),
+        # 태그 색인과 그림체 카탈로그를 함께 예열해 첫 열기를 웜 경로로 만든다.
+        warm_index=lambda server: (
+            app["_ac_index"](server.spec),
+            app["load_combos"](),
+        ),
         start_daemon=lambda target: app["threading"].Thread(
             target=target,
             daemon=True,
