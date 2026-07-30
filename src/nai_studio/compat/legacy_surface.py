@@ -167,6 +167,8 @@ from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.runtime import file_transaction as _file_transaction
 from src.nai_studio.runtime.wiring import generation as _wiring_generation
+from src.nai_studio.runtime.wiring import management as _wiring_management
+from src.nai_studio.runtime.wiring import settings as _wiring_settings
 from src.nai_studio.runtime.wiring import library as _wiring_library
 from src.nai_studio.compat import studio_wiring as _studio_wiring
 from src.nai_studio.runtime import program_entry as _program_entry
@@ -1715,28 +1717,11 @@ _SETTING_TX_LOCK = threading.RLock()
 
 
 def _setting_store_paths():
-    """세팅 서비스가 현재 프로필 경로를 호출 시점에 읽게 한다."""
-    return _setting_store.SettingStorePaths(
-        settings_dir=SETTINGS_DIR,
-        schema_dir=SCHEMA_DIR,
-        preset_dir=SCENESET_DIR,
-    )
+    return _wiring_settings.setting_store_paths(globals())
 
 
 def _setting_store_operations():
-    """원자 저장·잠금·컴파일 규칙을 세팅 저장소에 연결한다."""
-    return _setting_store.SettingStoreOperations(
-        transaction=_setting_transaction,
-        load_json=globals()["load_json_recover"],
-        atomic_write_json=globals()["atomic_write_json"],
-        recoverable_remove=globals()["recoverable_remove"],
-        safe_name=globals()["_safe_name"],
-        derive_catalog=globals()["derive_setting_catalog"],
-        axis_specs=globals()["axis_specs"],
-        ensure_schema_split=globals()["ensure_schema_split"],
-        warning=globals()["log"].warning,
-        info=globals()["log"].info,
-    )
+    return _wiring_settings.setting_store_operations(globals())
 
 
 def ensure_settings_migration():
@@ -2573,21 +2558,7 @@ COMPARE_RECIPE_SETTING_KEYS = STYLE_BUNDLE_SETTING_KEYS
 
 
 def _comparison_operations():
-    """비교 계획이 쓰는 저장·세팅 경계를 호출 시점의 구현에 연결한다."""
-    return _comparison_planning.ComparisonPlanningOperations(
-        load_combos=globals()["load_combos"],
-        load_spec=globals()["load_spec"],
-        list_styles=globals()["list_styles"],
-        style_bundle_signature=globals()["style_bundle_signature"],
-        load_asset_config=globals()["load_asset_config"],
-        compute_pending=globals()["compute_pending"],
-        setting_reference_config=globals()["setting_reference_config"],
-        character_resource_config=globals()["character_resource_config"],
-        characters_resource_config=globals()["characters_resource_config"],
-        inherited_blueprint=globals()["inherited_blueprint"],
-        recipe_setting_keys=COMPARE_RECIPE_SETTING_KEYS,
-        max_characters=MAX_CHARS,
-    )
+    return _wiring_management.comparison_planning_operations(globals())
 
 
 def _comparison_id(prefix, *parts):
@@ -2608,13 +2579,7 @@ def comparison_characters(cfg):
 
 
 def _setting_runtime_operations():
-    """현재 세팅·캐릭터·이름 경계를 호출 때 주입해 APP patch를 보존한다."""
-    return _setting_runtime.SettingRuntimeOperations(
-        comparison_characters=globals()["comparison_characters"],
-        derive_catalog=globals()["derive_setting_catalog"],
-        safe_name=globals()["_safe_name"],
-        setting_state=globals()["setting_state"],
-    )
+    return _wiring_settings.setting_runtime_operations(globals())
 
 
 def setting_cast_members(cfg, state):
@@ -2823,85 +2788,15 @@ def _collection_handler_operations():
 
 
 def _setting_transaction():
-    """기존 세팅 파일의 프로세스·스레드 잠금을 같은 순서로 묶는다."""
-    stack = ExitStack()
-    stack.enter_context(
-        globals()["shared_data_transaction"](
-            globals()["SETTINGS_DIR"].parent
-        )
-    )
-    stack.enter_context(globals()["_SETTING_TX_LOCK"])
-    return stack
+    return _wiring_settings.setting_transaction(globals())
 
 
 def _settings_handler_operations():
-    """프로젝트·설정·씬 저장 의존성을 호출 시점에 연결한다."""
-    return _settings_handlers.SettingsHandlerOperations(
-        config_transaction=lambda: globals()["shared_data_transaction"](
-            globals()["CHAR_DIR"].parent
-        ),
-        setting_transaction=_setting_transaction,
-        default_config=globals()["DEFAULT_CONFIG"],
-        normalize_projects=globals()["normalize_projects"],
-        normalize_link=globals()["normalize_link"],
-        project_by_id=globals()["project_by_id"],
-        generation_blueprint=globals()["generation_blueprint"],
-        blueprint_common=globals()["blueprint_common"],
-        fingerprint_blueprint=globals()["fingerprint_blueprint"],
-        resolve_inheritance=globals()["resolve_inheritance"],
-        materialize_blueprint=globals()[
-            "materialize_blueprint_into_config"
-        ],
-        save_config=globals()["save_config"],
-        validate_config_value=globals()["validate_config_value"],
-        sync_chars_to_files=globals()["sync_chars_to_files"],
-        sync_blueprint_overrides=globals()[
-            "sync_blueprint_local_overrides"
-        ],
-        delete_char_files=globals()["delete_char_files"],
-        setting_path=globals()["setting_path"],
-        load_json=globals()["load_json_recover"],
-        setting_revision=globals()["setting_content_revision"],
-        normalize_resolution=globals()["normalize_resolution"],
-        normalize_centers=globals()["normalize_scene_centers"],
-        normalize_reference_ids=globals()[
-            "normalize_scene_reference_ids"
-        ],
-        atomic_write_json=globals()["atomic_write_json"],
-        warning=globals()["log"].warning,
-        info=globals()["log"].info,
-    )
+    return _wiring_settings.settings_handler_operations(globals())
 
 
 def _comparison_handler_operations():
-    """비교 실행·승격의 기존 계획·계보·worker 의존성을 연결한다."""
-    return _comparison_handlers.ComparisonHandlerOperations(
-        result_promotion_records=globals()["_result_promotion_records"],
-        legacy_lineage_unavailable=globals()[
-            "LegacyPromotionLineageUnavailable"
-        ],
-        promote_assets=globals()["promote_comparison_recipe_assets"],
-        append_promotion_ledger=globals()[
-            "_append_result_promotion_ledger"
-        ],
-        redact_diagnostic_text=globals()["redact_diagnostic_text"],
-        comparison_plan=globals()["comparison_plan"],
-        inherited_blueprint=globals()["inherited_blueprint"],
-        comparison_characters=globals()["comparison_characters"],
-        comparison_sources=globals()["comparison_sources"],
-        run_comparison=globals()["_run_comparison"],
-        selected_comparison_record=globals()[
-            "_selected_comparison_record"
-        ],
-        rerun_selected_comparison=globals()[
-            "_rerun_selected_comparison"
-        ],
-        start_daemon=lambda target: globals()["threading"].Thread(
-            target=target,
-            daemon=True,
-        ).start(),
-        error=globals()["log"].error,
-    )
+    return _wiring_management.comparison_handler_operations(globals())
 
 
 def _late_bound(name):
@@ -3243,11 +3138,7 @@ CHARACTER_ASSET_OPTIONAL_FIELDS = _character_storage.CHARACTER_ASSET_OPTIONAL_FI
 
 
 def _character_storage_paths():
-    return _character_storage.CharacterStoragePaths(
-        legacy_settings_file=LEGACY_SETTINGS_FILE,
-        settings_file=SETTINGS_FILE,
-        character_dir=CHAR_DIR,
-    )
+    return _wiring_settings.character_storage_paths(globals())
 
 
 def _character_random_id():
@@ -3257,17 +3148,7 @@ def _character_random_id():
 
 
 def _character_storage_operations():
-    """현재 파일·복구·ID 경계를 호출 때 주입해 기존 patch와 저장 순서를 보존한다."""
-    return _character_storage.CharacterStorageOperations(
-        read_legacy_settings=_read_legacy_txt,
-        setting_path=setting_path,
-        load_json=load_json_recover,
-        atomic_write_json=atomic_write_json,
-        recoverable_remove=recoverable_remove,
-        random_id=_character_random_id,
-        log_info=log.info,
-        log_warning=log.warning,
-    )
+    return _wiring_settings.character_storage_operations(globals())
 
 
 def _safe_name(name):

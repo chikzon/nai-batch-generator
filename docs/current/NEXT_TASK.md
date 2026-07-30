@@ -24,8 +24,12 @@
       (reference · auxiliary · pacing · step/retry/commit/execution ·
       handler bindings 3벌 · handler · image_tool · collection)
       5,253 → **5,071줄** (−182). 생성 경로 회귀 16/16 · exports 7 · 경계 5
-- [ ] 조각 4 — 세팅 계열 → `wiring/settings.py`, 관리·비교 계열 →
-      `wiring/management.py`, 라우트 바인딩 6벌 → `wiring/routes.py`
+- [x] 조각 4a — 세팅·캐릭터 저장 7함수 → `wiring/settings.py`,
+      비교 계획·핸들러 2함수 → `wiring/management.py`
+      5,071 → **4,952줄** (−119). 회귀 12/12 · exports 7 · 경계 5
+- [ ] 조각 4b — 관리 잔여(config init/projection · character? · output ·
+      job ledger · comparison runtime/execution/promotion · program_entry)
+      → `wiring/management.py`, 라우트 바인딩 6벌 → `wiring/routes.py`
 - [ ] 조각마다 경계 상한 하향(별도 커밋) — 역증가 차단
 
 ## 검증 원칙 (계획서)
