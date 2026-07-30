@@ -16,7 +16,17 @@
   - 시험 seam 변경 0 (app=globals() 호출 시점 조회로 monkeypatch 무손상)
 - 단계 2는 계획대로 wiring이 context를 받는 형태로 뒤에 수렴 (가정 명시됨)
 
-## 이 단계에서 할 것 (계획서 단계 4)
+## 단계 4 진행
+
+- [x] `ConfigServer` 본체 → `web/application_server.py` (namespace 주입,
+      서비스는 직접 import·레거시 이름은 호출 시점 조회). legacy에는
+      6줄 호환 서브클래스만. `@serialized_data_write`는 같은 잠금 의미의
+      with 블록으로 치환. ServerRuntime 조립도 함께 이동 —
+      **legacy 잔여 Operations/Paths 조립 0건**
+- [x] 4,524 → **4,208줄** (−316). 전체 회귀 171/171 + exports 7 통과
+- [x] LiveState·PublicCollectionManager는 계획대로 legacy 어댑터 유지
+
+## 원래 계획 (계획서 단계 4)
 
 1. `ConfigServer` 클래스 본체 → `web/application_server.py`
    - 메서드가 참조하는 레거시 이름들은 생성 시 주입되는 namespace(레거시
