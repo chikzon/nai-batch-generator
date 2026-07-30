@@ -53,7 +53,7 @@ def merge_rows_from_backup(preview: dict) -> list[dict]:
 
 
 def merge_rows_from_datapack(preview: dict) -> list[dict]:
-    """자료팩 검사 결과의 충돌을 공통 행으로 투영한다 (아직 2-way)."""
+    """자료팩 검사 결과의 충돌을 공통 행으로 투영한다 (장부 있으면 3-way)."""
     rows = []
     for conflict in preview.get("conflicts") or []:
         rows.append({
@@ -69,9 +69,9 @@ def merge_rows_from_datapack(preview: dict) -> list[dict]:
                 else ""
             ),
             "action": "변경",
-            "decision": "no-base",
-            "base_found": False,
-            "base": None,
+            "decision": conflict.get("decision", "no-base"),
+            "base_found": bool(conflict.get("base_found")),
+            "base": conflict.get("base"),
             "current": conflict.get("current"),
             "incoming": conflict.get("incoming"),
             "recoverable": True,

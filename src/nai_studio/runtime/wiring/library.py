@@ -68,6 +68,9 @@ def datapack_operations(app: Mapping[str, Any]):
         pack_queue=app["pack_import_queue"],
         summarize_queue=app["summarize_restore_queue"],
         warning=app["log"].warning,
+        # 백업과 같은 3-way 기준값 장부를 공유한다.
+        **app["_studio_wiring"].user_backup_baseline_fields(
+            app["PROFILE_DIR"]),
     )
 
 

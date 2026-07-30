@@ -75,6 +75,10 @@ class DatapackOperations:
     warning: Callable[[str], Any]
     # 파일별 교체 지점. 실패 주입 시험을 위해 갈아끼울 수 있다.
     replace: Callable[[Any, Any], None] = os.replace
+    # 3-way 병합 기준값 — 백업과 같은 장부(merge-baseline.json)를 쓴다.
+    # None이면 기존 2-way(no-base) 그대로다.
+    baseline_lookup: Callable[[str], dict | None] | None = None
+    record_baseline: Callable[[dict], Any] | None = None
 
 
 def datapack_lists(paths: DatapackPaths) -> dict[str, tuple[Path, str]]:
@@ -571,6 +575,55 @@ class _DatapackPreviewState:
     recognized: int = 0
 
 
+def _baseline_logical(paths: DatapackPaths, destination: Path) -> str:
+    """자료팩 대상 경로를 백업과 같은 장부 키(common/<상대>)로 바꾼다."""
+    try:
+        relative = Path(destination).resolve().relative_to(
+            Path(paths.base_dir).resolve())
+    except (OSError, ValueError):
+        return ""
+    return "common/" + relative.as_posix()
+
+
+def _conflict_baseline(
+    state: _DatapackPreviewState,
+    destination: Path | None,
+    key: str,
+    primary: str,
+    current: Any,
+    incoming: Any,
+    kind: str,
+) -> tuple[bool, Any, str]:
+    """장부에서 이 충돌의 기준값과 3-way 판정을 찾는다. 없으면 no-base."""
+    lookup = state.operations.baseline_lookup
+    if lookup is None or destination is None:
+        return False, None, "no-base"
+    logical = _baseline_logical(state.paths, destination)
+    entry = lookup(logical) if logical else None
+    value = (entry or {}).get("value")
+    if kind == "목록 자산":
+        if not isinstance(value, list):
+            return False, None, "no-base"
+        base = next(
+            (
+                item for item in value
+                if isinstance(item, dict)
+                and datapack_match_key(item, primary) == str(key)
+            ),
+            None,
+        )
+        if base is None:
+            return False, None, "no-base"
+    else:
+        if not isinstance(value, dict):
+            return False, None, "no-base"
+        base = value
+    from src.nai_studio.services.merge_plan import three_way_decision
+    decision = three_way_decision(
+        True, base, True, current, True, incoming)
+    return True, copy.deepcopy(base), decision
+
+
 def _add_preview_conflict(
     state: _DatapackPreviewState,
     logical: str,
@@ -578,6 +631,8 @@ def _add_preview_conflict(
     current: Any,
     incoming: Any,
     kind: str,
+    destination: Path | None = None,
+    primary: str = "id",
 ) -> None:
     conflict_id, current_sha, incoming_sha = datapack_conflict_id(
         state.operations,
@@ -587,6 +642,8 @@ def _add_preview_conflict(
         current,
         incoming,
     )
+    base_found, base, decision = _conflict_baseline(
+        state, destination, key, primary, current, incoming, kind)
     state.conflicts.append({
         "id": conflict_id,
         "logical": logical,
@@ -596,6 +653,9 @@ def _add_preview_conflict(
         "incoming": copy.deepcopy(incoming),
         "current_sha256": current_sha,
         "incoming_sha256": incoming_sha,
+        "base_found": base_found,
+        "base": base,
+        "decision": decision,
     })
 
 
@@ -633,6 +693,8 @@ def _preview_list_asset(
                 before,
                 item,
                 "목록 자산",
+                destination=destination,
+                primary=key,
             )
     return True
 
@@ -681,6 +743,7 @@ def _preview_whole_asset(
             current,
             incoming,
             kind,
+            destination=destination,
         )
 
 
@@ -1429,7 +1492,39 @@ def _import_datapack_bytes(
     state.batch["transaction"] = journal["id"]
     file_txn.commit_file_transaction(txn_paths, txn_ops, journal)
     state.operations = operations
+    _record_installed_baseline(paths, operations, journal)
     return _finalize_datapack_import(state, filename)
+
+
+def _record_installed_baseline(
+    paths: DatapackPaths,
+    operations: DatapackOperations,
+    journal: dict,
+) -> None:
+    """설치가 반영한 파일들을 3-way 기준값 장부에 기록한다 (실패는 경고만).
+
+    JSON은 값이 보존되고 이미지 등 바이너리는 해시만 남는다(merge_plan 규칙).
+    """
+    if operations.record_baseline is None:
+        return
+    applied: dict[str, bytes] = {}
+    for entry in journal.get("entries") or []:
+        if not entry.get("applied"):
+            continue
+        target = Path(paths.base_dir) / entry["target"]
+        logical = _baseline_logical(paths, target)
+        if not logical:
+            continue
+        try:
+            applied[logical] = target.read_bytes()
+        except OSError:
+            continue
+    if not applied:
+        return
+    try:
+        operations.record_baseline(applied)
+    except Exception as exc:
+        operations.warning(f"병합 기준값 기록을 건너뜁니다: {exc}")
 
 
 def import_datapack_bytes(

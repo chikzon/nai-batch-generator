@@ -191,5 +191,148 @@ class DatapackTransactionContractTests(unittest.TestCase):
         )
 
 
+class DatapackThreeWayContractTests(unittest.TestCase):
+    """자료팩 검사·설치가 백업과 같은 3-way 기준값 장부를 쓰는 계약."""
+
+    def setUp(self):
+        from src.nai_studio.services import merge_plan
+
+        self.temp = tempfile.TemporaryDirectory(prefix="nais-pack-3way-")
+        self.base = Path(self.temp.name)
+        (self.base / "수집").mkdir()
+        self.merge_plan = merge_plan
+        self.baseline_file = merge_plan.baseline_path(self.base)
+        self.paths = DatapackPaths(
+            base_dir=self.base,
+            style_file=self.base / "수집" / "그림체.json",
+            recipe_file=self.base / "수집" / "레시피.json",
+            combo_file=self.base / "수집" / "작가조합.json",
+            image_cache=self.base / "수집" / "이미지캐시",
+            tag_dir=self.base / "태그",
+            builder_file=self.base / "후보사전.json",
+            spec_file=self.base / "규격.json",
+            options_file=self.base / "옵션.json",
+            settings_dir=self.base / "세팅",
+            character_dir=self.base / "캐릭터",
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def operations(self, with_baseline=True) -> DatapackOperations:
+        from src.nai_studio.runtime.data_files import (
+            load_json_recover as load_json,
+        )
+
+        extra = {}
+        if with_baseline:
+            path = self.baseline_file
+
+            def lookup(logical):
+                return self.merge_plan.baseline_entry(
+                    self.merge_plan.load_baseline(path, load_json), logical)
+
+            def record(applied):
+                return self.merge_plan.record_applied_baseline(
+                    path, load_json, atomic_write_json, applied)
+
+            extra = {"baseline_lookup": lookup, "record_baseline": record}
+        return DatapackOperations(
+            transaction=shared_data_transaction,
+            atomic_write_bytes=_atomic_write_bytes,
+            atomic_write_json=atomic_write_json,
+            load_json=load_json_recover,
+            recoverable_remove=recoverable_remove,
+            row_digest=_row_digest,
+            character_signature=lambda record: _row_digest(record),
+            delete_character_files=lambda *_, **__: None,
+            sync_character_files=lambda *_, **__: None,
+            save_config=lambda *_, **__: None,
+            forget_caches=lambda *_, **__: None,
+            pack_queue=lambda *_, **__: {"items": []},
+            summarize_queue=lambda *_: {},
+            warning=lambda *_: None,
+            **extra,
+        )
+
+    def record_baseline_rows(self, rows):
+        raw = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+        self.merge_plan.record_applied_baseline(
+            self.baseline_file,
+            load_json_recover,
+            atomic_write_json,
+            {"common/수집/그림체.json": raw},
+        )
+
+    def pack_with_row(self, row) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("그림체.json", json.dumps([row]))
+        return buffer.getvalue()
+
+    def preview(self, blob, operations=None):
+        from src.nai_studio.services.datapack_store import (
+            preview_datapack_bytes,
+        )
+
+        return preview_datapack_bytes(
+            self.paths, operations or self.operations(), blob, "팩.zip")
+
+    def test_three_way_decisions_from_shared_ledger(self):
+        base_row = {"id": "그림체A", "prompt": "base"}
+        self.record_baseline_rows([base_row])
+        incoming = {"id": "그림체A", "prompt": "incoming"}
+        # 내 쪽이 기준 그대로 → 들어오는 쪽만 바뀜
+        atomic_write_json(
+            self.paths.style_file, [dict(base_row)], keep_backup=False)
+        conflict = self.preview(self.pack_with_row(incoming))["conflicts"][0]
+        self.assertEqual(conflict["decision"], "take-incoming")
+        self.assertEqual(conflict["base"], base_row)
+        # 들어오는 쪽이 기준 그대로 → 내 쪽만 바뀜
+        atomic_write_json(
+            self.paths.style_file,
+            [{"id": "그림체A", "prompt": "mine"}],
+            keep_backup=False,
+        )
+        conflict = self.preview(self.pack_with_row(base_row))["conflicts"][0]
+        self.assertEqual(conflict["decision"], "keep-current")
+        # 양쪽 다 기준에서 벗어남
+        conflict = self.preview(self.pack_with_row(incoming))["conflicts"][0]
+        self.assertEqual(conflict["decision"], "both-changed")
+
+    def test_without_ledger_stays_two_way(self):
+        atomic_write_json(
+            self.paths.style_file,
+            [{"id": "그림체A", "prompt": "mine"}],
+            keep_backup=False,
+        )
+        blob = self.pack_with_row({"id": "그림체A", "prompt": "incoming"})
+        conflict = self.preview(
+            blob, self.operations(with_baseline=False))["conflicts"][0]
+        self.assertEqual(conflict["decision"], "no-base")
+        self.assertFalse(conflict["base_found"])
+
+    def test_install_records_ledger_then_next_preview_is_three_way(self):
+        operations = self.operations()
+        incoming = {"id": "그림체A", "prompt": "installed"}
+        result = import_datapack_bytes(
+            self.paths, operations, self.pack_with_row(incoming), "팩.zip")
+        self.assertTrue(result["ok"], result)
+        ledger = self.merge_plan.load_baseline(
+            self.baseline_file, load_json_recover)
+        entry = ledger["files"].get("common/수집/그림체.json")
+        self.assertIsNotNone(entry, "설치가 장부를 갱신해야 한다")
+        self.assertEqual(entry["value"], [incoming])
+        # 내가 행을 수정한 뒤 같은 팩을 다시 검사 → 들어오는 쪽=기준 → keep-current
+        atomic_write_json(
+            self.paths.style_file,
+            [{"id": "그림체A", "prompt": "edited-by-me"}],
+            keep_backup=False,
+        )
+        conflict = self.preview(
+            self.pack_with_row(incoming), operations)["conflicts"][0]
+        self.assertEqual(conflict["decision"], "keep-current")
+
+
 if __name__ == "__main__":
     unittest.main()
