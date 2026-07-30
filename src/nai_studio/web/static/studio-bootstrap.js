@@ -430,7 +430,7 @@ function arrangeStudioWorkspace(){
   }
 
   const libraryNav = $('studioLibraryNav');
-  const libraryWork = ['input','catalog','results'].includes(
+  const libraryWork = ['input','review','catalog','results'].includes(
     (STATE.ui || {}).library_work) ? STATE.ui.library_work : 'input';
   if(libraryNav){
     libraryNav.classList.toggle('hidden', !studio);
@@ -479,7 +479,7 @@ function activateMode(mode){
     renderSettings(); renderScenePresets(); renderScenes();
     sbPickList(); paintClash(); bindComparison();
   }else if(mode === 'library'){
-    renderLibrary(); bindBooru(); bindRecipes();
+    renderLibrary(); bindBooru(); bindRecipes(); bindLibraryReview();
     if($('expGrid')) expLoad('');
   }else if(mode === 'builder'){
     renderScenes();

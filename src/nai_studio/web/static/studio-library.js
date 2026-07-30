@@ -1084,6 +1084,238 @@ if($('publicCollectStart')){
   PUBLIC_COLLECT_TIMER = setInterval(loadPublicCollection, 2000);
 }
 
+// 로그인해야 보이는 글은 브라우저가 직접 넘긴다 — 앱은 쿠키를 갖지 않는다.
+// 아래 코드는 arca.live 페이지에서 실행되며 본문 HTML과 이미지 바이트만
+// 이 앱(localhost)으로 POST 한다. 서버가 연결 번호와 출처를 다시 검사한다.
+function relayScriptText(code){
+  const origin = location.origin;
+  return "javascript:(async()=>{try{"
+    + "if(!location.pathname.startsWith('/b/aiart/'))"
+    + "{alert('아카라이브 AI그림 채널 글에서 실행하세요.');return;}"
+    + "const html=document.documentElement.outerHTML;"
+    + "const box=document.querySelector('.article-content')||document.body;"
+    + "const urls=[...box.querySelectorAll('img')].map(i=>i.dataset.originalurl||i.src)"
+    + ".filter(Boolean).slice(0,40);"
+    + "const images=[];for(const u of urls){const r=await fetch(u.startsWith('//')?'https:'+u:u,"
+    + "{credentials:'include'});const b=await r.blob();"
+    + "if(b.size>64*1024*1024)continue;"
+    + "const d=await new Promise(k=>{const f=new FileReader();"
+    + "f.onload=()=>k(String(f.result).split(',')[1]);f.readAsDataURL(b);});"
+    + "images.push({type:b.type,data:d});}"
+    + "const res=await fetch('" + origin + "/api/public_collection_relay',"
+    + "{method:'POST',headers:{'Content-Type':'application/json',"
+    + "'X-Pairing-Code':'" + code + "'},"
+    + "body:JSON.stringify({url:location.href,html,images})});"
+    + "const j=await res.json();"
+    + "alert(j.ok?('보냈습니다: 이미지 '+(j.metadata_images||0)+'장 · '+(j.classification||''))"
+    + ":('실패: '+(j.error||(j.errors||[]).join(', '))));"
+    + "}catch(e){alert('실패: '+e);}})()";
+}
+if($('relayPairingIssue')){
+  $('relayPairingIssue').addEventListener('click', async () => {
+    $('relayPairingMsg').textContent = '연결 번호를 발급하는 중입니다.';
+    try{
+      const r = await (await fetch('/api/public_collection_pairing',
+        {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})).json();
+      if(!r.ok){ $('relayPairingMsg').textContent = r.error || '발급하지 못했습니다.'; return; }
+      $('relayPairingCode').textContent = r.code;
+      $('relayPairingScript').value = relayScriptText(r.code);
+      $('relayPairingScript').classList.remove('hidden');
+      $('relayPairingCopy').classList.remove('hidden');
+      $('relayPairingMsg').textContent =
+        '전달 코드를 복사해 ' + (r.origin || 'arca.live') + ' 글 주소창에 붙여 실행하세요. '
+        + '이전에 발급한 번호는 이제 쓸 수 없습니다.';
+    }catch(e){ $('relayPairingMsg').textContent = '발급 실패: ' + e; }
+  });
+  $('relayPairingCopy').addEventListener('click', async () => {
+    const text = $('relayPairingScript').value;
+    try{
+      await navigator.clipboard.writeText(text);
+      $('relayPairingMsg').textContent = '전달 코드를 복사했습니다.';
+    }catch(e){
+      $('relayPairingScript').select();
+      $('relayPairingMsg').textContent = '복사 권한이 없어 코드를 선택했습니다. Ctrl+C로 복사하세요.';
+    }
+  });
+}
+
+// 검토·병합 — /api/style_dupes 로 겹친 묶음을 찾고, 둘을 골라
+// /api/merge_preview(source=library)로 나란히 보고, /api/merge_apply 로 근거만
+// 합친다. 되돌리기 손잡이는 /api/merge_undo 가 받는다 (자료팩과 같은 장부).
+let REVIEW_PICKED = [], REVIEW_UNDO = '';
+function reviewValue(value){
+  if(value === null || value === undefined || value === '') return '<i class="hint">없음</i>';
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 1);
+  return `<pre style="margin:3px 0;white-space:pre-wrap;font-size:var(--fs-2xs);">${esc(text)}</pre>`;
+}
+function reviewSegments(title, items){
+  if(!items || !items.length) return '';
+  return `<div style="margin-top:4px;"><b style="font-size:var(--fs-2xs);">${esc(title)}</b>`
+    + `<div class="bar" style="flex-wrap:wrap;gap:3px;margin-top:2px;">`
+    + items.map(item => `<span class="tag">${esc(item)}</span>`).join('') + '</div></div>';
+}
+function reviewPaintCompare(payload){
+  const host = $('reviewCompare');
+  host.classList.remove('hidden');
+  if(!payload.ok){
+    host.innerHTML = `<div class="hint">${esc(payload.error || '비교하지 못했습니다.')}</div>`;
+    return;
+  }
+  const rows = payload.rows || [];
+  host.innerHTML = `<div class="bar" style="flex-wrap:wrap;">
+      <strong style="font-size:var(--fs-xs);">나란히 비교</strong>
+      <span class="hint">대표를 고르면 나머지 항목의 근거만 대표에 합칩니다.</span>
+    </div>
+    <div class="grid2" style="margin-top:6px;gap:8px;">`
+    + rows.map((row, index) => `<div class="row" style="display:block;margin:0;">
+        <label class="bar" style="cursor:pointer;">
+          <input type="radio" name="reviewRep" value="${escA(row.id)}"
+            ${index === 0 ? 'checked' : ''} style="width:auto;flex:none;">
+          <b>${esc(row.title || row.id)}</b>
+          <span class="tag">${esc(row.source || '출처 미상')}</span>
+        </label>
+        <div class="hint">${esc(row.id)} · 이미지 ${Number(row.images ? row.images.length : 0)}장
+          · 근거 ${Number(row.evidence_records || 0)}건${row.raw_metadata_present ? ' · 원본 메타 있음' : ''}</div>
+        <details><summary>프롬프트</summary>${reviewValue(row.prompt)}</details>
+        <details><summary>네거티브</summary>${reviewValue(row.negative)}</details>
+        <details><summary>생성 설정</summary>${reviewValue(row.settings)}</details>
+        <details><summary>평가</summary>${reviewValue(row.rating)}</details>
+      </div>`).join('')
+    + `</div>
+    <div style="margin-top:7px;">`
+    + reviewSegments('프롬프트 — 같은 구간', (payload.prompt_diff || {}).common)
+    + reviewSegments('프롬프트 — 왼쪽만', (payload.prompt_diff || {}).left_only)
+    + reviewSegments('프롬프트 — 오른쪽만', (payload.prompt_diff || {}).right_only)
+    + reviewSegments('네거티브 — 왼쪽만', (payload.negative_diff || {}).left_only)
+    + reviewSegments('네거티브 — 오른쪽만', (payload.negative_diff || {}).right_only)
+    + `</div>
+    <div class="bar" style="margin-top:8px;">
+      <button type="button" id="reviewMergeApply" class="primary">고른 대표로 근거 합치기</button>
+      <span class="hint">원본 항목은 지우지 않습니다.</span>
+    </div>`;
+  $('reviewMergeApply').addEventListener('click', reviewApplyMerge);
+}
+async function reviewCompareSelected(){
+  if(REVIEW_PICKED.length !== 2){
+    $('reviewMergeMsg').textContent = '겹친 자료 중 두 개를 고르세요.';
+    return;
+  }
+  $('reviewMergeMsg').textContent = '나란히 비교를 준비하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/merge_preview', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Source':'library'},
+      body:JSON.stringify({ids:REVIEW_PICKED})})).json();
+    reviewPaintCompare(r);
+    $('reviewMergeMsg').textContent = r.ok ? '' : (r.error || '');
+  }catch(e){ $('reviewMergeMsg').textContent = '비교 실패: ' + e; }
+}
+async function reviewApplyMerge(){
+  const picked = document.querySelector('input[name="reviewRep"]:checked');
+  if(!picked) return;
+  const representative = picked.value;
+  const others = REVIEW_PICKED.filter(id => id !== representative);
+  $('reviewMergeMsg').textContent = '근거를 합치는 중입니다.';
+  try{
+    const r = await (await fetch('/api/merge_apply', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source:'library', representative, others})})).json();
+    const detail = r.detail || {};
+    if(!r.ok){
+      $('reviewMergeMsg').textContent = detail.error || '합치지 못했습니다.';
+      return;
+    }
+    REVIEW_UNDO = (r.undo || {}).id || '';
+    $('reviewMergeUndo').classList.toggle('hidden', !REVIEW_UNDO);
+    $('reviewMergeMsg').textContent = detail.changed
+      ? '대표에 근거를 합쳤습니다. 원본 항목은 그대로 남아 있습니다.'
+      : '합칠 새 근거가 없었습니다.';
+    $('reviewCompare').classList.add('hidden');
+    REVIEW_PICKED = [];
+    reviewLoadDupes();
+  }catch(e){ $('reviewMergeMsg').textContent = '합치기 실패: ' + e; }
+}
+async function reviewLoadDupes(){
+  const host = $('reviewDupeList');
+  if(!host) return;
+  host.innerHTML = '<div class="hint">겹친 자료를 찾는 중입니다.</div>';
+  try{
+    const r = await (await fetch('/api/style_dupes')).json();
+    const groups = r['목록'] || [];
+    $('reviewDupeCount').textContent = r.ok
+      ? `묶음 ${Number(r['묶음'] || 0).toLocaleString()}개 · 겹친 항목 ${Number(r['겹친항목'] || 0).toLocaleString()}개`
+      : (r.error || '');
+    if(!groups.length){
+      host.innerHTML = '<div class="hint">겹치는 자료가 없습니다.</div>';
+      return;
+    }
+    host.innerHTML = groups.slice(0, 40).map(group => `<details>
+      <summary style="cursor:pointer;">${esc(group['지문'] || '작가 묶음')}
+        <span class="tag">${Number(group['건수'] || 0)}건</span></summary>
+      <div style="margin-top:4px;display:grid;gap:3px;">`
+      + (group['항목'] || []).map(item => `<label class="bar" style="cursor:pointer;">
+          <input type="checkbox" data-review-pick="${escA(item.id)}" style="width:auto;flex:none;">
+          <span>${esc(item.title || item.id)}</span>
+          <span class="hint">${esc(item.source || '')}</span>
+        </label>`).join('')
+      + `</div></details>`).join('');
+    host.querySelectorAll('[data-review-pick]').forEach(box => {
+      box.addEventListener('change', () => {
+        const id = box.dataset.reviewPick;
+        REVIEW_PICKED = box.checked
+          ? [...REVIEW_PICKED.filter(value => value !== id), id].slice(-2)
+          : REVIEW_PICKED.filter(value => value !== id);
+        host.querySelectorAll('[data-review-pick]').forEach(other => {
+          other.checked = REVIEW_PICKED.includes(other.dataset.reviewPick);
+        });
+        if(REVIEW_PICKED.length === 2) reviewCompareSelected();
+        else $('reviewCompare').classList.add('hidden');
+      });
+    });
+  }catch(e){ host.innerHTML = `<div class="hint">${esc('찾기 실패: ' + e)}</div>`; }
+}
+async function reviewArchivePost(payload){
+  const r = await (await fetch('/api/archive_download_control', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})).json();
+  const parts = [];
+  if(r.error) parts.push(r.error);
+  if(r.running) parts.push('받는 중: ' + (r.url || ''));
+  if(r.received !== undefined){
+    parts.push(`${Number(r.received).toLocaleString()}`
+      + (r.expected_size ? ` / ${Number(r.expected_size).toLocaleString()}` : '') + '바이트');
+  }
+  if(r.destination) parts.push('저장 위치: ' + r.destination);
+  if(r.result) parts.push(r.result.ok ? '완료' : ('멈춤: ' + (r.result.error || '')));
+  $('reviewArchiveStatus').textContent = parts.join(' · ') || (r.ok ? '요청했습니다.' : '');
+  return r;
+}
+function bindLibraryReview(){
+  if(!$('libraryReviewCard') || $('libraryReviewCard')._bound) return;
+  $('libraryReviewCard')._bound = true;
+  $('reviewDupeLoad').addEventListener('click', reviewLoadDupes);
+  $('reviewMergeUndo').addEventListener('click', async () => {
+    if(!REVIEW_UNDO) return;
+    const r = await (await fetch('/api/merge_undo', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source:'library', id:REVIEW_UNDO})})).json();
+    $('reviewMergeMsg').textContent = r.ok
+      ? '병합을 되돌렸습니다.' : ((r.detail || {}).error || '되돌리지 못했습니다.');
+    if(r.ok){ REVIEW_UNDO = ''; $('reviewMergeUndo').classList.add('hidden'); reviewLoadDupes(); }
+  });
+  $('reviewArchiveStart').addEventListener('click', () => reviewArchivePost({
+    action:'start', url:$('reviewArchiveUrl').value.trim(),
+    sha256:$('reviewArchiveSha').value.trim()
+  }));
+  $('reviewArchiveStop').addEventListener('click', () => reviewArchivePost({action:'stop'}));
+  reviewArchivePost({action:'status'});
+  fetch('/api/public_collection').then(r => r.json()).then(state => {
+    $('reviewCollectSummary').textContent =
+      `공개 자료 수집: ${esc(String(state.status || 'idle'))}`
+      + ` · 새 글 ${Number(state.new_posts || 0)} · 바뀐 글 ${Number(state.changed_posts || 0)}`
+      + ` · 메타데이터 이미지 ${Number(state.metadata_images || 0)}장`
+      + ' — 시작·중지는 “자료 가져오기”에서 합니다.';
+  }).catch(() => {});
+}
+
 let PACK_FILES = [], PACK_ACTIVE = null, PACK_CHANGES = [], PACK_SHOW = 0,
   PACK_SHA = '', PACK_DIFF = '', PACK_LINES = [], PACK_LOG = null;
 function packValue(value){

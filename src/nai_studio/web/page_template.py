@@ -860,6 +860,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="studio-subnav-actions" role="tablist" aria-label="자료 작업">
           <button type="button" data-library-work="input" role="tab">자료 가져오기</button>
+          <button type="button" data-library-work="review" role="tab">검토·병합</button>
           <button type="button" data-library-work="catalog" role="tab">통합 자료실</button>
           <button type="button" data-library-work="results" role="tab">결과·선별</button>
         </div>
@@ -904,6 +905,70 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
           </div>
           <div id="publicCollectFailureList" style="margin-top:5px;"></div>
         </div>
+        <details id="relayPairingBox"
+          style="margin-top:9px;padding-top:8px;border-top:1px solid var(--line);">
+          <summary style="cursor:pointer;font-size:var(--fs-xs);">
+            <b>로그인해야 보이는 글 넘기기</b>
+            <span class="hint">— 브라우저에서 직접 전달 (쿠키·비밀번호를 앱에 저장하지 않음)</span>
+          </summary>
+          <p class="hint" style="margin:6px 0;">
+            아카라이브에 로그인된 브라우저에서 글을 열고 아래 코드를 주소창에
+            붙여 실행하면, 그 글의 본문과 이미지만 이 앱으로 넘어옵니다.
+            받은 자료는 위의 수집 결과와 같은 곳에 정리됩니다.
+            <b>연결 번호는 앱을 다시 켤 때마다 새로 발급</b>되며, 새로 발급하면
+            이전 번호는 즉시 무효입니다.
+          </p>
+          <div class="bar" style="flex-wrap:wrap;">
+            <button type="button" id="relayPairingIssue" class="primary">연결 번호 발급</button>
+            <code id="relayPairingCode" class="tag" aria-live="polite">아직 발급하지 않음</code>
+            <button type="button" id="relayPairingCopy" class="hidden">전달 코드 복사</button>
+          </div>
+          <textarea id="relayPairingScript" class="hidden" readonly
+            style="margin-top:6px;min-height:76px;font-size:var(--fs-2xs);"></textarea>
+          <div id="relayPairingMsg" class="hint" aria-live="polite"></div>
+        </details>
+      </div>
+
+      <!-- 검토·병합 — 자료 충돌·증거 병합·받아오는 진행을 한 흐름으로 -->
+      <div class="card" id="libraryReviewCard" data-library-panel="review">
+        <h2><span class="n">검토</span>겹치는 자료 나란히 보고 합치기
+          <span class="count" style="margin-left:auto;font-size:var(--fs-2xs);color:var(--muted);">원본은 지우지 않고 근거만 합칩니다</span></h2>
+        <p class="hint">같은 작가 묶음으로 겹친 그림체를 둘 골라 원문·설정·출처·평가를
+        나란히 보고, 대표를 정해 <b>근거만</b> 합칩니다. 프롬프트 원문은 고치지 않고
+        같은 구간과 서로 다른 구간만 표시합니다. 합친 뒤 한 판 되돌릴 수 있습니다.</p>
+        <div class="bar" style="flex-wrap:wrap;">
+          <button type="button" id="reviewDupeLoad" class="primary">겹친 자료 찾기</button>
+          <span id="reviewDupeCount" class="hint" aria-live="polite"></span>
+          <button type="button" id="reviewMergeUndo" class="hidden" style="margin-left:auto;">
+            마지막 병합 되돌리기
+          </button>
+        </div>
+        <div id="reviewDupeList" style="margin-top:8px;display:grid;gap:6px;"></div>
+        <div id="reviewCompare" class="hidden"
+          style="margin-top:9px;padding-top:8px;border-top:1px solid var(--line);"></div>
+        <div id="reviewMergeMsg" class="hint" aria-live="polite" style="margin-top:6px;"></div>
+        <details style="margin-top:10px;padding-top:8px;border-top:1px solid var(--line);">
+          <summary style="cursor:pointer;font-size:var(--fs-xs);">
+            <b>큰 자료 묶음 받아오기</b>
+            <span class="hint">— 끊겨도 이어받습니다 (HTTPS 주소만)</span>
+          </summary>
+          <div class="grid3" style="align-items:end;margin-top:6px;">
+            <div class="field" style="grid-column:span 2;">
+              <label>받을 주소</label>
+              <input id="reviewArchiveUrl" type="url"
+                placeholder="https://example.com/pack.zip">
+            </div>
+            <div class="field"><label>확인용 SHA-256 <span class="hint">(선택)</span></label>
+              <input id="reviewArchiveSha" type="text" placeholder="비우면 검사 안 함"></div>
+            <div class="bar">
+              <button type="button" id="reviewArchiveStart" class="primary">받기 시작</button>
+              <button type="button" id="reviewArchiveStop">멈춤</button>
+            </div>
+          </div>
+          <div id="reviewArchiveStatus" class="hint" aria-live="polite"
+            style="margin-top:6px;white-space:pre-wrap;"></div>
+        </details>
+        <div id="reviewCollectSummary" class="hint" style="margin-top:9px;"></div>
       </div>
 
       <!-- 생성물 탐색기 — 선별 · 비교 · 가상 폴더. 파일은 옮기지 않는다 -->
