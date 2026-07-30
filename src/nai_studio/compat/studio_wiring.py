@@ -15,7 +15,9 @@ from src.nai_studio.runtime.data_files import (
     atomic_write_json,
     load_json_recover,
 )
+from src.nai_studio.services import evidence_merge as _evidence_merge
 from src.nai_studio.services import merge_plan as _merge_plan
+from src.nai_studio.services import style_store as _style_store
 
 
 def user_backup_baseline_fields(profile_dir: Path) -> dict[str, Callable]:
@@ -41,4 +43,51 @@ def user_backup_baseline_fields(profile_dir: Path) -> dict[str, Callable]:
     }
 
 
-__all__ = ["user_backup_baseline_fields"]
+def extra_route_bindings(app: dict) -> dict:
+    """legacy `_route_bindings()`에 합쳐지는 추가 바인딩.
+
+    `app`은 legacy_surface의 globals()다 — 호출 시점에 읽어 기존 monkeypatch
+    관행(patch.object(APP, …))이 그대로 통한다.
+    """
+
+    def evidence_compare(ids):
+        paths = app["_style_store_paths"]()
+        operations = app["_style_store_operations"]()
+        rows = _style_store.load_styles(paths, operations)
+        return _evidence_merge.dupe_compare_payload(
+            rows,
+            ids,
+            canonical_settings=lambda record:
+                _style_store.canonical_style_settings(operations, record),
+            rating_for=app["style_rating"],
+        )
+
+    def evidence_merge(representative, others):
+        paths = app["_style_store_paths"]()
+        operations = app["_style_store_operations"]()
+        with operations.transaction(paths.transaction_root):
+            with operations.lock:
+                rows = _style_store.load_styles(paths, operations)
+                result = _evidence_merge.merge_evidence_rows(
+                    rows,
+                    representative,
+                    others,
+                    row_digest=app["_style_row_digest"],
+                )
+                if not result.get("ok") or not result.get("changed"):
+                    result.pop("rows", None)
+                    result.pop("batch", None)
+                    return result
+                _style_store.write_styles(
+                    paths, operations, result.pop("rows"))
+                result["batch"] = app["record_import_batch"](
+                    result.pop("batch"))
+        return result
+
+    return {
+        "evidence_compare": evidence_compare,
+        "evidence_merge": evidence_merge,
+    }
+
+
+__all__ = ["extra_route_bindings", "user_backup_baseline_fields"]

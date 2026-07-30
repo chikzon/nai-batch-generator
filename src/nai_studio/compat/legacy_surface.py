@@ -3517,6 +3517,7 @@ def _route_bindings():
         _route_collection_bindings(),
         _route_evaluation_fragment_bindings(),
         _route_settings_runtime_bindings(),
+        _studio_wiring.extra_route_bindings(globals()),
     )
     return {key: value for group in groups for key, value in group.items()}
 

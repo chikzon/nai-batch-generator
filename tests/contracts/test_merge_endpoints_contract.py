@@ -146,21 +146,60 @@ class MergeEndpointContractTests(unittest.TestCase):
         self.application = make_application()
         self.restore_log: list = []
         self.import_log: list = []
+        self.evidence_log: list = []
         self.recovery = recovery_ops(self.restore_log)
         self.collection = collection_ops(self.import_log)
+        self.merge = SimpleNamespace(
+            evidence_compare=lambda ids: {
+                "ok": True,
+                "source": "library",
+                "rows": [{"id": value} for value in ids],
+                "prompt_diff": {"common": [], "left_only": [], "right_only": []},
+            },
+            evidence_merge=lambda representative, others: (
+                self.evidence_log.append((representative, list(others))),
+                {"ok": True, "changed": True, "batch": "EV-1"},
+            )[1],
+        )
 
     def call(self, path: str, body: bytes = b"", headers=None) -> FakeRequest:
         request = FakeRequest(path, headers)
         handled = handle_merge_post(
-            request, self.application, self.recovery, self.collection, body)
+            request, self.application, self.recovery, self.collection,
+            self.merge, body)
         self.assertTrue(handled)
         return request
 
     def test_non_merge_paths_fall_through(self):
         request = FakeRequest("/api/backup_preview")
         self.assertFalse(handle_merge_post(
-            request, self.application, self.recovery, self.collection, b""))
+            request, self.application, self.recovery, self.collection,
+            self.merge, b""))
         self.assertIsNone(request.sent)
+
+    def test_library_compare_and_evidence_merge_round_trip(self):
+        request = self.call(
+            "/api/merge_preview",
+            json.dumps({"ids": ["a", "b"]}).encode("utf-8"),
+            {"X-Source": "library"})
+        self.assertTrue(request.sent["ok"])
+        self.assertEqual(request.sent["source"], "library")
+        self.assertEqual(len(request.sent["rows"]), 2)
+        request = self.call(
+            "/api/merge_apply",
+            json.dumps({
+                "source": "library",
+                "representative": "a",
+                "others": ["b"],
+            }).encode("utf-8"))
+        self.assertTrue(request.sent["ok"])
+        self.assertEqual(
+            request.sent["undo"], {"source": "library", "id": "EV-1"})
+        self.assertEqual(self.evidence_log, [("a", ["b"])])
+        undo = self.call(
+            "/api/merge_undo",
+            json.dumps({"source": "library", "id": "EV-1"}).encode("utf-8"))
+        self.assertTrue(undo.sent["ok"])
 
     def test_backup_preview_projects_unified_rows_with_decision(self):
         request = self.call(

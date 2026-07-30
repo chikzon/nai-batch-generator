@@ -15,6 +15,7 @@ from src.nai_studio.web.routes.evaluation_post import EvaluationPostOperations
 from src.nai_studio.web.routes.fragments_post import FragmentPostOperations
 from src.nai_studio.web.routes.generation import GenerationGetOperations
 from src.nai_studio.web.routes.generation_post import GenerationPostOperations
+from src.nai_studio.web.routes.merge_post import MergePostOperations
 from src.nai_studio.web.routes.recovery import RecoveryGetOperations
 from src.nai_studio.web.routes.recovery_post import RecoveryPostOperations
 from src.nai_studio.web.routes.runtime_post import RuntimePostOperations
@@ -34,6 +35,7 @@ _OPERATION_TYPES = {
     "settings_post": SettingsPostOperations,
     "generation_post": GenerationPostOperations,
     "runtime_post": RuntimePostOperations,
+    "merge_post": MergePostOperations,
 }
 
 # 서버 인스턴스의 상태나 잠금에 직접 연결되는 작업만 여기서 결합한다.

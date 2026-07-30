@@ -106,6 +106,7 @@ def _dispatch_post(
             application,
             operation_sets["recovery_post"],
             operation_sets["collection_post"],
+            operation_sets["merge_post"],
             body,
         )
         or handle_recovery_post(

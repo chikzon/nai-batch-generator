@@ -24,6 +24,24 @@
   가져온백업/트랜잭션 backup 이중 보관 정리(후보)
 - ⚠ legacy_surface 5,494/5,500줄 — 새 배선은 전부 `compat/studio_wiring.py`에
 
+## 진행 상태
+
+- [x] `services/evidence_merge.py` — 가중치 그룹 보존 구간 분리
+      (`prompt_segments`), 공통·좌/우 전용 diff(원문·순서 보존, 가중치 다르면
+      공통 아님), 나란히 비교 투영, 대표 자산 증거 병합(원본 비삭제)
+- [x] `/api/merge_preview·apply·undo`에 `source="library"` 추가 —
+      병합은 기존 자료팩 Undo 장부(list_updates)로 한 판 되돌리기
+- [x] `MergePostOperations` + app_wiring `merge_post` 그룹, 바인딩은
+      `studio_wiring.extra_route_bindings` (legacy +1줄, 5,495/5,500)
+- [x] 새 계약 시험 9+1개 · 경계 5/5 · 서버 기동 포함 회귀 3/3
+
+## 남긴 것
+
+- 나란히 비교·증거 병합의 화면 배치는 계획서 단계 4(자료 탭 통합 검토 흐름)
+  에서 연결한다. endpoint·자료 투영은 완성 상태.
+- merge_evaluations·merge_resources 연계는 캐릭터 자산 중복 검토가 생기는
+  시점(같은 단계 후속)에 이 서비스로 붙인다 — 지금은 호출처가 없다(YAGNI).
+
 ## 금지 범위
 
 - 원본 자산 자동 삭제·의미 병합, prompt 재작성, 기존 저장 schema 변경,

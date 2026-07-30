@@ -9,6 +9,7 @@ collection 세트를 그대로 받아 기존 workflow에 위임하고, merge_wor
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
@@ -32,6 +33,14 @@ from src.nai_studio.services.user_backup_workflow import (
 )
 
 
+@dataclass(frozen=True)
+class MergePostOperations:
+    """자료실 증거 병합 경계 — compat/studio_wiring이 조립한다."""
+
+    evidence_compare: Any
+    evidence_merge: Any
+
+
 def _json_body(body: bytes) -> dict:
     value = json.loads(body or b"{}")
     return value if isinstance(value, dict) else {}
@@ -40,7 +49,7 @@ def _json_body(body: bytes) -> dict:
 def _bad_source(request: Any) -> None:
     request._json({
         "ok": False,
-        "error": "source는 backup 또는 datapack이어야 합니다.",
+        "error": "source는 backup·datapack·library 중 하나여야 합니다.",
     })
 
 
@@ -49,6 +58,7 @@ def _merge_preview(
     application: Any,
     recovery_operations: Any,
     collection_operations: Any,
+    merge_operations: Any,
     body: bytes,
 ) -> None:
     source = str(request.headers.get("X-Source") or "").strip().lower()
@@ -64,6 +74,11 @@ def _merge_preview(
             unquote(request.headers.get("X-Filename", "")),
         )
         rows = merge_rows_from_datapack(detail)
+    elif source == "library":
+        # 자료실 중복 후보 나란히 비교 — 쓰기 없음
+        request._json(merge_operations.evidence_compare(
+            _json_body(body).get("ids") or []))
+        return
     else:
         _bad_source(request)
         return
@@ -75,6 +90,7 @@ def _merge_apply(
     application: Any,
     recovery_operations: Any,
     collection_operations: Any,
+    merge_operations: Any,
     body: bytes,
 ) -> None:
     data = _json_body(body)
@@ -96,6 +112,9 @@ def _merge_apply(
             overwrite=False,
             request_bytes=body,
         )
+    elif source == "library":
+        result = merge_operations.evidence_merge(
+            data.get("representative"), data.get("others") or [])
     else:
         _bad_source(request)
         return
@@ -107,6 +126,7 @@ def _merge_undo(
     application: Any,
     recovery_operations: Any,
     collection_operations: Any,
+    merge_operations: Any,
     body: bytes,
 ) -> None:
     data = _json_body(body)
@@ -114,7 +134,8 @@ def _merge_undo(
     if source == "backup":
         result = rollback_backup_workflow(
             application, recovery_operations, data.get("id"))
-    elif source == "datapack":
+    elif source in ("datapack", "library"):
+        # 증거 병합도 자료팩과 같은 Undo 장부(list_updates)를 쓴다.
         result = undo_pack_workflow(
             application, collection_operations, data.get("id"))
     else:
@@ -128,6 +149,7 @@ def handle_merge_post(
     application: Any,
     recovery_operations: Any,
     collection_operations: Any,
+    merge_operations: Any,
     body: bytes,
 ) -> bool:
     routes = (
@@ -143,6 +165,7 @@ def handle_merge_post(
                     application,
                     recovery_operations,
                     collection_operations,
+                    merge_operations,
                     body,
                 )
             except Exception as exc:
@@ -151,4 +174,4 @@ def handle_merge_post(
     return False
 
 
-__all__ = ["handle_merge_post"]
+__all__ = ["MergePostOperations", "handle_merge_post"]
