@@ -53,25 +53,26 @@ def _public_collection(
     operations: CollectionPostOperations,
     body: bytes,
 ) -> bool:
-    data = _json_body(body)
     routes = (
-        # ⚠ pairing·relay가 start/retry/control보다 먼저 와야 하는 것은
-        # 아니지만, 접두가 서로 겹치지 않는지 늘 확인할 것.
-        ("/api/public_collection_pairing", lambda: operations.public_pairing()),
-        ("/api/public_collection_relay", lambda: operations.public_relay(
+        ("/api/public_collection_pairing",
+         lambda data: operations.public_pairing()),
+        ("/api/public_collection_relay", lambda data: operations.public_relay(
             request.headers.get("Origin", ""),
             request.headers.get("X-Pairing-Code", ""),
             data,
         )),
-        ("/api/public_collection_start", lambda: operations.public_start(data)),
-        ("/api/public_collection_retry", lambda: operations.public_retry(data)),
-        ("/api/public_collection_control", lambda: operations.public_control(
-            data.get("action")
-        )),
+        ("/api/public_collection_start",
+         lambda data: operations.public_start(data)),
+        ("/api/public_collection_retry",
+         lambda data: operations.public_retry(data)),
+        ("/api/public_collection_control",
+         lambda data: operations.public_control(data.get("action"))),
     )
     for prefix, operation in routes:
         if request.path.startswith(prefix):
-            request._json(operation())
+            # ⚠ 경로가 맞을 때만 JSON을 파싱한다. 무조건 파싱하면 뒤의
+            # /api/ref_add 바이너리 업로드가 여기서 죽는다 (실검증에서 발견).
+            request._json(operation(_json_body(body)))
             return True
     return False
 

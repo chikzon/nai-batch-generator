@@ -52,21 +52,25 @@ def _simple_recovery(
     operations: RecoveryPostOperations,
     body: bytes,
 ) -> bool:
-    data = _json_body(body)
     routes = (
-        ("/api/local_image_normalize", lambda: operations.normalize_local_images(
-            data.get("fingerprint", "")
-        )),
-        ("/api/local_image_rollback", lambda: operations.rollback_local_images(
-            data.get("id", "")
-        )),
-        ("/api/metadata_audit_control", lambda: operations.metadata_control(body)),
-        ("/api/metadata_audit_candidate", lambda: operations.metadata_candidate(body)),
-        ("/api/metadata_audit_save", lambda: operations.metadata_save(body)),
+        ("/api/local_image_normalize",
+         lambda data: operations.normalize_local_images(
+             data.get("fingerprint", ""))),
+        ("/api/local_image_rollback",
+         lambda data: operations.rollback_local_images(data.get("id", ""))),
+        ("/api/metadata_audit_control",
+         lambda data: operations.metadata_control(body)),
+        ("/api/metadata_audit_candidate",
+         lambda data: operations.metadata_candidate(body)),
+        ("/api/metadata_audit_save",
+         lambda data: operations.metadata_save(body)),
     )
     for prefix, operation in routes:
         if request.path.startswith(prefix):
-            request._json(operation())
+            # ⚠ 경로가 맞을 때만 JSON을 파싱한다. 이 그룹은 다른 그룹보다
+            # 먼저 도는데, 무조건 파싱하면 뒤 그룹의 바이너리 업로드
+            # (/api/ref_add·pack_preview 등)가 여기서 죽는다.
+            request._json(operation(_json_body(body)))
             return True
     return False
 

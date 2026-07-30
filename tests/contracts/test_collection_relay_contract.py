@@ -153,6 +153,80 @@ class RelayPayloadContractTests(unittest.TestCase):
         self.assertFalse(self.relay(self.payload(html="  "))["ok"])
 
 
+class BinaryUploadDispatchContractTests(unittest.TestCase):
+    def test_binary_ref_add_body_is_not_parsed_as_json(self):
+        """공개수집 분기가 경로 불일치에도 JSON을 파싱하면 바이너리
+        레퍼런스 업로드가 죽는다 (bd9b578 회귀 — 실검증에서 발견)."""
+        from src.nai_studio.web.routes.collection_post import (
+            CollectionPostOperations,
+            handle_collection_post,
+        )
+
+        class FakeRequest:
+            path = "/api/ref_add"
+            headers = {"X-Kind": "cref", "X-Filename": "ref.png"}
+
+            def __init__(self):
+                self.sent = None
+
+            def _json(self, payload):
+                self.sent = payload
+
+        received: list = []
+        operations = CollectionPostOperations(
+            preview_pack=None, import_pack=None, pack_queue=None,
+            summarize_queue=None, forget_caches=None, load_spec=None,
+            options=None, load_options=None, public_start=None,
+            public_retry=None, public_control=None, undo_pack=None,
+            import_settings=None, resource_import=None,
+            reference_add=lambda body, kind, filename: (
+                received.append((bytes(body), kind)),
+                {"ok": True},
+            )[1],
+            reference_save=None, archive_download_control=None,
+            public_pairing=None, public_relay=None,
+        )
+        request = FakeRequest()
+        handled = handle_collection_post(
+            request, None, operations, PNG)
+        self.assertTrue(handled)
+        self.assertTrue(request.sent["ok"], request.sent)
+        self.assertEqual(received[0], (PNG, "cref"))
+
+    def test_recovery_group_lets_binary_bodies_pass_through(self):
+        """복구 그룹이 먼저 도는데 JSON을 무조건 파싱하면 뒤 그룹의
+        바이너리 업로드가 죽는다 (실검증에서 발견한 제품 결함)."""
+        from src.nai_studio.web.routes.recovery_post import (
+            RecoveryPostOperations,
+            handle_recovery_post,
+        )
+
+        class FakeRequest:
+            path = "/api/ref_add"
+            headers: dict = {}
+
+            def __init__(self):
+                self.sent = None
+
+            def _json(self, payload):
+                self.sent = payload
+
+        operations = RecoveryPostOperations(
+            preview_backup=None, restore_backup=None, rollback_backup=None,
+            load_settings=None, default_config=None,
+            migrate_selections=None, migrate_slots=None, load_spec=None,
+            options=None, load_options=None,
+            normalize_local_images=None, rollback_local_images=None,
+            rebuild_data_index=None, metadata_control=None,
+            metadata_candidate=None, metadata_save=None,
+            image_batch_queue=None, summarize_queue=None,
+        )
+        request = FakeRequest()
+        self.assertFalse(handle_recovery_post(
+            request, None, operations, PNG))
+        self.assertIsNone(request.sent)
+
+
 class RelayTransportContractTests(unittest.TestCase):
     def make_handler(self, path, headers):
         handler = object.__new__(ConfigRequestHandler)
