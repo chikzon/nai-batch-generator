@@ -26,13 +26,13 @@
 - Operations/Paths 조립: **0건** (runtime/wiring/ 5모듈 + web/
   application_server로 전부 이동).
 
-### 아직 legacy에 남은 이동 후보 (완료 아님 — 다음 축소 라운드)
+### 이동 후보 8함수 — 서비스로 이동 완료 (이름은 위임으로 유지)
 
-setting_reference_config(33줄)·character_resource_config(27줄)·
-save_scenes(29줄)·activate_comparison_run(32줄)·_comparison_result_context
-(37줄)·_nai_json_metadata(31줄)·ensure_schema_split(33줄)·setting_thumbs
-(29줄) 등 20줄 초과 함수 — 기능 계산이 섞여 있어 서비스로 옮길 가치가
-있으나 이번 라운드 범위 밖. 경계 상한 4,250이 역증가를 막는다.
+setting_reference_config·character_resource_config → character_runtime,
+save_scenes(정규화부) → settings_handlers.normalize_scene_rows,
+activate_comparison_run·_comparison_result_context → comparison_runtime,
+_nai_json_metadata → metadata_audit, ensure_schema_split·setting_thumbs
+→ setting_store. 경계 상한 4,000이 역증가를 막는다.
 """
 from __future__ import annotations
 

@@ -200,6 +200,7 @@ from src.nai_studio.services import (
     artist_workspace as _artist_workspace,
     builder_handlers as _builder_handlers,
     catalog_search as _catalog_search,
+    character_runtime as _character_runtime,
     character_storage as _character_storage,
     collection_handlers as _collection_handlers,
     comparison_execution as _comparison_execution,
@@ -221,6 +222,7 @@ from src.nai_studio.services import (
     library_catalog as _library_catalog,
     local_image_store as _local_image_store,
     management_state as _management_state,
+    metadata_audit as _metadata_audit,
     metadata_candidate_store as _metadata_candidate_store,
     nai_auxiliary as _nai_auxiliary,
     output_lifecycle as _output_lifecycle,
@@ -1747,34 +1749,12 @@ def scene_num_clashes():
 
 
 def setting_thumbs(name, cfg=None):
-    """세트 대표 썸네일 — 세트에 속한 씬 번호로 시작하는 결과물 중 가장 새것.
-    파일명이 `101_A01_핸드잡_시작전.webp` 꼴이므로 앞 3자리로 찾는다."""
-    st = next((s for s in list_settings() if s["name"] == name), None)
-    if not st:
-        return {}
-    scenes = st["data"].get("씬", {})
-    newest = {}                       # 씬번호 → (mtime, 경로)
-    root = out_root(cfg) / "nsfw_seed"
-    if root.exists():
-        for p in root.rglob("*"):
-            if p.suffix.lower() not in (".webp", ".png"):
-                continue
-            head = p.name[:3]
-            if not head.isdigit():
-                continue
-            n = int(head)
-            if str(n) not in scenes:
-                continue
-            m = p.stat().st_mtime
-            if n not in newest or m > newest[n][0]:
-                newest[n] = (m, p)
-    out = {}
-    for g in derive_setting_catalog(scenes):
-        best = max((newest[i] for i in g["ids"] if i in newest),
-                   default=None, key=lambda x: x[0])
-        if best:
-            out[str(g["id"])] = str(best[1].relative_to(out_root(cfg))).replace("\\", "/")
-    return out
+    return _setting_store.setting_thumbnails(
+        name,
+        out_root(cfg),
+        settings=list_settings(),
+        derive_catalog=derive_setting_catalog,
+    )
 
 
 def duplicate_setting_group(name, gid):
@@ -2093,36 +2073,7 @@ _METADATA_AUDIT_ADAPTER_LOCK = threading.Lock()
 
 
 def _nai_json_metadata(value):
-    """일반 앱 자료 JSON과 NAI 생성 메타데이터 JSON을 좁게 구분한다."""
-    if not isinstance(value, dict):
-        return None
-    candidates = [value]
-    for key in ("Comment", "comment", "Description", "description", "metadata"):
-        nested = value.get(key)
-        if isinstance(nested, str):
-            try:
-                nested = json.loads(nested)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-        if isinstance(nested, dict):
-            candidates.append(nested)
-    for candidate in candidates:
-        source = " ".join(str(candidate.get(key) or "")
-                          for key in ("source", "software", "model")).casefold()
-        has_prompt = bool(
-            candidate.get("v4_prompt")
-            or candidate.get("prompt")
-            or candidate.get("description")
-        )
-        has_generation = (
-            any(candidate.get(key) is not None
-                for key in ("seed", "steps", "sampler", "scale",
-                            "noise_schedule", "ucPreset"))
-            and ("novelai" in source or isinstance(candidate.get("v4_prompt"), dict))
-        )
-        if has_prompt and has_generation:
-            return candidate
-    return None
+    return _metadata_audit.nai_json_metadata(value)
 
 
 def _metadata_audit_inspector(payload, kind, _relative_path):
@@ -2359,37 +2310,13 @@ def setting_path(name):
 
 def ensure_schema_split():
     """구버전 asset_config.json + 옵션.json → 씬규격/ 3종으로 1회 분리"""
-    if SCHEMA_DIR.exists() or not CONFIG_FILE.exists():
-        return
-    try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            old = json.load(f)
-    except Exception as e:
-        log.warning(f"asset_config.json 분리 실패: {e}")
-        return
-    buckets = {"체위": {}, "표정": {}, "백합": {}}
-    for k, sc in old.get("scenes", {}).items():
-        if not k.isdigit():
-            continue
-        n = int(k)
-        if sc.get("pair") == "yuri" or n >= 800:
-            buckets["백합"][k] = sc
-        elif n < 101:
-            buckets["표정"][k] = sc
-        else:
-            buckets["체위"][k] = sc
-    opts = {
-        "체위": {"장소테마": OPTIONS.get("장소테마", {}), "시간대": OPTIONS.get("시간대", {}),
-                "표정진행": OPTIONS.get("표정진행", {})},
-        "표정": {},
-        "백합": {"탈의단계": OPTIONS.get("탈의단계", {})},
-    }
-    for kind in KINDS:
-        d = SCHEMA_DIR / kind
-        d.mkdir(parents=True, exist_ok=True)
-        data = {"종류": kind, "씬": buckets[kind], "옵션": opts[kind]}
-        atomic_write_json(d / "기본.json", data, keep_backup=False)
-    log.info(f"씬 규격 분리 완료: 체위 {len(buckets['체위'])} / 표정 {len(buckets['표정'])} / 백합 {len(buckets['백합'])}씬")
+    _setting_store.split_legacy_asset_config(
+        _setting_store_paths(),
+        _setting_store_operations(),
+        config_file=CONFIG_FILE,
+        options=OPTIONS,
+        kinds=KINDS,
+    )
 
 
 def kind_pack_path(cfg, kind):
@@ -3088,67 +3015,12 @@ def normalize_scene_reference_ids(value):
 
 
 def setting_reference_config(cfg, scene):
-    """씬 전용 Reference 선택을 현재 설정 위에 안전하게 얹는다.
-
-    `use_character_refs`가 꺼져 있으면 전역 활성 목록을 그대로 쓴다. 켜져 있으면
-    인물 순서대로 고른 id만 활성화한다. 같은 id를 여러 인물에 골라도 NAI에는 한 번만
-    보내며, 삭제되어 찾을 수 없는 id는 건너뛰고 이름 목록에는 근거를 남긴다.
-    """
-    if not scene.get("use_character_refs"):
-        active = [r.get("name") or r.get("id") or "무제"
-                  for r in (cfg.get("char_refs") or []) if r.get("enabled")]
-        return cfg, False, active
-    chosen = normalize_scene_reference_ids(scene.get("character_refs"))
-    by_id = {
-        str(item.get("id") or ""): item
-        for item in (cfg.get("char_refs") or [])
-        if isinstance(item, dict) and str(item.get("id") or "")
-    }
-    scoped = dict(cfg)
-    selected, names, seen = [], [], set()
-    for rid in chosen:
-        if not rid:
-            names.append("참조 안 함")
-            continue
-        item = by_id.get(rid)
-        if item is None:
-            names.append(f"없어진 참조({rid})")
-            continue
-        names.append(item.get("name") or rid)
-        if rid not in seen:
-            selected.append(dict(item, enabled=True))
-            seen.add(rid)
-    scoped["char_refs"] = selected
-    return scoped, True, names
+    return _character_runtime.scene_reference_config(
+        cfg, scene, normalize_reference_ids=normalize_scene_reference_ids)
 
 
 def character_resource_config(cfg, character):
-    """저장 캐스트가 가리키는 Vibe·Reference만 이 작업에 활성화한다.
-
-    id 목록이 비어 있으면 기존 전역 선택을 그대로 쓴다. 따라서 과거 캐스트와 설정은
-    동작이 바뀌지 않고, 새 출연 구성에서 자료 id를 명시했을 때만 범위를 좁힌다.
-    """
-    scoped = dict(cfg)
-    selected = selected_variation_values(character).get("selected_variant") or {}
-    for key, id_key in (("char_refs", "reference_ids"), ("vibes", "vibe_ids")):
-        source_ids = (
-            selected.get(id_key)
-            if id_key in selected else character.get(id_key)
-        )
-        wanted = [str(value) for value in (source_ids or []) if value]
-        if not wanted:
-            continue
-        by_id = {
-            str(item.get("id") or ""): item
-            for item in (cfg.get(key) or [])
-            if isinstance(item, dict) and item.get("id")
-        }
-        scoped[key] = [
-            dict(by_id[resource_id], enabled=True)
-            for resource_id in dict.fromkeys(wanted)
-            if resource_id in by_id
-        ]
-    return scoped
+    return _character_runtime.cast_resource_config(cfg, character)
 
 
 def characters_resource_config(cfg, characters):
@@ -3469,32 +3341,7 @@ def load_scenes():
 
 
 def save_scenes(scenes):
-    out, used_ids = [], set()
-    for s in scenes or []:
-        root_id = _safe_name(str(s.get("id") or s.get("name") or f"scene{len(out)+1}"))
-        sid, serial = root_id, 2
-        while sid.casefold() in used_ids:
-            sid = f"{root_id}-{serial}"
-            serial += 1
-        used_ids.add(sid.casefold())
-        out.append({
-            "id": sid,
-            "name": (s.get("name") or "").strip() or "이름 없음",
-            "prompt": s.get("prompt", ""),
-            # 씬이 **인물별 프롬프트**도 가질 수 있다 (배경·구도는 prompt, 인물은 여기).
-            # 씬 프롬프트에 인물 묘사를 적으면 base 로 들어가 왼쪽 캐릭터와 뭉개진다 —
-            # NAIS3 에서 "씬에 여자 프롬을 넣었더니 베이스의 여자와 합쳐졌다" 는 그 문제다.
-            "char1": s.get("char1", ""),
-            "char2": s.get("char2", ""),
-            "char1_neg": s.get("char1_neg", ""),
-            "char2_neg": s.get("char2_neg", ""),
-            "negative": s.get("negative", ""),
-            "width": int(s.get("width") or 832),
-            "height": int(s.get("height") or 1216),
-            "reserve": max(0, int(s.get("reserve") or 0)),   # 0 = 안 뽑음
-            # 해상도를 직접 입력으로 두겠다는 표시 (프리셋과 값이 같아도 칸을 보여 준다)
-            "custom_res": bool(s.get("custom_res")),
-        })
+    out = _settings_handlers.normalize_scene_rows(scenes, safe_name=_safe_name)
     atomic_write_json(SCENES_FILE, out, indent=1)
     return out
 
@@ -3949,76 +3796,13 @@ def comparison_runs(cfg, limit=50):
 
 
 def activate_comparison_run(cfg, folder):
-    """선택한 미완료 manifest를 현재 재개 대상으로 안전하게 활성화한다."""
-    root = out_root(cfg).resolve()
-    runs_root = (root / "비교생성").resolve()
-    rel = str(folder or "").strip().replace("\\", "/").strip("/")
-    candidate = (root / rel).resolve()
-    if (not rel or not _path_is_inside(candidate, runs_root)
-            or not candidate.is_dir()):
-        raise ValueError("선택한 비교 실험 폴더를 찾지 못했습니다.")
-    manifest_path = candidate / "manifest.json"
-    progress = load_json_recover(manifest_path)
-    if not isinstance(progress, dict):
-        raise ValueError("비교 실험 기록 형식이 올바르지 않습니다.")
-    plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
-    options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
-    completed = progress.get("completed")
-    resumable = bool(
-        progress.get("status") != "complete"
-        and progress.get("signature")
-        and isinstance(completed, dict)
-    )
-    if resumable:
-        atomic_write_json(COMPARE_PROGRESS_FILE, progress, indent=1)
-    return {
-        "ok": True,
-        "folder": candidate.relative_to(root).as_posix(),
-        "status": str(progress.get("status") or ""),
-        "completed": len(completed) if isinstance(completed, dict) else 0,
-        "total": int(plan.get("count") or 0),
-        "resumable": resumable,
-        "options": options,
-    }
+    return _comparison_runtime.activate_comparison_run(
+        _comparison_runtime_operations(), cfg, folder)
 
 
 def _comparison_result_context(cfg, rel):
-    """비교 결과 한 장의 파일·manifest·정확한 작업 레코드를 함께 찾는다."""
-    image_path = output_file_for_preview(cfg, rel)
-    if image_path is None:
-        raise ValueError("선택한 비교 결과 파일을 찾지 못했습니다.")
-    root = out_root(cfg).resolve()
-    runs_root = (root / "비교생성").resolve()
-    folder = image_path.parent.resolve()
-    if not _path_is_inside(folder, runs_root):
-        raise ValueError("비교 생성 결과만 현재 생성에 적용할 수 있습니다.")
-    manifest_path = folder / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("이 결과의 비교 manifest를 찾지 못했습니다.")
-    manifest = load_json_recover(manifest_path)
-    wanted = image_path.relative_to(root).as_posix()
-    for section in ("completed", "reruns"):
-        rows = manifest.get(section)
-        if not isinstance(rows, dict):
-            continue
-        for key, record in rows.items():
-            if (isinstance(record, dict)
-                    and str(record.get("file") or "").replace("\\", "/")
-                    == wanted):
-                effective = manifest
-                if section == "reruns":
-                    effective = copy.deepcopy(manifest)
-                    effective["completed"] = {str(key): copy.deepcopy(record)}
-                return {
-                    "image_path": image_path,
-                    "file": wanted,
-                    "folder": folder,
-                    "manifest": effective,
-                    "record": copy.deepcopy(record),
-                    "job_key": str(key),
-                    "section": section,
-                }
-    raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
+    return _comparison_runtime.comparison_result_context(
+        _comparison_runtime_operations(), cfg, rel)
 
 
 def _comparison_promotion_paths():

@@ -39,6 +39,39 @@ Reader = Callable[[Mapping[str, str]], bytes]
 MetadataInspector = Callable[[bytes, str, str], Any]
 
 
+def nai_json_metadata(value: Any) -> dict | None:
+    """일반 앱 자료 JSON과 NAI 생성 메타데이터 JSON을 좁게 구분한다."""
+    if not isinstance(value, dict):
+        return None
+    candidates = [value]
+    for key in ("Comment", "comment", "Description", "description", "metadata"):
+        nested = value.get(key)
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        source = " ".join(str(candidate.get(key) or "")
+                          for key in ("source", "software", "model")).casefold()
+        has_prompt = bool(
+            candidate.get("v4_prompt")
+            or candidate.get("prompt")
+            or candidate.get("description")
+        )
+        has_generation = (
+            any(candidate.get(key) is not None
+                for key in ("seed", "steps", "sampler", "scale",
+                            "noise_schedule", "ucPreset"))
+            and ("novelai" in source or isinstance(candidate.get("v4_prompt"), dict))
+        )
+        if has_prompt and has_generation:
+            return candidate
+    return None
+
+
 def _relative_path(value: Any) -> str:
     """안전한 상대 경로만 반환하고 절대·상위 이동 경로는 버린다."""
     text = str(value or "").strip().replace("\\", "/")

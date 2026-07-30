@@ -188,10 +188,76 @@ def active_people(
     return people, selected_centers
 
 
+def scene_reference_config(cfg, scene, *, normalize_reference_ids):
+    """씬 전용 Reference 선택을 현재 설정 위에 안전하게 얹는다.
+
+    `use_character_refs`가 꺼져 있으면 전역 활성 목록을 그대로 쓴다. 켜져 있으면
+    인물 순서대로 고른 id만 활성화한다. 같은 id를 여러 인물에 골라도 NAI에는 한 번만
+    보내며, 삭제되어 찾을 수 없는 id는 건너뛰고 이름 목록에는 근거를 남긴다.
+    """
+    if not scene.get("use_character_refs"):
+        active = [r.get("name") or r.get("id") or "무제"
+                  for r in (cfg.get("char_refs") or []) if r.get("enabled")]
+        return cfg, False, active
+    chosen = normalize_reference_ids(scene.get("character_refs"))
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in (cfg.get("char_refs") or [])
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    scoped = dict(cfg)
+    selected, names, seen = [], [], set()
+    for rid in chosen:
+        if not rid:
+            names.append("참조 안 함")
+            continue
+        item = by_id.get(rid)
+        if item is None:
+            names.append(f"없어진 참조({rid})")
+            continue
+        names.append(item.get("name") or rid)
+        if rid not in seen:
+            selected.append(dict(item, enabled=True))
+            seen.add(rid)
+    scoped["char_refs"] = selected
+    return scoped, True, names
+
+
+def cast_resource_config(cfg, character):
+    """저장 캐스트가 가리키는 Vibe·Reference만 이 작업에 활성화한다.
+
+    id 목록이 비어 있으면 기존 전역 선택을 그대로 쓴다. 따라서 과거 캐스트와 설정은
+    동작이 바뀌지 않고, 새 출연 구성에서 자료 id를 명시했을 때만 범위를 좁힌다.
+    """
+    scoped = dict(cfg)
+    selected = selected_variation_values(character).get("selected_variant") or {}
+    for key, id_key in (("char_refs", "reference_ids"), ("vibes", "vibe_ids")):
+        source_ids = (
+            selected.get(id_key)
+            if id_key in selected else character.get(id_key)
+        )
+        wanted = [str(value) for value in (source_ids or []) if value]
+        if not wanted:
+            continue
+        by_id = {
+            str(item.get("id") or ""): item
+            for item in (cfg.get(key) or [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        scoped[key] = [
+            dict(by_id[resource_id], enabled=True)
+            for resource_id in dict.fromkeys(wanted)
+            if resource_id in by_id
+        ]
+    return scoped
+
+
 __all__ = [
     "NAI_CHARACTER_LIMIT",
     "active_people",
+    "cast_resource_config",
     "character_run_from_group",
+    "scene_reference_config",
     "slot_bundle_identity",
     "slot_prompt",
 ]

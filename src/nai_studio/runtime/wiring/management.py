@@ -187,6 +187,9 @@ def comparison_runtime_operations(app: Mapping[str, Any]):
         load_state=app["load_state"],
         bump_daily=app["bump_daily"],
         save_state=app["save_state"],
+        # COMPARE_PROGRESS_FILE을 호출 시점에 읽어야 monkeypatch가 보인다.
+        save_resume_progress=lambda progress: app["atomic_write_json"](
+            app["COMPARE_PROGRESS_FILE"], progress, indent=1),
     )
 
 

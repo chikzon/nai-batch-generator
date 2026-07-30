@@ -710,9 +710,41 @@ def _apply_scene_updates(
     return changed_scenes, changed_fields
 
 
+def normalize_scene_rows(scenes: Any, *, safe_name: Callable[[Any], str]) -> list:
+    """씬 모드 저장 목록을 id 충돌 없이 저장 형태로 정규화한다."""
+    out, used_ids = [], set()
+    for s in scenes or []:
+        root_id = safe_name(str(s.get("id") or s.get("name") or f"scene{len(out)+1}"))
+        sid, serial = root_id, 2
+        while sid.casefold() in used_ids:
+            sid = f"{root_id}-{serial}"
+            serial += 1
+        used_ids.add(sid.casefold())
+        out.append({
+            "id": sid,
+            "name": (s.get("name") or "").strip() or "이름 없음",
+            "prompt": s.get("prompt", ""),
+            # 씬이 **인물별 프롬프트**도 가질 수 있다 (배경·구도는 prompt, 인물은 여기).
+            # 씬 프롬프트에 인물 묘사를 적으면 base 로 들어가 왼쪽 캐릭터와 뭉개진다 —
+            # NAIS3 에서 "씬에 여자 프롬을 넣었더니 베이스의 여자와 합쳐졌다" 는 그 문제다.
+            "char1": s.get("char1", ""),
+            "char2": s.get("char2", ""),
+            "char1_neg": s.get("char1_neg", ""),
+            "char2_neg": s.get("char2_neg", ""),
+            "negative": s.get("negative", ""),
+            "width": int(s.get("width") or 832),
+            "height": int(s.get("height") or 1216),
+            "reserve": max(0, int(s.get("reserve") or 0)),   # 0 = 안 뽑음
+            # 해상도를 직접 입력으로 두겠다는 표시 (프리셋과 값이 같아도 칸을 보여 준다)
+            "custom_res": bool(s.get("custom_res")),
+        })
+    return out
+
+
 __all__ = [
     "SettingsHandlerOperations",
     "handle_blueprint_project",
     "handle_save",
     "handle_scene_save",
+    "normalize_scene_rows",
 ]

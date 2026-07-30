@@ -1,36 +1,34 @@
-# 현재 작업 — 실자료 UI 성능 측정 (미완 목록 ④) — 완료
+# 현재 작업 — 레거시 이동 후보 8함수 서비스 이동 (미완 목록 ⑤) — 완료
 
-## 이번 커밋 (측정 + 예열 1줄)
+## 이번 커밋
 
-합성 자료(그림체 1,000건·캐릭터 300명·조각 50개, 별도 --data-dir)로
-playwright 실브라우저 측정. 결과:
+기능 계산이 섞여 있던 legacy 20줄+ 함수 8개를 기존 서비스로 이동.
+legacy에는 같은 이름의 얇은 위임만 남겨 monkeypatch 표면을 보존했다.
 
-| 항목 | 실측 | 목표 | 판정 |
-|---|---|---|---|
-| 초기 페이지 로드 | 429ms | 3,000ms | ✓ |
-| 탭 전환(5탭) | ≤16ms | 100ms | ✓ |
-| 탭 순회 DOM 노드 증가 | 0 | 누수 없음 | ✓ |
-| 390px 가로 넘침 | 0곳 | 0곳 | ✓ |
-| 작가 조합 첫 열기(1,000건) | 콜드 314ms → **예열 후 212ms** | 200ms | 오차 수준 |
+| legacy 이름 | 이동처 |
+|---|---|
+| setting_reference_config·character_resource_config | character_runtime (scene_reference_config·cast_resource_config) |
+| save_scenes (정규화부) | settings_handlers.normalize_scene_rows |
+| activate_comparison_run·_comparison_result_context | comparison_runtime (동명 + comparison_result_context) |
+| _nai_json_metadata | metadata_audit.nai_json_metadata |
+| ensure_schema_split·setting_thumbs | setting_store (split_legacy_asset_config·setting_thumbnails) |
 
-- 1차 측정의 1,574ms는 5개 탭 순회 lazy init과 겹친 오염이었다 —
-  콜드 서버에서 단독 재측정으로 314ms 확인(`/api/combos` 서버측
-  콜드 174ms·웜 57ms 절단 포함).
-- 수정: `wiring/management.py` 예열 람다에 `load_combos()` 추가
-  (태그 색인과 함께 기동 직후 백그라운드 예열 — legacy 0줄,
-  실패는 기존 try/except가 삼킴). 첫 열기 314→212ms 실측.
-- 212ms의 나머지는 목록 렌더 자체(~150ms) — 목표 200ms 대비
-  +12ms는 측정 오차 수준이고 체감 문제가 없어 여기서 멈춘다
-  (절대규칙: 부차 최적화에 파고들지 않는다).
+- monkeypatch 보존 방식: 위임이 **호출 시점에 모듈 전역을 조회**해 넘긴다 —
+  시험이 patch하는 `list_settings`·`derive_setting_catalog`·
+  `COMPARE_PROGRESS_FILE`·`SCHEMA_DIR`·`CONFIG_FILE` 전부 확인함.
+- ComparisonRuntimeOperations에 선택 필드 `save_resume_progress`
+  (기본 None — manifest는 안 쓰는 재개 전용 저장, wiring lambda가
+  COMPARE_PROGRESS_FILE을 호출 시점 조회).
+- legacy_surface 4,208 → 3,992줄. 경계 상한 4,250 → **4,000** 하향.
+- 검증: 회귀 171 · exports 7 · 경계 5 · merge endpoints/datapack/
+  evidence merge 계약 전부 OK.
 
-## 직전 완료 — 캐릭터 자산 중복 검토 (미완 목록 ②)
+## 직전 완료 — 실자료 UI 성능 측정 (④, 9c11df8)
 
-자료 탭 '캐릭터 겹침' 소절 + `/api/merge_preview·apply`
-source="characters" + character_text_key 교정. 실브라우저 왕복 검증.
+콜드 첫 열기 314ms → 예열(load_combos) 후 212ms. 나머지 지표 전부 목표 내.
 
-## 그 다음 미완 (순서)
+## 남은 것
 
-⑤ 레거시 이동 후보 8함수 (legacy_exports.py 색인에 명시)
 ③ arca bookmarklet 문안 — **사용자 지시로 보류**
 묶음 종료 시: v1.2.0 재빌드·스모크·인계서 재생성 (현재 인계서는
 f69abc1 기준, HEAD는 그 뒤로 진행됨)
@@ -38,4 +36,4 @@ f69abc1 기준, HEAD는 그 뒤로 진행됨)
 ## 금지 범위
 
 - push·태그·Release (사용자 지시 대기)
-- 렌더 최적화 추가 파기 (측정 오차 수준 — 멈춘다)
+- legacy_surface에 새 코드 추가 (경계 상한 4,000)

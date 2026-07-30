@@ -51,6 +51,89 @@ class ComparisonRuntimeOperations:
     load_state: Callable[[], dict]
     bump_daily: Callable[[dict], Any]
     save_state: Callable[[dict], Any]
+    # 재개용 진행 파일만 갱신한다 (manifest는 손대지 않는다 — save_progress와 다름).
+    save_resume_progress: Callable[[dict[str, Any]], Any] | None = None
+
+
+def activate_comparison_run(
+    operations: ComparisonRuntimeOperations,
+    config: dict,
+    folder: Any,
+) -> dict[str, Any]:
+    """선택한 미완료 manifest를 현재 재개 대상으로 안전하게 활성화한다."""
+    root = operations.output_root(config).resolve()
+    runs_root = (root / "비교생성").resolve()
+    rel = str(folder or "").strip().replace("\\", "/").strip("/")
+    candidate = (root / rel).resolve()
+    if (not rel or not operations.path_is_inside(candidate, runs_root)
+            or not candidate.is_dir()):
+        raise ValueError("선택한 비교 실험 폴더를 찾지 못했습니다.")
+    manifest_path = candidate / "manifest.json"
+    progress = operations.load_json(manifest_path)
+    if not isinstance(progress, dict):
+        raise ValueError("비교 실험 기록 형식이 올바르지 않습니다.")
+    plan = progress.get("plan") if isinstance(progress.get("plan"), dict) else {}
+    options = plan.get("options") if isinstance(plan.get("options"), dict) else {}
+    completed = progress.get("completed")
+    resumable = bool(
+        progress.get("status") != "complete"
+        and progress.get("signature")
+        and isinstance(completed, dict)
+    )
+    if resumable:
+        operations.save_resume_progress(progress)
+    return {
+        "ok": True,
+        "folder": candidate.relative_to(root).as_posix(),
+        "status": str(progress.get("status") or ""),
+        "completed": len(completed) if isinstance(completed, dict) else 0,
+        "total": int(plan.get("count") or 0),
+        "resumable": resumable,
+        "options": options,
+    }
+
+
+def comparison_result_context(
+    operations: ComparisonRuntimeOperations,
+    config: dict,
+    rel: Any,
+) -> dict[str, Any]:
+    """비교 결과 한 장의 파일·manifest·정확한 작업 레코드를 함께 찾는다."""
+    image_path = operations.output_file_for_preview(config, rel)
+    if image_path is None:
+        raise ValueError("선택한 비교 결과 파일을 찾지 못했습니다.")
+    root = operations.output_root(config).resolve()
+    runs_root = (root / "비교생성").resolve()
+    folder = image_path.parent.resolve()
+    if not operations.path_is_inside(folder, runs_root):
+        raise ValueError("비교 생성 결과만 현재 생성에 적용할 수 있습니다.")
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("이 결과의 비교 manifest를 찾지 못했습니다.")
+    manifest = operations.load_json(manifest_path)
+    wanted = image_path.relative_to(root).as_posix()
+    for section in ("completed", "reruns"):
+        rows = manifest.get(section)
+        if not isinstance(rows, dict):
+            continue
+        for key, record in rows.items():
+            if (isinstance(record, dict)
+                    and str(record.get("file") or "").replace("\\", "/")
+                    == wanted):
+                effective = manifest
+                if section == "reruns":
+                    effective = copy.deepcopy(manifest)
+                    effective["completed"] = {str(key): copy.deepcopy(record)}
+                return {
+                    "image_path": image_path,
+                    "file": wanted,
+                    "folder": folder,
+                    "manifest": effective,
+                    "record": copy.deepcopy(record),
+                    "job_key": str(key),
+                    "section": section,
+                }
+    raise ValueError("manifest에서 선택한 결과의 생성 기록을 찾지 못했습니다.")
 
 
 def comparison_runs(

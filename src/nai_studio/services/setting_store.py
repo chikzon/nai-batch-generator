@@ -827,6 +827,89 @@ def setting_catalog(
     return output
 
 
+def split_legacy_asset_config(
+    paths: SettingStorePaths,
+    operations: SettingStoreOperations,
+    *,
+    config_file: Path,
+    options: Mapping[str, Any],
+    kinds: tuple,
+) -> None:
+    """구버전 asset_config.json + 옵션.json → 씬규격/ 3종으로 1회 분리."""
+    if paths.schema_dir.exists() or not config_file.exists():
+        return
+    try:
+        with open(config_file, encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception as e:
+        operations.warning(f"asset_config.json 분리 실패: {e}")
+        return
+    buckets = {"체위": {}, "표정": {}, "백합": {}}
+    for k, sc in old.get("scenes", {}).items():
+        if not k.isdigit():
+            continue
+        n = int(k)
+        if sc.get("pair") == "yuri" or n >= 800:
+            buckets["백합"][k] = sc
+        elif n < 101:
+            buckets["표정"][k] = sc
+        else:
+            buckets["체위"][k] = sc
+    opts = {
+        "체위": {"장소테마": options.get("장소테마", {}),
+                "시간대": options.get("시간대", {}),
+                "표정진행": options.get("표정진행", {})},
+        "표정": {},
+        "백합": {"탈의단계": options.get("탈의단계", {})},
+    }
+    for kind in kinds:
+        d = paths.schema_dir / kind
+        d.mkdir(parents=True, exist_ok=True)
+        data = {"종류": kind, "씬": buckets[kind], "옵션": opts[kind]}
+        operations.atomic_write_json(d / "기본.json", data, keep_backup=False)
+    operations.info(
+        f"씬 규격 분리 완료: 체위 {len(buckets['체위'])} / "
+        f"표정 {len(buckets['표정'])} / 백합 {len(buckets['백합'])}씬")
+
+
+def setting_thumbnails(
+    name: str,
+    output_root: Path,
+    *,
+    settings: list,
+    derive_catalog: Callable[[dict], list],
+) -> dict:
+    """세트 대표 썸네일 — 세트에 속한 씬 번호로 시작하는 결과물 중 가장 새것.
+    파일명이 `101_A01_핸드잡_시작전.webp` 꼴이므로 앞 3자리로 찾는다."""
+    st = next((s for s in settings if s["name"] == name), None)
+    if not st:
+        return {}
+    scenes = st["data"].get("씬", {})
+    newest = {}                       # 씬번호 → (mtime, 경로)
+    root = output_root / "nsfw_seed"
+    if root.exists():
+        for p in root.rglob("*"):
+            if p.suffix.lower() not in (".webp", ".png"):
+                continue
+            head = p.name[:3]
+            if not head.isdigit():
+                continue
+            n = int(head)
+            if str(n) not in scenes:
+                continue
+            m = p.stat().st_mtime
+            if n not in newest or m > newest[n][0]:
+                newest[n] = (m, p)
+    out = {}
+    for g in derive_catalog(scenes):
+        best = max((newest[i] for i in g["ids"] if i in newest),
+                   default=None, key=lambda x: x[0])
+        if best:
+            out[str(g["id"])] = str(
+                best[1].relative_to(output_root)).replace("\\", "/")
+    return out
+
+
 __all__ = [
     "BUILDER_MODES",
     "SCENESET_KEYS",
@@ -851,6 +934,8 @@ __all__ = [
     "scene_num_clashes",
     "setting_catalog",
     "setting_path",
+    "setting_thumbnails",
+    "split_legacy_asset_config",
     "undo_duplicate_scene",
     "update_option",
     "used_scene_nums",
