@@ -20,9 +20,10 @@
       library_catalog · tag_catalog · builder_handlers · catalog_search ·
       remote_image_cache · fragment_import · public_style_import)
       5,386 → **5,253줄** (−133). 회귀 18/18 · 계약 28 · 경계 5
-- [ ] 조각 3 — 생성 계열 (reference · auxiliary · generation_step/retry/
-      commit/execution · handler bindings 3벌 · image_tool · collection ·
-      pacing) → `wiring/generation.py`
+- [x] 조각 3 — 생성 계열 13함수 → `wiring/generation.py`
+      (reference · auxiliary · pacing · step/retry/commit/execution ·
+      handler bindings 3벌 · handler · image_tool · collection)
+      5,253 → **5,071줄** (−182). 생성 경로 회귀 16/16 · exports 7 · 경계 5
 - [ ] 조각 4 — 세팅 계열 → `wiring/settings.py`, 관리·비교 계열 →
       `wiring/management.py`, 라우트 바인딩 6벌 → `wiring/routes.py`
 - [ ] 조각마다 경계 상한 하향(별도 커밋) — 역증가 차단

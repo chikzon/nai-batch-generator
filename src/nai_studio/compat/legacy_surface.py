@@ -166,6 +166,7 @@ from src.nai_studio.runtime.data_files import (
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.runtime import file_transaction as _file_transaction
+from src.nai_studio.runtime.wiring import generation as _wiring_generation
 from src.nai_studio.runtime.wiring import library as _wiring_library
 from src.nai_studio.compat import studio_wiring as _studio_wiring
 from src.nai_studio.runtime import program_entry as _program_entry
@@ -828,21 +829,7 @@ def _resource_import_operations():
 
 
 def _reference_operations():
-    """현재 프로필 파일·HTTP·원자 저장을 Reference 서비스에 연결한다."""
-    return _reference_preparation.ReferenceOperations(
-        vibe_dir=VIBE_DIR,
-        settings_file=SETTINGS_FILE,
-        default_config=DEFAULT_CONFIG,
-        vibe_paths=globals()["vibe_paths"],
-        encode_vibe=globals()["encode_vibe"],
-        atomic_write_text=globals()["atomic_write_text"],
-        transaction=globals()["shared_data_transaction"],
-        load_json=globals()["load_json_recover"],
-        save_config=globals()["save_config"],
-        http_post=globals()["requests"].post,
-        warning=globals()["log"].warning,
-        info=globals()["log"].info,
-    )
+    return _wiring_generation.reference_operations(globals())
 
 
 def encode_vibe(token, image_bytes, information_extracted=0.7,
@@ -1039,14 +1026,7 @@ def _last_from_zip(content):
 
 
 def _auxiliary_operations():
-    """보조 NAI 호출의 HTTP·이미지 변환·로그를 늦게 연결한다."""
-    return _nai_auxiliary.AuxiliaryOperations(
-        http_post=globals()["requests"].post,
-        http_get=globals()["requests"].get,
-        image_png_base64=globals()["_b64_png"],
-        info=globals()["log"].info,
-        warning=globals()["log"].warning,
-    )
+    return _wiring_generation.auxiliary_operations(globals())
 
 
 def call_director(token, image_bytes, method, prompt=None, defry=0):
@@ -2803,197 +2783,43 @@ def comparison_recipe_context(cfg, plan, styles, chars):
         _comparison_operations(), cfg, plan, styles, chars)
 
 def _generation_step_operations():
-    return _generation_step.GenerationStepOperations(
-        character_resource_config=globals()["character_resource_config"],
-        setting_reference_config=globals()["setting_reference_config"],
-        build_scene=globals()["build_scene"],
-        seed_for=globals()["seed_for"],
-        join_tags=globals()["_join_tags"],
-        setting_scene_people=globals()["setting_scene_people"],
-        with_position_mode=globals()["with_position_mode"],
-        with_centers=globals()["with_centers"],
-    )
+    return _wiring_generation.generation_step_operations(globals())
 
 
 def _generation_retry_operations():
-    return _generation_retry.GenerationRetryOperations(
-        pace_gate=globals()["pace_gate"],
-        pace_complete=globals()["pace_complete"],
-        call_nai_api=globals()["call_nai_api"],
-        warning=globals()["log"].warning,
-        error=globals()["log"].error,
-        critical=globals()["log"].critical,
-    )
+    return _wiring_generation.generation_retry_operations(globals())
 
 
 def _generation_commit_operations():
-    return _generation_commit.GenerationCommitOperations(
-        save_image=globals()["save_with_meta"],
-        output_format=globals()["out_format"],
-        output_clean_args=globals()["_ocargs"],
-        output_clean=globals()["out_clean"],
-        task_fingerprint=globals()["generation_task_fingerprint"],
-        record_job_result=globals()["record_job_result"],
-        output_root=globals()["out_root"],
-        make_progress_record=globals()["make_progress_record"],
-        progress_item_key=globals()["progress_item_key"],
-        bump_daily=globals()["bump_daily"],
-        daily_count=globals()["daily_count"],
-        save_state=globals()["save_state"],
-        warning=globals()["log"].warning,
-    )
+    return _wiring_generation.generation_commit_operations(globals())
 
 
 def _generation_execution_operations():
-    """세팅 생성의 계산·재시도·저장 의존성을 호출 시점에 연결한다."""
-    return _generation_execution.GenerationExecutionOperations(
-        step=_generation_step_operations(),
-        retry=_generation_retry_operations(),
-        commit=_generation_commit_operations(),
-        load_state=globals()["load_state"],
-        save_state=globals()["save_state"],
-        fixed_seed=globals()["fixed_seed"],
-        daily_count=globals()["daily_count"],
-        daily_cap=DAILY_CAP,
-        load_asset_config=globals()["load_asset_config"],
-        context_fingerprint=globals()["generation_context_fingerprint"],
-        compute_pending=globals()["compute_pending"],
-        progress_record_valid=globals()["progress_record_valid"],
-        progress_record_path=globals()["progress_record_path"],
-        pace=globals()["pace"],
-        output_sub=globals()["out_sub"],
-        runtime_params=globals()["runtime_generation_params"],
-        random_seed=lambda: globals()["random"].randint(0, 2**32 - 1),
-        random_uniform=globals()["random"].uniform,
-        info=globals()["log"].info,
-        warning=globals()["log"].warning,
-        error=globals()["log"].error,
-    )
+    return _wiring_generation.generation_execution_operations(globals())
 
 
 def _generation_handler_run_bindings():
-    return {
-        "common_job_store": globals()["common_job_store"],
-        "make_job_command": globals()["make_job_command"],
-        "transition_job": globals()["transition_job"],
-        "activate_comparison_run": globals()["activate_comparison_run"],
-        "retry_job": globals()["retry_job"],
-        "reconcile_job": globals()["reconcile_job"],
-        "inherited_blueprint": globals()["inherited_blueprint"],
-        "single_generation_material": globals()[
-            "single_generation_legacy_material"],
-        "characters_resource_config": globals()["characters_resource_config"],
-        "start_daemon": lambda target: globals()["threading"].Thread(
-            target=target, daemon=True).start(),
-        "error": globals()["log"].error,
-        "warning": globals()["log"].warning,
-    }
+    return _wiring_generation.generation_handler_run_bindings(globals())
 
 
 def _generation_handler_nai_bindings():
-    return {
-        "pace_gate": globals()["pace_gate"],
-        "runtime_generation_params": globals()["runtime_generation_params"],
-        "load_state": globals()["load_state"],
-        "call_nai_api": globals()["call_nai_api"],
-        "with_centers": globals()["with_centers"],
-        "pace_complete": globals()["pace_complete"],
-        "output_subdir": globals()["out_sub"],
-        "output_format": globals()["out_format"],
-        "output_clean_args": globals()["out_clean"],
-        "save_with_meta": globals()["save_with_meta"],
-        "output_root": globals()["out_root"],
-        "record_job_result": globals()["record_job_result"],
-        "bump_daily": globals()["bump_daily"],
-        "save_state": globals()["save_state"],
-        "daily_count": globals()["daily_count"],
-        "available_output_path": globals()["available_output_path"],
-    }
+    return _wiring_generation.generation_handler_nai_bindings(globals())
 
 
 def _generation_handler_image_bindings():
-    return {
-        "random_seed": globals()["random"].randint,
-        "reference_inset_canvas": globals()["reference_inset_canvas"],
-        "character_asset_from_record": globals()[
-            "character_asset_from_legacy_record"],
-        "variation_plan_material": globals()[
-            "variation_plan_to_legacy_payload_material"],
-        "slot_prompt": globals()["slot_prompt"],
-        "active_people": globals()["active_people"],
-        "now": lambda: globals()["datetime"].now(),
-        "extract_metadata": globals()["extract_nai_metadata"],
-        "model_id_from_metadata": globals()["model_id_from_metadata"],
-        "normalize_position_mode": globals()["normalize_position_mode"],
-        "scene_mode_pending": globals()["scene_mode_pending"],
-        "safe_name": globals()["_safe_name"],
-        "progress_record_path": globals()["progress_record_path"],
-        "join_tags": globals()["_join_tags"],
-        "seed_for": globals()["seed_for"],
-    }
+    return _wiring_generation.generation_handler_image_bindings(globals())
 
 
 def _generation_handler_operations():
-    """생성 HTTP handler의 의존성을 기능 묶음별로 늦게 연결한다."""
-    return _generation_handlers.GenerationHandlerOperations(
-        **_generation_handler_run_bindings(),
-        **_generation_handler_nai_bindings(),
-        **_generation_handler_image_bindings(),
-    )
+    return _wiring_generation.generation_handler_operations(globals())
 
 
 def _image_tool_operations():
-    """이미지 도구의 저장·NAI·계보 의존성을 호출 시점에 연결한다."""
-    return _image_tool_handlers.ImageToolOperations(
-        vibe_dir=globals()["VIBE_DIR"],
-        shared_data_transaction=globals()["shared_data_transaction"],
-        vibe_paths=globals()["vibe_paths"],
-        save_config=globals()["save_config"],
-        prepare_vibes=globals()["prepare_vibes"],
-        recoverable_remove=globals()["recoverable_remove"],
-        director_tools=globals()["DIRECTOR_TOOLS"],
-        call_upscale=globals()["call_upscale"],
-        call_director=globals()["call_director"],
-        inherited_blueprint=globals()["inherited_blueprint"],
-        output_sub=globals()["out_sub"],
-        record_job_result=globals()["record_job_result"],
-        output_root=globals()["out_root"],
-        info=globals()["log"].info,
-        warning=globals()["log"].warning,
-    )
+    return _wiring_generation.image_tool_operations(globals())
 
 
 def _collection_handler_operations():
-    """단건 복원·변형 저장의 기존 데이터 경계를 호출 시점에 연결한다."""
-    return _collection_handlers.CollectionHandlerOperations(
-        output_root=globals()["out_root"],
-        character_asset_from_legacy_record=globals()[
-            "character_asset_from_legacy_record"
-        ],
-        accept_variation=globals()["accept_variation"],
-        approved_variation_candidates=globals()[
-            "approved_proposal_to_legacy_candidates"
-        ],
-        apply_variation_candidates=globals()[
-            "apply_character_variation_candidates"
-        ],
-        local_import_image=globals()["_local_import_image"],
-        sync_chars_to_files=globals()["sync_chars_to_files"],
-        save_config=globals()["save_config"],
-        extract_nai_metadata=globals()["extract_nai_metadata"],
-        parse_artist_combo=globals()["parse_artist_combo"],
-        model_id_from_metadata=globals()["model_id_from_metadata"],
-        split_uc_preset=globals()["split_uc_preset"],
-        restore_quality_prompt=globals()["restore_quality_prompt"],
-        image_cache=globals()["IMG_CACHE"],
-        atomic_write_bytes=globals()["_atomic_write_bytes"],
-        evidence_from_image_record=globals()["evidence_from_image_record"],
-        style_asset_from_record=globals()["style_asset_from_record"],
-        add_style=globals()["add_style"],
-        image_inspect_queue=globals()["image_inspect_queue"],
-        summarize_restore_queue=globals()["summarize_restore_queue"],
-        warning=globals()["log"].warning,
-    )
+    return _wiring_generation.collection_handler_operations(globals())
 
 
 def _setting_transaction():
@@ -4116,15 +3942,7 @@ _LAST_CALL = {"t": 0.0}
 
 
 def _pacing_operations():
-    """현재 상태 장부와 patch 가능한 시계를 호출 간격 서비스에 연결한다."""
-    return _generation_pacing.PacingOperations(
-        load_state=globals()["load_state"],
-        daily_count=globals()["daily_count"],
-        random_uniform=globals()["random"].uniform,
-        now=globals()["time"].time,
-        sleep=globals()["time"].sleep,
-        last_call=globals()["_LAST_CALL"],
-    )
+    return _wiring_generation.pacing_operations(globals())
 
 
 def pace_gate(cfg, live=None, label=""):
