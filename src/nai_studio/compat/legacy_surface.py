@@ -166,6 +166,7 @@ from src.nai_studio.runtime.data_files import (
 from src.nai_studio.runtime.live_state import LiveState as RuntimeLiveState
 from src.nai_studio.runtime.errors import FatalStopError
 from src.nai_studio.runtime import file_transaction as _file_transaction
+from src.nai_studio.runtime.wiring import library as _wiring_library
 from src.nai_studio.compat import studio_wiring as _studio_wiring
 from src.nai_studio.runtime import program_entry as _program_entry
 from src.nai_studio.services.legacy_bridge import (
@@ -2071,40 +2072,11 @@ def import_settings_bytes(data, filename=""):
 # 자리는 기존 상수를 그대로 쓴다 (STYLE_FILE·RECIPE_FILE·COMBO_FILE·IMG_CACHE·TAG_DIR).
 # 새 경로 상수를 만들면 두 곳이 어긋날 수 있다.
 def _datapack_paths():
-    """자료팩 서비스가 쓸 현재 프로필 경로를 호출 시점에 조립한다."""
-    return _datapack_store.DatapackPaths(
-        base_dir=BASE_DIR,
-        style_file=STYLE_FILE,
-        recipe_file=RECIPE_FILE,
-        combo_file=COMBO_FILE,
-        image_cache=IMG_CACHE,
-        tag_dir=TAG_DIR,
-        builder_file=BUILDER_FILE,
-        spec_file=SPEC_FILE,
-        options_file=OPTIONS_FILE,
-        settings_dir=SETTINGS_DIR,
-        character_dir=CHAR_DIR,
-    )
+    return _wiring_library.datapack_paths(globals())
 
 
 def _datapack_operations():
-    """원자 저장과 캐릭터 동기화를 현재 전역 구현에 늦게 연결한다."""
-    return _datapack_store.DatapackOperations(
-        transaction=shared_data_transaction,
-        atomic_write_bytes=globals()["_atomic_write_bytes"],
-        atomic_write_json=globals()["atomic_write_json"],
-        load_json=globals()["load_json_recover"],
-        recoverable_remove=globals()["recoverable_remove"],
-        row_digest=globals()["_style_row_digest"],
-        character_signature=globals()["character_bundle_signature"],
-        delete_character_files=globals()["delete_char_files"],
-        sync_character_files=globals()["sync_chars_to_files"],
-        save_config=globals()["save_config"],
-        forget_caches=globals()["forget_collection_caches"],
-        pack_queue=globals()["pack_import_queue"],
-        summarize_queue=globals()["summarize_restore_queue"],
-        warning=log.warning,
-    )
+    return _wiring_library.datapack_operations(globals())
 
 
 def _datapack_lists():
@@ -2157,28 +2129,11 @@ _LOCAL_IMAGE_SUFFIXES = {".webp", ".png", ".jpg", ".jpeg"}
 
 
 def _local_image_paths():
-    return _local_image_store.LocalImagePaths(
-        base_dir=BASE_DIR,
-        image_cache=IMG_CACHE,
-        image_suffixes=tuple(sorted(_LOCAL_IMAGE_SUFFIXES)),
-        record_dir_name="이미지무결성기록",
-        journal_schema="nais-local-image-normalize/v1",
-    )
+    return _wiring_library.local_image_paths(globals())
 
 
 def _local_image_operations():
-    """현재 원자 저장·트랜잭션·시간 함수를 주입해 기존 patch 계약을 보존한다."""
-    return _local_image_store.LocalImageOperations(
-        transaction=shared_data_transaction,
-        lock=_LOCAL_IMAGE_LOCK,
-        atomic_write_bytes=_atomic_write_bytes,
-        atomic_write_json=atomic_write_json,
-        forget_caches=forget_collection_caches,
-        now=datetime.now,
-        unix_time=time.time,
-        random_bytes=os.urandom,
-        replace_file=os.replace,
-    )
+    return _wiring_library.local_image_operations(globals())
 
 
 def _collect_local_refs(value, found):
@@ -2261,25 +2216,11 @@ def _data_index_path():
 
 
 def _data_inventory_paths():
-    return _data_inventory.DataInventoryPaths(
-        base_dir=BASE_DIR,
-        program_dir=PROGRAM_DIR,
-        index_file=_data_index_path(),
-        schema=DATA_INDEX_SCHEMA,
-        profile=PROFILE,
-    )
+    return _wiring_library.data_inventory_paths(globals())
 
 
 def _data_inventory_operations():
-    return _data_inventory.DataInventoryOperations(
-        load_json=load_json_recover,
-        atomic_write_json=atomic_write_json,
-        now=datetime.now,
-        redact=redact_diagnostic_text,
-        folder_queue=folder_inventory_queue,
-        folder_summary=folder_inventory_summary,
-        summarize_queue=summarize_restore_queue,
-    )
+    return _wiring_library.data_inventory_operations(globals())
 
 
 def _load_data_index_cached():
@@ -2415,25 +2356,11 @@ def metadata_audit_control(body):
 
 
 def _metadata_candidate_paths():
-    return _metadata_candidate_store.MetadataCandidatePaths(
-        base_dir=BASE_DIR,
-    )
+    return _wiring_library.metadata_candidate_paths(globals())
 
 
 def _metadata_candidate_operations():
-    """현재 감사 singleton과 복원·그림체 저장 경계를 호출 때 주입해 patch를 보존한다."""
-    return _metadata_candidate_store.MetadataCandidateOperations(
-        adapter_for_paths=lambda _paths: metadata_audit_adapter(),
-        extract_nai_metadata=extract_nai_metadata,
-        nai_json_metadata=_nai_json_metadata,
-        prompt_parts=_prompt_parts,
-        param_keys=tuple(PARAM_KEYS),
-        image_inspect_queue=image_inspect_queue,
-        redact_diagnostic_text=redact_diagnostic_text,
-        parse_artist_combo=parse_artist_combo,
-        style_asset_from_record=style_asset_from_record,
-        add_style=add_style,
-    )
+    return _wiring_library.metadata_candidate_operations(globals())
 
 
 def metadata_audit_candidate(body, *, include_raw=False):
@@ -2510,47 +2437,11 @@ BACKUP_SECRET_KEYS = {"token", "booru_keys", "out_dir"}
 
 
 def _user_backup_paths():
-    return _user_backup_store.UserBackupPaths(
-        base_dir=BASE_DIR,
-        profile_dir=PROFILE_DIR,
-        sources=_user_backup_store.UserBackupSourcePaths(
-            settings_file=SETTINGS_FILE,
-            builder_file=BUILDER_FILE,
-            spec_file=SPEC_FILE,
-            options_file=OPTIONS_FILE,
-            tag_dir=TAG_DIR,
-            settings_dir=SETTINGS_DIR,
-            schema_dir=SCHEMA_DIR,
-            sceneset_dir=SCENESET_DIR,
-            style_dir=STYLE_DIR,
-            character_dir=CHAR_DIR,
-            fragment_dir=FRAG_DIR,
-            vibe_dir=VIBE_DIR,
-            picks_file=PICKS_FILE,
-            scenes_file=SCENES_FILE,
-        ),
-        profile_name=PROFILE,
-        schema=BACKUP_SCHEMA,
-        journal_schema="nais-restore-journal/v1",
-        journal_dir_name="복원기록",
-    )
+    return _wiring_library.user_backup_paths(globals())
 
 
 def _user_backup_operations():
-    """현재 복원·원자 저장 경계를 호출 때 주입해 기존 patch와 롤백 순서를 보존한다."""
-    return _user_backup_store.UserBackupOperations(
-        transaction=shared_data_transaction,
-        atomic_write_bytes=_atomic_write_bytes,
-        atomic_write_json=atomic_write_json,
-        load_settings=load_settings_recover,
-        rollback=rollback_user_backup,
-        after_restore=forget_collection_caches,
-        now=datetime.now,
-        random_bytes=os.urandom,
-        warning=log.warning,
-        recoverable_remove=recoverable_remove,
-        **_studio_wiring.user_backup_baseline_fields(PROFILE_DIR),
-    )
+    return _wiring_library.user_backup_operations(globals())
 
 
 def _backup_clean_settings(raw):
