@@ -14,6 +14,8 @@ import copy
 import re
 from typing import Any, Callable
 
+from src.nai_studio.domain.evaluation import merge_evaluations
+from src.nai_studio.domain.resources import canonical_resource
 from src.nai_studio.services.style_store import merge_style_evidence
 
 # 가중치 그룹 시작: `1.7::` `.9::` `-0.5::` — `::`로 닫힌다.
@@ -232,8 +234,221 @@ def merge_evidence_rows(
     }
 
 
+def _character_text(record: dict, *names: str) -> str:
+    for name in names:
+        value = record.get(name)
+        if value:
+            return str(value)
+    return ""
+
+
+def find_character_dupes(
+    characters: list,
+    *,
+    bundle_signature: Callable[[dict], str],
+) -> dict:
+    """같은 묶음 지문(프롬프트+네거티브+변형+참조)의 캐릭터를 묶는다."""
+    groups: dict[str, list[dict]] = {}
+    for record in characters or []:
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        groups.setdefault(bundle_signature(record), []).append(record)
+    duplicates = [
+        {
+            "건수": len(rows),
+            "항목": [
+                {"id": row.get("id"), "name": row.get("name")}
+                for row in rows
+            ],
+        }
+        for rows in groups.values()
+        if len(rows) >= 2
+    ]
+    duplicates.sort(key=lambda group: -group["건수"])
+    return {
+        "ok": True,
+        "묶음": len(duplicates),
+        "전체": len(characters or []),
+        "목록": duplicates[:300],
+    }
+
+
+def character_compare_payload(
+    characters: list,
+    ids: Any,
+    *,
+    bundle_signature: Callable[[dict], str],
+) -> dict:
+    """캐릭터 중복 후보를 원문·변형·참조·증거까지 나란히 투영한다 (쓰기 없음)."""
+    wanted = [str(value) for value in (ids or []) if str(value)]
+    if len(wanted) < 2:
+        return {"ok": False, "error": "비교할 캐릭터를 두 개 이상 골라 주세요."}
+    by_id = {
+        str(row.get("id")): row
+        for row in characters or []
+        if isinstance(row, dict) and row.get("id")
+    }
+    missing = [value for value in wanted if value not in by_id]
+    if missing:
+        return {
+            "ok": False,
+            "error": "찾을 수 없는 캐릭터가 있습니다: " + ", ".join(missing),
+        }
+    records = [by_id[value] for value in wanted]
+    rows = [{
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "prompt": _character_text(record, "female", "prompt", "외형"),
+        "outfit": _character_text(record, "clothed", "outfit", "착의"),
+        "negative": _character_text(record, "negative", "네거티브"),
+        "variants": copy.deepcopy(record.get("variants") or []),
+        "reference_ids": list(record.get("reference_ids") or []),
+        "vibe_ids": list(record.get("vibe_ids") or []),
+        "evidence_records": len(record.get("evidence_records") or []),
+        "bundle_signature": bundle_signature(record),
+    } for record in records]
+    first, second = records[0], records[1]
+    return {
+        "ok": True,
+        "source": "characters",
+        "rows": rows,
+        "prompt_diff": prompt_segment_diff(
+            _character_text(first, "female", "prompt", "외형"),
+            _character_text(second, "female", "prompt", "외형"),
+        ),
+        "negative_diff": prompt_segment_diff(
+            _character_text(first, "negative", "네거티브"),
+            _character_text(second, "negative", "네거티브"),
+        ),
+        "recoverable": False,
+    }
+
+
+def _union_records(base: list, extra: list, key: str = "id") -> list:
+    merged = list(base or [])
+    known = {
+        str(item.get(key)) if isinstance(item, dict) else repr(item)
+        for item in merged
+    }
+    for item in extra or []:
+        marker = (
+            str(item.get(key)) if isinstance(item, dict) else repr(item)
+        )
+        if marker not in known:
+            merged.append(copy.deepcopy(item))
+            known.add(marker)
+    return merged
+
+
+def _resource_duplicate_groups(
+    resource_records: list,
+    wanted_ids: set[str],
+) -> list[list[str]]:
+    """병합된 캐릭터가 가리키는 자원 중 내용이 같은 것들을 알려만 준다.
+
+    자원 자체는 자동 통합하지 않는다 — 도메인 canonical_resource의
+    내용 지문(강도·출처 무관)으로 같은 자원인지 판정만 한다.
+    """
+    by_fingerprint: dict[str, list[str]] = {}
+    for record in resource_records or []:
+        if not isinstance(record, dict):
+            continue
+        record_id = str(record.get("id") or "")
+        if record_id not in wanted_ids:
+            continue
+        try:
+            fingerprint = canonical_resource(record)["fingerprint"]
+        except Exception:
+            continue
+        by_fingerprint.setdefault(fingerprint, []).append(record_id)
+    return [ids for ids in by_fingerprint.values() if len(ids) >= 2]
+
+
+def merge_character_assets(
+    characters: list,
+    representative_id: Any,
+    other_ids: Any,
+    *,
+    bundle_signature: Callable[[dict], str],
+    resource_records: list | None = None,
+) -> dict:
+    """대표 캐릭터에 다른 캐릭터의 변형·참조·증거를 **더하기만** 한다.
+
+    원문(외형·착의·네거티브)은 대표 것을 그대로 두고, 원본 캐릭터도
+    삭제하지 않는다. 평가 레코드가 양쪽에 있으면 도메인 merge_evaluations로
+    합치고, 내용이 같은 자원 참조는 통합하지 않고 목록으로 알려 준다.
+    """
+    representative_id = str(representative_id or "")
+    wanted = [
+        str(value) for value in (other_ids or [])
+        if str(value) and str(value) != representative_id
+    ]
+    if not representative_id or not wanted:
+        return {"ok": False, "error": "대표와 합칠 캐릭터를 골라 주세요."}
+    index_by_id = {
+        str(row.get("id")): position
+        for position, row in enumerate(characters or [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    if representative_id not in index_by_id:
+        return {"ok": False, "error": "대표 캐릭터를 찾지 못했습니다."}
+    missing = [value for value in wanted if value not in index_by_id]
+    if missing:
+        return {
+            "ok": False,
+            "error": "합칠 캐릭터를 찾지 못했습니다: " + ", ".join(missing),
+        }
+    new_rows = [copy.deepcopy(row) for row in characters]
+    merged = new_rows[index_by_id[representative_id]]
+    before = copy.deepcopy(merged)
+    evaluations = [merged["evaluation"]] if isinstance(
+        merged.get("evaluation"), dict) else []
+    for value in wanted:
+        other = new_rows[index_by_id[value]]
+        merged["variants"] = _union_records(
+            merged.get("variants"), other.get("variants"))
+        for field in ("reference_ids", "vibe_ids", "evidence_refs"):
+            merged[field] = _union_records(
+                merged.get(field), other.get(field))
+            if not merged[field]:
+                merged.pop(field, None)
+        merged["evidence_records"] = _union_records(
+            merged.get("evidence_records"), other.get("evidence_records"))
+        if not merged["evidence_records"]:
+            merged.pop("evidence_records", None)
+        if isinstance(other.get("evaluation"), dict):
+            evaluations.append(other["evaluation"])
+    evaluation_conflicts: list = []
+    if len(evaluations) >= 2:
+        try:
+            outcome = merge_evaluations(*evaluations)
+            merged["evaluation"] = outcome["evaluation"]
+            evaluation_conflicts = list(outcome.get("conflicts") or [])
+        except Exception:
+            pass
+    changed = merged != before
+    resource_ids = {
+        str(item) for item in
+        list(merged.get("reference_ids") or [])
+        + list(merged.get("vibe_ids") or [])
+    }
+    return {
+        "ok": True,
+        "changed": changed,
+        "rows": new_rows,
+        "representative": representative_id,
+        "merged_from": wanted,
+        "evaluation_conflicts": evaluation_conflicts,
+        "resource_duplicates": _resource_duplicate_groups(
+            resource_records or [], resource_ids),
+    }
+
+
 __all__ = [
+    "character_compare_payload",
     "dupe_compare_payload",
+    "find_character_dupes",
+    "merge_character_assets",
     "merge_evidence_rows",
     "prompt_segment_diff",
     "prompt_segments",

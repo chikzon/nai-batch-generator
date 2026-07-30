@@ -178,9 +178,50 @@ def extra_route_bindings(app: dict) -> dict:
             _UPDATE_MANAGER = _update_check.UpdateManager(operations_factory)
         return _UPDATE_MANAGER
 
+    def character_dupes(cfg):
+        return _evidence_merge.find_character_dupes(
+            cfg.get("characters") or [],
+            bundle_signature=app["character_bundle_signature"],
+        )
+
+    def character_compare(cfg, ids):
+        return _evidence_merge.character_compare_payload(
+            cfg.get("characters") or [],
+            ids,
+            bundle_signature=app["character_bundle_signature"],
+        )
+
+    def character_merge(application, representative, others):
+        """대표 캐릭터에 더하기만 하고 저장·파일 동기화는 기존 경로로."""
+        with application.config_lock:
+            application.use_latest_config()
+            cfg = application.cfg
+            result = _evidence_merge.merge_character_assets(
+                cfg.get("characters") or [],
+                representative,
+                others,
+                bundle_signature=app["character_bundle_signature"],
+                resource_records=(
+                    list(cfg.get("vibes") or [])
+                    + list(cfg.get("char_refs") or [])
+                ),
+            )
+            if not result.get("ok") or not result.get("changed"):
+                result.pop("rows", None)
+                return result
+            cfg["characters"] = result.pop("rows")
+            app["sync_chars_to_files"](cfg)
+            app["save_config"](cfg)
+            application.config_revision += 1
+            result["revision"] = application.config_revision
+        return result
+
     return {
         "evidence_compare": evidence_compare,
         "evidence_merge": evidence_merge,
+        "character_compare": character_compare,
+        "character_merge": character_merge,
+        "character_dupes": character_dupes,
         "archive_download_control": (
             lambda data: archive_manager().control(data)),
         "public_pairing": _RELAY_PAIRING.issue,

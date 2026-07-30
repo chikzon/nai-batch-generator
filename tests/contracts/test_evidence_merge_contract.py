@@ -159,5 +159,155 @@ class EvidenceMergeContractTests(unittest.TestCase):
             rows, "style-a", [], row_digest=_digest)["ok"])
 
 
+def _bundle_signature(record: dict) -> str:
+    return json.dumps({
+        "prompt": record.get("female") or record.get("prompt") or "",
+        "outfit": record.get("clothed") or record.get("outfit") or "",
+        "negative": record.get("negative") or "",
+        "variants": record.get("variants") or [],
+        "reference_ids": record.get("reference_ids") or [],
+        "vibe_ids": record.get("vibe_ids") or [],
+    }, ensure_ascii=False, sort_keys=True)
+
+
+CHAR_A = {
+    "id": "char-a",
+    "name": "세렌",
+    "female": "1girl, blue hair",
+    "clothed": "navy cloak",
+    "negative": "lowres",
+    "variants": [{"id": "v1", "outfit": "swimsuit"}],
+    "reference_ids": ["ref-1"],
+    "vibe_ids": [],
+    "evidence_records": [{"id": "ev-a"}],
+    "evaluation": {
+        "subject": {"kind": "result", "path": "a.png"},
+        "rating": 4,
+        "favorite": False,
+        "tags": ["파랑"],
+    },
+}
+CHAR_B = {
+    "id": "char-b",
+    "name": "세렌 사본",
+    "female": "1girl, blue hair",
+    "clothed": "navy cloak",
+    "negative": "lowres",
+    "variants": [{"id": "v2", "outfit": "dress"}],
+    "reference_ids": ["ref-2"],
+    "vibe_ids": ["vibe-1"],
+    "evidence_records": [{"id": "ev-b"}],
+    "evaluation": {
+        "subject": {"kind": "result", "path": "a.png"},
+        "rating": 5,
+        "favorite": True,
+        "tags": ["망토"],
+    },
+}
+
+
+class CharacterDupeContractTests(unittest.TestCase):
+    def test_same_bundle_signature_groups_together(self):
+        from src.nai_studio.services.evidence_merge import (
+            find_character_dupes,
+        )
+
+        other = dict(CHAR_A) | {"id": "char-c", "female": "1girl, red hair"}
+        result = find_character_dupes(
+            [dict(CHAR_A), dict(CHAR_B), other],
+            bundle_signature=_bundle_signature,
+        )
+        self.assertTrue(result["ok"])
+        # A·B는 변형·참조가 달라 같은 묶음이 아니다 — 지문 함수 기준 그대로
+        self.assertEqual(result["묶음"], 0)
+        twins = find_character_dupes(
+            [dict(CHAR_A), dict(CHAR_A) | {"id": "char-c", "name": "쌍둥이"}],
+            bundle_signature=_bundle_signature,
+        )
+        self.assertEqual(twins["묶음"], 1)
+        self.assertEqual(twins["목록"][0]["건수"], 2)
+
+    def test_compare_payload_carries_bundles_and_diff(self):
+        from src.nai_studio.services.evidence_merge import (
+            character_compare_payload,
+        )
+
+        payload = character_compare_payload(
+            [dict(CHAR_A), dict(CHAR_B)],
+            ["char-a", "char-b"],
+            bundle_signature=_bundle_signature,
+        )
+        self.assertTrue(payload["ok"])
+        row = payload["rows"][0]
+        for key in ("prompt", "outfit", "negative", "variants",
+                    "reference_ids", "vibe_ids", "bundle_signature"):
+            self.assertIn(key, row)
+        self.assertEqual(payload["prompt_diff"]["left_only"], [])
+
+
+class CharacterMergeContractTests(unittest.TestCase):
+    def merge(self, resource_records=None):
+        from src.nai_studio.services.evidence_merge import (
+            merge_character_assets,
+        )
+
+        return merge_character_assets(
+            [dict(CHAR_A), dict(CHAR_B)],
+            "char-a",
+            ["char-b"],
+            bundle_signature=_bundle_signature,
+            resource_records=resource_records or [],
+        )
+
+    def test_merge_adds_only_and_keeps_originals(self):
+        result = self.merge()
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["changed"])
+        rows = result["rows"]
+        self.assertEqual(len(rows), 2)  # 원본 캐릭터는 남는다
+        merged = rows[0]
+        # 원문은 대표 것 그대로
+        self.assertEqual(merged["female"], CHAR_A["female"])
+        # 변형·참조·증거는 합집합
+        self.assertEqual(
+            [v["id"] for v in merged["variants"]], ["v1", "v2"])
+        self.assertEqual(sorted(merged["reference_ids"]), ["ref-1", "ref-2"])
+        self.assertEqual(merged["vibe_ids"], ["vibe-1"])
+        self.assertEqual(
+            [e["id"] for e in merged["evidence_records"]], ["ev-a", "ev-b"])
+        # 원본 B는 무변경
+        self.assertEqual(rows[1]["variants"], CHAR_B["variants"])
+
+    def test_evaluations_are_merged_via_domain_rules(self):
+        result = self.merge()
+        evaluation = result["rows"][0]["evaluation"]
+        self.assertTrue(evaluation["favorite"])  # any()
+        self.assertEqual(sorted(evaluation["tags"]), ["망토", "파랑"])
+
+    def test_duplicate_resources_are_reported_not_auto_merged(self):
+        same_image = {"image_ref": "local:same.png"}
+        resources = [
+            {"id": "ref-1", "kind": "character-reference", **same_image},
+            {"id": "ref-2", "kind": "character-reference", **same_image},
+            {"id": "vibe-1", "kind": "vibe",
+             "image_ref": "local:other.png"},
+        ]
+        result = self.merge(resource_records=resources)
+        self.assertEqual(
+            result["resource_duplicates"], [["ref-1", "ref-2"]])
+
+    def test_missing_ids_are_rejected(self):
+        from src.nai_studio.services.evidence_merge import (
+            merge_character_assets,
+        )
+
+        self.assertFalse(merge_character_assets(
+            [dict(CHAR_A)], "char-a", ["없는것"],
+            bundle_signature=_bundle_signature)["ok"])
+        self.assertFalse(merge_character_assets(
+            [dict(CHAR_A)], "char-a", [],
+            bundle_signature=_bundle_signature)["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,10 +35,13 @@ from src.nai_studio.services.user_backup_workflow import (
 
 @dataclass(frozen=True)
 class MergePostOperations:
-    """자료실 증거 병합 경계 — compat/studio_wiring이 조립한다."""
+    """자료실 증거·캐릭터 병합 경계 — compat/studio_wiring이 조립한다."""
 
     evidence_compare: Any
     evidence_merge: Any
+    character_compare: Any
+    character_merge: Any
+    character_dupes: Any
 
 
 def _json_body(body: bytes) -> dict:
@@ -79,6 +82,16 @@ def _merge_preview(
         request._json(merge_operations.evidence_compare(
             _json_body(body).get("ids") or []))
         return
+    elif source == "characters":
+        data = _json_body(body)
+        ids = data.get("ids") or []
+        if ids:
+            request._json(merge_operations.character_compare(
+                application.cfg, ids))
+        else:
+            # ids 없이 부르면 중복 묶음 목록을 준다
+            request._json(merge_operations.character_dupes(application.cfg))
+        return
     else:
         _bad_source(request)
         return
@@ -115,6 +128,9 @@ def _merge_apply(
     elif source == "library":
         result = merge_operations.evidence_merge(
             data.get("representative"), data.get("others") or [])
+    elif source == "characters":
+        result = merge_operations.character_merge(
+            application, data.get("representative"), data.get("others") or [])
     else:
         _bad_source(request)
         return
@@ -138,6 +154,12 @@ def _merge_undo(
         # 증거 병합도 자료팩과 같은 Undo 장부(list_updates)를 쓴다.
         result = undo_pack_workflow(
             application, collection_operations, data.get("id"))
+    elif source == "characters":
+        result = {
+            "ok": False,
+            "error": "캐릭터 병합은 대표에 더하기만 해 되돌릴 항목이 "
+                     "없습니다. 원본 캐릭터는 그대로 남아 있습니다.",
+        }
     else:
         _bad_source(request)
         return

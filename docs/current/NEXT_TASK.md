@@ -1,4 +1,16 @@
-# 현재 작업 — 자료팩 3-way 기준값 (단계 2 잔여 ①)
+# 현재 작업 — 캐릭터 자산 중복 검토 (단계 2 잔여 ②)
+
+## 이 커밋
+
+- `/api/merge_preview·apply` source="characters" — ids 없으면 중복
+  묶음(캐릭터 묶음 지문 기준), ids 주면 나란히 비교(원문·변형·참조·
+  증거·prompt diff), apply는 대표에 **더하기만**(원문·원본 캐릭터
+  불변, undo 불필요 설계). 평가는 도메인 merge_evaluations로 병합
+  (충돌 목록 동반), 내용 같은 자원 참조는 canonical_resource 지문으로
+  알려만 준다(자동 통합 금지). 저장은 기존 sync_chars_to_files·
+  save_config 경로.
+
+## 직전 완료 — 자료팩 3-way 기준값 (4c18bc6, 단계 2 잔여 ①)
 
 레거시 축소(단계 1~5)와 스크린샷 재촬영은 마감됐다 — 기록은
 `CLAUDE_PUSH_HANDOFF.md`(HEAD f69abc1 기준). 이제 미완 목록을 잇는다.
