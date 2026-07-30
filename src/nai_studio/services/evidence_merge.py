@@ -242,17 +242,31 @@ def _character_text(record: dict, *names: str) -> str:
     return ""
 
 
+def character_text_key(record: dict) -> str:
+    """중복 후보 판정 키 — 원문(외형·착의·네거티브)만 본다.
+
+    변형·참조·증거는 일부러 뺀다: 그 차이를 합치는 것이 병합의 목적이라,
+    지문에 넣으면 정작 합칠 쌍을 못 잡는다.
+    """
+    return "\n".join((
+        _character_text(record, "female", "prompt", "외형").strip(),
+        _character_text(record, "clothed", "outfit", "착의").strip(),
+        _character_text(record, "negative", "네거티브").strip(),
+    ))
+
+
 def find_character_dupes(
     characters: list,
     *,
     bundle_signature: Callable[[dict], str],
 ) -> dict:
-    """같은 묶음 지문(프롬프트+네거티브+변형+참조)의 캐릭터를 묶는다."""
+    """원문이 같은 캐릭터를 묶는다 (변형·참조가 달라도 같은 후보)."""
+    del bundle_signature  # 표시용 비교 payload에서만 쓴다
     groups: dict[str, list[dict]] = {}
     for record in characters or []:
         if not isinstance(record, dict) or not record.get("id"):
             continue
-        groups.setdefault(bundle_signature(record), []).append(record)
+        groups.setdefault(character_text_key(record), []).append(record)
     duplicates = [
         {
             "건수": len(rows),
@@ -446,6 +460,7 @@ def merge_character_assets(
 
 __all__ = [
     "character_compare_payload",
+    "character_text_key",
     "dupe_compare_payload",
     "find_character_dupes",
     "merge_character_assets",

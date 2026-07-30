@@ -1273,6 +1273,132 @@ async function reviewLoadDupes(){
     });
   }catch(e){ host.innerHTML = `<div class="hint">${esc('찾기 실패: ' + e)}</div>`; }
 }
+// 캐릭터 겹침 — source=characters. 병합은 대표에 더하기만이라 되돌리기가 없다.
+let REVIEW_CHAR_PICKED = [];
+function reviewCharPaintCompare(payload){
+  const host = $('reviewCharCompare');
+  host.classList.remove('hidden');
+  if(!payload.ok){
+    host.innerHTML = `<div class="hint">${esc(payload.error || '비교하지 못했습니다.')}</div>`;
+    return;
+  }
+  const rows = payload.rows || [];
+  host.innerHTML = `<div class="bar" style="flex-wrap:wrap;">
+      <strong style="font-size:var(--fs-xs);">캐릭터 나란히 비교</strong>
+      <span class="hint">대표를 고르면 나머지의 변형·참조·근거를 대표에 더합니다.</span>
+    </div>
+    <div class="grid2" style="margin-top:6px;gap:8px;">`
+    + rows.map((row, index) => `<div class="row" style="display:block;margin:0;">
+        <label class="bar" style="cursor:pointer;">
+          <input type="radio" name="reviewCharRep" value="${escA(row.id)}"
+            ${index === 0 ? 'checked' : ''} style="width:auto;flex:none;">
+          <b>${esc(row.name || row.id)}</b>
+        </label>
+        <div class="hint">변형 ${Number((row.variants || []).length)}개
+          · 참조 ${Number((row.reference_ids || []).length + (row.vibe_ids || []).length)}개
+          · 근거 ${Number(row.evidence_records || 0)}건</div>
+        <details><summary>외형</summary>${reviewValue(row.prompt)}</details>
+        <details><summary>착의</summary>${reviewValue(row.outfit)}</details>
+        <details><summary>네거티브</summary>${reviewValue(row.negative)}</details>
+        <details><summary>변형</summary>${reviewValue(row.variants)}</details>
+      </div>`).join('')
+    + `</div>
+    <div style="margin-top:7px;">`
+    + reviewSegments('외형 — 같은 구간', (payload.prompt_diff || {}).common)
+    + reviewSegments('외형 — 왼쪽만', (payload.prompt_diff || {}).left_only)
+    + reviewSegments('외형 — 오른쪽만', (payload.prompt_diff || {}).right_only)
+    + `</div>
+    <div class="bar" style="margin-top:8px;">
+      <button type="button" id="reviewCharApply" class="primary">고른 대표에 더하기</button>
+      <span class="hint">원문·원본 캐릭터는 바꾸지 않습니다.</span>
+    </div>`;
+  $('reviewCharApply').addEventListener('click', reviewCharApplyMerge);
+}
+async function reviewCharCompareSelected(){
+  if(REVIEW_CHAR_PICKED.length !== 2) return;
+  $('reviewCharMsg').textContent = '나란히 비교를 준비하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/merge_preview', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Source':'characters'},
+      body:JSON.stringify({ids:REVIEW_CHAR_PICKED})})).json();
+    reviewCharPaintCompare(r);
+    $('reviewCharMsg').textContent = r.ok ? '' : (r.error || '');
+  }catch(e){ $('reviewCharMsg').textContent = '비교 실패: ' + e; }
+}
+async function reviewCharApplyMerge(){
+  const picked = document.querySelector('input[name="reviewCharRep"]:checked');
+  if(!picked) return;
+  const representative = picked.value;
+  const others = REVIEW_CHAR_PICKED.filter(id => id !== representative);
+  $('reviewCharMsg').textContent = '대표에 더하는 중입니다.';
+  try{
+    const r = await (await fetch('/api/merge_apply', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source:'characters', representative, others})})).json();
+    const detail = r.detail || {};
+    if(!r.ok){
+      $('reviewCharMsg').textContent = detail.error || '더하지 못했습니다.';
+      return;
+    }
+    const notes = [];
+    notes.push(detail.changed
+      ? '대표에 변형·참조·근거를 더했습니다. 원본 캐릭터는 그대로 남아 있습니다.'
+      : '더할 새 내용이 없었습니다.');
+    if((detail.resource_duplicates || []).length){
+      notes.push('내용이 같은 참조 자원이 있습니다: '
+        + detail.resource_duplicates.map(group => group.join('=')).join(', ')
+        + ' — 필요하면 레퍼런스 화면에서 정리하세요.');
+    }
+    if((detail.evaluation_conflicts || []).length){
+      notes.push(`평가 값 충돌 ${detail.evaluation_conflicts.length}건은 원본 snapshot에 남겼습니다.`);
+    }
+    $('reviewCharMsg').textContent = notes.join(' ');
+    $('reviewCharCompare').classList.add('hidden');
+    REVIEW_CHAR_PICKED = [];
+    reviewCharLoadDupes();
+    reloadConfig();
+  }catch(e){ $('reviewCharMsg').textContent = '더하기 실패: ' + e; }
+}
+async function reviewCharLoadDupes(){
+  const host = $('reviewCharList');
+  if(!host) return;
+  host.innerHTML = '<div class="hint">겹친 캐릭터를 찾는 중입니다.</div>';
+  try{
+    const r = await (await fetch('/api/merge_preview', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Source':'characters'},
+      body:JSON.stringify({})})).json();
+    const groups = r['목록'] || [];
+    $('reviewCharCount').textContent = r.ok
+      ? `묶음 ${Number(r['묶음'] || 0).toLocaleString()}개 · 캐릭터 ${Number(r['전체'] || 0).toLocaleString()}명`
+      : (r.error || '');
+    if(!groups.length){
+      host.innerHTML = '<div class="hint">겹치는 캐릭터가 없습니다.</div>';
+      return;
+    }
+    host.innerHTML = groups.slice(0, 40).map(group => `<details>
+      <summary style="cursor:pointer;">같은 묶음
+        <span class="tag">${Number(group['건수'] || 0)}명</span></summary>
+      <div style="margin-top:4px;display:grid;gap:3px;">`
+      + (group['항목'] || []).map(item => `<label class="bar" style="cursor:pointer;">
+          <input type="checkbox" data-review-char="${escA(item.id)}" style="width:auto;flex:none;">
+          <span>${esc(item.name || item.id)}</span>
+        </label>`).join('')
+      + `</div></details>`).join('');
+    host.querySelectorAll('[data-review-char]').forEach(box => {
+      box.addEventListener('change', () => {
+        const id = box.dataset.reviewChar;
+        REVIEW_CHAR_PICKED = box.checked
+          ? [...REVIEW_CHAR_PICKED.filter(value => value !== id), id].slice(-2)
+          : REVIEW_CHAR_PICKED.filter(value => value !== id);
+        host.querySelectorAll('[data-review-char]').forEach(other => {
+          other.checked = REVIEW_CHAR_PICKED.includes(other.dataset.reviewChar);
+        });
+        if(REVIEW_CHAR_PICKED.length === 2) reviewCharCompareSelected();
+        else $('reviewCharCompare').classList.add('hidden');
+      });
+    });
+  }catch(e){ host.innerHTML = `<div class="hint">${esc('찾기 실패: ' + e)}</div>`; }
+}
 async function reviewArchivePost(payload){
   const r = await (await fetch('/api/archive_download_control', {method:'POST',
     headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})).json();
@@ -1292,6 +1418,7 @@ function bindLibraryReview(){
   if(!$('libraryReviewCard') || $('libraryReviewCard')._bound) return;
   $('libraryReviewCard')._bound = true;
   $('reviewDupeLoad').addEventListener('click', reviewLoadDupes);
+  $('reviewCharLoad').addEventListener('click', reviewCharLoadDupes);
   $('reviewMergeUndo').addEventListener('click', async () => {
     if(!REVIEW_UNDO) return;
     const r = await (await fetch('/api/merge_undo', {method:'POST',

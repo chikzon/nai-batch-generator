@@ -218,14 +218,12 @@ class CharacterDupeContractTests(unittest.TestCase):
             bundle_signature=_bundle_signature,
         )
         self.assertTrue(result["ok"])
-        # A·B는 변형·참조가 달라 같은 묶음이 아니다 — 지문 함수 기준 그대로
-        self.assertEqual(result["묶음"], 0)
-        twins = find_character_dupes(
-            [dict(CHAR_A), dict(CHAR_A) | {"id": "char-c", "name": "쌍둥이"}],
-            bundle_signature=_bundle_signature,
-        )
-        self.assertEqual(twins["묶음"], 1)
-        self.assertEqual(twins["목록"][0]["건수"], 2)
+        # A·B는 변형·참조만 다르다 — 원문이 같으니 병합 후보 한 묶음이다
+        self.assertEqual(result["묶음"], 1)
+        self.assertEqual(result["목록"][0]["건수"], 2)
+        self.assertEqual(
+            sorted(item["id"] for item in result["목록"][0]["항목"]),
+            ["char-a", "char-b"])
 
     def test_compare_payload_carries_bundles_and_diff(self):
         from src.nai_studio.services.evidence_merge import (

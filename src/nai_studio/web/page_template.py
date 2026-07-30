@@ -947,6 +947,20 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <div id="reviewCompare" class="hidden"
           style="margin-top:9px;padding-top:8px;border-top:1px solid var(--line);"></div>
         <div id="reviewMergeMsg" class="hint" aria-live="polite" style="margin-top:6px;"></div>
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--line);">
+          <div class="bar" style="flex-wrap:wrap;">
+            <b style="font-size:var(--fs-xs);">캐릭터 겹침</b>
+            <button type="button" id="reviewCharLoad">겹친 캐릭터 찾기</button>
+            <span id="reviewCharCount" class="hint" aria-live="polite"></span>
+          </div>
+          <p class="hint" style="margin:4px 0 0;">같은 묶음(외형·착의·네거티브·변형·참조)의
+          캐릭터를 둘 골라 나란히 보고, 대표에 변형·참조·근거를 <b>더하기만</b> 합니다.
+          원문과 원본 캐릭터는 그대로 남습니다.</p>
+          <div id="reviewCharList" style="margin-top:6px;display:grid;gap:6px;"></div>
+          <div id="reviewCharCompare" class="hidden"
+            style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line);"></div>
+          <div id="reviewCharMsg" class="hint" aria-live="polite" style="margin-top:6px;"></div>
+        </div>
         <details style="margin-top:10px;padding-top:8px;border-top:1px solid var(--line);">
           <summary style="cursor:pointer;font-size:var(--fs-xs);">
             <b>큰 자료 묶음 받아오기</b>
